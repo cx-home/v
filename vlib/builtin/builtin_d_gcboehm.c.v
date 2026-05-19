@@ -48,7 +48,26 @@ $if dynamic_boehm ? {
 	$if macos || linux {
 		#flag -DGC_BUILTIN_ATOMIC=1
 		#flag -I @VEXEROOT/thirdparty/libgc/include
-		$if (prod && !tinyc && !debug) || !(amd64 || arm64 || i386 || arm32 || rv64) {
+		// Fix for macOS hardened-runtime: skip the precompiled `gc.o`
+		// on macOS even under `-prod`. The precompiled object was built
+		// with parallel-mark trampolines enabled, which require rwx
+		// pages; macOS hardened runtime denies them and aborts at first
+		// allocation with "Cannot allocate executable pages". Force the
+		// source-compile path (via the tcc/lib/libgc.a archive) on
+		// macOS so we get a libgc without the trampoline allocator.
+		// Linux is unaffected and keeps the precompiled fast-path.
+		$if macos {
+			$if !use_bundled_libgc ? {
+				$if tinyc {
+					#flag @VEXEROOT/thirdparty/tcc/lib/libgc.dylib
+					#flag -Wl,-rpath,"@VEXEROOT/thirdparty/tcc/lib"
+				} $else {
+					#flag -L@VEXEROOT/thirdparty/tcc/lib
+					#flag -lgc
+					#flag -Xlinker -rpath -Xlinker "@VEXEROOT/thirdparty/tcc/lib"
+				}
+			}
+		} $else $if (prod && !tinyc && !debug) || !(amd64 || arm64 || i386 || arm32 || rv64) {
 			// TODO: replace the architecture check with a `!$exists("@VEXEROOT/thirdparty/tcc/lib/libgc.a")` comptime call
 			#flag -DALL_INTERIOR_POINTERS=1
 			#flag @VEXEROOT/thirdparty/libgc/gc.o
