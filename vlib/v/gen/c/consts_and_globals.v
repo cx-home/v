@@ -490,7 +490,14 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 		mut init := ''
 		extern := if field.is_extern { 'extern ' } else { '' }
 		field_visibility_kw := if field.is_extern { '' } else { visibility_kw }
-		modifier := if field.is_volatile { ' volatile ' } else { '' }
+		mut modifier := if field.is_volatile { ' volatile ' } else { '' }
+		// `@[thread_local] __global x = ...` → per-thread storage. The `__thread`
+		// GCC/Clang/tcc extension is used (widely supported, and our zero/nil/
+		// literal initializers are valid for it). Without this the global is
+		// process-shared and concurrent users race — see cx_region.c.v.
+		if node.attrs.contains('thread_local') {
+			modifier += '__thread '
+		}
 		final_c_name := field.name.all_after('C.')
 		if field.is_extern {
 			def_builder.writeln('${extern}${field_visibility_kw}${modifier}${styp} ${attributes}${final_c_name}; // global 2')
