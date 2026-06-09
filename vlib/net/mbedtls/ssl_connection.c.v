@@ -357,6 +357,12 @@ pub:
 	get_certificate ?fn (mut SSLListener, string) !&SSLCerts
 
 	read_timeout time.Duration = default_mbedtls_client_read_timeout // the SSL client read timeout
+
+	// DTLS handshake retransmission window (dtls.c.v). 0 ⇒ mbedTLS / RFC 6347
+	// default (1 s … 60 s). Set a bound to fail fast on a dial to an unbound peer
+	// (hermetic tests); leave 0 in production.
+	dtls_handshake_min_ms u32
+	dtls_handshake_max_ms u32
 }
 
 fn ssl_read_timeout_ms(timeout time.Duration) u32 {
