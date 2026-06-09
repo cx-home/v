@@ -170,7 +170,9 @@ fn (mut pv Picoev) set_timeout(fd int, secs int) {
 fn (mut pv Picoev) handle_timeout() {
 	mut to_remove := []int{}
 	for fd, timeout in pv.timeouts {
-		if timeout <= pv.loop.now {
+		// cx patch (§24): held-open SSE fds are exempt from the idle timeout —
+		// they live across many pushes and are closed by the cx SSE layer.
+		if timeout <= pv.loop.now && !cx_is_held(fd) {
 			to_remove << fd
 		}
 	}
@@ -213,6 +215,15 @@ fn accept_callback(listen_fd int, _events int, cb_arg voidptr) {
 // close_conn closes the socket `fd` and removes it from the loop.
 @[inline]
 pub fn (mut pv Picoev) close_conn(fd int) {
+	// cx patch (§24): if this is a held-open SSE fd, notify the cx layer to drop
+	// it from its subscriber set (under the push lock) BEFORE the socket closes,
+	// so a concurrent push from another reactor can't write to a reused fd.
+	if cx_is_held(fd) {
+		if cx_sse_on_close != unsafe { nil } {
+			cx_sse_on_close(fd)
+		}
+		cx_release_fd(fd)
+	}
 	if pv.delete(fd) != 0 {
 		elog('Error during del')
 	}
