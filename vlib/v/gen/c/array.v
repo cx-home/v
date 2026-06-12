@@ -1101,13 +1101,25 @@ fn (mut g Gen) gen_array_map(node ast.CallExpr) {
 	}
 
 	if left_is_array {
-		g.writeln2(';',
-			'builtin__array_push${noscan}((array*)&${past.tmp_var}, &${tmp_map_expr_result_name});')
+		if perceus_map_reuse {
+			// In-place reuse: the buffer already has cap == orig.len and we refill
+			// exactly orig.len slots by ascending index, so a direct indexed store
+			// avoids array_push's call + grow-check + element memmove (the dominant
+			// single-thread cost). `len` is restored after the loop (it was zeroed).
+			g.writeln2(';', '((${ret_elem_styp}*)${past.tmp_var}.data)[${i}] = ${tmp_map_expr_result_name};')
+		} else {
+			g.writeln2(';',
+				'builtin__array_push${noscan}((array*)&${past.tmp_var}, &${tmp_map_expr_result_name});')
+		}
 	} else {
 		g.writeln2(';', '${past.tmp_var}[${i}] = ${tmp_map_expr_result_name};')
 	}
 	g.indent--
 	g.writeln('}')
+	if perceus_map_reuse {
+		// restore the length the direct-store loop bypassed (push would have bumped it)
+		g.writeln('${past.tmp_var}.len = ${past.tmp_var}_len;')
+	}
 	if !is_embed_map_filter {
 		g.set_current_pos_as_last_stmt_pos()
 	}
