@@ -77,26 +77,19 @@ static int v_os_exec_capture_start(char *const argv[], int *child_pid, int *read
 	return 0;
 }
 #else
-// Use opaque void* declarations for posix_spawn instead of #include <spawn.h>.
-// Including <spawn.h> transitively pulls in <features.h>/<sys/cdefs.h>, which
-// breaks under musl-gcc on the Ubuntu docker image where <sys/cdefs.h> is not
-// on the include path. The 128-byte buffer is comfortably larger than the
-// real posix_spawn_file_actions_t on glibc (~80 bytes) and musl (~40 bytes);
-// posix_spawn_file_actions_init() initializes the buffer, so its true layout
-// is not needed here. We pass NULL for posix_spawnattr_t, so it is not
-// declared. Calling these via void* is ABI-compatible: pointer parameters
-// are passed identically regardless of pointee type.
-typedef struct { unsigned char _opaque[128]; } v_posix_spawn_file_actions_t;
+// cx fork patch: use the REAL <spawn.h> declarations instead of private opaque
+// void* externs. Upstream self-declares posix_spawn/posix_spawnp to dodge a
+// musl-gcc <sys/cdefs.h> include-path issue on its Ubuntu docker, but those
+// declarations conflict ("conflicting types for 'posix_spawn'") with the SDK's
+// real, `restrict`/typedef-qualified signature whenever <spawn.h> is ALSO in the
+// translation unit — which cx pulls in via code/cx_pty.h's pty shim. Including the
+// system header (idempotent with cx_pty.h) is the correct fix for cx's macOS/Linux
+// (glibc) targets and removes the duplicate declaration.
+#include <spawn.h>
+#define v_posix_spawn_file_actions_t posix_spawn_file_actions_t
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int posix_spawn(pid_t *, const char *, const void *, const void *, char *const [], char *const []);
-extern int posix_spawnp(pid_t *, const char *, const void *, const void *, char *const [], char *const []);
-extern int posix_spawn_file_actions_init(void *);
-extern int posix_spawn_file_actions_destroy(void *);
-extern int posix_spawn_file_actions_adddup2(void *, int, int);
-extern int posix_spawn_file_actions_addclose(void *, int);
-
 extern char **environ;
 #ifdef __cplusplus
 }
