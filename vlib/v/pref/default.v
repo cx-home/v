@@ -247,13 +247,17 @@ pub fn (mut p Preferences) fill_with_defaults() {
 			p.gc_mode = .no_gc
 			p.build_options << ['-gc', 'none']
 		} else {
-			// enable the GC by default
-			p.gc_mode = .boehm_full_opt
+			// Default GC = architecture E (Perceus-disciplined RC front line +
+			// precise STW vgc tracing backstop). The compiler self-build takes the
+			// `building_v` branch above (-> .no_gc) and wasm/c2v/prealloc set .no_gc
+			// explicitly, so this only changes ordinary C-backend programs — which is
+			// every consumer of this toolchain. `-gc boehm` (and the other modes)
+			// still override explicitly via the `-gc` flag.
 			// NOTE: these are added to p.compile_defines[_all]
 			// more than once when building modules for usecache
-			p.parse_define('gcboehm')
-			p.parse_define('gcboehm_full')
-			p.parse_define('gcboehm_opt')
+			p.gc_mode = .vgc
+			p.parse_define('vgc')
+			p.parse_define('perceus')
 		}
 	}
 	if p.is_debug {
