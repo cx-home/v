@@ -78,24 +78,8 @@ pub fn malloc(n isize) &u8 {
 			res = &u8(vgc_malloc(usize(n)))
 		}
 	} $else $if gcboehm ? {
-		$if cx_regions ? {
-			// Scope-aware region (see cx_region.c.v): while a thread is inside a
-			// region scope, small scanned allocations bump from the per-thread
-			// region instead of locking Boehm's global allocator. Inert when no
-			// scope is active → identical to default.
-			if cx_region_is_active() && n > 0 && n <= cx_region_max_obj {
-				unsafe {
-					res = cx_region_alloc(n)
-				}
-			} else {
-				unsafe {
-					res = C.GC_MALLOC(n)
-				}
-			}
-		} $else {
-			unsafe {
-				res = C.GC_MALLOC(n)
-			}
+		unsafe {
+			res = C.GC_MALLOC(n)
 		}
 	} $else $if freestanding {
 		// todo: is this safe to call malloc there? We export __malloc as malloc and it uses dlmalloc behind the scenes
@@ -280,15 +264,7 @@ pub fn v_realloc(b &u8, n isize) &u8 {
 	} $else $if vgc ? {
 		new_ptr = unsafe { &u8(vgc_realloc(b, usize(n))) }
 	} $else $if gcboehm ? {
-		$if cx_regions ? {
-			if cx_region_is_active() && cx_region_owns(b) {
-				new_ptr = cx_region_realloc_to_gc(b, n)
-			} else {
-				new_ptr = unsafe { C.GC_REALLOC(b, n) }
-			}
-		} $else {
-			new_ptr = unsafe { C.GC_REALLOC(b, n) }
-		}
+		new_ptr = unsafe { C.GC_REALLOC(b, n) }
 	} $else {
 		$if windows {
 			// Warning! On windows, we always use _aligned_realloc to reallocate memory.
@@ -351,19 +327,7 @@ pub fn realloc_data(old_data &u8, old_size int, new_size int) &u8 {
 	$if vgc ? {
 		nptr = unsafe { &u8(vgc_realloc(old_data, usize(new_size))) }
 	} $else $if gcboehm ? {
-		$if cx_regions ? {
-			if cx_region_is_active() && cx_region_owns(old_data) {
-				unsafe {
-					nptr = &u8(C.GC_MALLOC(new_size))
-					mins := if old_size < new_size { old_size } else { new_size }
-					C.memcpy(nptr, old_data, mins)
-				}
-			} else {
-				nptr = unsafe { C.GC_REALLOC(old_data, new_size) }
-			}
-		} $else {
-			nptr = unsafe { C.GC_REALLOC(old_data, new_size) }
-		}
+		nptr = unsafe { C.GC_REALLOC(old_data, new_size) }
 	} $else {
 		$if windows {
 			// Warning! On windows, we always use _aligned_realloc to reallocate memory.

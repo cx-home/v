@@ -551,9 +551,9 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			qualifiers += 'volatile '
 		}
 		// `@[thread_local] __global x` → per-thread storage via the `__thread`
-		// GCC/Clang/tcc extension (cx_region.c.v relies on this; without it the
-		// global is process-shared and concurrent users race). Forward-ported onto
-		// upstream's `qualifiers` (replaced the old volatile-only `modifier`).
+		// GCC/Clang/tcc extension; without it the global is process-shared and
+		// concurrent users race. Forward-ported onto upstream's `qualifiers`
+		// (replaced the old volatile-only `modifier`).
 		if node.attrs.contains('thread_local') {
 			qualifiers += '__thread '
 		}
