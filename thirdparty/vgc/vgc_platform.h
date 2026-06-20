@@ -125,6 +125,8 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_sub_u32(ptr, val) __sync_sub_and_fetch((volatile uint32_t*)(ptr), (uint32_t)(val))
   #define vgc_atomic_fetch_or_u8(ptr, val) __sync_fetch_and_or((volatile uint8_t*)(ptr), (uint8_t)(val))
   #define vgc_atomic_fetch_and_u8(ptr, val) __sync_fetch_and_and((volatile uint8_t*)(ptr), (uint8_t)(val))
+  #define vgc_atomic_load_u16(ptr) (*(volatile uint16_t*)(ptr))
+  #define vgc_atomic_store_u16(ptr, val) do { *(volatile uint16_t*)(ptr) = (val); __sync_synchronize(); } while(0)
   #define vgc_atomic_cas_u32(ptr, expected, desired) __sync_bool_compare_and_swap((volatile uint32_t*)(ptr), *(expected), (desired))
   #define vgc_atomic_exchange_u32(ptr, val) __sync_lock_test_and_set((volatile uint32_t*)(ptr), (val))
   #define vgc_atomic_fence() __sync_synchronize()
@@ -145,6 +147,10 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_sub_u32(ptr, val) _InterlockedExchangeAdd((volatile long*)(ptr), -(long)(val))
   #define vgc_atomic_fetch_or_u8(ptr, val) ((uint8_t)_InterlockedOr8((volatile char*)(ptr), (char)(val)))
   #define vgc_atomic_fetch_and_u8(ptr, val) ((uint8_t)_InterlockedAnd8((volatile char*)(ptr), (char)(val)))
+  static inline uint16_t vgc_atomic_load_u16_fn(volatile uint16_t* p) { uint16_t v = *p; _ReadBarrier(); return v; }
+  static inline void vgc_atomic_store_u16_fn(volatile uint16_t* p, uint16_t v) { _WriteBarrier(); *p = v; }
+  #define vgc_atomic_load_u16(ptr) vgc_atomic_load_u16_fn((volatile uint16_t*)(ptr))
+  #define vgc_atomic_store_u16(ptr, val) vgc_atomic_store_u16_fn((volatile uint16_t*)(ptr), (uint16_t)(val))
   #define vgc_atomic_cas_u32(ptr, expected, desired) (_InterlockedCompareExchange((volatile long*)(ptr), (long)(desired), (long)*(expected)) == (long)*(expected))
   #define vgc_atomic_exchange_u32(ptr, val) (uint32_t)_InterlockedExchange((volatile long*)(ptr), (long)(val))
   #define vgc_atomic_fence() _ReadWriteBarrier()
@@ -160,6 +166,8 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_sub_u32(ptr, val) __atomic_sub_fetch((volatile uint32_t*)(ptr), (uint32_t)(val), __ATOMIC_ACQ_REL)
   #define vgc_atomic_fetch_or_u8(ptr, val) __atomic_fetch_or((volatile uint8_t*)(ptr), (uint8_t)(val), __ATOMIC_ACQ_REL)
   #define vgc_atomic_fetch_and_u8(ptr, val) __atomic_fetch_and((volatile uint8_t*)(ptr), (uint8_t)(val), __ATOMIC_ACQ_REL)
+  #define vgc_atomic_load_u16(ptr) __atomic_load_n((volatile uint16_t*)(ptr), __ATOMIC_ACQUIRE)
+  #define vgc_atomic_store_u16(ptr, val) __atomic_store_n((volatile uint16_t*)(ptr), (uint16_t)(val), __ATOMIC_RELEASE)
   #define vgc_atomic_cas_u32(ptr, expected, desired) __atomic_compare_exchange_n((volatile uint32_t*)(ptr), (uint32_t*)(expected), (uint32_t)(desired), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
   #define vgc_atomic_exchange_u32(ptr, val) __atomic_exchange_n((volatile uint32_t*)(ptr), (uint32_t)(val), __ATOMIC_ACQ_REL)
   #define vgc_atomic_fence() __atomic_thread_fence(__ATOMIC_SEQ_CST)
@@ -470,7 +478,13 @@ static inline void vgc_addr_map_register(uintptr_t base, size_t size, int arena_
     uintptr_t lo = base >> VGC_ADDR_SHIFT;
     uintptr_t hi = (base + size - 1) >> VGC_ADDR_SHIFT;
     for (uintptr_t i = lo; i <= hi && i < VGC_ADDR_MAP_SIZE; i++) {
-        vgc_addr_map[i] = (uint16_t)(arena_idx + 1);
+        // RELEASE store: vgc_span_alloc (writer, under heap lock) publishes the chunk
+        // hint; vgc_addr_to_arena reads it LOCK-FREE from vgc_find_span in the
+        // vgc_free/vgc_realloc mutator hot path. A plain u16 write/read pair raced
+        // (ThreadSanitizer: data race on global vgc_addr_map between vgc_span_alloc and
+        // vgc_find_span under concurrent HTTP load) — the last unsynchronized
+        // lock-free-reader/writer in the allocator after the narenas/page_span fixes.
+        vgc_atomic_store_u16(&vgc_addr_map[i], (uint16_t)(arena_idx + 1));
     }
 }
 
@@ -478,7 +492,7 @@ static inline void vgc_addr_map_register(uintptr_t base, size_t size, int arena_
 static inline int vgc_addr_to_arena(uintptr_t addr) {
     uintptr_t idx = addr >> VGC_ADDR_SHIFT;
     if (idx >= VGC_ADDR_MAP_SIZE) return -1;
-    int v = vgc_addr_map[idx];
+    int v = (int)vgc_atomic_load_u16(&vgc_addr_map[idx]); // ACQUIRE (pairs with register's RELEASE)
     return v ? v - 1 : -1;
 }
 
