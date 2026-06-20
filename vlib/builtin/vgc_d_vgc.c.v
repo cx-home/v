@@ -76,6 +76,12 @@ const vgc_num_classes = 68
 const vgc_num_span_classes = 136 // 68 * 2 (scan + noscan variants)
 const vgc_arena_size = usize(64) * 1024 * 1024 // 64MB per arena
 const vgc_pages_per_arena = vgc_arena_size / vgc_page_size
+// free_spans pool bound: spans of 1..vgc_max_pooled_pages-1 pages are recyclable.
+// A literal (not the computed vgc_pages_per_arena) because V needs a constant-literal
+// for the fixed-array size below. 8192 pages * 8 KB = 64 MB = one full arena, so every
+// span that can fit in an arena is poolable (#52/#57: the old 32-page/256 KB bound
+// silently leaked larger transients).
+const vgc_max_pooled_pages = 8192
 const vgc_max_arenas = 64
 const vgc_max_threads = 64
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
@@ -229,7 +235,13 @@ mut:
 	nspans       int
 	// Free spans (completely empty, reusable by page count)
 	free_spans_lock u32
-	free_spans      [32]&VGC_Span // free spans indexed by npages (1..31, 0=unused)
+	// free spans indexed by npages (1..vgc_pages_per_arena-1, 0=unused). Sized to a
+	// full arena so EVERY span that fits in one arena is recyclable. The old [32]
+	// bound (256 KB) silently leaked larger transients (e.g. a ~1 MB zstd dst buffer
+	// in a streaming-write hot loop): swept empty, but vgc_put_free_span/_get_free_span
+	// refused npages>=32, so the span was never pooled and the arena bump pointer
+	// (never rewound) kept advancing → unbounded RSS. cx-private #52/#57.
+	free_spans      [vgc_max_pooled_pages]&VGC_Span
 	// Per-thread caches
 	caches       [64]VGC_Cache
 	ncaches      int // high-water mark of slots ever used
@@ -589,7 +601,7 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 
 // Try to get a recycled span from the free list
 fn vgc_get_free_span(npages u32) &VGC_Span {
-	if npages == 0 || npages >= 32 {
+	if npages == 0 || npages >= u32(vgc_max_pooled_pages) {
 		return unsafe { nil }
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
@@ -615,7 +627,7 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 // Return a fully-empty span to the free list for reuse
 fn vgc_put_free_span(mut span VGC_Span) {
 	npages := span.npages
-	if npages == 0 || npages >= 32 {
+	if npages == 0 || npages >= u32(vgc_max_pooled_pages) {
 		return
 	}
 	// DIAGNOSTIC: did we just free the span holding the watched address?
