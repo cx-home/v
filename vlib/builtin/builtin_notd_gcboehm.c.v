@@ -49,7 +49,12 @@ pub fn gc_disable() {}
 
 // gc_collect explicitly performs a garbage collection.
 // When the GC is not on, (with `-gc none`), it is a NOP.
-pub fn gc_collect() {}
+// Under the vgc collector (`-gc e`) it forces a full STW collection now.
+pub fn gc_collect() {
+	$if vgc ? {
+		vgc_force_collect()
+	}
+}
 
 pub type FnGC_WarnCB = fn (msg &char, arg usize)
 
