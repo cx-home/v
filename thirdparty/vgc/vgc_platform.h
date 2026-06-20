@@ -952,6 +952,44 @@ static inline void vgc_rootfind_report(uint64_t referrer, int in_stack, uint64_t
           vgc_rootfind_region(lo, hi, kind);
       }
   }
+#elif defined(__APPLE__)
+  // macOS rootfinder (DEBUG, -d vgc_verify). Same intent as the Linux version but
+  // walks the task's VM map via mach_vm_region instead of /proc/self/maps — and,
+  // unlike Linux, does NOT skip thread-stack / large-anon regions: spawned-thread
+  // stacks are multi-MiB anon mappings, so skipping them would hide exactly the
+  // STACKMISS we are hunting. Runs in-STW under -d vgc_verify only, so the cost is
+  // acceptable for diagnosis. No malloc (suspended threads may hold the libc lock).
+  #include <mach/mach.h>
+  #include <mach/mach_vm.h>
+  extern void vgc_rootfind_region(uintptr_t lo, uintptr_t hi, int kind); // V callback
+  static inline void vgc_rootfind_enumerate(uintptr_t arena_lo, uintptr_t arena_hi) {
+      mach_vm_address_t address = 0;
+      while (1) {
+          mach_vm_size_t size = 0;
+          vm_region_basic_info_data_64_t info;
+          mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+          mach_port_t object_name = MACH_PORT_NULL;
+          kern_return_t kr = mach_vm_region(mach_task_self(), &address, &size,
+              VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name);
+          if (kr != KERN_SUCCESS) break;
+          uintptr_t lo = (uintptr_t)address;
+          uintptr_t hi = (uintptr_t)(address + size);
+          int readable = (info.protection & VM_PROT_READ) != 0;
+          int writable = (info.protection & VM_PROT_WRITE) != 0;
+          address = address + size; // advance regardless
+          if (!readable || !writable || hi <= lo) continue;
+          // Skip regions fully inside the GC arena (heap->heap is the transitive
+          // case the mark-closure verifier covers). The callback also does a
+          // per-word arena exclusion for regions that straddle the bound.
+          if (lo >= arena_lo && hi <= arena_hi) continue;
+          // Skip absurdly large regions (the arena's 64 MiB chunks, shared caches):
+          // a root to a live object lives in a small holder, a data segment, or a
+          // thread stack (<=64 MiB). This keeps the in-STW scan bounded while still
+          // covering every thread stack — the Linux version's blind spot.
+          if ((hi - lo) > (uintptr_t)64 * 1024 * 1024) continue;
+          vgc_rootfind_region(lo, hi, 0);
+      }
+  }
 #else
   static inline void vgc_rootfind_enumerate(uintptr_t arena_lo, uintptr_t arena_hi) { (void)arena_lo; (void)arena_hi; }
 #endif
