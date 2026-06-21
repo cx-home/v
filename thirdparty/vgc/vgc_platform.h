@@ -653,6 +653,22 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       for (int i = 0; i < 29 && c < max; i++) regs[c++] = (uintptr_t)st.__x[i];
       if (c < max) regs[c++] = (uintptr_t)arm_thread_state64_get_fp(st);
       if (c < max) regs[c++] = (uintptr_t)arm_thread_state64_get_lr(st);
+      // ALSO capture the NEON/SIMD register file (v0–v31). The GP scan above misses a
+      // live pointer that a suspended thread holds ONLY in a vector register — e.g.
+      // clang lowers string_clone/map memcpy through SIMD and may keep the live src/dst
+      // pointer in a q-reg across the copy. With >=2 reactor mutators the collector
+      // suspends a thread at exactly such a point and the object, reachable from no
+      // scanned stack/GP-reg, is swept -> use-after-free (cx-private #63). The collector
+      // self-scans via setjmp (vgc_run_gc_spilled), which on arm64 spills callee-saved
+      // d8–d15 onto its own scanned stack, so this asymmetry only bites OTHER suspended
+      // threads — matching the single-reactor-clean / multi-reactor-crash signature.
+      // Each 128-bit q-reg contributes both 64-bit lanes as conservative root candidates.
+      arm_neon_state64_t ns;
+      mach_msg_type_number_t nn = ARM_NEON_STATE64_COUNT;
+      if (thread_get_state((thread_act_t)t, ARM_NEON_STATE64, (thread_state_t)&ns, &nn) == KERN_SUCCESS) {
+          const uint64_t* q = (const uint64_t*)&ns.__v[0]; // 32 × 128-bit = 64 × u64 lanes
+          for (int i = 0; i < 64 && c < max; i++) regs[c++] = (uintptr_t)q[i];
+      }
       return c;
     #elif defined(__x86_64__)
       x86_thread_state64_t st;

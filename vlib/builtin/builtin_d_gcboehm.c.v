@@ -218,6 +218,16 @@ pub fn gc_collect() {
 	C.GC_gcollect()
 }
 
+// gc_pin / gc_unpin: NOPs under boehm. Boehm scans conservatively (incl. the C heap
+// and foreign memory), so a GC pointer parked in non-GC memory is already covered —
+// the precise-collector blind spot the Pinner addresses does not exist here. The API
+// exists so FFI shims can call it unconditionally regardless of the active backend.
+@[markused]
+pub fn gc_pin(p voidptr) {}
+
+@[markused]
+pub fn gc_unpin(p voidptr) {}
+
 // gc_enable explicitly enables the GC.
 // Note, that garbage collections are done automatically, when needed in most cases,
 // and also that by default the GC is on, so you do not need to enable it.
