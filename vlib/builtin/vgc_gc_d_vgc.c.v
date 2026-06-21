@@ -219,6 +219,12 @@ fn vgc_gc_start() {
 	C.vgc_trace(9, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP0
 	vgc_do_sweep()
 	C.vgc_trace(10, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP1
+	$if vgc_markbit ? {
+		// #63 mark-bit: IN-STW, immediately post-sweep — freed buffers have alloc=0 and
+		// THIS cycle's mark bits are still valid (cleared only at next cycle's start).
+		// Bounded ~1024-entry table scan, NOT per-freed-buffer. World resumes below.
+		vgc_assoc_marksweep()
+	}
 
 	// Drop mcache slots whose cached span sweep just recycled to the pool (and the
 	// tiny cursor). Must run while the world is still stopped, after sweep. Without
@@ -1198,18 +1204,19 @@ fn vgc_sweep_span(span &VGC_Span) {
 		if garbage != 0 {
 			freed += u32(C.vgc_popcount8(garbage))
 			$if vgc_passive ? {
-				// #63 PASSIVE: record each freed SMALL noscan buffer (the map-key
-				// char-buffer class) at its TRUE freeing GC into the swept-log. PURELY
-				// PASSIVE — alloc bits are still cleared below (no retention), so the
-				// crash is preserved. Bit-loop only over small noscan spans (the victim
-				// class), bounded STW cost. NO quarantine / arming / holder-find.
-				if span.noscan && span.elem_size <= u32(32) { // 16/24/32B = key-buffer classes
-					for bit in 0 .. 8 {
-						if garbage & (u8(1) << bit) != 0 {
-							oi := u32(b) * 8 + u32(bit)
-							if oi < span.nelems {
-								vgc_slog_record(span.base + usize(oi) * usize(span.elem_size),
-									span.elem_size)
+				$if !vgc_nosweep ? { // attribution: -d vgc_nosweep disables the sweep-hook
+					// #63 PASSIVE: record each freed SMALL noscan buffer (the map-key
+					// char-buffer class) at its TRUE freeing GC into the swept-log. PURELY
+					// PASSIVE — alloc bits are still cleared below (no retention), so the
+					// crash is preserved. Bit-loop only over small noscan spans, bounded.
+					if span.noscan && span.elem_size <= u32(32) { // 16/24/32B = key-buffer classes
+						for bit in 0 .. 8 {
+							if garbage & (u8(1) << bit) != 0 {
+								oi := u32(b) * 8 + u32(bit)
+								if oi < span.nelems {
+									vgc_slog_record(span.base + usize(oi) * usize(span.elem_size),
+										span.elem_size)
+								}
 							}
 						}
 					}

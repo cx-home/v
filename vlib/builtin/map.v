@@ -260,13 +260,21 @@ fn map_clone_string(dest voidptr, pkey voidptr) {
 	unsafe {
 		s := *&string(pkey)
 		$if vgc_passive ? {
-			// #63 PASSIVE detector at the exact crash-path read (no arming). If the
-			// source key struct/buffer was freed-while-live, the detector fires here;
-			// GOLD correlation if it matches a swept-log entry.
-			if s.len < 0 || s.len > 0x08000000 {
-				vgc_uaf_report(usize(pkey), s.len, usize(s.str))
-			} else {
-				vgc_uaf_check_buf(usize(s.str), s.len)
+			$if !vgc_nodet ? { // attribution: -d vgc_nodet disables the per-clone detector
+				// #63 PASSIVE detector at the exact crash-path read (no arming). If the
+				// source key struct/buffer was freed-while-live, the detector fires here;
+				// GOLD correlation if it matches a swept-log entry.
+				if s.len < 0 || s.len > 0x08000000 {
+					vgc_uaf_report(usize(pkey), s.len, usize(s.str))
+				} else {
+					vgc_uaf_check_buf(usize(s.str), s.len)
+				}
+			}
+			$if vgc_markbit ? {
+				// #63 mark-bit: record (victim buffer, source key-slot). NO find_span here —
+				// the holder (keys-array) is resolved + mark-read IN-STW at the freeing GC
+				// by vgc_assoc_marksweep. Cheap: two stores per key clone.
+				vgc_assoc_record(usize(s.str), usize(pkey))
 			}
 		}
 		cloned := s.clone()

@@ -2284,3 +2284,103 @@ fn vgc_uaf_check_buf(strptr usize, slen int) bool {
 	}
 	return false
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #63 MARK-BIT mechanism (-d vgc_markbit) — fork-only, keys-array level. Answers
+// the falsification question: when a map-key buffer is swept, is its HOLDER (the
+// keys-array that contains the key struct) MARKED at that GC?
+//   holder UNMARKED  -> root-miss at/above keys-array (map/MatchEnv/renv chain)
+//   holder MARKED, buffer swept -> shade/mark race on the buffer (NOT a root miss)
+// Recording is CHEAP: at the clone site we store (buf, pkey) only — NO find_span,
+// NO slog. The find_span (holder identity + mark read) is DEFERRED to a bounded
+// (~1024) table scan run IN-STW immediately after vgc_do_sweep (freed buffers have
+// alloc=0; this cycle's mark bits are still valid — cleared only next cycle). So
+// the per-clone cost is ~one ring push, and the per-GC cost is bounded by the
+// table size, NOT the freed-buffer count. NO arming-retention, NO holder-find scan.
+// Tags: 0x6ab0=swept key-buffer, 0x6ab1=holder(keys-array obj base),
+//       0x6ab2=holder mark (0=unmarked/root-miss, 1=marked/shade-race, ffffffff=n/a),
+//       0x6abf=count of swept-with-holder-check this GC.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const vgc_assoc_n = 1024
+__global vgc_assoc_buf = [1024]usize{} // key-buffer addr (victim candidate)
+__global vgc_assoc_pkey = [1024]usize{} // source key-slot addr (interior ptr into keys-array)
+__global vgc_assoc_head = u32(0)
+__global vgc_assoc_total = u64(0) // total associations recorded (stat)
+__global vgc_assoc_unmarked = u64(0) // swept buffer whose holder was UNMARKED (root-miss)
+__global vgc_assoc_marked = u64(0) // swept buffer whose holder was MARKED (shade-race)
+
+// vgc_assoc_record: at the clone site only. Two stores, no find_span. Rolling ring.
+fn vgc_assoc_record(buf usize, pkey usize) {
+	if buf == 0 || pkey == 0 {
+		return
+	}
+	vgc_assoc_total++
+	h := vgc_assoc_head % u32(vgc_assoc_n)
+	vgc_assoc_buf[h] = buf
+	vgc_assoc_pkey[h] = pkey
+	vgc_assoc_head = h + 1
+}
+
+// vgc_assoc_marksweep: IN-STW, immediately after vgc_do_sweep (mark bits still
+// valid, freed buffers have alloc=0). Scans the bounded table (~1024), and for each
+// key-buffer FREED this GC, resolves its holder (keys-array, via find_span(pkey))
+// and reads the holder's mark bit. Reports each + clears the entry (report-once).
+fn vgc_assoc_marksweep() {
+	mut nrep := 0
+	for i in 0 .. vgc_assoc_n {
+		buf := vgc_assoc_buf[i]
+		if buf == 0 {
+			continue
+		}
+		// Is the key-buffer FREED this GC? (alloc bit clear / span recycled)
+		mut freed := false
+		if buf < vgc_arena_lo || buf >= vgc_arena_hi {
+			vgc_assoc_buf[i] = 0
+			continue
+		}
+		bspan := vgc_find_span(voidptr(buf))
+		if bspan == unsafe { nil } || !bspan.in_use || bspan.elem_size == 0 {
+			freed = true
+		} else {
+			bidx := u32((buf - bspan.base) / usize(bspan.elem_size))
+			if bidx < bspan.nelems && bspan.alloc_bits != unsafe { nil }
+				&& C.vgc_bitmap_get(bspan.alloc_bits, bidx) == 0 {
+				freed = true
+			}
+		}
+		if !freed {
+			continue // still live — leave in the rolling table for a later GC
+		}
+		// Freed this GC: resolve the holder (keys-array containing pkey) + read its mark.
+		pkey := vgc_assoc_pkey[i]
+		mut hm := i64(-1) // -1 = holder not in arena / not resolvable
+		mut hbase := usize(0)
+		if pkey >= vgc_arena_lo && pkey < vgc_arena_hi {
+			hspan := vgc_find_span(voidptr(pkey))
+			if hspan != unsafe { nil } && hspan.in_use && hspan.elem_size != 0
+				&& hspan.mark_bits != unsafe { nil } {
+				hidx := u32((pkey - hspan.base) / usize(hspan.elem_size))
+				if hidx < hspan.nelems {
+					hbase = hspan.base + usize(hidx) * usize(hspan.elem_size)
+					hm = if C.vgc_bitmap_get(hspan.mark_bits, hidx) != 0 { i64(1) } else { i64(0) }
+				}
+			}
+		}
+		if nrep < 64 {
+			C.vgc_say(0x6ab0, u64(buf))
+			C.vgc_say(0x6ab1, u64(hbase))
+			C.vgc_say(0x6ab2, u64(hm))
+		}
+		if hm == 1 {
+			vgc_assoc_marked++
+		} else if hm == 0 {
+			vgc_assoc_unmarked++
+		}
+		nrep++
+		vgc_assoc_buf[i] = 0 // report-once: clear the swept entry
+	}
+	if nrep > 0 {
+		C.vgc_say(0x6abf, u64(nrep))
+	}
+}
