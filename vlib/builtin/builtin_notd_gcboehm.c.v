@@ -56,6 +56,29 @@ pub fn gc_collect() {
 	}
 }
 
+// gc_pin registers `p` as a GC root until a matching gc_unpin — the V analog of Go's
+// `runtime.Pinner`. Use it across an FFI boundary that parks a V/GC pointer in non-GC
+// memory (e.g. a C library that holds a buffer across an async write): the PRECISE vgc
+// collector cannot see such a reference through the C side and would reclaim the live
+// object -> use-after-free (cx-private #63). While pinned, `p` and everything reachable
+// from it survive collection. Each gc_pin MUST be balanced by exactly one gc_unpin.
+// NOP under `-gc none`; under `-gc boehm` the conservative scan already covers C memory,
+// so pinning is unnecessary (NOP there too — see builtin_d_gcboehm.c.v).
+@[markused]
+pub fn gc_pin(p voidptr) {
+	$if vgc ? {
+		vgc_pin(p)
+	}
+}
+
+// gc_unpin removes one pin previously added by gc_pin. NOP if `p` is not pinned.
+@[markused]
+pub fn gc_unpin(p voidptr) {
+	$if vgc ? {
+		vgc_unpin(p)
+	}
+}
+
 pub type FnGC_WarnCB = fn (msg &char, arg usize)
 
 fn C.GC_get_warn_proc() FnGC_WarnCB
