@@ -312,6 +312,84 @@ __global vgc_nspawn_roots = int(0)
 __global vgc_spawn_root_lock = u32(0)
 
 // ============================================================
+// Pinner — cgo-safe explicit roots (the Go `runtime.Pinner` analog)
+// ============================================================
+// A live GC object reachable ONLY from non-GC memory (a libc-malloc'd / anon C
+// structure the FFI boundary holds across a call — e.g. the picoev transport
+// holding a per-request buffer across an async write) is INVISIBLE to vgc's precise
+// root scan (globals + stacks + heap), so the collector reclaims it -> use-after-free
+// (cx-private #63, the multi-reactor HTTP residual). Go's GC has the same blind spot
+// and forbids it by rule ("C code must not keep a Go pointer after the call returns")
+// while offering runtime.Pinner for the legitimate case. This is that primitive:
+// vgc_pin(p) adds p to a set the collector SHADES as a root every cycle (so p and
+// everything transitively reachable from it survive); vgc_unpin(p) drops one pin.
+// The FFI shim pins for exactly the window C holds the pointer. Cheap (a set scan per
+// GC), unlike conservatively scanning all of C memory (~44x HTTP slowdown, rejected).
+//
+// Pins are NOT deduplicated: each vgc_pin adds a slot and each vgc_unpin removes one,
+// so N pins of the same object need N unpins (de-facto refcount — safe when distinct
+// owners pin a shared object). Concurrency: pin/unpin take vgc_pin_lock
+// (mutator-vs-mutator). The collector reads the slots LOCK-FREE under STW (frozen
+// mutators): each slot is one aligned usize (no torn read), and unpin's swap-remove
+// writes the moved value to its new slot BEFORE shrinking the count, so a frozen
+// mid-unpin leaves every still-pinned address present in >=1 slot (at worst shaded
+// twice for one cycle — harmless). Same discipline as vgc_spawn_roots.
+const vgc_pin_cap = 65536 // max concurrent pins; the array (512 KB) is scanned each GC
+__global vgc_pins = [vgc_pin_cap]voidptr{}
+__global vgc_npins = int(0)
+__global vgc_pin_lock = u32(0)
+
+// vgc_pin registers p as a root until a matching vgc_unpin. Idempotent on nil.
+@[markused]
+fn vgc_pin(p voidptr) {
+	if p == unsafe { nil } {
+		return
+	}
+	C.vgc_mutex_lock(&vgc_pin_lock)
+	if vgc_npins < vgc_pin_cap {
+		unsafe {
+			vgc_pins[vgc_npins] = p
+		}
+		// Publish the slot BEFORE bumping the count: the collector reads [0,npins)
+		// lock-free under STW and must never observe an uncounted/half-written slot.
+		C.vgc_atomic_fence()
+		vgc_npins++
+	} else {
+		// Full ⇒ a pin/unpin leak (cap is far above any real in-flight set). Loud,
+		// never silent: an unpinned live root would reintroduce the #63 UAF.
+		C.vgc_say(0x9171, u64(usize(p))) // PINNER FULL
+	}
+	C.vgc_mutex_unlock(&vgc_pin_lock)
+}
+
+// vgc_unpin removes ONE pin of p (the most recently added matching slot). No-op if
+// p was never pinned / already fully unpinned.
+@[markused]
+fn vgc_unpin(p voidptr) {
+	if p == unsafe { nil } {
+		return
+	}
+	C.vgc_mutex_lock(&vgc_pin_lock)
+	mut k := vgc_npins - 1
+	for k >= 0 {
+		if unsafe { vgc_pins[k] } == p {
+			last := vgc_npins - 1
+			// Move the last slot into k BEFORE shrinking npins, so the lock-free
+			// collector read never loses a still-pinned address mid-unpin.
+			unsafe {
+				vgc_pins[k] = vgc_pins[last]
+			}
+			C.vgc_atomic_fence()
+			vgc_npins = last
+			C.vgc_mutex_unlock(&vgc_pin_lock)
+			return
+		}
+		k--
+	}
+	C.vgc_mutex_unlock(&vgc_pin_lock)
+}
+
+// ============================================================
 // Initialization
 // ============================================================
 
