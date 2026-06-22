@@ -38,11 +38,16 @@ fn vgc_gc_start() {
 	// (collector-only) runs lock-free. Released right after sweep, before resume.
 	// (Lock order: free_spans_lock then cache_lock; no mutator holds free_spans_lock
 	// and then waits on cache_lock, so no deadlock.)
-	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
-
-	// === Phase 1: Sweep Termination (STW) ===
-	// Ensure any previous sweep is complete
-	vgc_sweep_finish()
+	// The cooperative-safepoint collector (DEFAULT) must NOT hold any allocator lock
+	// while waiting for mutators to self-park (a thread blocked on the lock can't reach
+	// the poll) — it acquires free_spans_lock + runs sweep_finish AFTER the park wait,
+	// below. Only the legacy mach-suspend collector (-d vgc_legacy_stw) takes it up-front.
+	$if vgc_legacy_stw ? {
+		C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+		// === Phase 1: Sweep Termination (STW) ===
+		// Ensure any previous sweep is complete
+		vgc_sweep_finish()
+	}
 
 	// === Stop the world via OS-level mach suspend ===
 	// Suspend every live registered mutator (except this collector). Unlike the
@@ -62,43 +67,92 @@ fn vgc_gc_start() {
 		vgc_watch_marked = 0
 	}
 	C.vgc_trace(5, self_idx, u64(vgc_heap.gc_cycle), u64(vgc_heap.ncaches)) // GC_BEG
-	C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0) // OS-suspend, not cooperative
+	// susp[i] records which slots THIS cycle mach-suspended, so resume targets exactly
+	// them. Default path: every other registered mutator. Cooperative path: only the
+	// stragglers that did not self-park. Used by both branches + the resume loop.
+	mut susp := [vgc_max_threads]bool{}
+	$if !vgc_legacy_stw ? {
+		// #63 COOPERATIVE STW (DEFAULT; -d vgc_legacy_stw reverts to legacy mach-suspend-all):
+		// request a cooperative stop; each RUNNING
+		// mutator self-parks at the alloc-path poll (vgc_d_vgc.c.v:1407 -> vgc_safepoint ->
+		// vgc_park_spill), self-spilling its own callee-saved registers onto its own
+		// scanned stack — the SAME sound shape as the collector's setjmp self-scan
+		// (vgc_run_gc_spilled). This removes the arbitrary-PC EXTERNAL register scan that is
+		// the residual #63 root miss. Threads not reaching a poll within the bounded wait
+		// (blocked in a syscall — thread_get_state capture PROVEN complete, GAP-1 — or in a
+		// tight non-allocating loop) are mach-suspended as a fallback. Lock order: hold NO
+		// allocator lock while waiting (else an allocating thread blocks before it can
+		// reach the poll), take them AFTER, then mach-suspend stragglers (which, being
+		// non-allocating/blocked, hold no allocator lock — preserving the
+		// no-frozen-lock-holder invariant).
+		C.vgc_mutex_lock(&vgc_heap.cache_lock) // registration gate (held across the cycle)
+		C.vgc_atomic_store_u32(&vgc_heap.gc_stopped_count, 0)
+		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 1)
+		mut want := u32(0)
+		for i in 0 .. vgc_heap.ncaches {
+			c := unsafe { &vgc_heap.caches[i] }
+			if c.registered && i != self_idx && c.mach_port != 0 {
+				want++
+			}
+		}
+		// Bounded wait: an ACTIVELY-ALLOCATING thread (the victim MatchEnv.clone path)
+		// polls vgc_maybe_gc constantly and self-parks within microseconds; a thread
+		// blocked in a syscall (kevent/recv) or a tight non-allocating loop never reaches
+		// the poll, so waiting for it is pure waste — it is mach-suspended below. Keep the
+		// wait short (just long enough for allocating threads to hit their next poll) so the
+		// per-GC cost stays negligible. (20M spun ~tens of ms EVERY GC because an idle
+		// listener thread never parks -> ~1.8x single-reactor slowdown; 200k is ~100x less.)
+		mut spins := 0
+		for C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want && spins < 200000 {
+			C.vgc_atomic_fence()
+			spins++
+		}
+		// Now safe to take allocator locks (parkers hold none at the poll site) + finish
+		// any lazy sweep from the previous cycle.
+		C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+		vgc_sweep_finish()
+		C.vgc_mutex_lock(&vgc_heap.lock)
+		for i in 0 .. 136 {
+			C.vgc_mutex_lock(&vgc_heap.central[i].lock)
+		}
+		// Mach-suspend only stragglers (registered, not self, not self-parked). Allocator
+		// locks are held first, so a straggler cannot be frozen holding one.
+		for i in 0 .. vgc_heap.ncaches {
+			c := unsafe { &vgc_heap.caches[i] }
+			C.vgc_trace(6, i, if c.registered { u64(1) } else { u64(0) }, u64(c.mach_port))
+			if c.registered && i != self_idx && c.mach_port != 0
+				&& C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 {
+				C.vgc_suspend_thread(c.mach_port)
+				susp[i] = true
+				C.vgc_trace(7, i, u64(c.mach_port), 0)
+			}
+		}
+	} $else {
+		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0) // OS-suspend, not cooperative
 
-	// Serialize thread registration/deregistration with STW: hold cache_lock
-	// across the whole cycle. Acquired BEFORE any suspend (so no holder is
-	// frozen), it blocks new vgc_register_thread/vgc_thread_exit_cb until the
-	// cycle ends — closing the thread-create-vs-STW race where a thread that
-	// registers just as STW starts would run unsuspended and allocate white.
-	C.vgc_mutex_lock(&vgc_heap.cache_lock)
+		// Serialize thread registration/deregistration with STW: hold cache_lock across the
+		// whole cycle. Acquired BEFORE any suspend (no holder frozen); blocks new
+		// register/exit until the cycle ends (the create-vs-STW white-allocation race).
+		C.vgc_mutex_lock(&vgc_heap.cache_lock)
 
-	// Acquire EVERY allocator lock BEFORE stopping the world, so no mutator is ever
-	// mach-suspended mid-critical-section. This is the root fix for the thread-churn
-	// segv class: previously the collector suspended first and then STOLE (zeroed)
-	// these locks "to avoid deadlocking on a frozen owner", but a mutator frozen
-	// mid-vgc_span_alloc / vgc_central_get_span / vgc_get_free_span would, on resume,
-	// find its lock zeroed and run concurrently with another allocator -> two threads
-	// bump the same arena / pop the same free span -> a span with a garbage base ->
-	// SIGSEGV in the allocation/bitmap memset. Acquiring up-front (while mutators are
-	// still RUNNING and will release promptly) means every allocator structure is
-	// quiescent and consistent for the whole cycle, and the frozen-owner problem
-	// cannot arise. Safe against deadlock: the collector never RE-ENTERS vgc_heap.lock
-	// or central[].lock (mutator-only; verified), and vgc_put_free_span is lock-free
-	// (the collector already holds free_spans_lock, taken at the top of this fn); a
-	// mutator never holds two allocator locks at once, so acquisition order is free.
-	// (cache_lock: the registration gate, already held. work_lock: re-entered by the
-	// mark; no mutator holds it under full-STW, so it is reset, not pre-acquired.)
-	C.vgc_mutex_lock(&vgc_heap.lock)
-	for i in 0 .. 136 {
-		C.vgc_mutex_lock(&vgc_heap.central[i].lock)
-	}
+		// Acquire EVERY allocator lock BEFORE stopping the world, so no mutator is ever
+		// mach-suspended mid-critical-section (the thread-churn segv class). The collector
+		// never re-enters vgc_heap.lock / central[].lock (mutator-only) and already holds
+		// free_spans_lock, so acquisition order is deadlock-free.
+		C.vgc_mutex_lock(&vgc_heap.lock)
+		for i in 0 .. 136 {
+			C.vgc_mutex_lock(&vgc_heap.central[i].lock)
+		}
 
-	for i in 0 .. vgc_heap.ncaches {
-		c := unsafe { &vgc_heap.caches[i] }
-		reg := if c.registered { u64(1) } else { u64(0) }
-		C.vgc_trace(6, i, reg, u64(c.mach_port)) // SUSP? (decision inputs for EVERY slot)
-		if c.registered && i != self_idx && c.mach_port != 0 {
-			C.vgc_suspend_thread(c.mach_port)
-			C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
+		for i in 0 .. vgc_heap.ncaches {
+			c := unsafe { &vgc_heap.caches[i] }
+			reg := if c.registered { u64(1) } else { u64(0) }
+			C.vgc_trace(6, i, reg, u64(c.mach_port)) // SUSP? (decision inputs for EVERY slot)
+			if c.registered && i != self_idx && c.mach_port != 0 {
+				C.vgc_suspend_thread(c.mach_port)
+				susp[i] = true
+				C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
+			}
 		}
 	}
 	// work_lock is re-entered by vgc_work_put/get during mark; no mutator holds it
@@ -250,13 +304,22 @@ fn vgc_gc_start() {
 	C.vgc_mutex_unlock(&vgc_heap.lock)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 
+	$if !vgc_legacy_stw ? {
+		// Release the cooperative parkers: they spin on gc_stop_flag, and the allocator
+		// locks are already released above, so they will not block on resume. susp[] (set
+		// only for mach-suspended stragglers) is the authoritative resume set, so clearing
+		// gc_stop_flag here cannot confuse the resume loop below.
+		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0)
+	}
+
 	// Resume the world: mark + sweep are complete, every live object survived, and
 	// gc_cycle/trigger are already advanced (above) so resumed mutators stamp spans
-	// with the correct cycle.
+	// with the correct cycle. Resume exactly the slots THIS cycle mach-suspended
+	// (susp[]); cooperative parkers are released via gc_stop_flag above.
 	C.vgc_atomic_fence()
 	for i in 0 .. vgc_heap.ncaches {
-		c := unsafe { &vgc_heap.caches[i] }
-		if c.registered && i != self_idx && c.mach_port != 0 {
+		if susp[i] {
+			c := unsafe { &vgc_heap.caches[i] }
 			C.vgc_resume_thread(c.mach_port)
 			C.vgc_trace(11, i, u64(c.mach_port), 0) // RESUME
 		}
@@ -449,6 +512,15 @@ fn vgc_scan_suspended_roots(self_idx int) {
 		c := unsafe { &vgc_heap.caches[i] }
 		if !c.registered || i == self_idx || c.mach_port == 0 {
 			continue
+		}
+		$if !vgc_legacy_stw ? {
+			// Cooperative parkers (stopped==1) already recorded their SELF-SPILLED range
+			// via vgc_park_spill; calling thread_get_state on a spinning parker would
+			// overwrite stack_lo/hi with the spin-loop range and drop its roots. Only
+			// mach-suspended stragglers (stopped==0) need the external register/SP scan.
+			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0 {
+				continue
+			}
 		}
 		mut sp := usize(0)
 		// 31 GP (x0–x28 + fp + lr) + 64 NEON lanes (v0–v31 × 2) = 95 conservative
