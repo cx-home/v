@@ -1093,7 +1093,7 @@ fn (mut db DB) read_response() !RedisValue {
 		ch := db.resp_buf[0]
 		if ch == `+` || ch == `-` || ch == `:` || ch == `$` || ch == `*` || ch == `#` || ch == `,`
 			|| ch == `(` || ch == `!` || ch == `=` || ch == `%` || ch == `~` || ch == `>`
-			|| ch == `|` {
+			|| ch == `|` || ch == `_` {
 			break
 		}
 		// Give up after bounded attempts and return diagnostics.
@@ -1192,6 +1192,13 @@ fn (mut db DB) read_response() !RedisValue {
 			}
 			// Attributes are parsed like maps; reuse map parsing (attrs preserved as map[string]RedisValue)
 			return db.read_resp3_map_payload()!
+		}
+		`_` { // Null (RESP3: `_\r\n`)
+			if db.version < 3 {
+				return error('`read_response()`: unknown response prefix: ${db.resp_buf.bytestr()}')
+			}
+			db.read_header()! // consume the trailing CRLF
+			return RedisValue(RedisNull{})
 		}
 		else {
 			// Fallback: this should be unreachable because we validated prefixes above,
