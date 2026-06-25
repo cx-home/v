@@ -497,6 +497,13 @@ pub:
 	read_timeout time.Duration = default_mbedtls_client_read_timeout // the SSL client read timeout
 
 	alpn_protocols []string // the list of ALPN protocols to advertise, e.g. ['h2', 'http/1.1']; empty means no ALPN extension is sent
+
+	// Optional TLS protocol-version bounds (mbedtls_ssl_protocol_version values:
+	// 0x0303 = TLS 1.2, 0x0304 = TLS 1.3). 0 = mbedTLS default (negotiate the
+	// highest mutually supported). Cap max to TLS 1.2 for peers that mishandle a
+	// mbedTLS 1.3 handshake (e.g. some FTPS servers under PROT P).
+	max_tls_version u16
+	min_tls_version u16
 	// DTLS handshake retransmission window (dtls.c.v). 0 ⇒ mbedTLS / RFC 6347
 	// default (1 s … 60 s). Set a bound to fail fast on a dial to an unbound peer
 	// (hermetic tests); leave 0 in production.
@@ -650,6 +657,14 @@ fn (mut s SSLConn) init() ! {
 	if ret != 0 {
 		return error_with_code('net.mbedtls SSLConn.init, mbedtls_ssl_config_defaults failed to set SSL configuration ret: ${ret}',
 			ret)
+	}
+	// Optional protocol-version bounds (e.g. cap to TLS 1.2 for FTPS peers that
+	// crash on a mbedTLS 1.3 handshake). Applied after config_defaults.
+	if s.config.max_tls_version != 0 {
+		C.mbedtls_ssl_conf_max_tls_version(&s.conf, int(s.config.max_tls_version))
+	}
+	if s.config.min_tls_version != 0 {
+		C.mbedtls_ssl_conf_min_tls_version(&s.conf, int(s.config.min_tls_version))
 	}
 	$if trace_mbedtls_timeouts ? {
 		dump(s.read_timeout)
