@@ -194,6 +194,8 @@ fn C.mbedtls_ssl_handshake(&C.mbedtls_ssl_context) i32
 fn C.mbedtls_ssl_read(&C.mbedtls_ssl_context, &u8, usize) i32
 fn C.mbedtls_ssl_write(&C.mbedtls_ssl_context, &u8, usize) i32
 fn C.mbedtls_ssl_close_notify(&C.mbedtls_ssl_context) i32
+fn C.mbedtls_ssl_conf_max_tls_version(&C.mbedtls_ssl_config, int)
+fn C.mbedtls_ssl_conf_min_tls_version(&C.mbedtls_ssl_config, int)
 fn C.mbedtls_ssl_free(&C.mbedtls_ssl_context)
 fn C.mbedtls_ssl_config_init(&C.mbedtls_ssl_config)
 fn C.mbedtls_ssl_config_defaults(&C.mbedtls_ssl_config, i32, i32, i32) i32
