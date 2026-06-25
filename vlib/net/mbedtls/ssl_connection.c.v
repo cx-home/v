@@ -464,6 +464,18 @@ pub fn (mut s SSLConn) close() ! {
 	s.shutdown()!
 }
 
+// close_notify sends a TLS close-notify alert to the peer (a clean, in-protocol
+// stream termination) WITHOUT freeing the connection. Some peers — e.g. an FTPS
+// data channel under PROT P — treat a missing close-notify as a truncated
+// transfer, so callers send this after the final write, before close().
+// Best-effort: the return is the mbedtls status (0 on success), ignorable.
+pub fn (mut s SSLConn) close_notify() int {
+	if !s.opened {
+		return 0
+	}
+	return C.mbedtls_ssl_close_notify(&s.ssl)
+}
+
 // shutdown terminates the ssl connection and does cleanup
 pub fn (mut s SSLConn) shutdown() ! {
 	$if trace_ssl ? {
