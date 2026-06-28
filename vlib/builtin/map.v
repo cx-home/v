@@ -259,6 +259,23 @@ fn map_map_eq(a map, b map) bool {
 fn map_clone_string(dest voidptr, pkey voidptr) {
 	unsafe {
 		s := *&string(pkey)
+		$if cx_watch_keytext ? {
+			// #145 LIGHT ARM (deep-fix A): arm the GC watch on a LIVE victim-class
+			// source-key char buffer (small noscan import/closure key, 1..24B — the
+			// s:*/http:* map-key class) so its freeing sweep emits the 0x5eed
+			// root-coverage+mark verdict (vgc_sweep_span). A single aligned store, no
+			// reset (vgc_gc_start zeroes the localizers per cycle) and no fence ->
+			// minimal, NON-MASKING. Mutators are frozen through mark+sweep, so
+			// watch_addr is stable across the GC that evaluates it. A 0x5eed with
+			// nonzero roots + marked==0 ⇒ a SCANNED ROOT held this buffer yet mark
+			// dropped it = the captured-but-unmarked consistency bug, with the byte
+			// pinning the root class (stack/reg/spawn/rng). roots==0 ⇒ benign death
+			// (the arm sampled a key whose holder had already died).
+			if s.len >= 1 && s.len <= 24 && usize(s.str) >= vgc_arena_lo
+				&& usize(s.str) < vgc_arena_hi {
+				vgc_watch_addr = usize(s.str)
+			}
+		}
 		$if vgc_passive ? {
 			// #63/#145 PASSIVE detector at the exact crash-path read (no arming). If
 			// the source key struct/buffer was freed-while-live, the detector fires
@@ -285,6 +302,19 @@ fn map_clone_string(dest voidptr, pkey voidptr) {
 			}
 		}
 		cloned := s.clone()
+		$if cx_watch_keytext ? {
+			// #145 deep-fix A: arm on the DESTINATION (the freshly-created per-request
+			// env-clone COPY — the exact victim class: a small noscan key buffer owned
+			// by this request's bindings map). If a GC fires mid-request while this copy
+			// is still held by the live request env and the mark MISSES it, its freeing
+			// sweep trips 0x5eed with nonzero roots. Source-arming sampled only live
+			// (always-marked) keys; the destination copy is what actually gets dropped.
+			cstr := cloned.str
+			if cloned.len >= 1 && cloned.len <= 24 && usize(cstr) >= vgc_arena_lo
+				&& usize(cstr) < vgc_arena_hi {
+				vgc_watch_addr = usize(cstr)
+			}
+		}
 		// Use memcpy for native backend compatibility
 		// (*&string(dest)) = cloned doesn't reliably store full struct
 		vmemcpy(dest, voidptr(&cloned), sizeof(string))
