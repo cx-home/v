@@ -187,6 +187,26 @@ fn vgc_gc_start() {
 			}
 		}
 	}
+	$if vgc_passive ? {
+		// #145 LIGHT non-masking STW-completeness probe: at mark time every registered
+		// peer must be either self-parked (stopped==1) or mach-suspended (susp[i]). Any
+		// peer that is registered, not self, has a mach_port, yet is NEITHER ran free
+		// during mark -> its live roots were never scanned (the smoking gun for a
+		// sweep-while-live). O(ncaches), once per GC, emits only on anomaly -> no
+		// per-word cost, cannot mask the race.
+		mut uncovered := u32(0)
+		for i in 0 .. vgc_heap.ncaches {
+			c := unsafe { &vgc_heap.caches[i] }
+			if c.registered && i != self_idx && c.mach_port != 0 {
+				if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 && !susp[i] {
+					uncovered++
+				}
+			}
+		}
+		if uncovered != 0 {
+			C.vgc_say(0x57ab, u64(uncovered)) // STW-anomaly: peers running free during mark
+		}
+	}
 	// work_lock is re-entered by vgc_work_put/get during mark; no mutator holds it
 	// under full-STW (the write barrier never fires while mutators are frozen), so a
 	// plain reset is enough (it is not pre-acquired since the collector re-enters it).
@@ -284,6 +304,17 @@ fn vgc_gc_start() {
 
 	// Sweep synchronously - it's fast and avoids race conditions
 	vgc_watch_snapshot(6) // STAGE 6: immediately pre-sweep (the verdict mark+alloc state)
+	$if vgc_closonly ? {
+		// #145 deep-fix A: LEAN closure-only oracle. Runs ONLY the marked-referrer →
+		// unmarked-referent check (vgc_verify_mark_closure: tags 0xc105 total, 0x5ca0
+		// scan-type=definite-bug, + per-edge vgc_verify_report naming holder/victim),
+		// WITHOUT the heavy vgc_rootfind_enumerate all-anon-region scan that collapsed
+		// throughput to ~3 rps under -d vgc_verify. A closure violation IS the descent
+		// miss observed directly (every marked object, not a single sampled watch),
+		// under STW. Paired throughput vs cx_coop_det decides whether even this second
+		// heap scan masks. Isolated so the rootfind noise/cost can't confound.
+		vgc_verify_mark_closure()
+	}
 	$if vgc_verify ? {
 		// DEBUG: verify the mark reached closure before we free anything. Runs
 		// fully inside this STW window (world stopped), so it does NOT perturb the
@@ -1297,6 +1328,20 @@ fn vgc_sweep_span(span &VGC_Span) {
 				// byte3=rng_cov (each = thread idx+1, or 0).
 				roots := u64(vgc_watch_in_stack & 0xff) | (u64(vgc_watch_in_reg & 0xff) << 8) | (u64(vgc_watch_in_spawn & 0xff) << 16) | (u64(vgc_watch_rng_cov & 0xff) << 24)
 				C.vgc_say(0x5eed, roots) // SWEEP-of-watched: localizer bitfield
+				$if cx_watch_keytext ? {
+					// #145 deep-fix A: on a captured-but-swept verdict (a scanned root
+					// held this buffer yet it is being freed unmarked) dump the buffer
+					// TEXT (still mapped under -d vgc_nosweep) so the exact victim key is
+					// named. Rare (only the watched obj, only when root-held) -> no
+					// collector slowdown, non-masking.
+					if roots != 0 {
+						n := if span.elem_size < u32(24) { span.elem_size } else { u32(24) }
+						C.vgc_say(0x5e1d, roots) // duplicate to flag the rooted-victim case
+						C.write(2, c'[watch-rooted-swept] ', usize(21))
+						C.write(2, voidptr(vgc_watch_addr), usize(n))
+						C.write(2, c'\n', usize(1))
+					}
+				}
 			}
 		}
 		if garbage != 0 {

@@ -2261,6 +2261,9 @@ fn vgc_uaf_check_buf(strptr usize, slen int) bool {
 				C.vgc_say(0xc0d1, g - 1)
 			}
 		}
+		$if cx_watch_keytext ? {
+			vgc_watch_addr = strptr // #145 deep-fix A: re-arm on the PROVEN victim slot
+		}
 		return true
 	}
 	idx := u32((strptr - span.base) / usize(span.elem_size))
@@ -2280,6 +2283,9 @@ fn vgc_uaf_check_buf(strptr usize, slen int) bool {
 				C.vgc_say(0xc0de, u64(strptr))
 				C.vgc_say(0xc0d1, g - 1)
 			}
+		}
+		$if cx_watch_keytext ? {
+			vgc_watch_addr = strptr // #145 deep-fix A: re-arm on the PROVEN victim slot
 		}
 		return true
 	}
