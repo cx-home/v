@@ -642,3 +642,86 @@ pub fn gc_memory_use() usize {
 		return 0
 	}
 }
+
+// GcChurnMetric selects what gc_collect_if_churned measures growth against.
+pub enum GcChurnMetric {
+	// committed — sum of arena bytes carved (vgc: Σ arenas.used; boehm:
+	// GC_get_memory_use). Monotonic: grows on new carves, never shrinks on sweep
+	// (freed spans stay committed by design). MEASURED on #131: gating on its
+	// delta does NOT bound RSS — new carves outpace the gate and committed is
+	// never returned, so RSS keeps climbing (82→326 MB at N=4 where .allocated
+	// holds flat). Cheaper to read than .allocated, but only suitable where the
+	// working set is genuinely stable. Prefer .allocated for server workloads.
+	committed
+	// allocated — cumulative bytes ever allocated (vgc: total_alloc accounting,
+	// flushed every ~1 MB per cache). Tracks allocation CHURN even when freed
+	// spans are reused, so it keeps firing on a steady-state transient-heavy
+	// workload — collecting before new spans must carve, which holds RSS at the
+	// working-set floor (MEASURED #131: flat ~49 MB where committed climbs).
+	// vgc-only; falls back to committed elsewhere.
+	allocated
+}
+
+__global (
+	gc_churn_base u64 // metric reading at the last churn collect (baseline)
+	gc_churn_busy u32 // single-collector window claim across reactor threads
+)
+
+// gc_collect_if_churned forces a collection at a HOST SAFEPOINT iff `metric` has
+// advanced by >= `threshold` bytes since the last churn collect. Returns true if
+// it collected. `threshold == 0` disables it.
+//
+// This is an OPT-IN second trigger, additive to (and independent of) the vgc
+// auto-pacer's heap_live/next_gc throughput pacing, which is left unchanged. It
+// exists for transient-heavy / small-live-set workloads (cx-private #57/#131/#52)
+// where the live-set pacer never fires while committed pages — and thus RSS —
+// climb. Call it at a natural boundary (end of an HTTP request, a stream chunk),
+// NEVER on the allocation hot path: a collect mid-request both mistimes
+// reclamation and serializes peer mutators behind the STW pause.
+pub fn gc_collect_if_churned(threshold u64, metric GcChurnMetric) bool {
+	if threshold == 0 {
+		return false
+	}
+	$if vgc ? {
+		cur := if metric == .allocated {
+			C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
+		} else {
+			u64(vgc_memory_use())
+		}
+		base := C.vgc_atomic_load_u64(&gc_churn_base)
+		if cur < base + threshold {
+			return false
+		}
+		// Claim the window so peer reactor threads that crossed the same delta
+		// don't all collect at once; the loser just returns and re-checks next
+		// safepoint against the rebased baseline.
+		mut expected := u32(0)
+		if !C.vgc_atomic_cas_u32(&gc_churn_busy, &expected, u32(1)) {
+			return false
+		}
+		gc_collect()
+		// Rebase to a post-collect reading of the SAME metric. total_alloc is
+		// monotonic, so this advances the window past the bytes just reclaimed;
+		// arenas.used does not shrink on sweep, so for .committed this ~equals
+		// `cur` — both are correct for delta-gating.
+		newbase := if metric == .allocated {
+			C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
+		} else {
+			u64(vgc_memory_use())
+		}
+		C.vgc_atomic_store_u64(&gc_churn_base, newbase)
+		C.vgc_atomic_store_u32(&gc_churn_busy, u32(0))
+		return true
+	} $else {
+		// Non-vgc (boehm / none): only committed bytes are observable. `metric`
+		// is accepted for source compatibility; .allocated degrades to committed.
+		cur := u64(gc_memory_use())
+		if cur < gc_churn_base + threshold {
+			return false
+		}
+		gc_churn_base = cur
+		gc_collect()
+		gc_churn_base = u64(gc_memory_use())
+		return true
+	}
+}
