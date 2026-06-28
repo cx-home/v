@@ -1492,6 +1492,9 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 					$if vgc_verify ? {
 						unsafe { C.memset(ptr, 0, usize(span.elem_size)) } // DEBUG: clean verifier signal (see non-tiny path)
 					}
+					$if vgc_closonly ? {
+						unsafe { C.memset(ptr, 0, usize(span.elem_size)) } // #145: clean closure-check signal (stale-tail FP)
+					}
 				}
 				unsafe {
 					// Mark the span as tiny-packed: this slot will hold several
@@ -1532,6 +1535,12 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 			// verifier never mistakes a noscan slot's stale tail bytes for a live
 			// pointer. The real collector never scans noscan spans, so this has no
 			// production effect — it only cleans the verifier's signal.
+			unsafe { C.memset(ptr, 0, usize(span.elem_size)) }
+		}
+		$if vgc_closonly ? {
+			// #145 deep-fix A: same full-slot clean as vgc_verify, so cx_closonly_det's
+			// closure check is not fooled by stale-tail bytes in a recycled noscan slot
+			// (the suspected false-positive source). DEBUG-only; default build unaffected.
 			unsafe { C.memset(ptr, 0, usize(span.elem_size)) }
 		}
 	}
