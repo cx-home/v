@@ -589,6 +589,21 @@ fn vgc_thread_exit_cb(idx int) {
 	C.vgc_set_cache_idx(-1)
 }
 
+// vgc_my_stack_base returns THIS thread's registered stack_base (the fixed stack
+// top used to bound the conservative root scan), or 0 if unregistered. #145
+// diagnostic: lets cx-private check whether a live stack object (e.g. the
+// per-request env) actually falls within the scannable [sp, stack_base] range —
+// if its address exceeds stack_base it is ABOVE the recorded top and never
+// scanned (a stack-bounds root miss). markused so it is not DCE'd.
+@[markused]
+pub fn vgc_my_stack_base() usize {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 {
+		return 0
+	}
+	return unsafe { vgc_heap.caches[idx].stack_base }
+}
+
 fn vgc_ensure_registered() {
 	if C.vgc_get_cache_idx() < 0 {
 		vgc_register_thread()
