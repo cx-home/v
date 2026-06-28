@@ -302,6 +302,22 @@ fn map_clone_string(dest voidptr, pkey voidptr) {
 			}
 		}
 		cloned := s.clone()
+		$if cx_watch_holder ? {
+			// #145 deep-fix A: arm the GC watch on the HOLDER (the per-request env's
+			// bindings keys-array object that CONTAINS this dest key slot), not the
+			// leaf buffer. The keys-array base pointer is stored as a word inside renv
+			// on the reactor's stack, so the 0x5eed root verdict at its freeing sweep is
+			// MEANINGFUL: in_stack!=0 => the stack scan found renv's keys ptr (then why
+			// swept? stack/mark bug); ALL-zero + swept => the keys-array root is held
+			// only somewhere the scan misses (external/C-heap) = the root miss. Single
+			// store; gc_start zeroes localizers per cycle; mutators frozen during GC.
+			hspan := vgc_find_span(voidptr(dest))
+			if hspan != nil && hspan.elem_size != 0 {
+				// object base (= d.keys, the value stored in renv.bindings), not span base
+				oi := (usize(dest) - hspan.base) / usize(hspan.elem_size)
+				vgc_watch_addr = hspan.base + oi * usize(hspan.elem_size)
+			}
+		}
 		$if cx_watch_keytext ? {
 			// #145 deep-fix A: arm on the DESTINATION (the freshly-created per-request
 			// env-clone COPY — the exact victim class: a small noscan key buffer owned
