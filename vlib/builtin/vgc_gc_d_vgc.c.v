@@ -102,10 +102,42 @@ fn vgc_gc_start() {
 		// wait short (just long enough for allocating threads to hit their next poll) so the
 		// per-GC cost stays negligible. (20M spun ~tens of ms EVERY GC because an idle
 		// listener thread never parks -> ~1.8x single-reactor slowdown; 200k is ~100x less.)
-		mut spins := 0
-		for C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want && spins < 200000 {
-			C.vgc_atomic_fence()
-			spins++
+		$if vgc_wait_full ? {
+			// #145 DIAGNOSTIC DISCRIMINATOR (quiescence wait): give EVERY running
+			// mutator unbounded time to self-park (self-spill) instead of being
+			// mach-suspended at an arbitrary PC and scanned by the legacy external
+			// scanner. Wait until either all registered threads parked OR the parked
+			// count plateaus for a long stretch — a plateau means the remaining
+			// threads are syscall-blocked (idle listener) / tight non-allocating
+			// loops, which never reach a poll and are mach-suspended below (sound for
+			// syscall-blocked per GAP-1). If the sweep-while-live oracle goes SILENT
+			// under this build (paired vs the bounded default), the root cause is the
+			// mach-suspend-of-a-running-mutator external-scan fallback (H1).
+			mut last := u32(0xffffffff)
+			mut stable := u64(0)
+			for C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want {
+				cur := C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count)
+				if cur == last {
+					stable++
+					if stable > u64(200000000) {
+						break
+					}
+				} else {
+					stable = 0
+					last = cur
+				}
+				C.vgc_atomic_fence()
+			}
+		} $else {
+			// Bounded wait: an ACTIVELY-ALLOCATING thread polls vgc_maybe_gc constantly
+			// and self-parks within microseconds; a syscall-blocked / tight-loop thread
+			// never reaches the poll, so it is mach-suspended below. Keep it short so the
+			// per-GC cost stays negligible.
+			mut spins := 0
+			for C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want && spins < 200000 {
+				C.vgc_atomic_fence()
+				spins++
+			}
 		}
 		// Now safe to take allocator locks (parkers hold none at the poll site) + finish
 		// any lazy sweep from the previous cycle.
@@ -1269,6 +1301,26 @@ fn vgc_sweep_span(span &VGC_Span) {
 		}
 		if garbage != 0 {
 			freed += u32(C.vgc_popcount8(garbage))
+			$if vgc_passive ? {
+				$if !vgc_nosweep ? {
+					// #63/#145 PASSIVE: record each freed SMALL noscan buffer (the
+					// map-key char-buffer victim class) at its TRUE freeing GC into the
+					// swept-log for GOLD correlation. PURELY PASSIVE — alloc bits are
+					// still cleared below (no retention), so the crash/UAF is preserved.
+					// Bit-loop only over small noscan spans, bounded STW cost.
+					if span.noscan && span.elem_size <= u32(32) {
+						for bit in 0 .. 8 {
+							if garbage & (u8(1) << bit) != 0 {
+								oi := u32(b) * 8 + u32(bit)
+								if oi < span.nelems {
+									vgc_slog_record(span.base + usize(oi) * usize(span.elem_size),
+										span.elem_size)
+								}
+							}
+						}
+					}
+				}
+			}
 			// Clear the garbage bits from alloc bitmap
 			unsafe {
 				span.alloc_bits[b] = alloc_byte & mark_byte

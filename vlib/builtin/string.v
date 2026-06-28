@@ -345,6 +345,16 @@ pub fn (a string) clone() string {
 	if a.len <= 0 {
 		return ''
 	}
+	$if vgc_passive ? {
+		// #63/#145 PASSIVE buffer-UAF detector at the fault site (the vmemcpy below
+		// reads a.str). Fires if a.str was freed-while-live; GOLD if it matches the
+		// swept-log. Detector reads span METADATA only (crash-safe) and does NOT skip
+		// the vmemcpy, so a real SIGSEGV is preserved (no masking).
+		if a.len > 0x08000000 {
+			vgc_uaf_report(usize(a.str), a.len, usize(a.str))
+		}
+		vgc_uaf_check_buf(usize(a.str), a.len)
+	}
 	mut b := string{
 		str: unsafe { malloc_noscan(a.len + 1) }
 		len: a.len
