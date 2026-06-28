@@ -259,6 +259,31 @@ fn map_map_eq(a map, b map) bool {
 fn map_clone_string(dest voidptr, pkey voidptr) {
 	unsafe {
 		s := *&string(pkey)
+		$if vgc_passive ? {
+			// #63/#145 PASSIVE detector at the exact crash-path read (no arming). If
+			// the source key struct/buffer was freed-while-live, the detector fires
+			// here; GOLD correlation if it matches a swept-log entry.
+			if s.len < 0 || s.len > 0x08000000 {
+				vgc_uaf_report(usize(pkey), s.len, usize(s.str))
+			} else {
+				freed := vgc_uaf_check_buf(usize(s.str), s.len)
+				$if cx_clone_keytext ? {
+					// #145 LIGHT LOCALIZER: on a freed source-key catch, dump the key's
+					// TEXT (still mapped+readable under -d vgc_nosweep) so the victim
+					// binding is identifiable (per-request `field_NN` => transient
+					// intermediate clone; top-level def/import name => shared structure).
+					// Prints only on the rare catch => no collector slowdown (non-masking).
+					if freed {
+						C.vgc_say(0x6caf, u64(s.len)) // CLONE-key len
+						C.write(2, c'[clone-uaf-key] ', usize(16))
+						if s.len > 0 && s.len < 4096 {
+							C.write(2, s.str, usize(s.len))
+						}
+						C.write(2, c'\n', usize(1))
+					}
+				}
+			}
+		}
 		cloned := s.clone()
 		// Use memcpy for native backend compatibility
 		// (*&string(dest)) = cloned doesn't reliably store full struct
