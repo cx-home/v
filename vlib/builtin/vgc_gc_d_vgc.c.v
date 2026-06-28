@@ -304,6 +304,11 @@ fn vgc_gc_start() {
 
 	// Sweep synchronously - it's fast and avoids race conditions
 	vgc_watch_snapshot(6) // STAGE 6: immediately pre-sweep (the verdict mark+alloc state)
+	$if vgc_closlean ? {
+		// #145 deep-fix A: LEAN closure check (SCAN-referrer spans only — see the
+		// noscan-skip in vgc_verify_mark_closure). Cheap enough to coexist with bf1.
+		vgc_verify_mark_closure()
+	}
 	$if vgc_closonly ? {
 		// #145 deep-fix A: LEAN closure-only oracle. Runs ONLY the marked-referrer →
 		// unmarked-referent check (vgc_verify_mark_closure: tags 0xc105 total, 0x5ca0
@@ -1161,6 +1166,19 @@ fn vgc_verify_mark_closure() {
 		}
 		if span.alloc_bits == unsafe { nil } || span.mark_bits == unsafe { nil } {
 			continue
+		}
+		$if vgc_closlean ? {
+			// #145 deep-fix A: LEAN closure check — skip NOSCAN referrer spans. They
+			// produced 100% false positives (stale recycled-tail bytes misread as
+			// pointers; killed by full-slot zerofill) and SCAN-type violations were
+			// already 0. Scanning only SCAN spans removes the dominant cost (text/buffer
+			// noscan spans are the bulk of the heap) so the check is cheap enough to run
+			// every GC WITHOUT collapsing throughput -> it can coexist with the bf1 UAF
+			// oracle. If this stays 0 while bf1 fires => the swept-live victim is
+			// unreachable from the marked set = a ROOT miss (mark closure is sound).
+			if span.noscan {
+				continue
+			}
 		}
 		for oi in 0 .. span.nelems {
 			// Only marked + allocated objects are live referrers.
