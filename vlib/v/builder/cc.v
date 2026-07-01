@@ -491,7 +491,10 @@ fn (mut v Builder) post_process_c_compiler_output_with_report(ccompiler string, 
 			}
 		}
 	}
-	if c_error_should_send_bug_report(report_res.output) {
+	// `v bug-report-send` makes a network request to bugs.vlang.io on C errors, which
+	// hangs indefinitely in sandboxed / offline environments (and is inappropriate for
+	// an unattended CI gate). Allow opting out via VNOBUGREPORT.
+	if os.getenv('VNOBUGREPORT') == '' && c_error_should_send_bug_report(report_res.output) {
 		known_c_functions := v.known_c_functions()
 		if c_output_suggests_missing_c_function(report_res.output, known_c_functions) == '' {
 			v.submit_c_error_bug_report(report_ccompiler, report_res.output)
