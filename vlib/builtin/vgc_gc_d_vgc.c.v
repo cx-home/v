@@ -221,6 +221,21 @@ fn vgc_gc_start() {
 	// a stack-only scan misses; validated in bench/parallel-alloc/stw_root_scan.c).
 	vgc_scan_suspended_roots(self_idx)
 	vgc_watch_snapshot(1) // STAGE 1: post suspended-thread reg/stack roots (main's reg holds c)
+	$if vgc_rangedump ? {
+		// #58 diagnostic: dump EVERY registered thread's post-refresh scan range so a
+		// rootfind EXTERNAL holder can be correlated — is it below stack_lo (size under-
+		// estimated), above stack_hi (base wrong), or in no range at all (unregistered peer)?
+		for di in 0 .. vgc_heap.ncaches {
+			dc := unsafe { &vgc_heap.caches[di] }
+			if dc.registered && dc.mach_port != 0 {
+				C.write(2, c'[rangedump] ', usize(12))
+				C.vgc_say(0x5a9e, u64(di))
+				C.vgc_say(0x5a10, u64(dc.stack_lo))
+				C.vgc_say(0x5a11, u64(dc.stack_hi))
+				C.vgc_say(0x5aba, u64(dc.stack_base))
+			}
+		}
+	}
 
 	// === Phase 2: Mark (parallel) ===
 	// Enable write barrier (for concurrent correctness)
@@ -243,7 +258,7 @@ fn vgc_gc_start() {
 	// only counted after its slot is written. (See vgc_spawn_roots.)
 	for i in 0 .. vgc_nspawn_roots {
 		root := usize(vgc_spawn_roots[i])
-		vgc_shade(root)
+		vgc_shade_spawn_root(root)
 		// DIAGNOSTIC (root-scan-miss localizer): is the watched object the spawn
 		// arg itself (bit0), or reachable from it via arg->...->c (bit1)? Pins
 		// whether the spawn-root drain actually reaches c.
@@ -525,7 +540,7 @@ fn vgc_gc_start_concurrent() {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 1)
 	vgc_mark_roots() // globals/BSS + every thread stack (snapshot)
 	for i in 0 .. vgc_nspawn_roots {
-		vgc_shade(usize(vgc_spawn_roots[i]))
+		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
 	}
 	vgc_cm_stw_exit(self_idx) // RESUME the world — mark now runs concurrently
 
@@ -538,7 +553,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_scan_suspended_roots(self_idx) // re-scan dirtied roots (stacks moved)
 	vgc_mark_roots()
 	for i in 0 .. vgc_nspawn_roots {
-		vgc_shade(usize(vgc_spawn_roots[i]))
+		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
 	}
 	vgc_rescan_dirty_spans() // re-scan everything the barrier dirtied
 	vgc_drain_mark_work() // final drain of the grey set
@@ -820,6 +835,37 @@ fn vgc_shade(addr usize) {
 			}
 		}
 	}
+}
+
+// vgc_shade_spawn_root shades an in-flight spawn-argument struct AND unconditionally
+// scans its whole object range for pointers — EVEN IF the span is noscan. V's spawn
+// codegen allocates the arg struct by raw size (builtin___v_malloc(sizeof thread_arg_...),
+// untyped => noscan), yet it holds the child thread's live argument pointers (e.g. a
+// [?worker]'s cloned bindings/closures maps). Plain vgc_shade would MARK-but-not-TRACE it
+// (the `if !span.noscan` enqueue skip), leaving those args' referents — the map key
+// strings — unmarked => swept-while-live => the #58/#63 concurrent-worker UAF
+// (string_clone segfault). Conservatively scanning the arg object roots the whole
+// argument graph. (A spawn-root ALWAYS carries pointers, so the noscan skip is wrong here.)
+fn vgc_shade_spawn_root(addr usize) {
+	if addr < vgc_arena_lo || addr >= vgc_arena_hi {
+		return
+	}
+	span := vgc_find_span(voidptr(addr))
+	if span == unsafe { nil } || !span.in_use || span.elem_size == 0 {
+		return
+	}
+	obj_idx := u32((addr - span.base) / usize(span.elem_size))
+	if obj_idx >= span.nelems {
+		return
+	}
+	if span.alloc_bits == unsafe { nil } || C.vgc_bitmap_get(span.alloc_bits, obj_idx) == 0 {
+		return
+	}
+	if span.mark_bits != unsafe { nil } {
+		C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
+	}
+	obj_base := span.base + usize(obj_idx) * usize(span.elem_size)
+	vgc_scan_range(obj_base, obj_base + usize(span.elem_size))
 }
 
 // Parallel mark using OS threads.

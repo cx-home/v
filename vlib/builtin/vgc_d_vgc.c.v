@@ -604,6 +604,20 @@ pub fn vgc_my_stack_base() usize {
 	return unsafe { vgc_heap.caches[idx].stack_base }
 }
 
+// vgc_my_stack_info returns THIS thread's (cache_idx, stack_lo, stack_hi) — the FULL
+// registered scan bounds, or (-1,0,0) if unregistered. #58/#63 diagnostic: lets a
+// concurrent [?worker] thread check whether its own live stack frame falls within the
+// bounds vgc's STW root scan actually covers. idx<0 => unregistered (STW misses the whole
+// stack); addr outside [lo,hi] => registered with WRONG bounds (mis-registration).
+@[markused]
+pub fn vgc_my_stack_info() (int, usize, usize) {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 {
+		return -1, usize(0), usize(0)
+	}
+	return idx, unsafe { vgc_heap.caches[idx].stack_lo }, unsafe { vgc_heap.caches[idx].stack_hi }
+}
+
 fn vgc_ensure_registered() {
 	if C.vgc_get_cache_idx() < 0 {
 		vgc_register_thread()
