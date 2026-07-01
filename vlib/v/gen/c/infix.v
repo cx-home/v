@@ -1344,7 +1344,15 @@ fn (mut g Gen) infix_expr_is_op(node ast.InfixExpr) {
 	} else if node.right is ast.TypeNode {
 		g.write_type_tag_expr_for_is_left(node, is_aggregate, is_orig_sumtype)
 		g.write(' ${cmp_op} ')
-		g.write('${int(right_type)}')
+		// Use type_sidx, not a raw `int(right_type)` literal: under -usecache the
+		// sum-type variant tag `_typ` is assigned via the unified `_v_type_idx_<T>()`
+		// functions (the program TU's numbering; build_module objects reference them
+		// extern), matching how the cast wrappers set it. A raw literal here is the
+		// module's LOCAL type index, which differs from that unified value across
+		// cached objects → `x is T` silently disagrees with how the value was tagged
+		// (and with `match`), misdispatching. In a plain build type_sidx is exactly
+		// `int(right_type)`, so this is a no-op there.
+		g.write('${g.type_sidx(right_type)}')
 	} else {
 		g.write_type_tag_expr_for_is_left(node, is_aggregate, is_orig_sumtype)
 		g.write(' ${cmp_op} ')
