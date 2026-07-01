@@ -237,6 +237,21 @@ fn vgc_gc_start() {
 		}
 	}
 
+	$if vgc_spcheck ? {
+		// #58: shadow the exact ranges this cycle's root scan will use. Stragglers'
+		// ranges were just refreshed from their captured SP (vgc_scan_suspended_roots);
+		// parkers self-recorded theirs in vgc_park_spill. World is stopped: consistent.
+		for si in 0 .. vgc_heap.ncaches {
+			sc := unsafe { &vgc_heap.caches[si] }
+			if sc.registered && si < 64 {
+				vgc_spchk_lo[si] = sc.stack_lo
+				vgc_spchk_hi[si] = sc.stack_hi
+				vgc_spchk_cyc[si] = u64(vgc_heap.gc_cycle)
+				vgc_spchk_parked[si] = u64(C.vgc_atomic_load_u32(&vgc_heap.caches[si].stopped))
+			}
+		}
+	}
+
 	// === Phase 2: Mark (parallel) ===
 	// Enable write barrier (for concurrent correctness)
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 1)
@@ -377,6 +392,17 @@ fn vgc_gc_start() {
 	// spans acquired during THIS cycle. Doing the bump here closes the window: every
 	// post-resume acquisition stamps exactly the cycle the next sweep checks against.
 	vgc_update_trigger()
+	if vgc_gctrace != 0 {
+		// VGC_GCTRACE=1 per-cycle pacing trace (GODEBUG=gctrace analog). Emitted
+		// under STW right after the trigger recompute, so every field is a
+		// consistent snapshot: cycle, marked (true live set), the recomputed base
+		// goal (pre thread-multiplier), arena/span pressure, live mutators.
+		// Env-gated (one integer test per cycle when off).
+		C.vgc_gctrace_line(u64(vgc_heap.gc_cycle),
+			C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
+			C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas),
+			u64(vgc_heap.nspans), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
+	}
 	vgc_heap.gc_cycle++
 
 	// Mark + sweep done — release every allocator lock held across the cycle before
@@ -1543,6 +1569,11 @@ fn vgc_update_trigger() {
 	// Avoid very small heap goals that force frequent full cycles on bursty workloads.
 	if goal < vgc_base_floor {
 		goal = vgc_base_floor
+	}
+	// Clamp to the soft heap limit: the backstop must keep firing well before the
+	// physical arena ceiling regardless of how large the marked set gets (#57/#71).
+	if goal > vgc_heap_soft_limit {
+		goal = vgc_heap_soft_limit
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 }

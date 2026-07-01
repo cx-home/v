@@ -706,6 +706,8 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       volatile uintptr_t sp;     // interrupted stack pointer (from ucontext)
       uintptr_t regs[VGC_MAC_MAXREG];
       volatile int nregs;
+      semaphore_t sem;           // park semaphore (created once per slot, reused)
+      volatile uint32_t sem_init;
   } vgc_mac_susp;
   static vgc_mac_susp vgc_mac_slots[VGC_MAC_MAXTH];
 
@@ -747,7 +749,25 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
     #endif
       s->nregs = c;
       __atomic_store_n(&s->acked, 1, __ATOMIC_RELEASE);
+      // Park until released. BLOCK on the slot's mach semaphore instead of
+      // yield-spinning: a yield-spun parker stays runnable for the whole STW,
+      // burning a core per parked thread and competing with the collector's
+      // mark/sweep for CPU (#57: a near-idle server showed ~37% of a sleeping
+      // worker's samples inside this loop; #68: parked reactors slowed the
+      // collector). A short plain-load spin absorbs sub-microsecond STWs; then
+      // semaphore_wait (a mach trap — async-signal-safe, no libc state) sleeps
+      // the thread. Counting semantics kill the lost-wake race: if the resume
+      // signals before the wait, the wait returns immediately; a stale count
+      // from a prior cycle is absorbed by the release re-check loop.
+      // -DVGC_PARK_SPIN (cflags) restores the legacy yield-spin for A/B measurement.
+  #ifdef VGC_PARK_SPIN
       while (__atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0) { sched_yield(); }
+  #else
+      for (int i = 0; i < 256 && __atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0; i++) { }
+      while (__atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0) {
+          semaphore_wait(s->sem); // KERN_ABORTED / stale count -> re-check release
+      }
+  #endif
       __atomic_store_n(&s->acked, 0, __ATOMIC_RELEASE); // confirm departure before slot reuse
   }
 
@@ -783,6 +803,15 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       for (int i = 0; i < VGC_MAC_MAXTH; i++)
           if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == 0) { s = &vgc_mac_slots[i]; break; }
       if (s == 0) return; // table full (should not happen: MAXTH >= caches)
+      if (s->sem_init == 0) { // one-time park semaphore for this slot (collector context, pre-signal)
+          semaphore_t sem_new;
+          if (semaphore_create(mach_task_self(), &sem_new, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS) {
+              s->sem = sem_new;
+              s->sem_init = 1;
+          } else {
+              return; // cannot park this target safely without a semaphore: skip (backstop path)
+          }
+      }
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0; s->pt = pt;
       __atomic_store_n(&s->port, t, __ATOMIC_RELEASE); // publish key before signaling
       if (pthread_kill(pt, VGC_SUSPEND_SIGNAL) != 0) {
@@ -800,6 +829,9 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       vgc_mac_susp* s = vgc_mac_find(t);
       if (s == 0) return;
       __atomic_store_n(&s->release, 1, __ATOMIC_RELEASE);
+  #ifndef VGC_PARK_SPIN
+      semaphore_signal(s->sem); // wake the blocked parker (counting: no lost wake)
+  #endif
       for (int i = 0; i < 200000; i++) { // wait for the handler to leave before freeing
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) == 0) break;
           sched_yield();
@@ -889,7 +921,21 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
     #endif
       s->nregs = c;
       __atomic_store_n(&s->acked, 1, __ATOMIC_RELEASE); // settle/ack: SP+regs now trustworthy
+      // Park until released. BLOCK on a futex instead of yield-spinning: a
+      // yield-spun parker stays runnable for the whole STW, burning a core per
+      // parked thread and competing with the collector for CPU (#57/#68 — see
+      // the darwin twin). Short plain-load spin for sub-microsecond STWs, then
+      // FUTEX_WAIT on `release` (raw syscall: async-signal-safe). The kernel
+      // re-checks release==0 under the futex lock, so a resume racing the wait
+      // cannot be lost. -DVGC_PARK_SPIN restores the legacy yield-spin for A/B.
+  #ifdef VGC_PARK_SPIN
       while (__atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0) { sched_yield(); }
+  #else
+      for (int i = 0; i < 256 && __atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0; i++) { }
+      while (__atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0) {
+          syscall(SYS_futex, (uint32_t*)&s->release, 0 /*FUTEX_WAIT*/, 0, (void*)0, (void*)0, 0);
+      }
+  #endif
       __atomic_store_n(&s->acked, 0, __ATOMIC_RELEASE); // confirm departure before slot reuse
   }
 
@@ -952,6 +998,9 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       vgc_lin_susp* s = vgc_lin_find(t);
       if (s == 0) return;
       __atomic_store_n(&s->release, 1, __ATOMIC_RELEASE);
+  #ifndef VGC_PARK_SPIN
+      syscall(SYS_futex, (uint32_t*)&s->release, 1 /*FUTEX_WAKE*/, 1, (void*)0, (void*)0, 0);
+  #endif
       for (int i = 0; i < 200000; i++) { // wait for the handler to leave before freeing
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) == 0) break;
           sched_yield();
@@ -994,6 +1043,39 @@ static void vgc__wh(uint64_t v) {
 }
 static inline void vgc_say(uint64_t tag, uint64_t v) { // loud one-line stderr note
     vgc__ws("[vgc tag="); vgc__wh(tag); vgc__ws(" v="); vgc__wh(v); vgc__ws("]\n");
+}
+
+// ── #58 free-provenance ring support (-d vgc_freering diagnostic builds) ──
+// Return-address capture for attributing an explicit vgc_free to its emitting
+// code site. Macros (not inline fns) so the builtin argument stays a literal
+// and the level-0 address is the CALLER of the V fn that invokes the macro.
+// Levels >0 walk the frame-pointer chain — fine on macOS arm64 (fp kept) in
+// non-optimized diagnostic builds; never compiled into default builds.
+#define vgc_ra0() __builtin_return_address(0)
+#define vgc_ra1() __builtin_return_address(1)
+#define vgc_ra2() __builtin_return_address(2)
+// Text-segment anchor for offline symbolication (ASLR slide = runtime anchor
+// minus `nm` static address of this symbol).
+#define vgc_ra_anchor() ((void*)&vgc_say)
+
+// VGC_GCTRACE=1 per-cycle pacing line (async-signal-safe: write(2) only, no
+// stdio). Format: [gc N] marked=X goal=Y arenas=A spans=S threads=T (bytes in
+// decimal MB for readability; exact bytes matter less than the trend).
+static void vgc__wdec(uint64_t v) {
+    char b[24]; int i = 24;
+    if (v == 0) { b[--i] = '0'; }
+    while (v > 0 && i > 0) { b[--i] = (char)('0' + (v % 10)); v /= 10; }
+    (void)!write(2, b + i, 24 - i);
+}
+static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
+                             uint64_t narenas, uint64_t nspans, uint64_t lthreads) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] marked="); vgc__wdec(marked / (1024 * 1024));
+    vgc__ws("MB goal="); vgc__wdec(goal / (1024 * 1024));
+    vgc__ws("MB arenas="); vgc__wdec(narenas);
+    vgc__ws(" spans="); vgc__wdec(nspans);
+    vgc__ws(" threads="); vgc__wdec(lthreads);
+    vgc__ws("\n");
 }
 
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
