@@ -613,6 +613,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #include <pthread.h>
   #include <sched.h>
   #include <string.h>
+  #include <errno.h> // ESRCH: distinguish a genuinely-gone thread from a transient pthread_kill failure
 
 #if defined(VGC_MACH_SUSPEND)
   // ---- LEGACY async mach-suspend STW (build with -DVGC_MACH_SUSPEND to revert). ----
@@ -828,10 +829,29 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       }
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0; s->pt = pt;
       __atomic_store_n(&s->port, t, __ATOMIC_RELEASE); // publish key before signaling
-      if (pthread_kill(pt, VGC_SUSPEND_SIGNAL) != 0) {
-          vgc_say(0xdead2, (uint64_t)t); // target gone (signal undeliverable)
-          __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE); // target gone: release slot
-          return 0;
+      // Only ESRCH means the thread is genuinely GONE. Any other error (EAGAIN,
+      // transient EINTR-class) is a delivery hiccup for a LIVE thread — dropping
+      // it here let a running mutator allocate through mark+sweep (its new object
+      // born unmarked -> swept while live = the #58 UAF, bit-watch 0xc1ea2). Retry
+      // instead of skipping; a genuinely-gone thread returns ESRCH and is skipped.
+      {
+          int kr = pthread_kill(pt, VGC_SUSPEND_SIGNAL);
+          if (kr == ESRCH) {
+              vgc_say(0xdea52, (uint64_t)t); // target genuinely gone (ESRCH)
+              __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
+              return 0;
+          }
+          for (uint64_t kspin = 1; kr != 0; kspin++) {
+              // transient failure for a live thread: re-verify existence, retry.
+              if (pthread_kill(pt, 0) == ESRCH) {
+                  vgc_say(0xdea52, (uint64_t)t);
+                  __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
+                  return 0;
+              }
+              if ((kspin & 0xfffff) == 0) vgc_say(0xdead2, (uint64_t)t); // abnormal retry (visible)
+              sched_yield();
+              kr = pthread_kill(pt, VGC_SUSPEND_SIGNAL);
+          }
       }
       for (int i = 0; i < 200000; i++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1; // settled
@@ -844,7 +864,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #else
       for (uint64_t spins = 1;; spins++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1;
-          if (pthread_kill(pt, 0) != 0) { // target exited: no handler will ever ack
+          if (pthread_kill(pt, 0) == ESRCH) { // target genuinely exited: no ack will ever come
               vgc_say(0xdead5, (uint64_t)t);
               __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
               return 0;
@@ -908,6 +928,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #include <ucontext.h>
   #include <unistd.h>
   #include <sys/syscall.h>
+  #include <errno.h> // ESRCH: genuinely-gone vs transient tgkill failure
 
   // Private suspend signal. SIGRTMIN+6 mirrors Boehm's default GC_SIG_SUSPEND so
   // it does not clobber an application's SIGUSR1/SIGUSR2 handlers. (SIGRTMIN is a
@@ -1018,9 +1039,25 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       if (s == 0) return 0; // table full (should not happen: MAXTH >= caches)
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0;
       __atomic_store_n(&s->tid, t, __ATOMIC_RELEASE); // publish key before signaling
-      if (syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL) != 0) {
-          __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE); // target gone: release the slot
-          return 0;
+      // Only ESRCH = genuinely gone; retry any transient failure for a live thread
+      // (see the darwin twin — dropping a live peer = the #58 sweep-while-live UAF).
+      {
+          int kr = syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL);
+          if (kr != 0 && errno == ESRCH) {
+              vgc_say(0xdea52, (uint64_t)t);
+              __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
+              return 0;
+          }
+          for (uint64_t kspin = 1; kr != 0; kspin++) {
+              if (syscall(SYS_tgkill, getpid(), (int)t, 0) != 0 && errno == ESRCH) {
+                  vgc_say(0xdea52, (uint64_t)t);
+                  __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
+                  return 0;
+              }
+              if ((kspin & 0xfffff) == 0) vgc_say(0xdead2, (uint64_t)t);
+              sched_yield();
+              kr = syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL);
+          }
       }
       for (int i = 0; i < 200000; i++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1; // settled

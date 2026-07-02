@@ -1319,11 +1319,24 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 // gc_phase load skipped) under the default build.
 @[inline]
 fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
-	$if vgc_concurrent ? {
-		if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
-			if span.mark_bits != unsafe { nil } {
-				C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
-			}
+	// ALLOC-BLACK IS UNCONDITIONAL (was gated behind vgc_concurrent). Rationale
+	// (#57/#58/#63/#145): the STW backstop assumes every mutator is frozen through
+	// mark+sweep, so an allocation during a cycle "cannot happen" and needs no
+	// mark. But the OS suspend is not perfectly airtight — pthread_kill can
+	// transiently fail / a mach port can be momentarily unresolvable, and the
+	// collector then proceeds treating that peer as gone (tags 0xdead2/5). A peer
+	// that is actually alive keeps allocating; its new object gets an alloc bit
+	// but, mark having already run, no mark bit -> it lands in `garbage` and sweep
+	// frees it WHILE LIVE (born_dcyc==0, bit-watch 0xc1ea2 = swept-at-birth; the
+	// root cause of the concurrent-worker UAF). Marking every object born while a
+	// GC is in progress makes such a slipped allocation survive the sweep. Under a
+	// genuinely stopped world this branch never runs (gc_phase==off on the alloc
+	// fast path), so it is zero-cost in the common case and a pure soundness floor
+	// otherwise. Independent of, and complementary to, the atomic sweep write-back
+	// and the suspend-retry fix.
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		if span.mark_bits != unsafe { nil } {
+			C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
 		}
 	}
 }
