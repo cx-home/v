@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h> // abort (span-registry-full hard fail in vgc_span_alloc)
 
+static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnostics section)
+
 // ============================================================
 // Global / BSS data-segment roots
 // V `__global` variables (e.g. rand.default_rng, and any user global holding a
@@ -623,29 +625,30 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   static inline uint32_t vgc_thread_self_port(void) {
       return (uint32_t)pthread_mach_thread_np(pthread_self());
   }
-  static inline void vgc_suspend_thread(uint32_t t) {
-      if (thread_suspend((thread_act_t)t) != KERN_SUCCESS) return;
+  static inline int vgc_suspend_thread(uint32_t t) {
+      if (thread_suspend((thread_act_t)t) != KERN_SUCCESS) return 0;
       uintptr_t prev_sp = 0, prev_pc = 0;
       for (int i = 0; i < 200000; i++) {
         #if defined(__arm64__) || defined(__aarch64__)
           arm_thread_state64_t st;
           mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
-          if (thread_get_state((thread_act_t)t, ARM_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return;
+          if (thread_get_state((thread_act_t)t, ARM_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return 1;
           uintptr_t sp = (uintptr_t)arm_thread_state64_get_sp(st);
           uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(st);
         #elif defined(__x86_64__)
           x86_thread_state64_t st;
           mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
-          if (thread_get_state((thread_act_t)t, x86_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return;
+          if (thread_get_state((thread_act_t)t, x86_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return 1;
           uintptr_t sp = (uintptr_t)st.__rsp;
           uintptr_t pc = (uintptr_t)st.__rip;
         #else
-          return;
+          return 1;
         #endif
-          if (i > 0 && sp == prev_sp && pc == prev_pc) return; // frozen => stopped
+          if (i > 0 && sp == prev_sp && pc == prev_pc) return 1; // frozen => stopped
           prev_sp = sp;
           prev_pc = pc;
       }
+      return 1; // kernel-suspended (settle heuristic exhausted; thread IS suspended)
   }
   static inline void vgc_resume_thread(uint32_t t) { thread_resume((thread_act_t)t); }
   static inline int vgc_thread_regs(uint32_t t, uintptr_t* sp_out, uintptr_t* regs, int max) {
@@ -793,37 +796,65 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
           if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == t) return &vgc_mac_slots[i];
       return 0;
   }
-  // Suspend = claim a slot, signal the target pthread, SPIN UNTIL ACK (the settle).
+  // Suspend = claim a slot, signal the target pthread, WAIT UNTIL ACK (the settle).
   // Single collector under STW, so slot claiming is single-threaded vs other suspends.
-  static inline void vgc_suspend_thread(uint32_t t) {
-      if (t == 0) return;
+  // Returns 1 once the target has acked (captured + parked); 0 only if the target is
+  // GONE (pthread lookup/kill fails). The former bounded 200k-yield ack wait was a
+  // SOUNDNESS HOLE: when it expired under scheduling load the collector proceeded
+  // with a still-RUNNING mutator — it kept allocating/mutating through mark+sweep
+  // with a stale scanned window, and the caller set susp[] unconditionally so even
+  // the 0x57ab STW-completeness probe counted it as covered. That is the
+  // sweep-while-live shape of the #57/#58/#63/#145 residual. A live registered
+  // thread is now waited for indefinitely (re-signaling periodically in case the
+  // first signal hit a masked/spurious window), with a loud diagnostic if the wait
+  // is abnormally long. -DVGC_ACK_BOUNDED restores the old bounded wait for A/B.
+  static inline int vgc_suspend_thread(uint32_t t) {
+      if (t == 0) return 0;
       pthread_t pt = pthread_from_mach_thread_np((mach_port_t)t);
-      if (pt == 0) return; // target gone
+      if (pt == 0) return 0; // target gone
       vgc_mac_susp* s = 0;
       for (int i = 0; i < VGC_MAC_MAXTH; i++)
           if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == 0) { s = &vgc_mac_slots[i]; break; }
-      if (s == 0) return; // table full (should not happen: MAXTH >= caches)
+      if (s == 0) return 0; // table full (should not happen: MAXTH >= caches)
       if (s->sem_init == 0) { // one-time park semaphore for this slot (collector context, pre-signal)
           semaphore_t sem_new;
           if (semaphore_create(mach_task_self(), &sem_new, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS) {
               s->sem = sem_new;
               s->sem_init = 1;
           } else {
-              return; // cannot park this target safely without a semaphore: skip (backstop path)
+              return 0; // cannot park this target safely without a semaphore: skip (backstop path)
           }
       }
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0; s->pt = pt;
       __atomic_store_n(&s->port, t, __ATOMIC_RELEASE); // publish key before signaling
       if (pthread_kill(pt, VGC_SUSPEND_SIGNAL) != 0) {
           __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE); // target gone: release slot
-          return;
+          return 0;
       }
       for (int i = 0; i < 200000; i++) {
-          if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return; // settled
+          if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1; // settled
           sched_yield();
       }
-      // Backstop expired (signal lost / thread dying): leave acked==0 so
-      // vgc_thread_regs returns 0 and the collector safely skips this thread.
+  #ifdef VGC_ACK_BOUNDED
+      // Legacy hole, kept ONLY for A/B measurement: proceed with a running mutator.
+      vgc_say(0x0acc, (uint64_t)t); // ACK-TIMEOUT: unstopped mutator during mark
+      return 0;
+  #else
+      for (uint64_t spins = 1;; spins++) {
+          if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1;
+          if (pthread_kill(pt, 0) != 0) { // target exited: no handler will ever ack
+              __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
+              return 0;
+          }
+          if ((spins & 0xffff) == 0) {
+              (void)pthread_kill(pt, VGC_SUSPEND_SIGNAL); // re-signal a lost/consumed delivery
+          }
+          if ((spins & 0xfffff) == 0) {
+              vgc_say(0x0acd, (uint64_t)t); // abnormal: still waiting for ack (visible, not silent)
+          }
+          sched_yield();
+      }
+  #endif
   }
   static inline void vgc_resume_thread(uint32_t t) {
       vgc_mac_susp* s = vgc_mac_find(t);
@@ -968,30 +999,49 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       return 0;
   }
 
-  // Suspend = claim a slot, signal the target, and SPIN UNTIL ACK (the settle).
+  // Suspend = claim a slot, signal the target, and WAIT UNTIL ACK (the settle).
   // Only one collector runs the suspend loop at a time (STW gc_phase guard), so
   // slot claiming is single-threaded against other suspends; the handler reads it
-  // concurrently, guarded by atomics.
-  static inline void vgc_suspend_thread(uint32_t t) {
-      if (t == 0) return;
+  // concurrently, guarded by atomics. Returns 1 once the target acked; 0 only if
+  // the target is GONE. See the darwin twin for why the former bounded ack wait
+  // was a soundness hole (#57/#58/#63/#145 sweep-while-live residual);
+  // -DVGC_ACK_BOUNDED restores it for A/B.
+  static inline int vgc_suspend_thread(uint32_t t) {
+      if (t == 0) return 0;
       vgc_lin_susp* s = 0;
       for (int i = 0; i < VGC_LINUX_MAXTH; i++) {
           if (__atomic_load_n(&vgc_lin_slots[i].tid, __ATOMIC_ACQUIRE) == 0) { s = &vgc_lin_slots[i]; break; }
       }
-      if (s == 0) return; // table full (should not happen: MAXTH >= caches)
+      if (s == 0) return 0; // table full (should not happen: MAXTH >= caches)
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0;
       __atomic_store_n(&s->tid, t, __ATOMIC_RELEASE); // publish key before signaling
       if (syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL) != 0) {
           __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE); // target gone: release the slot
-          return;
+          return 0;
       }
       for (int i = 0; i < 200000; i++) {
-          if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return; // settled
+          if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1; // settled
           sched_yield();
       }
-      // Backstop expired (signal lost / thread dying): leave acked==0 so
-      // vgc_thread_regs returns 0 and the collector safely skips this thread,
-      // matching darwin's thread_get_state failure path.
+  #ifdef VGC_ACK_BOUNDED
+      vgc_say(0x0acc, (uint64_t)t); // ACK-TIMEOUT: unstopped mutator during mark (A/B only)
+      return 0;
+  #else
+      for (uint64_t spins = 1;; spins++) {
+          if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1;
+          if (syscall(SYS_tgkill, getpid(), (int)t, 0) != 0) { // target exited
+              __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
+              return 0;
+          }
+          if ((spins & 0xffff) == 0) {
+              (void)syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL); // re-signal
+          }
+          if ((spins & 0xfffff) == 0) {
+              vgc_say(0x0acd, (uint64_t)t); // abnormal: still waiting for ack
+          }
+          sched_yield();
+      }
+  #endif
   }
 
   static inline void vgc_resume_thread(uint32_t t) {
@@ -1024,7 +1074,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   // Other platforms (Windows/BSD): signal/mach STW not yet ported. Return 0 so the
   // collector detects "no OS-suspend available" and falls back safely.
   static inline uint32_t vgc_thread_self_port(void) { return 0; }
-  static inline void vgc_suspend_thread(uint32_t t) { (void)t; }
+  static inline int vgc_suspend_thread(uint32_t t) { (void)t; return 0; }
   static inline void vgc_resume_thread(uint32_t t) { (void)t; }
   static inline int vgc_thread_regs(uint32_t t, uintptr_t* sp_out, uintptr_t* regs, int max) {
       (void)t; (void)sp_out; (void)regs; (void)max; return 0;

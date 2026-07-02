@@ -154,8 +154,10 @@ fn vgc_gc_start() {
 			C.vgc_trace(6, i, if c.registered { u64(1) } else { u64(0) }, u64(c.mach_port))
 			if c.registered && i != self_idx && c.mach_port != 0
 				&& C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 {
-				C.vgc_suspend_thread(c.mach_port)
-				susp[i] = true
+				// susp[i] reflects the ACK, not the attempt: an un-acked target is a
+				// gone thread (safe to skip), never a running mutator (the suspend now
+				// waits indefinitely for live targets — the bounded-wait soundness hole).
+				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
 				C.vgc_trace(7, i, u64(c.mach_port), 0)
 			}
 		}
@@ -181,8 +183,8 @@ fn vgc_gc_start() {
 			reg := if c.registered { u64(1) } else { u64(0) }
 			C.vgc_trace(6, i, reg, u64(c.mach_port)) // SUSP? (decision inputs for EVERY slot)
 			if c.registered && i != self_idx && c.mach_port != 0 {
-				C.vgc_suspend_thread(c.mach_port)
-				susp[i] = true
+				// susp[i] reflects the ACK (see the cooperative branch above).
+				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
 				C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
 			}
 		}
@@ -461,7 +463,7 @@ fn vgc_cm_stw_enter(self_idx int) {
 	for i in 0 .. vgc_heap.ncaches {
 		c := unsafe { &vgc_heap.caches[i] }
 		if c.registered && i != self_idx && c.mach_port != 0 {
-			C.vgc_suspend_thread(c.mach_port)
+			_ = C.vgc_suspend_thread(c.mach_port)
 		}
 	}
 	// The work queue is collector-exclusive (mutators never enqueue — the write barrier

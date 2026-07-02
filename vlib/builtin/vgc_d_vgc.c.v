@@ -47,7 +47,7 @@ fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stopped_count &u32, my_stopped &u32, range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_thread_self_port() u32
-fn C.vgc_suspend_thread(t u32)
+fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
 fn C.vgc_resume_thread(t u32)
 fn C.vgc_thread_regs(t u32, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
