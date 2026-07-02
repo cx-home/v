@@ -1336,7 +1336,18 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 	// and the suspend-retry fix.
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
 		if span.mark_bits != unsafe { nil } {
-			C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
+			// ATOMIC OR, not vgc_bitmap_test_and_set (a plain read-modify-write):
+			// this hook runs in MUTATOR context — concurrently with other mutators
+			// allocating neighbors in the same mark byte (the post-release window
+			// where gc_stop_flag is already 0 but gc_phase is not yet off) and,
+			// in the slipped-mutator case, with the collector's own marking. A
+			// torn mark byte here ERASES freshly-set neighbor marks => sweep
+			// frees live objects — worse than no hook at all.
+			mask := u8(1) << (obj_idx & 7)
+			unsafe {
+				_ = C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) +
+					usize(obj_idx >> 3))), mask)
+			}
 		}
 	}
 }
