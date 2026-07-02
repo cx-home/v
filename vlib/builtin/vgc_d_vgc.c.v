@@ -549,6 +549,42 @@ pub fn vgc_envcheck_dedupe(p usize) bool {
 	return true
 }
 
+// ── #58 BIRTH REGISTRY (-d vgc_birthcheck) ──────────────────────────────────
+// Direct-mapped: ptr -> gc_cycle at allocation, for victim-class objects.
+// Collisions overwrite (younger birth wins — fine: we only ask about recent
+// allocations). Lookup miss => born before the table wrapped (old object).
+__global vgc_birth_ptr = [262144]usize{}
+__global vgc_birth_cyc = [262144]u64{}
+
+@[inline]
+fn vgc_birth_record(addr usize) {
+	i := int((u64(addr) * u64(0x9E3779B97F4A7C15)) >> 46)
+	vgc_birth_ptr[i] = addr
+	vgc_birth_cyc[i] = u64(vgc_heap.gc_cycle)
+}
+
+// vgc_birth_delta: cycles between `p`'s recorded birth and now; -1 = unknown.
+@[markused]
+pub fn vgc_birth_delta(p voidptr) i64 {
+	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
+	if vgc_birth_ptr[i] != usize(p) {
+		return -1
+	}
+	return i64(u64(vgc_heap.gc_cycle) - vgc_birth_cyc[i])
+}
+
+__global vgc_envchk_tick = u64(0)
+
+// vgc_envcheck_sample: cheap 1-in-256 sampler for probes on ultra-hot paths
+// (eval_node runs millions/s; the full map-status check there made rounds ~20x
+// slower). A dead env evaluates thousands of nodes, so sampling costs no
+// detection coverage — only a bounded first-report latency. Racy on purpose.
+@[markused]
+pub fn vgc_envcheck_sample() bool {
+	vgc_envchk_tick++
+	return (vgc_envchk_tick & 0xff) == 0
+}
+
 // ── #58 SWEEP-TIME ROOT FORENSIC (-d vgc_keysweep) ──────────────────────────
 // vgc_sweep_span records every scan-class, keys-array-sized object it frees;
 // vgc_do_sweep then (still under STW) rescans every registered thread window
@@ -1306,6 +1342,21 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 					span.free_index = i + 1 // hint only; a stale value is still correct
 					vgc_alloc_black_hook(span, i) // concurrent mark: alloc-black
 					addr := span.base + usize(i) * usize(span.elem_size)
+					$if vgc_birthcheck ? {
+						// #58 forensic: the atomic OR above just claimed this bit; a
+						// clear read-back means something is clobbering this span's
+						// alloc bitmap out from under us (0xa110 = born-dead). Also
+						// register victim-class births (ptr + gc cycle) so DEAD-KEYS
+						// can report the birth→dead-read cycle delta: delta==0 with
+						// no explicit free = a wild bitmap clear.
+						if C.vgc_bitmap_get(span.alloc_bits, i) == 0 {
+							C.vgc_say(0xa110, u64(addr))
+						}
+						if !span.noscan && span.elem_size >= u32(128)
+							&& span.elem_size <= u32(192) {
+							vgc_birth_record(addr)
+						}
+					}
 					return unsafe { voidptr(addr) }
 				}
 			}
