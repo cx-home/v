@@ -573,6 +573,37 @@ pub fn vgc_birth_delta(p voidptr) i64 {
 	return i64(u64(vgc_heap.gc_cycle) - vgc_birth_cyc[i])
 }
 
+// ── #58 BIT-WATCH (-d vgc_birthcheck) ───────────────────────────────────────
+// Per-thread one-slot watch on the MOST RECENT victim-class allocation's alloc
+// bit: (bitmap byte address, mask, object addr). Every site that can clear an
+// alloc bit checks the watch first and names itself:
+//   0xc1ea1 = vgc_free (explicit)      0xc1ea2 = sweep garbage-clear
+//   0xc1ea3 = span reset/recycle       (value = the watched object address)
+// Direct attribution — no inference. Racy one-slot-per-thread by design.
+__global vgc_bw_byte = [64]usize{} // address of the alloc_bits byte
+__global vgc_bw_mask = [64]u8{}
+__global vgc_bw_addr = [64]usize{}
+
+@[inline]
+fn vgc_bw_arm(byte_addr usize, mask u8, obj usize) {
+	idx := C.vgc_get_cache_idx()
+	if idx >= 0 && idx < 64 {
+		vgc_bw_byte[idx] = byte_addr
+		vgc_bw_mask[idx] = mask
+		vgc_bw_addr[idx] = obj
+	}
+}
+
+// vgc_bw_check: does clearing `mask` at `byte_addr` hit ANY thread's watched
+// bit? Called only from the (rare relative to allocation) clear sites.
+fn vgc_bw_check(byte_addr usize, mask u8, who u64) {
+	for i in 0 .. 64 {
+		if vgc_bw_byte[i] == byte_addr && (vgc_bw_mask[i] & mask) != 0 {
+			C.vgc_say(who, u64(vgc_bw_addr[i]))
+		}
+	}
+}
+
 __global vgc_envchk_tick = u64(0)
 
 // vgc_envcheck_sample: cheap 1-in-256 sampler for probes on ultra-hot paths
@@ -1256,6 +1287,14 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	// at them and zero the bytes in use. nobjs <= 1024 -> bitmap_size <= 128 <= 136,
 	// so the inline buffers always suffice. No allocation, no syscalls on reuse.
 	bitmap_size := (nobjs + 7) / 8
+	$if vgc_birthcheck ? {
+		// span (re)init wipes the whole bitmap — if any thread's watched bit lives
+		// in these bytes, this recycle is the clearer (0xc1ea3).
+		for wb in 0 .. int(bitmap_size) {
+			vgc_bw_check(usize(voidptr(unsafe { &span.alloc_buf[0] })) + usize(wb), 0xff,
+				0xc1ea3)
+		}
+	}
 	unsafe {
 		span.alloc_bits = &span.alloc_buf[0]
 		span.mark_bits = &span.mark_buf[0]
@@ -1355,6 +1394,8 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 						if !span.noscan && span.elem_size >= u32(128)
 							&& span.elem_size <= u32(192) {
 							vgc_birth_record(addr)
+							vgc_bw_arm(usize(span.alloc_bits) + usize(byte_idx), mask,
+								addr)
 						}
 					}
 					return unsafe { voidptr(addr) }
@@ -2079,6 +2120,9 @@ fn vgc_free(ptr voidptr) {
 	mask := u8(1) << (obj_idx & 7)
 	byte_ptr := unsafe { &u8(voidptr(usize(span.alloc_bits) + usize(obj_idx >> 3))) }
 	if span.on_central == 0 {
+		$if vgc_birthcheck ? {
+			vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)
+		}
 		old := C.vgc_atomic_fetch_and_u8(byte_ptr, ~mask)
 		if (old & mask) != 0 {
 			C.vgc_atomic_sub_u32(&u32(voidptr(&span.alloc_count)), 1)
@@ -2103,6 +2147,9 @@ fn vgc_free(ptr voidptr) {
 		// mcache allocation of a sibling slot in the same byte cannot lose
 		// either update. (central.lock still serializes free-vs-free for
 		// double-free idempotency and guards the central-list reads.)
+		$if vgc_birthcheck ? {
+			vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)
+		}
 		old := C.vgc_atomic_fetch_and_u8(byte_ptr, ~mask)
 		if (old & mask) != 0 {
 			C.vgc_atomic_sub_u32(&u32(voidptr(&span.alloc_count)), 1)

@@ -1533,6 +1533,9 @@ fn vgc_sweep_span(span &VGC_Span) {
 			// identical; when any mutator is still running (however it slipped the
 			// STW net), the atomic AND clears only the swept bits and cannot eat a
 			// concurrent claim. Defense-in-depth with zero extra cost.
+			$if vgc_birthcheck ? {
+				vgc_bw_check(usize(span.alloc_bits) + usize(b), garbage, 0xc1ea2)
+			}
 			unsafe {
 				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) + usize(b))),
 					~garbage)
