@@ -61,6 +61,7 @@ fn C.vgc_ra0() voidptr // #58 freering: __builtin_return_address(0) of the calli
 fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site)
 fn C.vgc_ra2() voidptr // #58 freering: two frames up
 fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
+fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -526,58 +527,78 @@ pub fn vgc_map_keys_ptr(mp voidptr) voidptr {
 	}
 }
 
+// vgc_current_sp: #58 cx_envcheck support — the caller's REAL stack pointer via
+// the C-level vgc_real_sp(). (A V-level `&local` probe gets heap-boxed by escape
+// analysis the moment its address is taken, yielding an arena address — which
+// silently invalidated an earlier above/below-frame discriminator.)
+@[markused]
+pub fn vgc_current_sp() usize {
+	return usize(C.vgc_real_sp())
+}
+
+__global vgc_envchk_last = usize(0)
+
+// vgc_envcheck_dedupe: true iff `p` differs from the previously reported env
+// (racy across threads by design — a diagnostic dedupe, not a correctness gate).
+@[markused]
+pub fn vgc_envcheck_dedupe(p usize) bool {
+	if p == vgc_envchk_last {
+		return false
+	}
+	vgc_envchk_last = p
+	return true
+}
+
 // ── #58 SWEEP-TIME ROOT FORENSIC (-d vgc_keysweep) ──────────────────────────
 // vgc_sweep_span records every scan-class, keys-array-sized object it frees;
 // vgc_do_sweep then (still under STW) rescans every registered thread window
 // for words pointing into those objects. See vgc_do_sweep for the verdict tags.
-const vgc_ks_cap = 8192
+const vgc_ks_cap = 262144 // 2^18 direct-mapped slots (~2 MB BSS; ~120k candidates/GC observed)
 
-__global vgc_ks_addrs = [8192]usize{}
-__global vgc_ks_sizes = [8192]u32{}
+__global vgc_ks_tab = [262144]usize{} // freed-object BASE address (0 = empty slot)
 __global vgc_ks_count = u32(0)
 __global vgc_ks_overflow = u32(0)
 
-// vgc_ks_sort: shellsort the candidate buffer by base address so the stack pass
-// can binary-search. Runs once per GC under STW; N<=8192 => ~1M ops, bounded.
-fn vgc_ks_sort() {
-	n := int(vgc_ks_count)
-	mut gap := n / 2
-	for gap > 0 {
-		for i in gap .. n {
-			ta := vgc_ks_addrs[i]
-			ts := vgc_ks_sizes[i]
-			mut j := i
-			for j >= gap && vgc_ks_addrs[j - gap] > ta {
-				vgc_ks_addrs[j] = vgc_ks_addrs[j - gap]
-				vgc_ks_sizes[j] = vgc_ks_sizes[j - gap]
-				j -= gap
-			}
-			vgc_ks_addrs[j] = ta
-			vgc_ks_sizes[j] = ts
-		}
-		gap /= 2
-	}
+// The earlier sorted-buffer design could not keep up: the [?let] clone churn
+// frees ~100k keys-array-class objects PER CYCLE, overflowing any bounded
+// append buffer (silently voiding the negative verdict) and the per-cycle sort
+// made rounds minutes long. Direct-mapped open-addressing hash instead: O(1)
+// insert per freed object, O(1) probe per stack word, no sort. EXACT base-
+// pointer matching only — the holder word of interest (a map struct's
+// key_values.keys field) IS a base pointer; interior cursors are out of scope.
+@[inline]
+fn vgc_ks_hash(a usize) int {
+	return int((u64(a) * u64(0x9E3779B97F4A7C15)) >> 46)
 }
 
-// vgc_ks_find: greatest recorded base <= val, hit iff val inside [base, base+size).
 @[inline]
-fn vgc_ks_find(val usize) int {
-	mut lo := 0
-	mut hi := int(vgc_ks_count) - 1
-	mut best := -1
-	for lo <= hi {
-		mid := (lo + hi) / 2
-		if vgc_ks_addrs[mid] <= val {
-			best = mid
-			lo = mid + 1
-		} else {
-			hi = mid - 1
+fn vgc_ks_insert(base usize) {
+	h := vgc_ks_hash(base)
+	for probe in 0 .. 8 {
+		i := (h + probe) & (vgc_ks_cap - 1)
+		if vgc_ks_tab[i] == 0 {
+			vgc_ks_tab[i] = base
+			vgc_ks_count++
+			return
 		}
 	}
-	if best >= 0 && val < vgc_ks_addrs[best] + usize(vgc_ks_sizes[best]) {
-		return best
+	vgc_ks_overflow++
+}
+
+@[inline]
+fn vgc_ks_lookup(val usize) bool {
+	h := vgc_ks_hash(val)
+	for probe in 0 .. 8 {
+		i := (h + probe) & (vgc_ks_cap - 1)
+		t := vgc_ks_tab[i]
+		if t == 0 {
+			return false
+		}
+		if t == val {
+			return true
+		}
 	}
-	return -1
+	return false
 }
 
 // vgc_spchk_report: catch-side emitter (called from map_clone_string on a bf1

@@ -1367,6 +1367,7 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 // Sweep all spans synchronously.
 fn vgc_do_sweep() {
 	$if vgc_keysweep ? {
+		unsafe { C.memset(&vgc_ks_tab[0], 0, usize(sizeof(usize)) * usize(vgc_ks_cap)) }
 		vgc_ks_count = 0
 		vgc_ks_overflow = 0
 	}
@@ -1386,7 +1387,6 @@ fn vgc_do_sweep() {
 		// DEAD-KEYS interpreter probe still fires means the roots were NOT on any
 		// stack during the GC (a stale env copy written after the fact).
 		if vgc_ks_count > 0 {
-			vgc_ks_sort()
 			ks_self := C.vgc_get_cache_idx()
 			for ti in 0 .. vgc_heap.ncaches {
 				if ti == ks_self {
@@ -1403,10 +1403,9 @@ fn vgc_do_sweep() {
 				for w + sizeof(usize) <= tc.stack_hi {
 					val := unsafe { *(&usize(voidptr(w))) }
 					if val >= vgc_arena_lo && val < vgc_arena_hi {
-						ki := vgc_ks_find(val)
-						if ki >= 0 {
+						if vgc_ks_lookup(val) {
 							C.vgc_say(0x5ee9, u64(w)) // holder word (on a scanned stack!)
-							C.vgc_say(0x5eea, u64(vgc_ks_addrs[ki])) // the freed object it points into
+							C.vgc_say(0x5eea, u64(val)) // the freed object it points to
 							C.vgc_say(0x5eeb, u64(u32(ti))) // holder thread cache idx
 						}
 					}
@@ -1485,20 +1484,18 @@ fn vgc_sweep_span(span &VGC_Span) {
 			freed += u32(C.vgc_popcount8(garbage))
 			$if vgc_keysweep ? {
 				// #58 forensic: record every scan-class keys-array-sized object this
-				// sweep frees, for the post-sweep registered-window rescan.
-				if !span.noscan && span.elem_size >= u32(64) && span.elem_size <= u32(512) {
+				// sweep frees, for the post-sweep registered-window rescan. Keys
+				// arrays of the victim-class small maps live in the 128-192B classes
+				// (DenseArray init cap 8 x 16B string structs + one 1.125x expand).
+				// The wider nets overflowed the candidate buffer every cycle (the
+				// heap is goal-sized, not floor-sized), silently voiding the negative
+				// verdict. Precision beats breadth here.
+				if !span.noscan && span.elem_size >= u32(128) && span.elem_size <= u32(192) {
 					for kbit in 0 .. 8 {
 						if garbage & (u8(1) << kbit) != 0 {
 							koi := u32(b) * 8 + u32(kbit)
 							if koi < span.nelems {
-								if vgc_ks_count < u32(vgc_ks_cap) {
-									vgc_ks_addrs[int(vgc_ks_count)] = span.base +
-										usize(koi) * usize(span.elem_size)
-									vgc_ks_sizes[int(vgc_ks_count)] = u32(span.elem_size)
-									vgc_ks_count++
-								} else {
-									vgc_ks_overflow++
-								}
+								vgc_ks_insert(span.base + usize(koi) * usize(span.elem_size))
 							}
 						}
 					}
