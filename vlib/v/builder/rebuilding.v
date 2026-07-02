@@ -31,6 +31,7 @@ pub fn (mut b Builder) rebuild_modules() {
 	$if trace_invalidations ? {
 		eprintln('> rebuild_modules invalidations: ${invalidations}')
 	}
+	mut stale_object_might_survive := false
 	if invalidations.len > 0 {
 		vexe := pref.vexe_path()
 		for imp in invalidations {
@@ -40,18 +41,37 @@ pub fn (mut b Builder) rebuild_modules() {
 				// silently ignored while the new source hashes were ALREADY saved —
 				// every later build then saw "hashes unchanged", skipped invalidation,
 				// and linked the STALE cached object forever (until a manual cache
-				// wipe). Observed as a permanent all-tests link failure; an
-				// ABI-compatible variant would be a silently wrong binary. Abort
-				// loudly instead, WITHOUT saving the hashes, so the next run
-				// re-detects the change and retries the rebuild.
-				verror('`v build-module ${imp}` failed (exit code ${rc}); aborting -usecache build. Cached hashes NOT updated — rerun after fixing the module, or build without -usecache.')
+				// wipe). Observed as a permanent all-tests link failure
+				// (_builtin__init_consts unresolved); an ABI-compatible variant would
+				// be a silently WRONG binary. Aborting outright is too strict — the
+				// invalidator sometimes names paths that are not real buildable
+				// modules (e.g. a folder of standalone _test.v files) whose rebuild
+				// has always failed harmlessly and which have no cached object to go
+				// stale. The precise guard: a failure is only dangerous if a stale
+				// object could still be SERVED — so remove the module's cached object;
+				// once nothing stale can be linked, recording the new source hashes is
+				// safe. Only if the stale object cannot be removed do we skip the hash
+				// save (forcing re-detection + retry on the next run). A genuinely
+				// needed-but-missing object is rebuilt on demand by
+				// rebuild_cached_module, which fails loudly.
+				stale_o := b.pref.cache_manager.mod_postfix_with_key2cpath(imp, '.o',
+					imp)
+				if os.exists(stale_o) {
+					os.rm(stale_o) or { stale_object_might_survive = true }
+					eprintln('warning: `v build-module ${imp}` failed (exit code ${rc}); removed its cached object so nothing stale can be linked.')
+				} else {
+					vcache.dlog('| Builder.' + @FN, 'build-module failed for ${imp} (rc=${rc}); no cached object under this key — harmless (not a servable module)')
+				}
 			}
 		}
 	}
-	// Persist the new source hashes only now — after every invalidated module was
-	// rebuilt successfully — so a failed rebuild can never poison the cache state.
-	mut cm := vcache.new_cache_manager(all_files)
-	cm.save('.hashes', 'all_files', snew_hashes) or {}
+	if !stale_object_might_survive {
+		// Persist the new source hashes only now — after every invalidated module was
+		// rebuilt (or its stale object provably removed) — so a failed rebuild can
+		// never poison the cache state.
+		mut cm := vcache.new_cache_manager(all_files)
+		cm.save('.hashes', 'all_files', snew_hashes) or {}
+	}
 }
 
 pub fn (mut b Builder) find_invalidated_modules_by_files(all_files []string) ([]string, string) {
