@@ -1486,7 +1486,7 @@ fn vgc_sweep_span(span &VGC_Span) {
 			$if vgc_keysweep ? {
 				// #58 forensic: record every scan-class keys-array-sized object this
 				// sweep frees, for the post-sweep registered-window rescan.
-				if !span.noscan && span.elem_size >= u32(64) && span.elem_size <= u32(4096) {
+				if !span.noscan && span.elem_size >= u32(64) && span.elem_size <= u32(512) {
 					for kbit in 0 .. 8 {
 						if garbage & (u8(1) << kbit) != 0 {
 							koi := u32(b) * 8 + u32(kbit)
