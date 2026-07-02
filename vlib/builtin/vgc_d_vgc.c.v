@@ -526,6 +526,60 @@ pub fn vgc_map_keys_ptr(mp voidptr) voidptr {
 	}
 }
 
+// ── #58 SWEEP-TIME ROOT FORENSIC (-d vgc_keysweep) ──────────────────────────
+// vgc_sweep_span records every scan-class, keys-array-sized object it frees;
+// vgc_do_sweep then (still under STW) rescans every registered thread window
+// for words pointing into those objects. See vgc_do_sweep for the verdict tags.
+const vgc_ks_cap = 8192
+
+__global vgc_ks_addrs = [8192]usize{}
+__global vgc_ks_sizes = [8192]u32{}
+__global vgc_ks_count = u32(0)
+__global vgc_ks_overflow = u32(0)
+
+// vgc_ks_sort: shellsort the candidate buffer by base address so the stack pass
+// can binary-search. Runs once per GC under STW; N<=8192 => ~1M ops, bounded.
+fn vgc_ks_sort() {
+	n := int(vgc_ks_count)
+	mut gap := n / 2
+	for gap > 0 {
+		for i in gap .. n {
+			ta := vgc_ks_addrs[i]
+			ts := vgc_ks_sizes[i]
+			mut j := i
+			for j >= gap && vgc_ks_addrs[j - gap] > ta {
+				vgc_ks_addrs[j] = vgc_ks_addrs[j - gap]
+				vgc_ks_sizes[j] = vgc_ks_sizes[j - gap]
+				j -= gap
+			}
+			vgc_ks_addrs[j] = ta
+			vgc_ks_sizes[j] = ts
+		}
+		gap /= 2
+	}
+}
+
+// vgc_ks_find: greatest recorded base <= val, hit iff val inside [base, base+size).
+@[inline]
+fn vgc_ks_find(val usize) int {
+	mut lo := 0
+	mut hi := int(vgc_ks_count) - 1
+	mut best := -1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if vgc_ks_addrs[mid] <= val {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best >= 0 && val < vgc_ks_addrs[best] + usize(vgc_ks_sizes[best]) {
+		return best
+	}
+	return -1
+}
+
 // vgc_spchk_report: catch-side emitter (called from map_clone_string on a bf1
 // catch under -d vgc_spcheck). 0x51ee/ef = this thread's last-scanned [lo,hi];
 // 0x51f0 = the catching frame; 0x51f1 = GC cycles since that scan; 0x51f2 =

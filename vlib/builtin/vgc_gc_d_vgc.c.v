@@ -1366,12 +1366,57 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 
 // Sweep all spans synchronously.
 fn vgc_do_sweep() {
+	$if vgc_keysweep ? {
+		vgc_ks_count = 0
+		vgc_ks_overflow = 0
+	}
 	for i in 0 .. vgc_heap.nspans {
 		span := unsafe { vgc_heap.allspans[i] }
 		if span == unsafe { nil } || !span.in_use {
 			continue
 		}
 		vgc_sweep_span(span)
+	}
+	$if vgc_keysweep ? {
+		// #58 FORENSIC (world still stopped, sweep just freed): does any REGISTERED
+		// thread's scanned window STILL hold a word pointing into an object this
+		// sweep freed (scan-class, keys-array-sized)? A hit is the smoking gun for
+		// a mark-pipeline miss — the root was VISIBLE at sweep time yet its object
+		// was reclaimed — with the exact holder word address. No hits while the
+		// DEAD-KEYS interpreter probe still fires means the roots were NOT on any
+		// stack during the GC (a stale env copy written after the fact).
+		if vgc_ks_count > 0 {
+			vgc_ks_sort()
+			ks_self := C.vgc_get_cache_idx()
+			for ti in 0 .. vgc_heap.ncaches {
+				if ti == ks_self {
+					// The COLLECTOR's own frames evolved since its mark-time snapshot
+					// (sweep locals legitimately reference freed objects) — skip self;
+					// only the frozen mutators' windows are meaningful here.
+					continue
+				}
+				tc := unsafe { &vgc_heap.caches[ti] }
+				if !tc.registered || tc.stack_lo == 0 || tc.stack_hi <= tc.stack_lo {
+					continue
+				}
+				mut w := (tc.stack_lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+				for w + sizeof(usize) <= tc.stack_hi {
+					val := unsafe { *(&usize(voidptr(w))) }
+					if val >= vgc_arena_lo && val < vgc_arena_hi {
+						ki := vgc_ks_find(val)
+						if ki >= 0 {
+							C.vgc_say(0x5ee9, u64(w)) // holder word (on a scanned stack!)
+							C.vgc_say(0x5eea, u64(vgc_ks_addrs[ki])) // the freed object it points into
+							C.vgc_say(0x5eeb, u64(u32(ti))) // holder thread cache idx
+						}
+					}
+					w += sizeof(usize)
+				}
+			}
+			if vgc_ks_overflow != 0 {
+				C.vgc_say(0x5eec, u64(vgc_ks_overflow)) // candidates dropped (buffer full)
+			}
+		}
 	}
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 1)
 }
@@ -1438,6 +1483,27 @@ fn vgc_sweep_span(span &VGC_Span) {
 		}
 		if garbage != 0 {
 			freed += u32(C.vgc_popcount8(garbage))
+			$if vgc_keysweep ? {
+				// #58 forensic: record every scan-class keys-array-sized object this
+				// sweep frees, for the post-sweep registered-window rescan.
+				if !span.noscan && span.elem_size >= u32(64) && span.elem_size <= u32(4096) {
+					for kbit in 0 .. 8 {
+						if garbage & (u8(1) << kbit) != 0 {
+							koi := u32(b) * 8 + u32(kbit)
+							if koi < span.nelems {
+								if vgc_ks_count < u32(vgc_ks_cap) {
+									vgc_ks_addrs[int(vgc_ks_count)] = span.base +
+										usize(koi) * usize(span.elem_size)
+									vgc_ks_sizes[int(vgc_ks_count)] = u32(span.elem_size)
+									vgc_ks_count++
+								} else {
+									vgc_ks_overflow++
+								}
+							}
+						}
+					}
+				}
+			}
 			$if vgc_passive ? {
 				$if !vgc_nosweep ? {
 					// #63/#145 PASSIVE: record each freed SMALL noscan buffer (the
