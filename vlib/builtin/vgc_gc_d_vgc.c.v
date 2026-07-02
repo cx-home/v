@@ -1521,9 +1521,21 @@ fn vgc_sweep_span(span &VGC_Span) {
 					}
 				}
 			}
-			// Clear the garbage bits from alloc bitmap
+			// Clear the garbage bits from the alloc bitmap. ATOMIC AND of exactly
+			// ~garbage (NOT a plain write-back of `alloc_byte & mark_byte`): the
+			// plain store publishes a value computed from a byte read earlier in
+			// this loop, so any claim (vgc_span_alloc_obj's atomic OR) that lands
+			// between that read and this store is silently ERASED — the object is
+			// born with its bit verified set, then reads dead within the same GC
+			// cycle with no sweep or free in between (#57/#58/#63/#145 lineage;
+			// proven by the birth-certificate forensic: birth_dcyc==0, 0xa110==0,
+			// free-ring silent). Under a truly stopped world the two forms are
+			// identical; when any mutator is still running (however it slipped the
+			// STW net), the atomic AND clears only the swept bits and cannot eat a
+			// concurrent claim. Defense-in-depth with zero extra cost.
 			unsafe {
-				span.alloc_bits[b] = alloc_byte & mark_byte
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) + usize(b))),
+					~garbage)
 			}
 			// Track lowest freed index for free_index hint
 			base_idx := b * 8

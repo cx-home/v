@@ -811,23 +811,25 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   static inline int vgc_suspend_thread(uint32_t t) {
       if (t == 0) return 0;
       pthread_t pt = pthread_from_mach_thread_np((mach_port_t)t);
-      if (pt == 0) return 0; // target gone
+      if (pt == 0) { vgc_say(0xdead1, (uint64_t)t); return 0; } // target gone (port unresolvable)
       vgc_mac_susp* s = 0;
       for (int i = 0; i < VGC_MAC_MAXTH; i++)
           if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == 0) { s = &vgc_mac_slots[i]; break; }
-      if (s == 0) return 0; // table full (should not happen: MAXTH >= caches)
+      if (s == 0) { vgc_say(0xdead3, (uint64_t)t); return 0; } // table full (should not happen: MAXTH >= caches)
       if (s->sem_init == 0) { // one-time park semaphore for this slot (collector context, pre-signal)
           semaphore_t sem_new;
           if (semaphore_create(mach_task_self(), &sem_new, SYNC_POLICY_FIFO, 0) == KERN_SUCCESS) {
               s->sem = sem_new;
               s->sem_init = 1;
           } else {
+              vgc_say(0xdead4, (uint64_t)t);
               return 0; // cannot park this target safely without a semaphore: skip (backstop path)
           }
       }
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0; s->pt = pt;
       __atomic_store_n(&s->port, t, __ATOMIC_RELEASE); // publish key before signaling
       if (pthread_kill(pt, VGC_SUSPEND_SIGNAL) != 0) {
+          vgc_say(0xdead2, (uint64_t)t); // target gone (signal undeliverable)
           __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE); // target gone: release slot
           return 0;
       }
@@ -843,6 +845,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       for (uint64_t spins = 1;; spins++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1;
           if (pthread_kill(pt, 0) != 0) { // target exited: no handler will ever ack
+              vgc_say(0xdead5, (uint64_t)t);
               __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
               return 0;
           }
