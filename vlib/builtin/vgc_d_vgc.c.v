@@ -441,6 +441,91 @@ __global vgc_spchk_hi = [64]usize{}
 __global vgc_spchk_cyc = [64]u64{}
 __global vgc_spchk_parked = [64]u64{}
 
+// vgc_map_backing_status: #58 cx_envcheck probe support. Reports whether a live
+// map's key/value backing arrays are still ALLOCATED in the vgc heap. An
+// interpreter-held env whose bindings map has a freed (alloc-bit-clear) backing
+// array is the sweep-while-live UAF caught at its source. Packed result:
+// byte0 = keys status (bit0 alloc, bit1 span in_use, 0xff = not a heap ptr),
+// byte1 = values status, bytes2-5 = map len (u32).
+@[markused]
+pub fn vgc_map_backing_status(mp voidptr) u64 {
+	mut ks := u64(0xff)
+	mut vs := u64(0xff)
+	mut mlen := u64(0)
+	unsafe {
+		m := &map(mp)
+		mlen = u64(u32(m.len))
+		if usize(voidptr(m.key_values.keys)) >= vgc_arena_lo
+			&& usize(voidptr(m.key_values.keys)) < vgc_arena_hi {
+			ks = vgc_is_allocated(voidptr(m.key_values.keys)) & 3
+		}
+		if usize(voidptr(m.key_values.values)) >= vgc_arena_lo
+			&& usize(voidptr(m.key_values.values)) < vgc_arena_hi {
+			vs = vgc_is_allocated(voidptr(m.key_values.values)) & 3
+		}
+	}
+	return ks | (vs << 8) | (mlen << 16)
+}
+
+// vgc_spchk_self: #58 cx_envcheck support — this thread's scanned-window shadow
+// from the most recent GC: (cache_idx, lo, hi, cycles_since, parked). Valid only
+// when the collector snapshots the shadow (-d vgc_spcheck builds); otherwise
+// returns zeros. Lets an eval-side probe test whether an address it holds live
+// was inside the window the collector actually scanned.
+@[markused]
+pub fn vgc_spchk_self() (int, usize, usize, u64, u64) {
+	cidx := C.vgc_get_cache_idx()
+	if cidx < 0 || cidx >= 64 {
+		return -1, usize(0), usize(0), u64(0), u64(0)
+	}
+	return cidx, vgc_spchk_lo[cidx], vgc_spchk_hi[cidx], u64(vgc_heap.gc_cycle) - vgc_spchk_cyc[cidx], vgc_spchk_parked[cidx]
+}
+
+// vgc_addr_status: #58 cx_envcheck support — packed vgc view of an arbitrary
+// address: 0xff = not in the arena; else bit0 = alloc-bit set, bit1 = span
+// in_use (vgc_is_allocated low bits).
+@[markused]
+pub fn vgc_addr_status(p voidptr) u64 {
+	if usize(p) < vgc_arena_lo || usize(p) >= vgc_arena_hi {
+		return 0xff
+	}
+	return vgc_is_allocated(p) & 3
+}
+
+// vgc_explicit_free_ra: #58 cx_envcheck support — was `p` (an object base)
+// explicitly freed recently? Scans the -d vgc_freering ring newest→oldest and
+// returns the freeing call's ra1 (the codegen free site) or 0 if not found
+// (=> the alloc-bit clear came from the GC sweep). Zero unless the build also
+// carries -d vgc_freering.
+@[markused]
+pub fn vgc_explicit_free_ra(p voidptr) u64 {
+	$if vgc_freering ? {
+		total := C.vgc_atomic_load_u32(&vgc_freering_idx)
+		mut n := u32(vgc_freering_size)
+		if total < n {
+			n = total
+		}
+		for k in 0 .. int(n) {
+			i := int((total - 1 - u32(k)) & u32(vgc_freering_size - 1))
+			rp := vgc_freering_ptrs[i]
+			if rp != 0 && usize(p) >= rp && usize(p) - rp < 64 {
+				return u64(vgc_freering_ra1s[i])
+			}
+		}
+	}
+	return 0
+}
+
+// vgc_map_keys_ptr: #58 cx_envcheck support — the raw keys backing pointer of a
+// map, for ring lookups / correlation from outside builtin.
+@[markused]
+pub fn vgc_map_keys_ptr(mp voidptr) voidptr {
+	unsafe {
+		m := &map(mp)
+		return voidptr(m.key_values.keys)
+	}
+}
+
 // vgc_spchk_report: catch-side emitter (called from map_clone_string on a bf1
 // catch under -d vgc_spcheck). 0x51ee/ef = this thread's last-scanned [lo,hi];
 // 0x51f0 = the catching frame; 0x51f1 = GC cycles since that scan; 0x51f2 =
