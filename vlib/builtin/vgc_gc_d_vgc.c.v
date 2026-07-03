@@ -811,11 +811,27 @@ fn vgc_protect_cached_spans() {
 				}
 			}
 		}
+		// #58: protect the TINY-cursor block's owning span too. Once the tiny
+		// block's span fills, it is evicted from c.alloc[] to central and the loop
+		// above no longer reaches it — yet the cursor still carves from it. The
+		// block itself is conservatively rooted (the caches array lives inside the
+		// vgc_heap global, which mark_roots scans as a data segment), so it is
+		// marked and its span non-empty; this stamp is belt-and-braces against
+		// alloc_count drift ever making that span look empty to the recycler.
+		if c.tiny != 0 {
+			ts := vgc_find_span(voidptr(c.tiny))
+			if ts != unsafe { nil } {
+				unsafe {
+					(&VGC_Span(ts)).sweep_gen = u32(vgc_heap.gc_cycle)
+				}
+			}
+		}
 	}
 }
 
 // vgc_fixup_caches clears every per-thread mcache slot whose cached span was
-// recycled by THIS cycle's sweep, plus the tiny-allocator cursor. The collector
+// recycled by THIS cycle's sweep (the tiny-allocator cursor is KEPT — see the #58
+// note inside; dropping it raced signal-frozen mutators mid-carve). The collector
 // sweeps ALL spans, including the one a thread currently has cached in
 // caches[i].alloc[class]; if sweep finds that span empty it recycles it to the
 // free-span pool (in_use=false, bitmaps freed, pages decommitted) while the mcache
@@ -831,10 +847,28 @@ fn vgc_protect_cached_spans() {
 fn vgc_fixup_caches() {
 	for i in 0 .. vgc_heap.ncaches {
 		mut c := unsafe { &vgc_heap.caches[i] }
-		// The tiny cursor points into a span that may have been swept+decommitted this
-		// cycle; always drop it (worst case abandons the current tiny block's tail).
-		c.tiny = 0
-		c.tiny_offset = 0
+		// #58 ROOT CAUSE (workers8 string_clone segfault, lldb-captured): the tiny
+		// cursor was UNCONDITIONALLY dropped here. But a mutator can be SIGNAL-
+		// FROZEN (darwin/linux async-suspend STW stops threads at arbitrary PCs)
+		// inside vgc_malloc_noscan_opts BETWEEN its `cache.tiny != 0` check and the
+		// `cache.tiny + off` carve. Zeroing the cursor under it made the resumed
+		// thread compute ptr = 0 + off (near-NULL) and hand THAT out as a live
+		// buffer -> immediate SIGSEGV on the first write (captured: res.str = 0x8
+		// with a healthy 2-byte source key). The drop is also UNNECESSARY: the tiny
+		// block is conservatively ROOTED (this caches array lives inside the
+		// vgc_heap global, which mark_roots scans as a data segment), so it is
+		// marked, survives sweep, and vgc_protect_cached_spans stamps its owning
+		// span against recycle. Keep the cursor; drop it ONLY if its span was
+		// genuinely recycled this cycle — which the protections above make
+		// impossible, so say it LOUDLY if it ever fires.
+		if c.tiny != 0 {
+			ts := vgc_find_span(voidptr(c.tiny))
+			if ts == unsafe { nil } || !ts.in_use {
+				C.vgc_say(0x717e, u64(c.tiny)) // TINY cursor span recycled — protection hole
+				c.tiny = 0
+				c.tiny_offset = 0
+			}
+		}
 		for sc in 0 .. 136 {
 			span := unsafe { c.alloc[sc] }
 			if span != unsafe { nil } && !span.in_use {
@@ -1578,6 +1612,28 @@ fn vgc_do_sweep() {
 // Translated from Go's mspan.sweep() in mgcsweep.go.
 fn vgc_sweep_span(span &VGC_Span) {
 	if span.alloc_bits == unsafe { nil } || span.mark_bits == unsafe { nil } {
+		return
+	}
+	// #58 ROOT CAUSE (quiet half — the workers8 sweep-while-live UAF): a mutator
+	// can be SIGNAL-FROZEN (async-suspend STW stops threads at ARBITRARY PCs)
+	// inside the allocation fast path BETWEEN its atomic alloc-bit claim and the
+	// point where the new object's address exists in any scannable location
+	// (registers/stack). During that window the slot is alloc=1/mark=0 — to this
+	// sweep it is indistinguishable from garbage — so the bit was CLEARED under
+	// the in-flight claim; the resumed thread completed the claim and handed out
+	// a slot the allocator would hand out AGAIN => two live owners => torn
+	// structs / bit-clear reads (the 0xbf1 oracle) / string_clone segfaults.
+	// alloc-black cannot close this: it is phase-gated at the claim, and the
+	// freeze happens BEFORE the cycle starts (the mark-bit wipe at cycle start
+	// likewise erases any pre-set mark). The airtight invariant instead: every
+	// span a mutator can be mid-claim in RIGHT NOW is exactly the set stamped
+	// sweep_gen == gc_cycle (cache-resident spans + the tiny-cursor owner via
+	// vgc_protect_cached_spans; freshly acquired spans via span_init/central_get).
+	// Skip sweeping those spans entirely this cycle. Their garbage is reclaimed
+	// one cycle late, and the delay is self-limiting: unreclaimed slots keep
+	// their alloc bits, so the span fills, gets evicted from the cache, loses its
+	// stamp, and the NEXT sweep reclaims it normally.
+	if span.sweep_gen == u32(vgc_heap.gc_cycle) {
 		return
 	}
 
