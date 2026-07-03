@@ -153,6 +153,21 @@ fn vgc_gc_start() {
 		for i in 0 .. 136 {
 			C.vgc_mutex_lock(&vgc_heap.central[i].lock)
 		}
+		// SPAWN-ROOT LOCK, same lock-before-suspend discipline (#57/#58/#63/#145
+		// ROOT CAUSE): the spawn-roots loop below iterated UNLOCKED on the belief
+		// that "the world is stopped, so no mutator can be mid add/remove" — but a
+		// DYING worker's exit path (thread_wrapper tail: vgc_spawn_root_remove)
+		// runs with NO safepoint and can be past signal delivery (ESRCH => the
+		// suspend loop rightly skips it). Its swap-remove moves the LAST entry
+		// into a slot the iteration already passed => that entry — a STARTING
+		// worker's arg struct carrying its cloned bindings/closures maps — is
+		// never shaded => its keys arrays are swept => the new worker begins on
+		// freed maps (string_clone segfault; victim = binding-key/worker-name
+		// buffers). Holding the lock across the cycle makes the dying thread's
+		// remove wait until after the resume, closing the race. Deadlock-free:
+		// remove/add hold ONLY this lock, never allocate, never poll, so no
+		// frozen holder exists (acquired before any suspension, like the rest).
+		C.vgc_mutex_lock(&vgc_spawn_root_lock)
 		// Mach-suspend only stragglers (registered, not self, not self-parked). Allocator
 		// locks are held first, so a straggler cannot be frozen holding one.
 		for i in 0 .. vgc_heap.ncaches {
@@ -186,6 +201,7 @@ fn vgc_gc_start() {
 		for i in 0 .. 136 {
 			C.vgc_mutex_lock(&vgc_heap.central[i].lock)
 		}
+		C.vgc_mutex_lock(&vgc_spawn_root_lock) // see the cooperative branch above
 
 		for i in 0 .. vgc_heap.ncaches {
 			c := unsafe { &vgc_heap.caches[i] }
@@ -420,6 +436,7 @@ fn vgc_gc_start() {
 
 	// Mark + sweep done — release every allocator lock held across the cycle before
 	// resuming, so resumed mutators don't block on them. (Reverse acquisition order.)
+	C.vgc_mutex_unlock(&vgc_spawn_root_lock)
 	for i in 0 .. 136 {
 		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
 	}
@@ -470,6 +487,7 @@ fn vgc_cm_stw_enter(self_idx int) {
 	for i in 0 .. 136 {
 		C.vgc_mutex_lock(&vgc_heap.central[i].lock)
 	}
+	C.vgc_mutex_lock(&vgc_spawn_root_lock) // dying-thread remove vs spawn-root scan (see vgc_gc_start)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0) // OS-suspend, not cooperative
 	for i in 0 .. vgc_heap.ncaches {
 		c := unsafe { &vgc_heap.caches[i] }
@@ -486,6 +504,7 @@ fn vgc_cm_stw_enter(self_idx int) {
 // Release every allocator lock (reverse order) and resume every other mutator.
 @[markused]
 fn vgc_cm_stw_exit(self_idx int) {
+	C.vgc_mutex_unlock(&vgc_spawn_root_lock)
 	for i in 0 .. 136 {
 		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
 	}
