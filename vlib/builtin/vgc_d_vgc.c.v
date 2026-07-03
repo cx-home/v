@@ -567,12 +567,37 @@ pub fn vgc_envcheck_dedupe(p usize) bool {
 // allocations). Lookup miss => born before the table wrapped (old object).
 __global vgc_birth_ptr = [262144]usize{}
 __global vgc_birth_cyc = [262144]u64{}
+__global vgc_birth_span = [262144]usize{} // descriptor identity at claim time
 
 @[inline]
-fn vgc_birth_record(addr usize) {
+fn vgc_birth_record(addr usize, span_ptr usize) {
 	i := int((u64(addr) * u64(0x9E3779B97F4A7C15)) >> 46)
 	vgc_birth_ptr[i] = addr
 	vgc_birth_cyc[i] = u64(vgc_heap.gc_cycle)
+	vgc_birth_span[i] = span_ptr
+}
+
+// vgc_birth_span_of: the span DESCRIPTOR that carved `p` at its recorded birth,
+// 0 if unknown. A mismatch with the CURRENT vgc_find_span(p) answer = two
+// descriptors covering the same address range (span aliasing) — the same
+// memory served twice; every "wild bit clear" symptom follows.
+@[markused]
+pub fn vgc_birth_span_of(p voidptr) usize {
+	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
+	if vgc_birth_ptr[i] != usize(p) {
+		return 0
+	}
+	return vgc_birth_span[i]
+}
+
+// vgc_find_span_addr: the current descriptor address for `p` (0 = none).
+@[markused]
+pub fn vgc_find_span_addr(p voidptr) usize {
+	sp := vgc_find_span(p)
+	if sp == unsafe { nil } {
+		return 0
+	}
+	return usize(voidptr(sp))
 }
 
 // vgc_birth_delta: cycles between `p`'s recorded birth and now; -1 = unknown.
@@ -1471,9 +1496,14 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 						}
 						if !span.noscan && span.elem_size >= u32(128)
 							&& span.elem_size <= u32(192) {
-							vgc_birth_record(addr)
+							vgc_birth_record(addr, usize(voidptr(span)))
 							vgc_bw_arm(usize(span.alloc_bits) + usize(byte_idx), mask,
 								addr)
+							// Descriptor-identity check at birth: the span we just
+							// carved from must be the one the address map resolves.
+							if vgc_find_span_addr(voidptr(addr)) != usize(voidptr(span)) {
+								C.vgc_say(0xa1a5, u64(addr)) // ALIASED AT BIRTH
+							}
 						}
 					}
 					return unsafe { voidptr(addr) }
