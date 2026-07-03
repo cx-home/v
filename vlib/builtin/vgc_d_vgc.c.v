@@ -62,6 +62,7 @@ fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site
 fn C.vgc_ra2() voidptr // #58 freering: two frames up
 fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
+fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -600,7 +601,46 @@ fn vgc_bw_check(byte_addr usize, mask u8, who u64) {
 	for i in 0 .. 64 {
 		if vgc_bw_byte[i] == byte_addr && (vgc_bw_mask[i] & mask) != 0 {
 			C.vgc_say(who, u64(vgc_bw_addr[i]))
+			if who == 0xc1ea2 {
+				// The sweep is about to free a watched (recently-born) object:
+				// answer, AT THIS EXACT INSTANT under the same STW, where its base
+				// pointer lives — 0x10c1 word-address on a frozen stack (+0x10c9
+				// thread), 0x10c2 in a parked thread's captured registers, 0x10c3
+				// NOWHERE the collector looks (a true orphan at free time).
+				vgc_bw_whereis(vgc_bw_addr[i])
+			}
 		}
+	}
+}
+
+fn vgc_bw_whereis(obj usize) {
+	mut found := false
+	self_idx := C.vgc_get_cache_idx()
+	for ti in 0 .. vgc_heap.ncaches {
+		if ti == self_idx {
+			continue // the collector's own frames legitimately reference sweep victims
+		}
+		tc := unsafe { &vgc_heap.caches[ti] }
+		if !tc.registered || tc.stack_lo == 0 || tc.stack_hi <= tc.stack_lo {
+			continue
+		}
+		mut w := (tc.stack_lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+		for w + sizeof(usize) <= tc.stack_hi {
+			if unsafe { *(&usize(voidptr(w))) } == obj {
+				C.vgc_say(0x10c1, u64(w))
+				C.vgc_say(0x10c9, u64(u32(ti)))
+				found = true
+			}
+			w += sizeof(usize)
+		}
+	}
+	ri := C.vgc_captured_regs_contain(obj)
+	if ri != 0 {
+		C.vgc_say(0x10c2, u64(ri))
+		found = true
+	}
+	if !found {
+		C.vgc_say(0x10c3, u64(obj))
 	}
 }
 
@@ -1334,6 +1374,9 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 	// fast path), so it is zero-cost in the common case and a pure soundness floor
 	// otherwise. Independent of, and complementary to, the atomic sweep write-back
 	// and the suspend-retry fix.
+	$if vgc_allocblack_off ? {
+		return // A/B isolation switch: disable the alloc-black soundness floor
+	}
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
 		if span.mark_bits != unsafe { nil } {
 			// ATOMIC OR, not vgc_bitmap_test_and_set (a plain read-modify-write):

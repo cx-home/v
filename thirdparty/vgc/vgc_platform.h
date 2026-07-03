@@ -715,6 +715,20 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   } vgc_mac_susp;
   static vgc_mac_susp vgc_mac_slots[VGC_MAC_MAXTH];
 
+  // #58 forensic: is `val` present in ANY currently-parked thread's captured
+  // register file? Returns slot index+1, or 0. Collector-context only (slots are
+  // stable while the world is stopped).
+  static inline int vgc_captured_regs_contain(uintptr_t val) {
+      for (int i = 0; i < VGC_MAC_MAXTH; i++) {
+          if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == 0) continue;
+          if (!__atomic_load_n(&vgc_mac_slots[i].acked, __ATOMIC_ACQUIRE)) continue;
+          int n = vgc_mac_slots[i].nregs;
+          for (int r = 0; r < n; r++)
+              if (vgc_mac_slots[i].regs[r] == val) return i + 1;
+      }
+      return 0;
+  }
+
   // Async-signal-safe: pthread_self/pthread_equal, volatile atomics, register copy,
   // sched_yield. No malloc/locks/stdio.
   static void vgc_suspend_handler(int sig, siginfo_t* si, void* uctx) {
@@ -834,6 +848,13 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       // it here let a running mutator allocate through mark+sweep (its new object
       // born unmarked -> swept while live = the #58 UAF, bit-watch 0xc1ea2). Retry
       // instead of skipping; a genuinely-gone thread returns ESRCH and is skipped.
+  #ifdef VGC_ACK_BOUNDED
+      if (pthread_kill(pt, VGC_SUSPEND_SIGNAL) != 0) { // legacy: any failure = gone
+          vgc_say(0xdead2, (uint64_t)t);
+          __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
+          return 0;
+      }
+  #else
       {
           int kr = pthread_kill(pt, VGC_SUSPEND_SIGNAL);
           if (kr == ESRCH) {
@@ -853,6 +874,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
               kr = pthread_kill(pt, VGC_SUSPEND_SIGNAL);
           }
       }
+  #endif
       for (int i = 0; i < 200000; i++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1; // settled
           sched_yield();
@@ -948,6 +970,18 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       volatile int nregs;
   } vgc_lin_susp;
   static vgc_lin_susp vgc_lin_slots[VGC_LINUX_MAXTH];
+
+  // #58 forensic twin of the darwin helper: search parked threads' captured regs.
+  static inline int vgc_captured_regs_contain(uintptr_t val) {
+      for (int i = 0; i < VGC_LINUX_MAXTH; i++) {
+          if (__atomic_load_n(&vgc_lin_slots[i].tid, __ATOMIC_ACQUIRE) == 0) continue;
+          if (!__atomic_load_n(&vgc_lin_slots[i].acked, __ATOMIC_ACQUIRE)) continue;
+          int n = vgc_lin_slots[i].nregs;
+          for (int r = 0; r < n; r++)
+              if (vgc_lin_slots[i].regs[r] == val) return i + 1;
+      }
+      return 0;
+  }
 
   static inline uint32_t vgc_lin_gettid(void) {
       return (uint32_t)syscall(SYS_gettid); // async-signal-safe
@@ -1113,6 +1147,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
 #else
   // Other platforms (Windows/BSD): signal/mach STW not yet ported. Return 0 so the
   // collector detects "no OS-suspend available" and falls back safely.
+  static inline int vgc_captured_regs_contain(uintptr_t val) { (void)val; return 0; }
   static inline uint32_t vgc_thread_self_port(void) { return 0; }
   static inline int vgc_suspend_thread(uint32_t t) { (void)t; return 0; }
   static inline void vgc_resume_thread(uint32_t t) { (void)t; }

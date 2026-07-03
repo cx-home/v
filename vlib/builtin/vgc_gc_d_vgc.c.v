@@ -1536,9 +1536,16 @@ fn vgc_sweep_span(span &VGC_Span) {
 			$if vgc_birthcheck ? {
 				vgc_bw_check(usize(span.alloc_bits) + usize(b), garbage, 0xc1ea2)
 			}
-			unsafe {
-				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) + usize(b))),
-					~garbage)
+			$if vgc_sweep_plain ? {
+				// A/B isolation switch: the historical plain write-back.
+				unsafe {
+					span.alloc_bits[b] = alloc_byte & mark_byte
+				}
+			} $else {
+				unsafe {
+					_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) +
+						usize(b))), ~garbage)
+				}
 			}
 			// Track lowest freed index for free_index hint
 			base_idx := b * 8
