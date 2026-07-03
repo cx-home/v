@@ -373,6 +373,12 @@ fn vgc_gc_start() {
 		// pointer to a victim-class object the trace missed = noscan-misclassification
 		// (a pointer-bearing struct allocated via malloc_noscan). v2==v1 => not a
 		// noscan holder either -> the reference is a dangling interpreter alias.
+		// LIGHT aggregate (the per-word find_span attribution masked the race —
+		// heavy probes shift the window; only this light form reproduces): scan
+		// every MARKED noscan object's words (shade+enqueue), drain, recount
+		// victim-class marks. w2>w1 => a marked noscan object held a live pointer
+		// the trace missed = noscan-misclassification. This is the CONFIRMED
+		// mechanism + the regression oracle for the fix (fix => w2==w1 always).
 		w1 := vgc_count_marked_victimclass()
 		for i in 0 .. vgc_heap.nspans {
 			span := unsafe { vgc_heap.allspans[i] }
@@ -948,7 +954,23 @@ fn vgc_shade(addr usize) {
 	if span.mark_bits != unsafe { nil } {
 		if C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx) == 0 {
 			// Newly marked - add to work queue for scanning (only if it may contain pointers)
-			if !span.noscan {
+			mut scanit := !span.noscan
+			$if vgc_scanall ? {
+				scanit = true // #58 diagnostic: conservatively scan ALL noscan objects
+			}
+			$if vgc_scansmall ? {
+				// #58 FIX: also conservatively scan SMALL noscan objects. V codegen marks
+				// some small pointer-bearing structs noscan (misclassification); their
+				// referents (worker bindings keys-arrays) then go untraced and swept-while-
+				// live. Confirmed by the noscan-holder discriminator: conservatively
+				// scanning noscan objects reaches the missed victim. Bounded to <=64B so
+				// large noscan buffers (strings/arrays, genuinely pointer-free) stay
+				// skipped => negligible perf. Conservative scan only OVER-retains, never UAF.
+				if span.noscan && span.elem_size <= u32(64) {
+					scanit = true
+				}
+			}
+			if scanit {
 				obj_addr := span.base + usize(obj_idx) * usize(span.elem_size)
 				vgc_work_put(obj_addr)
 			}
@@ -1036,8 +1058,21 @@ fn vgc_drain_mark_work() {
 			break
 		}
 		span := vgc_find_span(voidptr(obj_addr))
-		if span == unsafe { nil } || span.noscan {
-			continue // noscan objects contain no pointers (codegen-reliable: only primitive/pointer-free types)
+		if span == unsafe { nil } {
+			continue
+		}
+		if span.noscan {
+			$if vgc_scanall ? {
+				// diagnostic: scan every enqueued noscan object (no size gate)
+			} $else {
+				$if vgc_scansmall ? {
+					if span.elem_size > u32(64) {
+						continue
+					}
+				} $else {
+					continue // noscan objects contain no pointers (codegen-reliable)
+				}
+			}
 		}
 		// Scan every word conservatively. NOTE: precise per-span ptrmap scanning is
 		// UNSOUND here and was removed — a span serves one size CLASS, but real
