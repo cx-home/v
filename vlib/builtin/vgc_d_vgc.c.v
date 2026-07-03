@@ -45,9 +45,9 @@ fn C.vgc_mutex_lock(lk &u32)
 fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
-fn C.vgc_park_spill(stop_flag &u32, stopped_count &u32, my_stopped &u32, range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_thread_self_port() u32
-fn C.vgc_suspend_thread(t u32)
+fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
 fn C.vgc_resume_thread(t u32)
 fn C.vgc_thread_regs(t u32, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
@@ -57,6 +57,14 @@ fn C.vgc_num_cpus() int
 fn C.vgc_trace(ev int, slot int, a u64, b u64)
 fn C.vgc_trace_init()
 fn C.vgc_say(tag u64, v u64) // loud one-line stderr note (used by the span-registry abort)
+fn C.vgc_ra0() voidptr // #58 freering: __builtin_return_address(0) of the calling V fn
+fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site)
+fn C.vgc_ra2() voidptr // #58 freering: two frames up
+fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
+fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
+fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
+fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
+fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -167,6 +175,15 @@ mut:
 	stack_hi   usize // highest stack address
 	thread_id  u64
 	stopped    u32 // 1 if stopped for GC
+	// Which stop-cycle this park belongs to (== gc_stop_seq at park time). A
+	// stale `stopped==1` from the PREVIOUS cycle is a soundness trap: a parker
+	// waking from GC-1 (its spin exited when the flag briefly dropped) still
+	// reads stopped==1 when back-to-back GC-2's suspend loop inspects it — GC-2
+	// then counts it covered while it wakes and RUNS through mark+sweep. The
+	// collector must trust stopped only when park_seq matches the current
+	// gc_stop_seq; anything else is a straggler and gets signal-suspended.
+	// (#57/#58/#63/#145: the mid-GC mutator the forensics kept catching.)
+	park_seq   u32
 	mach_port  u32 // OS thread handle for OS-level suspend-the-world (darwin)
 	// Per-thread heap accounting (Go per-P style). The alloc/free fast path bumps
 	// these THREAD-PRIVATE counters (no shared atomic), flushing into the global
@@ -268,6 +285,7 @@ mut:
 	gc_workers_done  u32 // atomic
 	gc_nworkers      int
 	gc_stop_flag     u32 // atomic: tells threads to stop for GC
+	gc_stop_seq      u32 // atomic: stop-cycle generation (bumped per STW; see park_seq)
 	gc_stopped_count u32 // atomic: threads stopped
 	gc_target_stops  u32 // number of threads to stop
 	// Sweep state
@@ -404,6 +422,351 @@ fn vgc_unpin(p voidptr) {
 // (escape hatch); any other VGC_PACE value forces it on.
 __global vgc_base_floor = u64(256 * 1024 * 1024)
 __global vgc_pace_by_threads = true
+// VGC_GCTRACE=1 enables the per-cycle pacing trace (vgc_gctrace_line): cycle,
+// marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
+// gctrace analog) — costs one integer test per cycle when off.
+__global vgc_gctrace = u32(0)
+// Per-extra-mutator pacing headroom (bytes; VGC_PACE_MB overrides). Replaces the
+// former MULTIPLICATIVE per-thread goal scaling (`goal *= live_threads`), which
+// was unsound as policy: on a many-threaded server it scaled the WHOLE live-set
+// goal by N (e.g. marked 558 MB x2 x9 threads = a 10 GB trigger, beyond the 4 GB
+// arena capacity), so the pacer never fired again and the heap rode arena
+// exhaustion until an allocation burst failed => the #57 field OOM
+// (`V panic: memory allocation failure` at RSS ~4.6 GB). Only the per-thread
+// allocation SLACK should scale with thread count, and additively.
+__global vgc_thread_headroom = u64(128 * 1024 * 1024)
+// Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
+// here so collection always engages well before the physical arena ceiling
+// (vgc_max_arenas * vgc_arena_size = 4 GB). Default = half the arena capacity.
+// Go's GOMEMLIMIT analog for the backstop collector.
+__global vgc_heap_soft_limit = u64(2) * 1024 * 1024 * 1024
+
+// ── #58 SCANNED-WINDOW SHADOW (-d vgc_spcheck) ──────────────────────────────
+// Per-thread snapshot of the [stack_lo, stack_hi] range the collector actually
+// scanned at the most recent GC, plus whether the thread was a cooperative
+// parker (stopped==1) or a signal-suspended straggler. On a bf1 UAF catch the
+// reading mutator compares the SOURCE map struct's address and its current
+// frame depth against its own last-scanned window — a holder frame below the
+// scanned lo is the root-miss, localized. Written only under STW; read only on
+// the rare catch path — cannot mask.
+__global vgc_spchk_lo = [64]usize{}
+__global vgc_spchk_hi = [64]usize{}
+__global vgc_spchk_cyc = [64]u64{}
+__global vgc_spchk_parked = [64]u64{}
+
+// vgc_map_backing_status: #58 cx_envcheck probe support. Reports whether a live
+// map's key/value backing arrays are still ALLOCATED in the vgc heap. An
+// interpreter-held env whose bindings map has a freed (alloc-bit-clear) backing
+// array is the sweep-while-live UAF caught at its source. Packed result:
+// byte0 = keys status (bit0 alloc, bit1 span in_use, 0xff = not a heap ptr),
+// byte1 = values status, bytes2-5 = map len (u32).
+@[markused]
+pub fn vgc_map_backing_status(mp voidptr) u64 {
+	mut ks := u64(0xff)
+	mut vs := u64(0xff)
+	mut mlen := u64(0)
+	unsafe {
+		m := &map(mp)
+		mlen = u64(u32(m.len))
+		if usize(voidptr(m.key_values.keys)) >= vgc_arena_lo
+			&& usize(voidptr(m.key_values.keys)) < vgc_arena_hi {
+			ks = vgc_is_allocated(voidptr(m.key_values.keys)) & 3
+		}
+		if usize(voidptr(m.key_values.values)) >= vgc_arena_lo
+			&& usize(voidptr(m.key_values.values)) < vgc_arena_hi {
+			vs = vgc_is_allocated(voidptr(m.key_values.values)) & 3
+		}
+	}
+	return ks | (vs << 8) | (mlen << 16)
+}
+
+// vgc_spchk_self: #58 cx_envcheck support — this thread's scanned-window shadow
+// from the most recent GC: (cache_idx, lo, hi, cycles_since, parked). Valid only
+// when the collector snapshots the shadow (-d vgc_spcheck builds); otherwise
+// returns zeros. Lets an eval-side probe test whether an address it holds live
+// was inside the window the collector actually scanned.
+@[markused]
+pub fn vgc_spchk_self() (int, usize, usize, u64, u64) {
+	cidx := C.vgc_get_cache_idx()
+	if cidx < 0 || cidx >= 64 {
+		return -1, usize(0), usize(0), u64(0), u64(0)
+	}
+	return cidx, vgc_spchk_lo[cidx], vgc_spchk_hi[cidx], u64(vgc_heap.gc_cycle) - vgc_spchk_cyc[cidx], vgc_spchk_parked[cidx]
+}
+
+// vgc_addr_status: #58 cx_envcheck support — packed vgc view of an arbitrary
+// address: 0xff = not in the arena; else bit0 = alloc-bit set, bit1 = span
+// in_use (vgc_is_allocated low bits).
+@[markused]
+pub fn vgc_addr_status(p voidptr) u64 {
+	if usize(p) < vgc_arena_lo || usize(p) >= vgc_arena_hi {
+		return 0xff
+	}
+	return vgc_is_allocated(p) & 3
+}
+
+// vgc_explicit_free_ra: #58 cx_envcheck support — was `p` (an object base)
+// explicitly freed recently? Scans the -d vgc_freering ring newest→oldest and
+// returns the freeing call's ra1 (the codegen free site) or 0 if not found
+// (=> the alloc-bit clear came from the GC sweep). Zero unless the build also
+// carries -d vgc_freering.
+@[markused]
+pub fn vgc_explicit_free_ra(p voidptr) u64 {
+	$if vgc_freering ? {
+		total := C.vgc_atomic_load_u32(&vgc_freering_idx)
+		mut n := u32(vgc_freering_size)
+		if total < n {
+			n = total
+		}
+		for k in 0 .. int(n) {
+			i := int((total - 1 - u32(k)) & u32(vgc_freering_size - 1))
+			rp := vgc_freering_ptrs[i]
+			if rp != 0 && usize(p) >= rp && usize(p) - rp < 64 {
+				return u64(vgc_freering_ra1s[i])
+			}
+		}
+	}
+	return 0
+}
+
+// vgc_map_keys_ptr: #58 cx_envcheck support — the raw keys backing pointer of a
+// map, for ring lookups / correlation from outside builtin.
+@[markused]
+pub fn vgc_map_keys_ptr(mp voidptr) voidptr {
+	unsafe {
+		m := &map(mp)
+		return voidptr(m.key_values.keys)
+	}
+}
+
+// vgc_current_sp: #58 cx_envcheck support — the caller's REAL stack pointer via
+// the C-level vgc_real_sp(). (A V-level `&local` probe gets heap-boxed by escape
+// analysis the moment its address is taken, yielding an arena address — which
+// silently invalidated an earlier above/below-frame discriminator.)
+@[markused]
+pub fn vgc_current_sp() usize {
+	return usize(C.vgc_real_sp())
+}
+
+__global vgc_envchk_last = usize(0)
+
+// vgc_envcheck_dedupe: true iff `p` differs from the previously reported env
+// (racy across threads by design — a diagnostic dedupe, not a correctness gate).
+@[markused]
+pub fn vgc_envcheck_dedupe(p usize) bool {
+	if p == vgc_envchk_last {
+		return false
+	}
+	vgc_envchk_last = p
+	return true
+}
+
+// ── #58 BIRTH REGISTRY (-d vgc_birthcheck) ──────────────────────────────────
+// Direct-mapped: ptr -> gc_cycle at allocation, for victim-class objects.
+// Collisions overwrite (younger birth wins — fine: we only ask about recent
+// allocations). Lookup miss => born before the table wrapped (old object).
+__global vgc_birth_ptr = [262144]usize{}
+__global vgc_birth_cyc = [262144]u64{}
+__global vgc_birth_span = [262144]usize{} // descriptor identity at claim time
+
+@[inline]
+fn vgc_birth_record(addr usize, span_ptr usize) {
+	i := int((u64(addr) * u64(0x9E3779B97F4A7C15)) >> 46)
+	vgc_birth_ptr[i] = addr
+	vgc_birth_cyc[i] = u64(vgc_heap.gc_cycle)
+	vgc_birth_span[i] = span_ptr
+}
+
+// vgc_birth_span_of: the span DESCRIPTOR that carved `p` at its recorded birth,
+// 0 if unknown. A mismatch with the CURRENT vgc_find_span(p) answer = two
+// descriptors covering the same address range (span aliasing) — the same
+// memory served twice; every "wild bit clear" symptom follows.
+@[markused]
+pub fn vgc_birth_span_of(p voidptr) usize {
+	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
+	if vgc_birth_ptr[i] != usize(p) {
+		return 0
+	}
+	return vgc_birth_span[i]
+}
+
+// vgc_find_span_addr: the current descriptor address for `p` (0 = none).
+@[markused]
+pub fn vgc_find_span_addr(p voidptr) usize {
+	sp := vgc_find_span(p)
+	if sp == unsafe { nil } {
+		return 0
+	}
+	return usize(voidptr(sp))
+}
+
+// vgc_birth_delta: cycles between `p`'s recorded birth and now; -1 = unknown.
+@[markused]
+pub fn vgc_birth_delta(p voidptr) i64 {
+	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
+	if vgc_birth_ptr[i] != usize(p) {
+		return -1
+	}
+	return i64(u64(vgc_heap.gc_cycle) - vgc_birth_cyc[i])
+}
+
+// ── #58 BIT-WATCH (-d vgc_birthcheck) ───────────────────────────────────────
+// Per-thread one-slot watch on the MOST RECENT victim-class allocation's alloc
+// bit: (bitmap byte address, mask, object addr). Every site that can clear an
+// alloc bit checks the watch first and names itself:
+//   0xc1ea1 = vgc_free (explicit)      0xc1ea2 = sweep garbage-clear
+//   0xc1ea3 = span reset/recycle       (value = the watched object address)
+// Direct attribution — no inference. Racy one-slot-per-thread by design.
+__global vgc_bw_byte = [64]usize{} // address of the alloc_bits byte
+__global vgc_bw_mask = [64]u8{}
+__global vgc_bw_addr = [64]usize{}
+
+@[inline]
+fn vgc_bw_arm(byte_addr usize, mask u8, obj usize) {
+	idx := C.vgc_get_cache_idx()
+	if idx >= 0 && idx < 64 {
+		vgc_bw_byte[idx] = byte_addr
+		vgc_bw_mask[idx] = mask
+		vgc_bw_addr[idx] = obj
+	}
+}
+
+// vgc_bw_check: does clearing `mask` at `byte_addr` hit ANY thread's watched
+// bit? Called only from the (rare relative to allocation) clear sites.
+fn vgc_bw_check(byte_addr usize, mask u8, who u64) {
+	for i in 0 .. 64 {
+		if vgc_bw_byte[i] == byte_addr && (vgc_bw_mask[i] & mask) != 0 {
+			C.vgc_say(who, u64(vgc_bw_addr[i]))
+			if who == 0xc1ea2 {
+				// The sweep is about to free a watched (recently-born) object:
+				// answer, AT THIS EXACT INSTANT under the same STW, where its base
+				// pointer lives — 0x10c1 word-address on a frozen stack (+0x10c9
+				// thread), 0x10c2 in a parked thread's captured registers, 0x10c3
+				// NOWHERE the collector looks (a true orphan at free time).
+				vgc_bw_whereis(vgc_bw_addr[i])
+			}
+		}
+	}
+}
+
+fn vgc_bw_whereis(obj usize) {
+	mut found := false
+	self_idx := C.vgc_get_cache_idx()
+	for ti in 0 .. vgc_heap.ncaches {
+		if ti == self_idx {
+			continue // the collector's own frames legitimately reference sweep victims
+		}
+		tc := unsafe { &vgc_heap.caches[ti] }
+		if !tc.registered || tc.stack_lo == 0 || tc.stack_hi <= tc.stack_lo {
+			continue
+		}
+		mut w := (tc.stack_lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+		for w + sizeof(usize) <= tc.stack_hi {
+			if unsafe { *(&usize(voidptr(w))) } == obj {
+				C.vgc_say(0x10c1, u64(w))
+				C.vgc_say(0x10c9, u64(u32(ti)))
+				found = true
+			}
+			w += sizeof(usize)
+		}
+	}
+	ri := C.vgc_captured_regs_contain(obj)
+	if ri != 0 {
+		C.vgc_say(0x10c2, u64(ri))
+		found = true
+	}
+	if !found {
+		C.vgc_say(0x10c3, u64(obj))
+	}
+}
+
+__global vgc_envchk_tick = u64(0)
+
+// vgc_envcheck_sample: cheap 1-in-256 sampler for probes on ultra-hot paths
+// (eval_node runs millions/s; the full map-status check there made rounds ~20x
+// slower). A dead env evaluates thousands of nodes, so sampling costs no
+// detection coverage — only a bounded first-report latency. Racy on purpose.
+@[markused]
+pub fn vgc_envcheck_sample() bool {
+	vgc_envchk_tick++
+	return (vgc_envchk_tick & 0xff) == 0
+}
+
+// ── #58 SWEEP-TIME ROOT FORENSIC (-d vgc_keysweep) ──────────────────────────
+// vgc_sweep_span records every scan-class, keys-array-sized object it frees;
+// vgc_do_sweep then (still under STW) rescans every registered thread window
+// for words pointing into those objects. See vgc_do_sweep for the verdict tags.
+const vgc_ks_cap = 262144 // 2^18 direct-mapped slots (~2 MB BSS; ~120k candidates/GC observed)
+
+__global vgc_ks_tab = [262144]usize{} // freed-object BASE address (0 = empty slot)
+__global vgc_ks_count = u32(0)
+__global vgc_ks_overflow = u32(0)
+
+// The earlier sorted-buffer design could not keep up: the [?let] clone churn
+// frees ~100k keys-array-class objects PER CYCLE, overflowing any bounded
+// append buffer (silently voiding the negative verdict) and the per-cycle sort
+// made rounds minutes long. Direct-mapped open-addressing hash instead: O(1)
+// insert per freed object, O(1) probe per stack word, no sort. EXACT base-
+// pointer matching only — the holder word of interest (a map struct's
+// key_values.keys field) IS a base pointer; interior cursors are out of scope.
+@[inline]
+fn vgc_ks_hash(a usize) int {
+	return int((u64(a) * u64(0x9E3779B97F4A7C15)) >> 46)
+}
+
+@[inline]
+fn vgc_ks_insert(base usize) {
+	h := vgc_ks_hash(base)
+	for probe in 0 .. 8 {
+		i := (h + probe) & (vgc_ks_cap - 1)
+		if vgc_ks_tab[i] == 0 {
+			vgc_ks_tab[i] = base
+			vgc_ks_count++
+			return
+		}
+	}
+	vgc_ks_overflow++
+}
+
+@[inline]
+fn vgc_ks_lookup(val usize) bool {
+	h := vgc_ks_hash(val)
+	for probe in 0 .. 8 {
+		i := (h + probe) & (vgc_ks_cap - 1)
+		t := vgc_ks_tab[i]
+		if t == 0 {
+			return false
+		}
+		if t == val {
+			return true
+		}
+	}
+	return false
+}
+
+// vgc_spchk_report: catch-side emitter (called from map_clone_string on a bf1
+// catch under -d vgc_spcheck). 0x51ee/ef = this thread's last-scanned [lo,hi];
+// 0x51f0 = the catching frame; 0x51f1 = GC cycles since that scan; 0x51f2 =
+// parked(1)/straggler(0) at that scan; 0x51fa = alloc status of the keys-array
+// slot (bit0 alloc, bit1 span in_use); 0x51fd = bytes the catching frame sits
+// BELOW the scanned lo (the root-miss signature), emitted only when it does.
+@[markused]
+fn vgc_spchk_report(pkey voidptr, myframe usize) {
+	cidx := C.vgc_get_cache_idx()
+	if cidx < 0 || cidx >= 64 {
+		return
+	}
+	C.vgc_say(0x51ee, u64(vgc_spchk_lo[cidx]))
+	C.vgc_say(0x51ef, u64(vgc_spchk_hi[cidx]))
+	C.vgc_say(0x51f0, u64(myframe))
+	C.vgc_say(0x51f1, u64(vgc_heap.gc_cycle) - vgc_spchk_cyc[cidx])
+	C.vgc_say(0x51f2, vgc_spchk_parked[cidx])
+	C.vgc_say(0x51fa, vgc_is_allocated(pkey))
+	C.vgc_say(0x51fb, u64(usize(pkey)))
+	if myframe < vgc_spchk_lo[cidx] {
+		C.vgc_say(0x51fd, u64(vgc_spchk_lo[cidx] - myframe))
+	}
+}
 
 fn C.atoll(&char) i64
 fn C.getenv(&char) &char
@@ -428,6 +791,26 @@ pub fn vgc_init() {
 		// Explicit override of the on-by-default pacing: VGC_PACE=0 disables it,
 		// any other value forces it on.
 		vgc_pace_by_threads = C.atoll(pace_env) != 0
+	}
+	trace_env := C.getenv(c'VGC_GCTRACE')
+	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
+		vgc_gctrace = 1
+	}
+	pace_mb_env := C.getenv(c'VGC_PACE_MB')
+	if pace_mb_env != unsafe { nil } {
+		pmb := C.atoll(pace_mb_env)
+		if pmb >= 0 {
+			vgc_thread_headroom = u64(pmb) * 1024 * 1024
+		}
+	}
+	// Soft limit: half the physical arena capacity by default, env-overridable.
+	vgc_heap_soft_limit = u64(vgc_max_arenas) * u64(vgc_arena_size) / 2
+	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
+	if lim_env != unsafe { nil } {
+		lmb := C.atoll(lim_env)
+		if lmb > 0 {
+			vgc_heap_soft_limit = u64(lmb) * 1024 * 1024
+		}
 	}
 	vgc_heap.next_gc = vgc_base_floor // favor throughput over early collections
 	vgc_heap.gc_phase = vgc_phase_off
@@ -602,6 +985,20 @@ pub fn vgc_my_stack_base() usize {
 		return 0
 	}
 	return unsafe { vgc_heap.caches[idx].stack_base }
+}
+
+// vgc_my_stack_info returns THIS thread's (cache_idx, stack_lo, stack_hi) — the FULL
+// registered scan bounds, or (-1,0,0) if unregistered. #58/#63 diagnostic: lets a
+// concurrent [?worker] thread check whether its own live stack frame falls within the
+// bounds vgc's STW root scan actually covers. idx<0 => unregistered (STW misses the whole
+// stack); addr outside [lo,hi] => registered with WRONG bounds (mis-registration).
+@[markused]
+pub fn vgc_my_stack_info() (int, usize, usize) {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 {
+		return -1, usize(0), usize(0)
+	}
+	return idx, unsafe { vgc_heap.caches[idx].stack_lo }, unsafe { vgc_heap.caches[idx].stack_hi }
 }
 
 fn vgc_ensure_registered() {
@@ -966,6 +1363,14 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	// at them and zero the bytes in use. nobjs <= 1024 -> bitmap_size <= 128 <= 136,
 	// so the inline buffers always suffice. No allocation, no syscalls on reuse.
 	bitmap_size := (nobjs + 7) / 8
+	$if vgc_birthcheck ? {
+		// span (re)init wipes the whole bitmap — if any thread's watched bit lives
+		// in these bytes, this recycle is the clearer (0xc1ea3).
+		for wb in 0 .. int(bitmap_size) {
+			vgc_bw_check(usize(voidptr(unsafe { &span.alloc_buf[0] })) + usize(wb), 0xff,
+				0xc1ea3)
+		}
+	}
 	unsafe {
 		span.alloc_bits = &span.alloc_buf[0]
 		span.mark_bits = &span.mark_buf[0]
@@ -990,10 +1395,37 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 // gc_phase load skipped) under the default build.
 @[inline]
 fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
-	$if vgc_concurrent ? {
-		if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
-			if span.mark_bits != unsafe { nil } {
-				C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
+	// ALLOC-BLACK IS UNCONDITIONAL (was gated behind vgc_concurrent). Rationale
+	// (#57/#58/#63/#145): the STW backstop assumes every mutator is frozen through
+	// mark+sweep, so an allocation during a cycle "cannot happen" and needs no
+	// mark. But the OS suspend is not perfectly airtight — pthread_kill can
+	// transiently fail / a mach port can be momentarily unresolvable, and the
+	// collector then proceeds treating that peer as gone (tags 0xdead2/5). A peer
+	// that is actually alive keeps allocating; its new object gets an alloc bit
+	// but, mark having already run, no mark bit -> it lands in `garbage` and sweep
+	// frees it WHILE LIVE (born_dcyc==0, bit-watch 0xc1ea2 = swept-at-birth; the
+	// root cause of the concurrent-worker UAF). Marking every object born while a
+	// GC is in progress makes such a slipped allocation survive the sweep. Under a
+	// genuinely stopped world this branch never runs (gc_phase==off on the alloc
+	// fast path), so it is zero-cost in the common case and a pure soundness floor
+	// otherwise. Independent of, and complementary to, the atomic sweep write-back
+	// and the suspend-retry fix.
+	$if vgc_allocblack_off ? {
+		return // A/B isolation switch: disable the alloc-black soundness floor
+	}
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		if span.mark_bits != unsafe { nil } {
+			// ATOMIC OR, not vgc_bitmap_test_and_set (a plain read-modify-write):
+			// this hook runs in MUTATOR context — concurrently with other mutators
+			// allocating neighbors in the same mark byte (the post-release window
+			// where gc_stop_flag is already 0 but gc_phase is not yet off) and,
+			// in the slipped-mutator case, with the collector's own marking. A
+			// torn mark byte here ERASES freshly-set neighbor marks => sweep
+			// frees live objects — worse than no hook at all.
+			mask := u8(1) << (obj_idx & 7)
+			unsafe {
+				_ = C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) +
+					usize(obj_idx >> 3))), mask)
 			}
 		}
 	}
@@ -1052,6 +1484,38 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 					span.free_index = i + 1 // hint only; a stale value is still correct
 					vgc_alloc_black_hook(span, i) // concurrent mark: alloc-black
 					addr := span.base + usize(i) * usize(span.elem_size)
+					$if vgc_birthcheck ? {
+						// #58 forensic: the atomic OR above just claimed this bit; a
+						// clear read-back means something is clobbering this span's
+						// alloc bitmap out from under us (0xa110 = born-dead). Also
+						// register victim-class births (ptr + gc cycle) so DEAD-KEYS
+						// can report the birth→dead-read cycle delta: delta==0 with
+						// no explicit free = a wild bitmap clear.
+						if C.vgc_bitmap_get(span.alloc_bits, i) == 0 {
+							C.vgc_say(0xa110, u64(addr))
+						}
+						if !span.noscan && span.elem_size >= u32(128)
+							&& span.elem_size <= u32(192) {
+							vgc_birth_record(addr, usize(voidptr(span)))
+							vgc_bw_arm(usize(span.alloc_bits) + usize(byte_idx), mask,
+								addr)
+							// Descriptor-identity check at birth: the span we just
+							// carved from must be the one the address map resolves.
+							if vgc_find_span_addr(voidptr(addr)) != usize(voidptr(span)) {
+								C.vgc_say(0xa1a5, u64(addr)) // ALIASED AT BIRTH
+							}
+							// BIRTH-DURING-GC: under an airtight STW no mutator can be
+							// here while a cycle runs. Any hit is the leaked mutator,
+							// caught red-handed WITH its allocation site (ra chain) —
+							// correlate 0xb1f7 addresses with later DEAD-KEYS victims.
+							gph := C.vgc_atomic_load_u32(&vgc_heap.gc_phase)
+							if gph != vgc_phase_off {
+								C.vgc_say(0xb1f7, u64(addr))
+								C.vgc_say(0xb1f8, u64(usize(C.vgc_ra2())))
+								C.vgc_say(0xb1f9, u64(gph))
+							}
+						}
+					}
 					return unsafe { voidptr(addr) }
 				}
 			}
@@ -1395,13 +1859,19 @@ fn vgc_maybe_gc() {
 		heap_live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
 		mut next_gc := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
 		if vgc_pace_by_threads {
-			// Per-thread pacing: give the heap N mutators' worth of headroom so N
-			// concurrent allocators don't trip the shared trigger N x more often
-			// per unit of per-thread progress.
+			// Per-thread pacing: give the heap N mutators' worth of ADDITIVE
+			// allocation headroom so N concurrent allocators don't trip the shared
+			// trigger N x more often per unit of per-thread progress. Additive (not
+			// the former `next_gc *= lt` multiplier) and clamped to the soft heap
+			// limit, so the goal can never outrun the arena capacity — the pacer
+			// must stay alive on many-threaded servers (#57/#71 field OOM).
 			lt := C.vgc_atomic_load_u32(&vgc_heap.live_threads)
 			if lt > 1 {
-				next_gc *= u64(lt)
+				next_gc += u64(lt - 1) * vgc_thread_headroom
 			}
+		}
+		if next_gc > vgc_heap_soft_limit {
+			next_gc = vgc_heap_soft_limit
 		}
 		C.vgc_trace(20, C.vgc_get_cache_idx(), heap_live, next_gc) // PACE (diagnostic)
 		if heap_live >= next_gc {
@@ -1768,6 +2238,9 @@ fn vgc_free(ptr voidptr) {
 	mask := u8(1) << (obj_idx & 7)
 	byte_ptr := unsafe { &u8(voidptr(usize(span.alloc_bits) + usize(obj_idx >> 3))) }
 	if span.on_central == 0 {
+		$if vgc_birthcheck ? {
+			vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)
+		}
 		old := C.vgc_atomic_fetch_and_u8(byte_ptr, ~mask)
 		if (old & mask) != 0 {
 			C.vgc_atomic_sub_u32(&u32(voidptr(&span.alloc_count)), 1)
@@ -1777,6 +2250,10 @@ fn vgc_free(ptr voidptr) {
 				}
 			}
 			vgc_acct_free(u64(span.elem_size))
+			$if vgc_freering ? {
+				vgc_freering_record(span.base + usize(obj_idx) * usize(span.elem_size),
+					usize(C.vgc_ra0()), usize(C.vgc_ra1()), usize(C.vgc_ra2()))
+			}
 		}
 		return
 	}
@@ -1788,6 +2265,9 @@ fn vgc_free(ptr voidptr) {
 		// mcache allocation of a sibling slot in the same byte cannot lose
 		// either update. (central.lock still serializes free-vs-free for
 		// double-free idempotency and guards the central-list reads.)
+		$if vgc_birthcheck ? {
+			vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)
+		}
 		old := C.vgc_atomic_fetch_and_u8(byte_ptr, ~mask)
 		if (old & mask) != 0 {
 			C.vgc_atomic_sub_u32(&u32(voidptr(&span.alloc_count)), 1)
@@ -1797,6 +2277,10 @@ fn vgc_free(ptr voidptr) {
 				}
 			}
 			vgc_acct_free(u64(span.elem_size))
+			$if vgc_freering ? {
+				vgc_freering_record(span.base + usize(obj_idx) * usize(span.elem_size),
+					usize(C.vgc_ra0()), usize(C.vgc_ra1()), usize(C.vgc_ra2()))
+			}
 		}
 	}
 	C.vgc_mutex_unlock(&central.lock)
@@ -1829,6 +2313,71 @@ fn vgc_is_allocated(ptr voidptr) u64 {
 	}
 	st |= u64(span.alloc_count) << 8
 	return st
+}
+
+// ── #57/#58 FREE-PROVENANCE RING (-d vgc_freering) ──────────────────────────
+// Attributes a bf1 UAF catch to the event that cleared the victim's alloc bit:
+// an EXPLICIT vgc_free (Perceus drop / builtin free / map internals) vs the GC
+// sweep. Every successful explicit clear records (ptr, ra0, ra1, ra2) in a
+// lock-free global ring; vgc_uaf_check_buf scans the ring on a catch.
+//   0xfee0 victim ptr found in ring => EXPLICITLY FREED while live (NOT a GC
+//          root-scan bug); 0xfee1/2/3 = return-address chain of the freeing
+//          call (symbolicate offline via the 0xba5e anchor); 0xfee5 = byte
+//          delta ring-ptr→victim; 0xfee4 = age in frees.
+//   0x5e77 not in ring => the clear came from sweep (or pre-ring history);
+//          0x5e78 = total explicit frees so far (eviction-risk check).
+// Ring writes are racy-by-design (slot overwrite, torn entries tolerable in a
+// diagnostic); cost per free is 4 plain stores + 1 atomic increment => far
+// below the masking threshold. Compiled out of default builds entirely.
+const vgc_freering_size = 262144 // 2^18 entries (~8 MB total side tables)
+
+__global vgc_freering_ptrs = [262144]usize{}
+__global vgc_freering_ra0s = [262144]usize{}
+__global vgc_freering_ra1s = [262144]usize{}
+__global vgc_freering_ra2s = [262144]usize{}
+__global vgc_freering_idx = u32(0)
+__global vgc_freering_anchor_said = u32(0)
+
+@[inline]
+fn vgc_freering_record(ptr usize, ra0 usize, ra1 usize, ra2 usize) {
+	i := C.vgc_atomic_add_u32(&vgc_freering_idx, 1) - 1
+	slot := int(i & u32(vgc_freering_size - 1))
+	vgc_freering_ptrs[slot] = ptr
+	vgc_freering_ra0s[slot] = ra0
+	vgc_freering_ra1s[slot] = ra1
+	vgc_freering_ra2s[slot] = ra2
+}
+
+// vgc_freering_lookup: on a bf1 catch, walk the ring newest→oldest for an entry
+// whose recorded base ptr is at/just-below the victim address (an explicit free
+// records the object base; the victim char-buffer read may sit at base). Emits
+// the verdict tags above. Bounded (one pass over ≤2^18 slots) and only runs on
+// the rare catch path — cannot mask.
+fn vgc_freering_lookup(strptr usize) {
+	if vgc_freering_anchor_said == 0 {
+		vgc_freering_anchor_said = 1
+		C.vgc_say(0xba5e, u64(usize(C.vgc_ra_anchor()))) // text anchor for ASLR slide
+	}
+	total := C.vgc_atomic_load_u32(&vgc_freering_idx)
+	mut n := u32(vgc_freering_size)
+	if total < n {
+		n = total
+	}
+	for k in 0 .. int(n) {
+		i := int((total - 1 - u32(k)) & u32(vgc_freering_size - 1))
+		p := vgc_freering_ptrs[i]
+		if p != 0 && strptr >= p && strptr - p < 64 {
+			C.vgc_say(0xfee0, u64(strptr))
+			C.vgc_say(0xfee1, u64(vgc_freering_ra0s[i]))
+			C.vgc_say(0xfee2, u64(vgc_freering_ra1s[i]))
+			C.vgc_say(0xfee3, u64(vgc_freering_ra2s[i]))
+			C.vgc_say(0xfee4, u64(u32(k)))
+			C.vgc_say(0xfee5, u64(strptr - p))
+			return
+		}
+	}
+	C.vgc_say(0x5e77, u64(strptr))
+	C.vgc_say(0x5e78, u64(total))
 }
 
 // DIAGNOSTIC (residual live-object-reclamation probe): watch one heap address
@@ -2172,8 +2721,9 @@ fn vgc_safepoint() {
 		return
 	}
 	unsafe {
-		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stopped_count,
-			&vgc_heap.caches[cache_idx].stopped, &vgc_heap.caches[cache_idx].stack_lo,
+		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq,
+			&vgc_heap.gc_stopped_count, &vgc_heap.caches[cache_idx].stopped,
+			&vgc_heap.caches[cache_idx].park_seq, &vgc_heap.caches[cache_idx].stack_lo,
 			&vgc_heap.caches[cache_idx].stack_hi, vgc_heap.caches[cache_idx].stack_base)
 	}
 }
@@ -2284,6 +2834,9 @@ fn vgc_uaf_check_buf(strptr usize, slen int) bool {
 				C.vgc_say(0xc0de, u64(strptr))
 				C.vgc_say(0xc0d1, g - 1)
 			}
+			$if vgc_freering ? {
+				vgc_freering_lookup(strptr)
+			}
 		}
 		$if cx_watch_keytext ? {
 			vgc_watch_addr = strptr // #145 deep-fix A: re-arm on the PROVEN victim slot
@@ -2306,6 +2859,9 @@ fn vgc_uaf_check_buf(strptr usize, slen int) bool {
 				vgc_gold_total++
 				C.vgc_say(0xc0de, u64(strptr))
 				C.vgc_say(0xc0d1, g - 1)
+			}
+			$if vgc_freering ? {
+				vgc_freering_lookup(strptr)
 			}
 		}
 		$if cx_watch_keytext ? {

@@ -87,6 +87,12 @@ fn vgc_gc_start() {
 		// no-frozen-lock-holder invariant).
 		C.vgc_mutex_lock(&vgc_heap.cache_lock) // registration gate (held across the cycle)
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stopped_count, 0)
+		// Bump the stop-cycle generation BEFORE raising the flag: a parker that
+		// enters because it saw the flag reads the seq of THIS cycle. The suspend
+		// loop below trusts stopped==1 only with a matching park_seq — a stale
+		// park from the previous back-to-back cycle is a WAKING (running) thread
+		// and is signal-suspended like any straggler (#57/#58/#63/#145).
+		_ = C.vgc_atomic_add_u32(&vgc_heap.gc_stop_seq, 1)
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 1)
 		mut want := u32(0)
 		for i in 0 .. vgc_heap.ncaches {
@@ -147,15 +153,35 @@ fn vgc_gc_start() {
 		for i in 0 .. 136 {
 			C.vgc_mutex_lock(&vgc_heap.central[i].lock)
 		}
+		// SPAWN-ROOT LOCK, same lock-before-suspend discipline (#57/#58/#63/#145
+		// ROOT CAUSE): the spawn-roots loop below iterated UNLOCKED on the belief
+		// that "the world is stopped, so no mutator can be mid add/remove" — but a
+		// DYING worker's exit path (thread_wrapper tail: vgc_spawn_root_remove)
+		// runs with NO safepoint and can be past signal delivery (ESRCH => the
+		// suspend loop rightly skips it). Its swap-remove moves the LAST entry
+		// into a slot the iteration already passed => that entry — a STARTING
+		// worker's arg struct carrying its cloned bindings/closures maps — is
+		// never shaded => its keys arrays are swept => the new worker begins on
+		// freed maps (string_clone segfault; victim = binding-key/worker-name
+		// buffers). Holding the lock across the cycle makes the dying thread's
+		// remove wait until after the resume, closing the race. Deadlock-free:
+		// remove/add hold ONLY this lock, never allocate, never poll, so no
+		// frozen holder exists (acquired before any suspension, like the rest).
+		C.vgc_mutex_lock(&vgc_spawn_root_lock)
 		// Mach-suspend only stragglers (registered, not self, not self-parked). Allocator
 		// locks are held first, so a straggler cannot be frozen holding one.
 		for i in 0 .. vgc_heap.ncaches {
 			c := unsafe { &vgc_heap.caches[i] }
 			C.vgc_trace(6, i, if c.registered { u64(1) } else { u64(0) }, u64(c.mach_port))
 			if c.registered && i != self_idx && c.mach_port != 0
-				&& C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 {
-				C.vgc_suspend_thread(c.mach_port)
-				susp[i] = true
+				&& (C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0
+				|| c.park_seq != C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)) {
+				// stopped==1 counts ONLY with a matching park_seq: a stale park from
+				// the previous cycle is a WAKING thread that will run through this
+				// GC — suspend it like any straggler. susp[i] reflects the ACK, not
+				// the attempt: an un-acked target is a gone thread (safe to skip),
+				// never a running mutator (the suspend waits for live targets).
+				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
 				C.vgc_trace(7, i, u64(c.mach_port), 0)
 			}
 		}
@@ -175,14 +201,15 @@ fn vgc_gc_start() {
 		for i in 0 .. 136 {
 			C.vgc_mutex_lock(&vgc_heap.central[i].lock)
 		}
+		C.vgc_mutex_lock(&vgc_spawn_root_lock) // see the cooperative branch above
 
 		for i in 0 .. vgc_heap.ncaches {
 			c := unsafe { &vgc_heap.caches[i] }
 			reg := if c.registered { u64(1) } else { u64(0) }
 			C.vgc_trace(6, i, reg, u64(c.mach_port)) // SUSP? (decision inputs for EVERY slot)
 			if c.registered && i != self_idx && c.mach_port != 0 {
-				C.vgc_suspend_thread(c.mach_port)
-				susp[i] = true
+				// susp[i] reflects the ACK (see the cooperative branch above).
+				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
 				C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
 			}
 		}
@@ -198,7 +225,9 @@ fn vgc_gc_start() {
 		for i in 0 .. vgc_heap.ncaches {
 			c := unsafe { &vgc_heap.caches[i] }
 			if c.registered && i != self_idx && c.mach_port != 0 {
-				if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 && !susp[i] {
+				parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
+					&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
+				if !parked_now && !susp[i] {
 					uncovered++
 				}
 			}
@@ -221,6 +250,36 @@ fn vgc_gc_start() {
 	// a stack-only scan misses; validated in bench/parallel-alloc/stw_root_scan.c).
 	vgc_scan_suspended_roots(self_idx)
 	vgc_watch_snapshot(1) // STAGE 1: post suspended-thread reg/stack roots (main's reg holds c)
+	$if vgc_rangedump ? {
+		// #58 diagnostic: dump EVERY registered thread's post-refresh scan range so a
+		// rootfind EXTERNAL holder can be correlated — is it below stack_lo (size under-
+		// estimated), above stack_hi (base wrong), or in no range at all (unregistered peer)?
+		for di in 0 .. vgc_heap.ncaches {
+			dc := unsafe { &vgc_heap.caches[di] }
+			if dc.registered && dc.mach_port != 0 {
+				C.write(2, c'[rangedump] ', usize(12))
+				C.vgc_say(0x5a9e, u64(di))
+				C.vgc_say(0x5a10, u64(dc.stack_lo))
+				C.vgc_say(0x5a11, u64(dc.stack_hi))
+				C.vgc_say(0x5aba, u64(dc.stack_base))
+			}
+		}
+	}
+
+	$if vgc_spcheck ? {
+		// #58: shadow the exact ranges this cycle's root scan will use. Stragglers'
+		// ranges were just refreshed from their captured SP (vgc_scan_suspended_roots);
+		// parkers self-recorded theirs in vgc_park_spill. World is stopped: consistent.
+		for si in 0 .. vgc_heap.ncaches {
+			sc := unsafe { &vgc_heap.caches[si] }
+			if sc.registered && si < 64 {
+				vgc_spchk_lo[si] = sc.stack_lo
+				vgc_spchk_hi[si] = sc.stack_hi
+				vgc_spchk_cyc[si] = u64(vgc_heap.gc_cycle)
+				vgc_spchk_parked[si] = u64(C.vgc_atomic_load_u32(&vgc_heap.caches[si].stopped))
+			}
+		}
+	}
 
 	// === Phase 2: Mark (parallel) ===
 	// Enable write barrier (for concurrent correctness)
@@ -243,7 +302,7 @@ fn vgc_gc_start() {
 	// only counted after its slot is written. (See vgc_spawn_roots.)
 	for i in 0 .. vgc_nspawn_roots {
 		root := usize(vgc_spawn_roots[i])
-		vgc_shade(root)
+		vgc_shade_spawn_root(root)
 		// DIAGNOSTIC (root-scan-miss localizer): is the watched object the spawn
 		// arg itself (bit0), or reachable from it via arg->...->c (bit1)? Pins
 		// whether the spawn-root drain actually reaches c.
@@ -362,10 +421,22 @@ fn vgc_gc_start() {
 	// spans acquired during THIS cycle. Doing the bump here closes the window: every
 	// post-resume acquisition stamps exactly the cycle the next sweep checks against.
 	vgc_update_trigger()
+	if vgc_gctrace != 0 {
+		// VGC_GCTRACE=1 per-cycle pacing trace (GODEBUG=gctrace analog). Emitted
+		// under STW right after the trigger recompute, so every field is a
+		// consistent snapshot: cycle, marked (true live set), the recomputed base
+		// goal (pre thread-multiplier), arena/span pressure, live mutators.
+		// Env-gated (one integer test per cycle when off).
+		C.vgc_gctrace_line(u64(vgc_heap.gc_cycle),
+			C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
+			C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas),
+			u64(vgc_heap.nspans), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
+	}
 	vgc_heap.gc_cycle++
 
 	// Mark + sweep done — release every allocator lock held across the cycle before
 	// resuming, so resumed mutators don't block on them. (Reverse acquisition order.)
+	C.vgc_mutex_unlock(&vgc_spawn_root_lock)
 	for i in 0 .. 136 {
 		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
 	}
@@ -416,11 +487,12 @@ fn vgc_cm_stw_enter(self_idx int) {
 	for i in 0 .. 136 {
 		C.vgc_mutex_lock(&vgc_heap.central[i].lock)
 	}
+	C.vgc_mutex_lock(&vgc_spawn_root_lock) // dying-thread remove vs spawn-root scan (see vgc_gc_start)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0) // OS-suspend, not cooperative
 	for i in 0 .. vgc_heap.ncaches {
 		c := unsafe { &vgc_heap.caches[i] }
 		if c.registered && i != self_idx && c.mach_port != 0 {
-			C.vgc_suspend_thread(c.mach_port)
+			_ = C.vgc_suspend_thread(c.mach_port)
 		}
 	}
 	// The work queue is collector-exclusive (mutators never enqueue — the write barrier
@@ -432,6 +504,7 @@ fn vgc_cm_stw_enter(self_idx int) {
 // Release every allocator lock (reverse order) and resume every other mutator.
 @[markused]
 fn vgc_cm_stw_exit(self_idx int) {
+	C.vgc_mutex_unlock(&vgc_spawn_root_lock)
 	for i in 0 .. 136 {
 		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
 	}
@@ -525,7 +598,7 @@ fn vgc_gc_start_concurrent() {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 1)
 	vgc_mark_roots() // globals/BSS + every thread stack (snapshot)
 	for i in 0 .. vgc_nspawn_roots {
-		vgc_shade(usize(vgc_spawn_roots[i]))
+		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
 	}
 	vgc_cm_stw_exit(self_idx) // RESUME the world — mark now runs concurrently
 
@@ -538,7 +611,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_scan_suspended_roots(self_idx) // re-scan dirtied roots (stacks moved)
 	vgc_mark_roots()
 	for i in 0 .. vgc_nspawn_roots {
-		vgc_shade(usize(vgc_spawn_roots[i]))
+		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
 	}
 	vgc_rescan_dirty_spans() // re-scan everything the barrier dirtied
 	vgc_drain_mark_work() // final drain of the grey set
@@ -582,11 +655,15 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			continue
 		}
 		$if !vgc_legacy_stw ? {
-			// Cooperative parkers (stopped==1) already recorded their SELF-SPILLED range
-			// via vgc_park_spill; calling thread_get_state on a spinning parker would
-			// overwrite stack_lo/hi with the spin-loop range and drop its roots. Only
-			// mach-suspended stragglers (stopped==0) need the external register/SP scan.
-			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0 {
+			// Cooperative parkers (stopped==1 AND parked for THIS cycle) already
+			// recorded their SELF-SPILLED range via vgc_park_spill; calling
+			// thread_get_state on a spinning parker would overwrite stack_lo/hi
+			// with the spin-loop range and drop its roots. A stale park (previous
+			// cycle's seq) means the thread was signal-suspended above — its range
+			// MUST be refreshed externally (the stale self-recorded one no longer
+			// covers its current frames).
+			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
+				&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq) {
 				continue
 			}
 		}
@@ -820,6 +897,37 @@ fn vgc_shade(addr usize) {
 			}
 		}
 	}
+}
+
+// vgc_shade_spawn_root shades an in-flight spawn-argument struct AND unconditionally
+// scans its whole object range for pointers — EVEN IF the span is noscan. V's spawn
+// codegen allocates the arg struct by raw size (builtin___v_malloc(sizeof thread_arg_...),
+// untyped => noscan), yet it holds the child thread's live argument pointers (e.g. a
+// [?worker]'s cloned bindings/closures maps). Plain vgc_shade would MARK-but-not-TRACE it
+// (the `if !span.noscan` enqueue skip), leaving those args' referents — the map key
+// strings — unmarked => swept-while-live => the #58/#63 concurrent-worker UAF
+// (string_clone segfault). Conservatively scanning the arg object roots the whole
+// argument graph. (A spawn-root ALWAYS carries pointers, so the noscan skip is wrong here.)
+fn vgc_shade_spawn_root(addr usize) {
+	if addr < vgc_arena_lo || addr >= vgc_arena_hi {
+		return
+	}
+	span := vgc_find_span(voidptr(addr))
+	if span == unsafe { nil } || !span.in_use || span.elem_size == 0 {
+		return
+	}
+	obj_idx := u32((addr - span.base) / usize(span.elem_size))
+	if obj_idx >= span.nelems {
+		return
+	}
+	if span.alloc_bits == unsafe { nil } || C.vgc_bitmap_get(span.alloc_bits, obj_idx) == 0 {
+		return
+	}
+	if span.mark_bits != unsafe { nil } {
+		C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
+	}
+	obj_base := span.base + usize(obj_idx) * usize(span.elem_size)
+	vgc_scan_range(obj_base, obj_base + usize(span.elem_size))
 }
 
 // Parallel mark using OS threads.
@@ -1292,12 +1400,76 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 
 // Sweep all spans synchronously.
 fn vgc_do_sweep() {
+	$if vgc_passive ? {
+		// #58 SWEEP-TIME coverage re-check: mark-time coverage (0x57ab) is not
+		// enough — a peer that un-parks MID-GC mutates between mark and sweep
+		// (the where-is-it forensic found victim pointers on frozen stacks that
+		// mark never saw => written after mark). Any registered non-self peer
+		// that is neither self-parked nor acked-suspended AT SWEEP START is the
+		// leaker: 0x57ac + slot index.
+		swp_self := C.vgc_get_cache_idx()
+		for ci in 0 .. vgc_heap.ncaches {
+			cc := unsafe { &vgc_heap.caches[ci] }
+			if !cc.registered || ci == swp_self || cc.mach_port == 0 {
+				continue
+			}
+			parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[ci].stopped) != 0
+				&& cc.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
+			if !parked_now && C.vgc_port_is_acked(cc.mach_port) == 0 {
+				C.vgc_say(0x57ac, u64(u32(ci)))
+			}
+		}
+	}
+	$if vgc_keysweep ? {
+		unsafe { C.memset(&vgc_ks_tab[0], 0, usize(sizeof(usize)) * usize(vgc_ks_cap)) }
+		vgc_ks_count = 0
+		vgc_ks_overflow = 0
+	}
 	for i in 0 .. vgc_heap.nspans {
 		span := unsafe { vgc_heap.allspans[i] }
 		if span == unsafe { nil } || !span.in_use {
 			continue
 		}
 		vgc_sweep_span(span)
+	}
+	$if vgc_keysweep ? {
+		// #58 FORENSIC (world still stopped, sweep just freed): does any REGISTERED
+		// thread's scanned window STILL hold a word pointing into an object this
+		// sweep freed (scan-class, keys-array-sized)? A hit is the smoking gun for
+		// a mark-pipeline miss — the root was VISIBLE at sweep time yet its object
+		// was reclaimed — with the exact holder word address. No hits while the
+		// DEAD-KEYS interpreter probe still fires means the roots were NOT on any
+		// stack during the GC (a stale env copy written after the fact).
+		if vgc_ks_count > 0 {
+			ks_self := C.vgc_get_cache_idx()
+			for ti in 0 .. vgc_heap.ncaches {
+				if ti == ks_self {
+					// The COLLECTOR's own frames evolved since its mark-time snapshot
+					// (sweep locals legitimately reference freed objects) — skip self;
+					// only the frozen mutators' windows are meaningful here.
+					continue
+				}
+				tc := unsafe { &vgc_heap.caches[ti] }
+				if !tc.registered || tc.stack_lo == 0 || tc.stack_hi <= tc.stack_lo {
+					continue
+				}
+				mut w := (tc.stack_lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+				for w + sizeof(usize) <= tc.stack_hi {
+					val := unsafe { *(&usize(voidptr(w))) }
+					if val >= vgc_arena_lo && val < vgc_arena_hi {
+						if vgc_ks_lookup(val) {
+							C.vgc_say(0x5ee9, u64(w)) // holder word (on a scanned stack!)
+							C.vgc_say(0x5eea, u64(val)) // the freed object it points to
+							C.vgc_say(0x5eeb, u64(u32(ti))) // holder thread cache idx
+						}
+					}
+					w += sizeof(usize)
+				}
+			}
+			if vgc_ks_overflow != 0 {
+				C.vgc_say(0x5eec, u64(vgc_ks_overflow)) // candidates dropped (buffer full)
+			}
+		}
 	}
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 1)
 }
@@ -1364,6 +1536,25 @@ fn vgc_sweep_span(span &VGC_Span) {
 		}
 		if garbage != 0 {
 			freed += u32(C.vgc_popcount8(garbage))
+			$if vgc_keysweep ? {
+				// #58 forensic: record every scan-class keys-array-sized object this
+				// sweep frees, for the post-sweep registered-window rescan. Keys
+				// arrays of the victim-class small maps live in the 128-192B classes
+				// (DenseArray init cap 8 x 16B string structs + one 1.125x expand).
+				// The wider nets overflowed the candidate buffer every cycle (the
+				// heap is goal-sized, not floor-sized), silently voiding the negative
+				// verdict. Precision beats breadth here.
+				if !span.noscan && span.elem_size >= u32(128) && span.elem_size <= u32(192) {
+					for kbit in 0 .. 8 {
+						if garbage & (u8(1) << kbit) != 0 {
+							koi := u32(b) * 8 + u32(kbit)
+							if koi < span.nelems {
+								vgc_ks_insert(span.base + usize(koi) * usize(span.elem_size))
+							}
+						}
+					}
+				}
+			}
 			$if vgc_passive ? {
 				$if !vgc_nosweep ? {
 					// #63/#145 PASSIVE: record each freed SMALL noscan buffer (the
@@ -1384,9 +1575,31 @@ fn vgc_sweep_span(span &VGC_Span) {
 					}
 				}
 			}
-			// Clear the garbage bits from alloc bitmap
-			unsafe {
-				span.alloc_bits[b] = alloc_byte & mark_byte
+			// Clear the garbage bits from the alloc bitmap. ATOMIC AND of exactly
+			// ~garbage (NOT a plain write-back of `alloc_byte & mark_byte`): the
+			// plain store publishes a value computed from a byte read earlier in
+			// this loop, so any claim (vgc_span_alloc_obj's atomic OR) that lands
+			// between that read and this store is silently ERASED — the object is
+			// born with its bit verified set, then reads dead within the same GC
+			// cycle with no sweep or free in between (#57/#58/#63/#145 lineage;
+			// proven by the birth-certificate forensic: birth_dcyc==0, 0xa110==0,
+			// free-ring silent). Under a truly stopped world the two forms are
+			// identical; when any mutator is still running (however it slipped the
+			// STW net), the atomic AND clears only the swept bits and cannot eat a
+			// concurrent claim. Defense-in-depth with zero extra cost.
+			$if vgc_birthcheck ? {
+				vgc_bw_check(usize(span.alloc_bits) + usize(b), garbage, 0xc1ea2)
+			}
+			$if vgc_sweep_plain ? {
+				// A/B isolation switch: the historical plain write-back.
+				unsafe {
+					span.alloc_bits[b] = alloc_byte & mark_byte
+				}
+			} $else {
+				unsafe {
+					_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) +
+						usize(b))), ~garbage)
+				}
 			}
 			// Track lowest freed index for free_index hint
 			base_idx := b * 8
@@ -1497,6 +1710,11 @@ fn vgc_update_trigger() {
 	// Avoid very small heap goals that force frequent full cycles on bursty workloads.
 	if goal < vgc_base_floor {
 		goal = vgc_base_floor
+	}
+	// Clamp to the soft heap limit: the backstop must keep firing well before the
+	// physical arena ceiling regardless of how large the marked set gets (#57/#71).
+	if goal > vgc_heap_soft_limit {
+		goal = vgc_heap_soft_limit
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 }

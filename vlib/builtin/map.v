@@ -284,6 +284,20 @@ fn map_clone_string(dest voidptr, pkey voidptr) {
 				vgc_uaf_report(usize(pkey), s.len, usize(s.str))
 			} else {
 				freed := vgc_uaf_check_buf(usize(s.str), s.len)
+				$if vgc_spcheck ? {
+					// #58: on a catch, compare THIS thread's current frame depth and the
+					// source key-slot address against the [lo,hi] window the collector
+					// scanned for this thread at the most recent GC. current-frame below
+					// scanned-lo (0x51fd) = the reading frames were outside the scanned
+					// window = root miss, localized. 0x51fa = alloc status of the keys-
+					// array slot itself (bit0 alloc, bit1 span in_use): 0 => the whole
+					// keys array was swept with the leaf (chain sweep); 1|2 => the array
+					// survived but its leaf was swept (mark-closure violation).
+					if freed {
+						mut frame_probe := 0
+						vgc_spchk_report(pkey, usize(voidptr(&frame_probe)))
+					}
+				}
 				$if cx_clone_keytext ? {
 					// #145 LIGHT LOCALIZER: on a freed source-key catch, dump the key's
 					// TEXT (still mapped+readable under -d vgc_nosweep) so the victim
