@@ -1504,6 +1504,16 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 							if vgc_find_span_addr(voidptr(addr)) != usize(voidptr(span)) {
 								C.vgc_say(0xa1a5, u64(addr)) // ALIASED AT BIRTH
 							}
+							// BIRTH-DURING-GC: under an airtight STW no mutator can be
+							// here while a cycle runs. Any hit is the leaked mutator,
+							// caught red-handed WITH its allocation site (ra chain) —
+							// correlate 0xb1f7 addresses with later DEAD-KEYS victims.
+							gph := C.vgc_atomic_load_u32(&vgc_heap.gc_phase)
+							if gph != vgc_phase_off {
+								C.vgc_say(0xb1f7, u64(addr))
+								C.vgc_say(0xb1f8, u64(usize(C.vgc_ra2())))
+								C.vgc_say(0xb1f9, u64(gph))
+							}
 						}
 					}
 					return unsafe { voidptr(addr) }
