@@ -94,6 +94,13 @@ fn vgc_gc_start() {
 		// and is signal-suspended like any straggler (#57/#58/#63/#145).
 		_ = C.vgc_atomic_add_u32(&vgc_heap.gc_stop_seq, 1)
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 1)
+		$if vgc_schedfuzz ? {
+			// Widen the post-flag / pre-suspend window (site 1): the interval in
+			// which a mutator can observe the flag, begin parking, or a dying
+			// worker can begin its spawn-root remove, before the collector reaches
+			// the suspend loop. Biases the exact race the forensics implicated.
+			vgc_fuzz_pause(1)
+		}
 		mut want := u32(0)
 		for i in 0 .. vgc_heap.ncaches {
 			c := unsafe { &vgc_heap.caches[i] }

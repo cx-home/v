@@ -62,6 +62,7 @@ fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site
 fn C.vgc_ra2() voidptr // #58 freering: two frames up
 fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
+fn C.vgc_cpu_pause() // cpu relax hint (pause/yield); see vgc_platform.h
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64) // VGC_GCTRACE=1 per-cycle line
@@ -426,6 +427,48 @@ __global vgc_pace_by_threads = true
 // marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
 // gctrace analog) — costs one integer test per cycle when off.
 __global vgc_gctrace = u32(0)
+
+// ── #58 SCHEDULE FUZZER (-d vgc_schedfuzz) ──────────────────────────────────
+// A seeded, deterministic delay injector at STW protocol choice points, to bias
+// the collector/mutator interleave toward the rare sweep-while-live window so it
+// reproduces on demand (the record-replay phase: nine mechanism hypotheses were
+// refuted because the window is timing-only and unbiasable by inspection). NOT
+// randomness — a per-process xorshift stream seeded by VGC_FUZZ_SEED, advanced
+// atomically, so a given seed yields the same delay sequence run-to-run. Delays
+// are ns-scale busy pauses (no syscall, no lock, no alloc) so they bias timing
+// without the heavy-instrument masking that killed every prior probe. Default
+// build: vgc_fuzz_seed==0 => vgc_fuzz_pause is one predictable branch, no delay.
+__global vgc_fuzz_state = u64(0)
+__global vgc_fuzz_seed = u64(0)
+__global vgc_fuzz_max = u32(0) // max pause iterations (VGC_FUZZ_MAX, default 4096)
+
+@[inline]
+fn vgc_fuzz_next() u64 {
+	// xorshift64* advanced under a CAS-free atomic add-then-mix (racy across
+	// threads by design — determinism is per-seed statistical, not bitwise).
+	mut x := C.vgc_atomic_add_u64(&vgc_fuzz_state, u64(0x9E3779B97F4A7C15))
+	x ^= x >> 30
+	x *= u64(0xBF58476D1CE4E5B9)
+	x ^= x >> 27
+	x *= u64(0x94D049BB133111EB)
+	x ^= x >> 31
+	return x
+}
+
+// vgc_fuzz_pause: at a protocol choice point (site id for future per-site
+// tuning), busy-spin a seeded-random number of iterations in [0, vgc_fuzz_max).
+// One branch when disabled.
+@[inline]
+fn vgc_fuzz_pause(site u32) {
+	if vgc_fuzz_seed == 0 {
+		return
+	}
+	n := u32(vgc_fuzz_next() % u64(vgc_fuzz_max)) + (site & 0)
+	for _ in 0 .. n {
+		C.vgc_cpu_pause()
+	}
+}
+
 // Per-extra-mutator pacing headroom (bytes; VGC_PACE_MB overrides). Replaces the
 // former MULTIPLICATIVE per-thread goal scaling (`goal *= live_threads`), which
 // was unsound as policy: on a many-threaded server it scaled the WHOLE live-set
@@ -796,6 +839,24 @@ pub fn vgc_init() {
 	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
 		vgc_gctrace = 1
 	}
+	$if vgc_schedfuzz ? {
+		fuzz_env := C.getenv(c'VGC_FUZZ_SEED')
+		if fuzz_env != unsafe { nil } {
+			sd := C.atoll(fuzz_env)
+			if sd > 0 {
+				vgc_fuzz_seed = u64(sd)
+				vgc_fuzz_state = u64(sd)
+			}
+		}
+		vgc_fuzz_max = u32(4096)
+		fmax_env := C.getenv(c'VGC_FUZZ_MAX')
+		if fmax_env != unsafe { nil } {
+			fm := C.atoll(fmax_env)
+			if fm > 0 {
+				vgc_fuzz_max = u32(fm)
+			}
+		}
+	}
 	pace_mb_env := C.getenv(c'VGC_PACE_MB')
 	if pace_mb_env != unsafe { nil } {
 		pmb := C.atoll(pace_mb_env)
@@ -1043,6 +1104,14 @@ fn vgc_spawn_root_add(p voidptr) {
 fn vgc_spawn_root_remove(p voidptr) {
 	if p == unsafe { nil } {
 		return
+	}
+	$if vgc_schedfuzz ? {
+		// Site 3: a dying worker is about to remove its spawn-root. Widening here
+		// biases the remove to land inside a collector's spawn-root SCAN window —
+		// the race the spawn-root lock closes (regression check: with the lock in
+		// place this fuzz must NOT reintroduce catches; without it, it should
+		// amplify them — the A/B that proves the lock is the mechanism).
+		vgc_fuzz_pause(3)
 	}
 	C.vgc_mutex_lock(&vgc_spawn_root_lock)
 	for i in 0 .. vgc_nspawn_roots {
@@ -2719,6 +2788,12 @@ fn vgc_safepoint() {
 	cache_idx := C.vgc_get_cache_idx()
 	if cache_idx < 0 {
 		return
+	}
+	$if vgc_schedfuzz ? {
+		// Site 2: a mutator has seen the stop flag and is about to park. Widening
+		// here biases the "in-transit mutator" window (left its work, not yet
+		// counted parked) that the park-generation and spawn-root races live in.
+		vgc_fuzz_pause(2)
 	}
 	unsafe {
 		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq,
