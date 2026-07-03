@@ -829,6 +829,18 @@ pub fn vgc_init() {
 			vgc_base_floor = u64(mb) * 1024 * 1024
 		}
 	}
+	// #58 repro amplifier: sub-MB GC trigger in KB. The seed sweep showed GC
+	// FREQUENCY (not scheduling latency) drives the sweep-while-live catch rate
+	// (MB=1 ~7/round vs MB=2 ~2/round; fuzz delays only MASKED). VGC_NEXT_GC_KB
+	// pushes the trigger below 1 MB to drive the rate toward deterministic for
+	// single-run interleave bisection. Overrides VGC_NEXT_GC_MB when set.
+	kb_env := C.getenv(c'VGC_NEXT_GC_KB')
+	if kb_env != unsafe { nil } {
+		kb := C.atoll(kb_env)
+		if kb > 0 {
+			vgc_base_floor = u64(kb) * 1024
+		}
+	}
 	pace_env := C.getenv(c'VGC_PACE')
 	if pace_env != unsafe { nil } {
 		// Explicit override of the on-by-default pacing: VGC_PACE=0 disables it,
