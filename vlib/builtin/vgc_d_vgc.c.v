@@ -427,6 +427,7 @@ __global vgc_pace_by_threads = true
 // marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
 // gctrace analog) — costs one integer test per cycle when off.
 __global vgc_gctrace = u32(0)
+__global vgc_workdrop_count = u64(0) // #58 -d vgc_workdrop: grey objects dropped by work_put os_alloc-nil
 
 // ── #58 SCHEDULE FUZZER (-d vgc_schedfuzz) ──────────────────────────────────
 // A seeded, deterministic delay injector at STW protocol choice points, to bias

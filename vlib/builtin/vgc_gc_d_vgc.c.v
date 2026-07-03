@@ -346,6 +346,30 @@ fn vgc_gc_start() {
 	// Disable write barrier
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
 
+	$if vgc_remark ? {
+		// #58 RE-MARK DETERMINISM CHECK (world still stopped, post-mark, pre-sweep):
+		// re-run mark from the SAME frozen roots. Re-marking is ADDITIVE (shading an
+		// already-marked object is a no-op; only newly-reached objects add bits), so
+		// it can only GROW the mark set and sweep stays strictly safer — no shadow,
+		// no restore. If the second pass marks victim-class objects the first missed
+		// (v2>v1), the first mark was INCOMPLETE from the same roots = a mark/scan
+		// bug (0xd7a2 v1, delta). If v2==v1 every GC, mark is complete/deterministic
+		// => a swept-while-live victim is genuinely UNREACHABLE from roots = a
+		// dangling interpreter alias (CX-level), not a GC mark miss. Cost: ~2x mark
+		// per GC, all under STW — timing cannot mask a structural discrepancy.
+		v1 := vgc_count_marked_victimclass()
+		vgc_mark_roots()
+		for i in 0 .. vgc_nspawn_roots {
+			vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
+		}
+		vgc_drain_mark_work()
+		v2 := vgc_count_marked_victimclass()
+		if v2 != v1 {
+			C.vgc_say(0xd7a2, u64(v1))
+			C.vgc_say(0xd7a3, u64(v2))
+		}
+	}
+
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
@@ -1070,6 +1094,10 @@ fn vgc_work_put(addr usize) {
 			} else {
 				new_buf = unsafe { &VGC_WorkBuf(C.vgc_os_alloc(usize(sizeof(VGC_WorkBuf)))) }
 				if new_buf == unsafe { nil } {
+					$if vgc_workdrop ? {
+						vgc_workdrop_count++ // #58: grey object SILENTLY DROPPED (os_alloc nil)
+						C.vgc_say(0xd709, u64(addr))
+					}
 					return
 				}
 			}
@@ -1101,6 +1129,10 @@ fn vgc_work_put(addr usize) {
 		} else {
 			new_buf = unsafe { &VGC_WorkBuf(C.vgc_os_alloc(usize(sizeof(VGC_WorkBuf)))) }
 			if new_buf == unsafe { nil } {
+				$if vgc_workdrop ? {
+					vgc_workdrop_count++ // #58: grey object SILENTLY DROPPED (os_alloc nil, slowpath)
+					C.vgc_say(0xd709, u64(addr))
+				}
 				C.vgc_mutex_unlock(&vgc_heap.work_lock)
 				return
 			}
@@ -1702,6 +1734,28 @@ fn vgc_count_marked() u64 {
 			count = span.nelems
 		}
 		total += u64(count) * u64(span.elem_size)
+	}
+	return total
+}
+
+// #58 re-mark support: count MARKED objects in the victim-class spans only
+// (scan-type, elem_size 128..192 — the worker bindings keys-array class). A
+// count, not bytes, so a same-roots re-mark that reaches more of them is
+// directly visible.
+fn vgc_count_marked_victimclass() u64 {
+	mut total := u64(0)
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
+			continue
+		}
+		if span.noscan || span.elem_size < u32(128) || span.elem_size > u32(192) {
+			continue
+		}
+		nbytes := (span.nelems + 7) / 8
+		for b in 0 .. nbytes {
+			total += u64(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
+		}
 	}
 	return total
 }
