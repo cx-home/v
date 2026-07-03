@@ -729,6 +729,16 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       return 0;
   }
 
+  // #58 forensic: is the thread with mach-port `t` currently parked in the
+  // suspend handler (acked, not yet departed)? Collector-context only.
+  static inline int vgc_port_is_acked(uint32_t t) {
+      for (int i = 0; i < VGC_MAC_MAXTH; i++) {
+          if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) != t) continue;
+          if (__atomic_load_n(&vgc_mac_slots[i].acked, __ATOMIC_ACQUIRE)) return 1;
+      }
+      return 0;
+  }
+
   // Async-signal-safe: pthread_self/pthread_equal, volatile atomics, register copy,
   // sched_yield. No malloc/locks/stdio.
   static void vgc_suspend_handler(int sig, siginfo_t* si, void* uctx) {
@@ -1050,6 +1060,14 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       return vgc_lin_gettid();
   }
 
+  static inline int vgc_port_is_acked(uint32_t t) {
+      for (int i = 0; i < VGC_LINUX_MAXTH; i++) {
+          if (__atomic_load_n(&vgc_lin_slots[i].tid, __ATOMIC_ACQUIRE) != t) continue;
+          if (__atomic_load_n(&vgc_lin_slots[i].acked, __ATOMIC_ACQUIRE)) return 1;
+      }
+      return 0;
+  }
+
   static inline vgc_lin_susp* vgc_lin_find(uint32_t t) {
       for (int i = 0; i < VGC_LINUX_MAXTH; i++) {
           if (__atomic_load_n(&vgc_lin_slots[i].tid, __ATOMIC_ACQUIRE) == t) return &vgc_lin_slots[i];
@@ -1148,6 +1166,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   // Other platforms (Windows/BSD): signal/mach STW not yet ported. Return 0 so the
   // collector detects "no OS-suspend available" and falls back safely.
   static inline int vgc_captured_regs_contain(uintptr_t val) { (void)val; return 0; }
+  static inline int vgc_port_is_acked(uint32_t t) { (void)t; return 0; }
   static inline uint32_t vgc_thread_self_port(void) { return 0; }
   static inline int vgc_suspend_thread(uint32_t t) { (void)t; return 0; }
   static inline void vgc_resume_thread(uint32_t t) { (void)t; }

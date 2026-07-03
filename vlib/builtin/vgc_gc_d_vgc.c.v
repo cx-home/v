@@ -1366,6 +1366,25 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 
 // Sweep all spans synchronously.
 fn vgc_do_sweep() {
+	$if vgc_passive ? {
+		// #58 SWEEP-TIME coverage re-check: mark-time coverage (0x57ab) is not
+		// enough — a peer that un-parks MID-GC mutates between mark and sweep
+		// (the where-is-it forensic found victim pointers on frozen stacks that
+		// mark never saw => written after mark). Any registered non-self peer
+		// that is neither self-parked nor acked-suspended AT SWEEP START is the
+		// leaker: 0x57ac + slot index.
+		swp_self := C.vgc_get_cache_idx()
+		for ci in 0 .. vgc_heap.ncaches {
+			cc := unsafe { &vgc_heap.caches[ci] }
+			if !cc.registered || ci == swp_self || cc.mach_port == 0 {
+				continue
+			}
+			if C.vgc_atomic_load_u32(&vgc_heap.caches[ci].stopped) == 0
+				&& C.vgc_port_is_acked(cc.mach_port) == 0 {
+				C.vgc_say(0x57ac, u64(u32(ci)))
+			}
+		}
+	}
 	$if vgc_keysweep ? {
 		unsafe { C.memset(&vgc_ks_tab[0], 0, usize(sizeof(usize)) * usize(vgc_ks_cap)) }
 		vgc_ks_count = 0
