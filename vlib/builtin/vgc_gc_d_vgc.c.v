@@ -347,16 +347,10 @@ fn vgc_gc_start() {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
 
 	$if vgc_remark ? {
-		// #58 RE-MARK DETERMINISM CHECK (world still stopped, post-mark, pre-sweep):
-		// re-run mark from the SAME frozen roots. Re-marking is ADDITIVE (shading an
-		// already-marked object is a no-op; only newly-reached objects add bits), so
-		// it can only GROW the mark set and sweep stays strictly safer — no shadow,
-		// no restore. If the second pass marks victim-class objects the first missed
-		// (v2>v1), the first mark was INCOMPLETE from the same roots = a mark/scan
-		// bug (0xd7a2 v1, delta). If v2==v1 every GC, mark is complete/deterministic
-		// => a swept-while-live victim is genuinely UNREACHABLE from roots = a
-		// dangling interpreter alias (CX-level), not a GC mark miss. Cost: ~2x mark
-		// per GC, all under STW — timing cannot mask a structural discrepancy.
+		// #58 RE-MARK DETERMINISM CHECK (world still stopped, post-mark, pre-sweep).
+		// Additive from the SAME frozen roots (idempotent -> sweep stays safe). If
+		// v2>v1 the first mark was INCOMPLETE from roots (0xd7a2). Established RESULT:
+		// v2==v1 every GC -> mark is complete + deterministic from roots.
 		v1 := vgc_count_marked_victimclass()
 		vgc_mark_roots()
 		for i in 0 .. vgc_nspawn_roots {
@@ -367,6 +361,38 @@ fn vgc_gc_start() {
 		if v2 != v1 {
 			C.vgc_say(0xd7a2, u64(v1))
 			C.vgc_say(0xd7a3, u64(v2))
+		}
+	}
+	$if vgc_remark_ns ? {
+		// #58 NOSCAN-HOLDER DISCRIMINATOR (world stopped, post-mark, pre-sweep).
+		// drain_mark_work SKIPS noscan objects (they "contain no pointers"), so a
+		// live pointer stored in a MARKED noscan object is never traced -> its
+		// referent is swept-while-live. Test: conservatively scan every MARKED
+		// noscan object's words (shading referents), drain, and recount victim-class
+		// marks. v2>v1 (0xd7b2 v1, 0xd7b3 v2) => a marked NOSCAN object holds a live
+		// pointer to a victim-class object the trace missed = noscan-misclassification
+		// (a pointer-bearing struct allocated via malloc_noscan). v2==v1 => not a
+		// noscan holder either -> the reference is a dangling interpreter alias.
+		w1 := vgc_count_marked_victimclass()
+		for i in 0 .. vgc_heap.nspans {
+			span := unsafe { vgc_heap.allspans[i] }
+			if span == unsafe { nil } || !span.in_use || !span.noscan
+				|| span.mark_bits == unsafe { nil } || span.elem_size == 0 {
+				continue
+			}
+			for oi in 0 .. span.nelems {
+				if C.vgc_bitmap_get(span.mark_bits, oi) == 0 {
+					continue
+				}
+				ob := span.base + usize(oi) * usize(span.elem_size)
+				vgc_scan_range(ob, ob + usize(span.elem_size))
+			}
+		}
+		vgc_drain_mark_work()
+		w2 := vgc_count_marked_victimclass()
+		if w2 != w1 {
+			C.vgc_say(0xd7b2, u64(w1))
+			C.vgc_say(0xd7b3, u64(w2))
 		}
 	}
 
