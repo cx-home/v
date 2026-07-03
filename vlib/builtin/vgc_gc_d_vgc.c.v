@@ -87,6 +87,12 @@ fn vgc_gc_start() {
 		// no-frozen-lock-holder invariant).
 		C.vgc_mutex_lock(&vgc_heap.cache_lock) // registration gate (held across the cycle)
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stopped_count, 0)
+		// Bump the stop-cycle generation BEFORE raising the flag: a parker that
+		// enters because it saw the flag reads the seq of THIS cycle. The suspend
+		// loop below trusts stopped==1 only with a matching park_seq — a stale
+		// park from the previous back-to-back cycle is a WAKING (running) thread
+		// and is signal-suspended like any straggler (#57/#58/#63/#145).
+		_ = C.vgc_atomic_add_u32(&vgc_heap.gc_stop_seq, 1)
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 1)
 		mut want := u32(0)
 		for i in 0 .. vgc_heap.ncaches {
@@ -153,10 +159,13 @@ fn vgc_gc_start() {
 			c := unsafe { &vgc_heap.caches[i] }
 			C.vgc_trace(6, i, if c.registered { u64(1) } else { u64(0) }, u64(c.mach_port))
 			if c.registered && i != self_idx && c.mach_port != 0
-				&& C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 {
-				// susp[i] reflects the ACK, not the attempt: an un-acked target is a
-				// gone thread (safe to skip), never a running mutator (the suspend now
-				// waits indefinitely for live targets — the bounded-wait soundness hole).
+				&& (C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0
+				|| c.park_seq != C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)) {
+				// stopped==1 counts ONLY with a matching park_seq: a stale park from
+				// the previous cycle is a WAKING thread that will run through this
+				// GC — suspend it like any straggler. susp[i] reflects the ACK, not
+				// the attempt: an un-acked target is a gone thread (safe to skip),
+				// never a running mutator (the suspend waits for live targets).
 				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
 				C.vgc_trace(7, i, u64(c.mach_port), 0)
 			}
@@ -200,7 +209,9 @@ fn vgc_gc_start() {
 		for i in 0 .. vgc_heap.ncaches {
 			c := unsafe { &vgc_heap.caches[i] }
 			if c.registered && i != self_idx && c.mach_port != 0 {
-				if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0 && !susp[i] {
+				parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
+					&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
+				if !parked_now && !susp[i] {
 					uncovered++
 				}
 			}
@@ -625,11 +636,15 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			continue
 		}
 		$if !vgc_legacy_stw ? {
-			// Cooperative parkers (stopped==1) already recorded their SELF-SPILLED range
-			// via vgc_park_spill; calling thread_get_state on a spinning parker would
-			// overwrite stack_lo/hi with the spin-loop range and drop its roots. Only
-			// mach-suspended stragglers (stopped==0) need the external register/SP scan.
-			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0 {
+			// Cooperative parkers (stopped==1 AND parked for THIS cycle) already
+			// recorded their SELF-SPILLED range via vgc_park_spill; calling
+			// thread_get_state on a spinning parker would overwrite stack_lo/hi
+			// with the spin-loop range and drop its roots. A stale park (previous
+			// cycle's seq) means the thread was signal-suspended above — its range
+			// MUST be refreshed externally (the stale self-recorded one no longer
+			// covers its current frames).
+			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
+				&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq) {
 				continue
 			}
 		}
@@ -1379,8 +1394,9 @@ fn vgc_do_sweep() {
 			if !cc.registered || ci == swp_self || cc.mach_port == 0 {
 				continue
 			}
-			if C.vgc_atomic_load_u32(&vgc_heap.caches[ci].stopped) == 0
-				&& C.vgc_port_is_acked(cc.mach_port) == 0 {
+			parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[ci].stopped) != 0
+				&& cc.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
+			if !parked_now && C.vgc_port_is_acked(cc.mach_port) == 0 {
 				C.vgc_say(0x57ac, u64(u32(ci)))
 			}
 		}

@@ -560,8 +560,9 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
 // hot loop variable like `last` is often kept in a callee-saved register and
 // never written to the stack). `buf` is kept alive across the spin so the
 // recorded [lo,hi] range, which covers this frame, includes the spilled regs.
-static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stopped_count,
-                                  uint32_t* my_stopped, uintptr_t* range_lo,
+static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
+                                  uint32_t* stopped_count, uint32_t* my_stopped,
+                                  uint32_t* my_park_seq, uintptr_t* range_lo,
                                   uintptr_t* range_hi, uintptr_t stack_base) {
     jmp_buf buf;
     setjmp(buf);
@@ -571,6 +572,12 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stopped_count,
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
     else { *range_lo = stack_base; *range_hi = sp; }
+    // Stamp WHICH stop-cycle this park answers, BEFORE publishing stopped=1 (a
+    // collector that trusts stopped therefore also sees a matching seq). A stale
+    // stopped=1 from the previous cycle otherwise lets a back-to-back GC count a
+    // WAKING thread as parked while it runs through mark+sweep — the mid-GC
+    // mutator behind the #57/#58/#63/#145 sweep-while-live lineage.
+    *my_park_seq = vgc_atomic_load_u32(stop_seq);
     vgc_atomic_store_u32(my_stopped, 1);
     vgc_atomic_add_u32(stopped_count, 1);
     while (vgc_atomic_load_u32(stop_flag) != 0) { vgc_cpu_pause(); }

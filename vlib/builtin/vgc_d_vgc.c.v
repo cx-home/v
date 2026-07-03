@@ -45,7 +45,7 @@ fn C.vgc_mutex_lock(lk &u32)
 fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
-fn C.vgc_park_spill(stop_flag &u32, stopped_count &u32, my_stopped &u32, range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_thread_self_port() u32
 fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
 fn C.vgc_resume_thread(t u32)
@@ -175,6 +175,15 @@ mut:
 	stack_hi   usize // highest stack address
 	thread_id  u64
 	stopped    u32 // 1 if stopped for GC
+	// Which stop-cycle this park belongs to (== gc_stop_seq at park time). A
+	// stale `stopped==1` from the PREVIOUS cycle is a soundness trap: a parker
+	// waking from GC-1 (its spin exited when the flag briefly dropped) still
+	// reads stopped==1 when back-to-back GC-2's suspend loop inspects it — GC-2
+	// then counts it covered while it wakes and RUNS through mark+sweep. The
+	// collector must trust stopped only when park_seq matches the current
+	// gc_stop_seq; anything else is a straggler and gets signal-suspended.
+	// (#57/#58/#63/#145: the mid-GC mutator the forensics kept catching.)
+	park_seq   u32
 	mach_port  u32 // OS thread handle for OS-level suspend-the-world (darwin)
 	// Per-thread heap accounting (Go per-P style). The alloc/free fast path bumps
 	// these THREAD-PRIVATE counters (no shared atomic), flushing into the global
@@ -276,6 +285,7 @@ mut:
 	gc_workers_done  u32 // atomic
 	gc_nworkers      int
 	gc_stop_flag     u32 // atomic: tells threads to stop for GC
+	gc_stop_seq      u32 // atomic: stop-cycle generation (bumped per STW; see park_seq)
 	gc_stopped_count u32 // atomic: threads stopped
 	gc_target_stops  u32 // number of threads to stop
 	// Sweep state
@@ -2671,8 +2681,9 @@ fn vgc_safepoint() {
 		return
 	}
 	unsafe {
-		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stopped_count,
-			&vgc_heap.caches[cache_idx].stopped, &vgc_heap.caches[cache_idx].stack_lo,
+		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq,
+			&vgc_heap.gc_stopped_count, &vgc_heap.caches[cache_idx].stopped,
+			&vgc_heap.caches[cache_idx].park_seq, &vgc_heap.caches[cache_idx].stack_lo,
 			&vgc_heap.caches[cache_idx].stack_hi, vgc_heap.caches[cache_idx].stack_base)
 	}
 }
