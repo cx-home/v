@@ -45,9 +45,9 @@ fn C.vgc_mutex_lock(lk &u32)
 fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
-fn C.vgc_park_spill(stop_flag &u32, stopped_count &u32, my_stopped &u32, range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_thread_self_port() u32
-fn C.vgc_suspend_thread(t u32)
+fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
 fn C.vgc_resume_thread(t u32)
 fn C.vgc_thread_regs(t u32, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
@@ -57,6 +57,10 @@ fn C.vgc_num_cpus() int
 fn C.vgc_trace(ev int, slot int, a u64, b u64)
 fn C.vgc_trace_init()
 fn C.vgc_say(tag u64, v u64) // loud one-line stderr note (used by the span-registry abort)
+fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
+fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
+fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
 fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
@@ -73,6 +77,12 @@ const vgc_num_classes = 68
 const vgc_num_span_classes = 136 // 68 * 2 (scan + noscan variants)
 const vgc_arena_size = usize(64) * 1024 * 1024 // 64MB per arena
 const vgc_pages_per_arena = vgc_arena_size / vgc_page_size
+// free_spans pool bound: spans of 1..vgc_max_pooled_pages-1 pages are recyclable.
+// A literal (not the computed vgc_pages_per_arena) because V needs a constant-literal
+// for the fixed-array size below. 8192 pages * 8 KB = 64 MB = one full arena, so every
+// span that can fit in an arena is poolable (the old 32-page/256 KB bound
+// silently leaked larger transients).
+const vgc_max_pooled_pages = 8192
 const vgc_max_arenas = 64
 const vgc_max_threads = 64
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
@@ -158,7 +168,16 @@ mut:
 	stack_hi   usize // highest stack address
 	thread_id  u64
 	stopped    u32 // 1 if stopped for GC
-	mach_port  u32 // OS thread handle for OS-level suspend-the-world (darwin)
+	// Which stop-cycle this park belongs to (== gc_stop_seq at park time). A
+	// stale `stopped==1` from the PREVIOUS cycle is a soundness trap: a parker
+	// waking from GC-1 (its spin exited when the flag briefly dropped) still
+	// reads stopped==1 when back-to-back GC-2's suspend loop inspects it — GC-2
+	// then counts it covered while it wakes and RUNS through mark+sweep. The
+	// collector must trust stopped only when park_seq matches the current
+	// gc_stop_seq; anything else is a straggler and gets signal-suspended.
+	// (this was the mid-GC mutator the sweep-while-live forensics kept catching.)
+	park_seq  u32
+	mach_port u32 // OS thread handle for OS-level suspend-the-world (darwin)
 	// Per-thread heap accounting (Go per-P style). The alloc/free fast path bumps
 	// these THREAD-PRIVATE counters (no shared atomic), flushing into the global
 	// heap_live/total_alloc only every ~vgc_acct_flush bytes. This removes the
@@ -226,7 +245,13 @@ mut:
 	nspans       int
 	// Free spans (completely empty, reusable by page count)
 	free_spans_lock u32
-	free_spans      [32]&VGC_Span // free spans indexed by npages (1..31, 0=unused)
+	// free spans indexed by npages (1..vgc_pages_per_arena-1, 0=unused). Sized to a
+	// full arena so EVERY span that fits in one arena is recyclable. The old [32]
+	// bound (256 KB) silently leaked larger transients (e.g. a ~1 MB zstd dst buffer
+	// in a streaming-write hot loop): swept empty, but vgc_put_free_span/_get_free_span
+	// refused npages>=32, so the span was never pooled and the arena bump pointer
+	// (never rewound) kept advancing → unbounded RSS.
+	free_spans [vgc_max_pooled_pages]&VGC_Span
 	// Per-thread caches
 	caches       [64]VGC_Cache
 	ncaches      int     // high-water mark of slots ever used
@@ -253,6 +278,7 @@ mut:
 	gc_workers_done  u32 // atomic
 	gc_nworkers      int
 	gc_stop_flag     u32 // atomic: tells threads to stop for GC
+	gc_stop_seq      u32 // atomic: stop-cycle generation (bumped per STW; see park_seq)
 	gc_stopped_count u32 // atomic: threads stopped
 	gc_target_stops  u32 // number of threads to stop
 	// Sweep state
@@ -321,6 +347,7 @@ __global vgc_spawn_root_lock = u32(0)
 // mid-unpin leaves every still-pinned address present in >=1 slot (at worst shaded
 // twice for one cycle — harmless). Same discipline as vgc_spawn_roots.
 const vgc_pin_cap = 65536 // max concurrent pins; the array (512 KB) is scanned each GC
+
 __global vgc_pins = [vgc_pin_cap]voidptr{}
 __global vgc_npins = int(0)
 __global vgc_pin_lock = u32(0)
@@ -342,7 +369,7 @@ fn vgc_pin(p voidptr) {
 		vgc_npins++
 	} else {
 		// Full ⇒ a pin/unpin leak (cap is far above any real in-flight set). Loud,
-		// never silent: an unpinned live root would reintroduce the #63 UAF.
+		// never silent: an unpinned live root would reintroduce that UAF.
 		C.vgc_say(0x9171, u64(usize(p))) // PINNER FULL
 	}
 	C.vgc_mutex_unlock(&vgc_pin_lock)
@@ -390,6 +417,24 @@ fn vgc_unpin(p voidptr) {
 // (escape hatch); any other VGC_PACE value forces it on.
 __global vgc_base_floor = u64(256 * 1024 * 1024)
 __global vgc_pace_by_threads = true
+// VGC_GCTRACE=1 enables the per-cycle pacing trace (vgc_gctrace_line): cycle,
+// marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
+// gctrace analog) — costs one integer test per cycle when off.
+__global vgc_gctrace = u32(0)
+// Per-extra-mutator pacing headroom (bytes; VGC_PACE_MB overrides). Replaces the
+// former MULTIPLICATIVE per-thread goal scaling (`goal *= live_threads`), which
+// was unsound as policy: on a many-threaded server it scaled the WHOLE live-set
+// goal by N (e.g. marked 558 MB x2 x9 threads = a 10 GB trigger, beyond the 4 GB
+// arena capacity), so the pacer never fired again and the heap rode arena
+// exhaustion until an allocation burst failed => a field OOM
+// (`V panic: memory allocation failure` at RSS ~4.6 GB). Only the per-thread
+// allocation SLACK should scale with thread count, and additively.
+__global vgc_thread_headroom = u64(128 * 1024 * 1024)
+// Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
+// here so collection always engages well before the physical arena ceiling
+// (vgc_max_arenas * vgc_arena_size = 4 GB). Default = half the arena capacity.
+// Go's GOMEMLIMIT analog for the backstop collector.
+__global vgc_heap_soft_limit = u64(2) * 1024 * 1024 * 1024
 
 fn C.atoll(&char) i64
 fn C.getenv(&char) &char
@@ -414,6 +459,26 @@ pub fn vgc_init() {
 		// Explicit override of the on-by-default pacing: VGC_PACE=0 disables it,
 		// any other value forces it on.
 		vgc_pace_by_threads = C.atoll(pace_env) != 0
+	}
+	trace_env := C.getenv(c'VGC_GCTRACE')
+	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
+		vgc_gctrace = 1
+	}
+	pace_mb_env := C.getenv(c'VGC_PACE_MB')
+	if pace_mb_env != unsafe { nil } {
+		pmb := C.atoll(pace_mb_env)
+		if pmb >= 0 {
+			vgc_thread_headroom = u64(pmb) * 1024 * 1024
+		}
+	}
+	// Soft limit: half the physical arena capacity by default, env-overridable.
+	vgc_heap_soft_limit = u64(vgc_max_arenas) * u64(vgc_arena_size) / 2
+	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
+	if lim_env != unsafe { nil } {
+		lmb := C.atoll(lim_env)
+		if lmb > 0 {
+			vgc_heap_soft_limit = u64(lmb) * 1024 * 1024
+		}
 	}
 	vgc_heap.next_gc = vgc_base_floor // favor throughput over early collections
 	vgc_heap.gc_phase = vgc_phase_off
@@ -664,7 +729,7 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 
 // Try to get a recycled span from the free list
 fn vgc_get_free_span(npages u32) &VGC_Span {
-	if npages == 0 || npages >= 32 {
+	if npages == 0 || npages >= u32(vgc_max_pooled_pages) {
 		return unsafe { nil }
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
@@ -690,7 +755,7 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 // Return a fully-empty span to the free list for reuse
 fn vgc_put_free_span(mut span VGC_Span) {
 	npages := span.npages
-	if npages == 0 || npages >= 32 {
+	if npages == 0 || npages >= u32(vgc_max_pooled_pages) {
 		return
 	}
 	// DIAGNOSTIC: did we just free the span holding the watched address?
@@ -960,10 +1025,38 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 // gc_phase load skipped) under the default build.
 @[inline]
 fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
-	$if vgc_concurrent ? {
-		if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
-			if span.mark_bits != unsafe { nil } {
-				C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
+	// ALLOC-BLACK IS UNCONDITIONAL (was gated behind vgc_concurrent). Rationale
+	// (sweep-while-live lineage): the STW backstop assumes every mutator is frozen through
+	// mark+sweep, so an allocation during a cycle "cannot happen" and needs no
+	// mark. But the OS suspend is not perfectly airtight — pthread_kill can
+	// transiently fail / a mach port can be momentarily unresolvable, and the
+	// collector then proceeds treating that peer as gone (tags 0xdead2/5). A peer
+	// that is actually alive keeps allocating; its new object gets an alloc bit
+	// but, mark having already run, no mark bit -> it lands in `garbage` and sweep
+	// frees it WHILE LIVE (swept in the same cycle it was born — the forensic
+	// signature of the leak; the
+	// root cause of the concurrent-worker UAF). Marking every object born while a
+	// GC is in progress makes such a slipped allocation survive the sweep. Under a
+	// genuinely stopped world this branch never runs (gc_phase==off on the alloc
+	// fast path), so it is zero-cost in the common case and a pure soundness floor
+	// otherwise. Independent of, and complementary to, the atomic sweep write-back
+	// and the suspend-retry fix.
+	$if vgc_allocblack_off ? {
+		return
+	}
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		if span.mark_bits != unsafe { nil } {
+			// ATOMIC OR, not vgc_bitmap_test_and_set (a plain read-modify-write):
+			// this hook runs in MUTATOR context — concurrently with other mutators
+			// allocating neighbors in the same mark byte (the post-release window
+			// where gc_stop_flag is already 0 but gc_phase is not yet off) and,
+			// in the slipped-mutator case, with the collector's own marking. A
+			// torn mark byte here ERASES freshly-set neighbor marks => sweep
+			// frees live objects — worse than no hook at all.
+			mask := u8(1) << (obj_idx & 7)
+			unsafe {
+				_ =
+					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
 			}
 		}
 	}
@@ -1365,13 +1458,19 @@ fn vgc_maybe_gc() {
 		heap_live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
 		mut next_gc := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
 		if vgc_pace_by_threads {
-			// Per-thread pacing: give the heap N mutators' worth of headroom so N
-			// concurrent allocators don't trip the shared trigger N x more often
-			// per unit of per-thread progress.
+			// Per-thread pacing: give the heap N mutators' worth of ADDITIVE
+			// allocation headroom so N concurrent allocators don't trip the shared
+			// trigger N x more often per unit of per-thread progress. Additive (not
+			// the former `next_gc *= lt` multiplier) and clamped to the soft heap
+			// limit, so the goal can never outrun the arena capacity — the pacer
+			// must stay alive on many-threaded servers (the field OOM mode).
 			lt := C.vgc_atomic_load_u32(&vgc_heap.live_threads)
 			if lt > 1 {
-				next_gc *= u64(lt)
+				next_gc += u64(lt - 1) * vgc_thread_headroom
 			}
+		}
+		if next_gc > vgc_heap_soft_limit {
+			next_gc = vgc_heap_soft_limit
 		}
 		C.vgc_trace(20, C.vgc_get_cache_idx(), heap_live, next_gc) // PACE (diagnostic)
 		if heap_live >= next_gc {
@@ -1474,6 +1573,9 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 				if zero_fill {
 					unsafe { C.memset(ptr, 0, usize(span.elem_size)) }
 				} else {
+					$if vgc_verify ? {
+						unsafe { C.memset(ptr, 0, usize(span.elem_size)) } // DEBUG: clean verifier signal (see non-tiny path)
+					}
 				}
 				unsafe {
 					// Mark the span as tiny-packed: this slot will hold several
@@ -1508,6 +1610,13 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 		vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
 		if zero_fill {
 			unsafe { C.memset(ptr, 0, n) }
+		}
+		$if vgc_verify ? {
+			// DEBUG-ONLY: zero the FULL slot (not just n) so the mark-closure
+			// verifier never mistakes a noscan slot's stale tail bytes for a live
+			// pointer. The real collector never scans noscan spans, so this has no
+			// production effect — it only cleans the verifier's signal.
+			unsafe { C.memset(ptr, 0, usize(span.elem_size)) }
 		}
 	}
 	return ptr
@@ -2133,8 +2242,9 @@ fn vgc_safepoint() {
 		return
 	}
 	unsafe {
-		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stopped_count,
-			&vgc_heap.caches[cache_idx].stopped, &vgc_heap.caches[cache_idx].stack_lo,
-			&vgc_heap.caches[cache_idx].stack_hi, vgc_heap.caches[cache_idx].stack_base)
+		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq, &vgc_heap.gc_stopped_count,
+			&vgc_heap.caches[cache_idx].stopped, &vgc_heap.caches[cache_idx].park_seq,
+			&vgc_heap.caches[cache_idx].stack_lo, &vgc_heap.caches[cache_idx].stack_hi,
+			vgc_heap.caches[cache_idx].stack_base)
 	}
 }
