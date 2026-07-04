@@ -437,8 +437,10 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			continue
 		}
 		mut sp := usize(0)
-		mut regs := [31]usize{}
-		n := C.vgc_thread_regs(c.mach_port, &sp, &regs[0], 31)
+		// 31 GP (x0–x28 + fp + lr) + 64 NEON lanes (v0–v31 × 2) = 95 conservative
+		// root candidates per suspended thread (arm64; x86_64 fills only the first 15).
+		mut regs := [95]usize{}
+		n := C.vgc_thread_regs(c.mach_port, &sp, &regs[0], 95)
 		C.vgc_trace(8, i, u64(sp), u64(n)) // SCAN (sp + reg count actually captured)
 		if n > 0 && sp != 0 {
 			vgc_refresh_stack_range_for_sp(i, sp) // [sp, stack_base]
@@ -587,6 +589,16 @@ fn vgc_mark_roots() {
 				vgc_watch_scan_range(cache.stack_lo, cache.stack_hi, i)
 			}
 		}
+	}
+
+	// Shade pinned objects — cgo-safe explicit roots (see vgc_pin). A live object
+	// reachable only from non-GC (FFI/C) memory is invisible to the precise scan
+	// above; pinning makes it a root so it (and its transitive referents) survive.
+	// Lock-free read under STW: frozen mutators cannot mutate the set, and unpin's
+	// publish-before-shrink keeps every live pin visible (see vgc_pin/vgc_unpin).
+	np := vgc_npins
+	for k in 0 .. np {
+		vgc_shade(usize(unsafe { vgc_pins[k] }))
 	}
 }
 
