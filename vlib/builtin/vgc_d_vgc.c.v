@@ -1441,8 +1441,22 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 	mut span := vgc_span_alloc(npages)
 	if span == unsafe { nil } {
 		// Reclaim + retry before OOM (see vgc_collect_and_retry_span).
+		// MUST mirror vgc_collect_and_retry_span: after force_collect, WAIT for any
+		// in-flight collection to finish before retrying. vgc_force_collect no-ops when
+		// another thread already holds the collector (vgc_gc_start CAS-fails and returns
+		// immediately if gc_phase != off). Without the wait, N concurrent large
+		// allocators that hit arena exhaustion at once burn all 8 retries spinning on a
+		// still-full heap WHILE the one winning collector is mid-sweep, then spuriously
+		// return nil — the caller NULL-derefs or memory_panics even though the collection
+		// is about to free the spans they need. (observed in the field as a multi-mutator
+		// HTTP-reactor OOM-panic. The small-object path already waits; the large path did
+		// not — this closes that asymmetry. Single-threaded is unaffected: no contender,
+		// so gc_phase is already off after our own force_collect.)
 		for _ in 0 .. 8 {
 			vgc_force_collect()
+			for C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+				C.vgc_atomic_fence()
+			}
 			span = vgc_span_alloc(npages)
 			if span != unsafe { nil } {
 				break
