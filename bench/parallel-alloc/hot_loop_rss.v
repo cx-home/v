@@ -53,15 +53,24 @@ fn main() {
 		iters = os.args[2].int()
 	}
 	t0 := time.now()
-	mut handles := []thread u64{}
-	for t in 0 .. nthreads {
-		handles << spawn worker(iters, t)
-	}
 	mut total := u64(0)
-	for h in handles {
-		total += h.wait()
+	if nthreads == 0 {
+		// Inline mode: run one worker on the MAIN thread with nothing spawned —
+		// the collector sees zero other registered mutators (want=0), so the
+		// stop-wait and mach-suspend paths are skipped entirely. Isolates the
+		// mark/sweep pause from the STW-protocol cost (#71 pause budgeting).
+		total = worker(iters, 0)
+	} else {
+		mut handles := []thread u64{}
+		for t in 0 .. nthreads {
+			handles << spawn worker(iters, t)
+		}
+		for h in handles {
+			total += h.wait()
+		}
 	}
 	elapsed := time.since(t0)
-	ops := f64(nthreads) * f64(iters) / (f64(elapsed.microseconds()) / 1_000_000.0)
+	nworkers := if nthreads == 0 { 1 } else { nthreads }
+	ops := f64(nworkers) * f64(iters) / (f64(elapsed.microseconds()) / 1_000_000.0)
 	println('threads=${nthreads} iters/thread=${iters} elapsed=${elapsed} Mops/s=${ops / 1_000_000.0:.2f} acc=${total} max_rss_kb=${max_rss_kb()}')
 }

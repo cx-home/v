@@ -26,6 +26,7 @@ fn C.vgc_atomic_add_u32(ptr &u32, val u32) u32
 fn C.vgc_atomic_cas_u32(ptr &u32, expected &u32, desired u32) bool
 fn C.vgc_atomic_exchange_u32(ptr &u32, val u32) u32
 fn C.vgc_atomic_fence()
+fn C.vgc_cpu_pause()
 fn C.vgc_os_alloc(size usize) voidptr
 fn C.vgc_os_free(ptr voidptr, size usize)
 fn C.vgc_os_decommit(ptr voidptr, size usize)
@@ -64,7 +65,7 @@ fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
-fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -243,10 +244,10 @@ mut:
 	// walks (incl. lazy sweep outside STW) never observe a relocated/freed buffer —
 	// sidestepping the realloc race that runtime doubling would introduce. Capacity is
 	// load-bearing: span reuse + the sweep_gen one-cycle grace make the live span
-	// count ~2x the heap-goal working set, and per-thread GC pacing
-	// (vgc_pace_by_threads) raises the heap goal ~N x for N mutators, so an alloc-heavy
-	// [par] workload needs far more than the old fixed 262144. vgc_span_alloc fails
-	// loudly (never silently) past cap.
+	// count ~2x the heap-goal working set, and a VGC_NEXT_GC_MB-pinned headroom (or a
+	// large marked set via the GOGC term) can push the goal far past the adaptive
+	// default, so an alloc-heavy [par] workload needs far more than the old fixed
+	// 262144. vgc_span_alloc fails loudly (never silently) past cap.
 	allspans     &&VGC_Span = unsafe { nil }
 	allspans_cap int
 	nspans       int
@@ -411,35 +412,66 @@ fn vgc_unpin(p voidptr) {
 // Initialization
 // ============================================================
 
-// Per-thread GC pacing + trigger-floor knobs. VGC_NEXT_GC_MB raises the GC trigger
-// floor (MB). Per-thread pacing scales the live trigger by the live mutator count so N
-// concurrent allocators don't trip the shared trigger N x more often per unit of
-// per-thread progress — recovering parallel alloc-heavy scaling under the full-STW
-// backstop. It is ON BY DEFAULT (B18): it is adaptive (no effect when live_threads<=1,
-// so single-threaded / small programs keep the historic 256 MB trigger and RSS), and
-// with the B18 allocator fixes (descriptor slab + drop-return) it gives ~2.9x [par]
-// scaling at bounded RSS (~2.3 GB on the #14 workload). Set VGC_PACE=0 to disable it
-// (escape hatch); any other VGC_PACE value forces it on.
+// GC pacing knobs. VGC_NEXT_GC_MB pins the pacer headroom (MB) — see the
+// adaptive-headroom block below. vgc_base_floor holds that pinned value; since
+// the cx #71 adaptive pacer it has no other role (the historic use as a fixed
+// 256 MB trigger floor, and the later per-thread additive ceiling on top of it,
+// are both retired — see vgc_headroom_cap for why the ceiling is now small and
+// flat).
 __global vgc_base_floor = u64(256 * 1024 * 1024)
-__global vgc_pace_by_threads = true
 // VGC_GCTRACE=1 enables the per-cycle pacing trace (vgc_gctrace_line): cycle,
 // marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
 // gctrace analog) — costs one integer test per cycle when off.
 __global vgc_gctrace = u32(0)
-// Per-extra-mutator pacing headroom (bytes; VGC_PACE_MB overrides). Replaces the
-// former MULTIPLICATIVE per-thread goal scaling (`goal *= live_threads`), which
-// was unsound as policy: on a many-threaded server it scaled the WHOLE live-set
-// goal by N (e.g. marked 558 MB x2 x9 threads = a 10 GB trigger, beyond the 4 GB
-// arena capacity), so the pacer never fired again and the heap rode arena
-// exhaustion until an allocation burst failed => the #57 field OOM
-// (`V panic: memory allocation failure` at RSS ~4.6 GB). Only the per-thread
-// allocation SLACK should scale with thread count, and additively.
-__global vgc_thread_headroom = u64(128 * 1024 * 1024)
+// Flat ceiling for the ADAPTIVE headroom (the pinned VGC_NEXT_GC_MB path is not
+// clamped by it). Deliberately small, and deliberately NOT scaled by thread
+// count: every probe of the old thread-scaled ceiling (256 MB + 128 MB per
+// extra mutator, and before that the multiplicative goal scaling that caused
+// the #57 field OOM at a 10 GB trigger) measured as pure space burn — at a
+// 4-worker allocate/discard extreme, pinned 64/128/256 MB headrooms were
+// throughput-equivalent while RSS scaled with the headroom (151/288/563 MB),
+// because past a few tens of MB the cycle cost is span-walk-dominated (walks
+// scale WITH the headroom), so extra space stops reducing the overhead ratio.
+// A loaded box or a dev (-O0) build made the old ceiling actively harmful: GC
+// stayed "expensive" by measurement, so servers rode to 768 MB+ heaps for
+// nothing. Big LIVE sets still get a proportional goal via the GOGC term.
+__global vgc_headroom_cap = u64(64 * 1024 * 1024)
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling
 // (vgc_max_arenas * vgc_arena_size = 4 GB). Default = half the arena capacity.
 // Go's GOMEMLIMIT analog for the backstop collector.
 __global vgc_heap_soft_limit = u64(2) * 1024 * 1024 * 1024
+// ── cx #71 ADAPTIVE PACER HEADROOM ──────────────────────────────────────────
+// vgc_headroom is how many bytes of net heap growth beyond the marked (live)
+// set the pacer allows before the next backstop cycle. It REPLACES the fixed
+// 256 MB absolute trigger floor + check-time per-thread additive, which were a
+// pure space-for-throughput trade: a tight allocate/discard loop with an O(1)
+// live set accumulated dead transients all the way to the floor (plus 128 MB x
+// live_threads on servers) before the first collection, so RSS rode the trigger
+// (boehm keeps the same loop bounded within a few MB) and every allocation-heavy
+// call site needed a manual gc_collect() crutch (cx #52 fd-streaming writes,
+// #57/#131 http reactors).
+// The headroom is ADAPTIVE instead of fixed: after every cycle the pacer
+// compares the cycle's STW cost against the mutator time since the previous
+// cycle (vgc_update_trigger). While GC overhead stays under ~2% of wall time
+// the headroom halves (collections are cheap — collect eagerly, RSS tracks the
+// live set the way boehm's allocation-driven trigger does); above ~10% it
+// doubles (collections are expensive — buy back throughput with space, up to
+// the small flat vgc_headroom_cap, clamped at the soft limit; see the cap's doc
+// for why growing further is pure space burn). The band is deliberately
+// TIME-generous, like boehm: space stays near the live set unless GC time is
+// severe.
+// VGC_NEXT_GC_MB (which used to set the fixed floor) now PINS the headroom at
+// the given size — adaptation off — preserving its test/ops semantics of "GC
+// about every N MB of growth", deterministically.
+__global vgc_headroom = u64(8) * 1024 * 1024
+__global vgc_headroom_min = u64(8) * 1024 * 1024
+__global vgc_headroom_pinned = false
+// Cycle timestamps for the overhead measurement (collector-only writes: t0 is
+// stamped by the thread that won the gc_phase CAS; last_end in the STW
+// trigger recompute — never touched on the allocation path).
+__global vgc_gc_t0 = u64(0)
+__global vgc_gc_last_end = u64(0)
 
 // ── #58 SCANNED-WINDOW SHADOW (-d vgc_spcheck) ──────────────────────────────
 // Per-thread snapshot of the [stack_lo, stack_hi] range the collector actually
@@ -770,6 +802,7 @@ fn vgc_spchk_report(pkey voidptr, myframe usize) {
 
 fn C.atoll(&char) i64
 fn C.getenv(&char) &char
+fn C.vgc_now_ns() u64
 
 // vgc_init initializes the vgc heap: it fills the size-class tables, enables the
 // collector and reads the `VGC_NEXT_GC_MB` environment override for the initial
@@ -783,24 +816,26 @@ pub fn vgc_init() {
 	if mb_env != unsafe { nil } {
 		mb := C.atoll(mb_env)
 		if mb > 0 {
+			// PIN the pacer: a fixed trigger headroom of exactly this size, no
+			// adaptation. Deterministic "collect about every N MB of growth" for
+			// tests (soundness gates run VGC_NEXT_GC_MB=4 to force frequent STW
+			// cycles) and for ops overrides. Also keeps the value as the ceiling
+			// base so the pinned headroom is never clamped below itself.
 			vgc_base_floor = u64(mb) * 1024 * 1024
+			vgc_headroom = vgc_base_floor
+			vgc_headroom_min = vgc_base_floor
+			vgc_headroom_pinned = true
 		}
-	}
-	pace_env := C.getenv(c'VGC_PACE')
-	if pace_env != unsafe { nil } {
-		// Explicit override of the on-by-default pacing: VGC_PACE=0 disables it,
-		// any other value forces it on.
-		vgc_pace_by_threads = C.atoll(pace_env) != 0
 	}
 	trace_env := C.getenv(c'VGC_GCTRACE')
 	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
 		vgc_gctrace = 1
 	}
-	pace_mb_env := C.getenv(c'VGC_PACE_MB')
-	if pace_mb_env != unsafe { nil } {
-		pmb := C.atoll(pace_mb_env)
-		if pmb >= 0 {
-			vgc_thread_headroom = u64(pmb) * 1024 * 1024
+	cap_env := C.getenv(c'VGC_HEADROOM_MB')
+	if cap_env != unsafe { nil } {
+		cmb := C.atoll(cap_env)
+		if cmb > 0 {
+			vgc_headroom_cap = u64(cmb) * 1024 * 1024
 		}
 	}
 	// Soft limit: half the physical arena capacity by default, env-overridable.
@@ -812,7 +847,13 @@ pub fn vgc_init() {
 			vgc_heap_soft_limit = u64(lmb) * 1024 * 1024
 		}
 	}
-	vgc_heap.next_gc = vgc_base_floor // favor throughput over early collections
+	// Initial trigger = the (small) adaptive headroom, NOT the 256 MB ceiling:
+	// a short-lived or small-live-set program never builds hundreds of MB of
+	// dead transients before its first collection (cx #71 — boehm-matching
+	// eagerness). An allocation-heavy program doubles its way to the ceiling in
+	// a handful of cheap early cycles (~log2(ceiling/min) collections).
+	vgc_heap.next_gc = vgc_headroom
+	vgc_gc_last_end = C.vgc_now_ns()
 	vgc_heap.gc_phase = vgc_phase_off
 	// NOTE: allspans is allocated LAZILY on the first vgc_span_alloc (under
 	// vgc_heap.lock), not here — spans can be allocated during _vinit, BEFORE
@@ -1857,22 +1898,12 @@ fn vgc_maybe_gc() {
 		u64(C.vgc_atomic_load_u32(&vgc_heap.gc_enabled))) // MAYBE_GC entry (diagnostic, pre-gate)
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) != 0 {
 		heap_live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
-		mut next_gc := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
-		if vgc_pace_by_threads {
-			// Per-thread pacing: give the heap N mutators' worth of ADDITIVE
-			// allocation headroom so N concurrent allocators don't trip the shared
-			// trigger N x more often per unit of per-thread progress. Additive (not
-			// the former `next_gc *= lt` multiplier) and clamped to the soft heap
-			// limit, so the goal can never outrun the arena capacity — the pacer
-			// must stay alive on many-threaded servers (#57/#71 field OOM).
-			lt := C.vgc_atomic_load_u32(&vgc_heap.live_threads)
-			if lt > 1 {
-				next_gc += u64(lt - 1) * vgc_thread_headroom
-			}
-		}
-		if next_gc > vgc_heap_soft_limit {
-			next_gc = vgc_heap_soft_limit
-		}
+		// next_gc is fully precomputed under STW by vgc_update_trigger (cx #71
+		// adaptive headroom; the former check-time per-thread additive moved into
+		// the ceiling there, already soft-limit clamped). The check is two atomic
+		// loads and a compare. Thread-count changes between cycles are absorbed by
+		// the adaptation, not by re-deriving the goal on the trigger path.
+		next_gc := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
 		C.vgc_trace(20, C.vgc_get_cache_idx(), heap_live, next_gc) // PACE (diagnostic)
 		if heap_live >= next_gc {
 			// Run the collection through a trampoline that spills THIS
