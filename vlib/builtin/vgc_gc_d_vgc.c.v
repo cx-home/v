@@ -29,6 +29,7 @@ fn vgc_gc_start() {
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return
 	}
+	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
 
 	// Take free_spans_lock for the WHOLE cycle, BEFORE stopping the world, so no
 	// mutator is ever frozen mid-vgc_get_free_span holding it (which, if the lock
@@ -139,9 +140,37 @@ fn vgc_gc_start() {
 			// and self-parks within microseconds; a syscall-blocked / tight-loop thread
 			// never reaches the poll, so it is mach-suspended below. Keep it short so the
 			// per-GC cost stays negligible.
+			// PLATEAU early-exit (#71): `want` counts EVERY other registered mutator,
+			// including permanently-blocked ones (main in thread-join, idle listeners in
+			// kevent) that will never park — with any such thread present the plain
+			// bounded wait burned the FULL spin budget every cycle, a fixed ~ms of pause
+			// regardless of heap size. That floor fed the adaptive pacer's overhead
+			// measurement and dragged the headroom (and RSS) up for programs whose GC
+			// work is otherwise tiny. Instead, once the parked count stops advancing for
+			// a stretch generously longer than any allocating thread's inter-poll gap
+			// (a span refill is at most ~1024 bump allocations away), the remaining
+			// threads are blocked/non-allocating by construction — stop waiting and
+			// mach-suspend them (the designed-sound straggler path, GAP-1).
+			// Plateau size: an allocating thread's worst-case inter-poll gap is one
+			// span refill away (~1024 bump allocations, ~tens of us); 2000 pause-loop
+			// iterations comfortably covers it while keeping the no-parker exit under
+			// ~0.1 ms. cpu_pause, not a seq_cst fence: the acquire load already gives
+			// the needed ordering, and 20k fence iterations alone cost ~1 ms of pause.
 			mut spins := 0
+			mut stable := 0
+			mut last_stopped := u32(0xffffffff)
 			for C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want && spins < 200000 {
-				C.vgc_atomic_fence()
+				cur := C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count)
+				if cur != last_stopped {
+					last_stopped = cur
+					stable = 0
+				} else {
+					stable++
+					if stable > 2000 {
+						break
+					}
+				}
+				C.vgc_cpu_pause()
 				spins++
 			}
 		}
@@ -427,10 +456,15 @@ fn vgc_gc_start() {
 		// consistent snapshot: cycle, marked (true live set), the recomputed base
 		// goal (pre thread-multiplier), arena/span pressure, live mutators.
 		// Env-gated (one integer test per cycle when off).
+		mut pause_us := u64(0)
+		if vgc_gc_last_end > vgc_gc_t0 {
+			pause_us = (vgc_gc_last_end - vgc_gc_t0) / 1000
+		}
 		C.vgc_gctrace_line(u64(vgc_heap.gc_cycle),
 			C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
 			C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas),
-			u64(vgc_heap.nspans), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
+			u64(vgc_heap.nspans), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
+			vgc_headroom / 1024, pause_us)
 	}
 	vgc_heap.gc_cycle++
 
@@ -584,6 +618,7 @@ fn vgc_gc_start_concurrent() {
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return // a cycle is already in flight
 	}
+	vgc_gc_t0 = C.vgc_now_ns() // adaptive-pacer cycle cost (#71); includes the concurrent middle
 	self_idx := C.vgc_get_cache_idx()
 
 	// ===== STW START =====
@@ -1755,18 +1790,77 @@ fn vgc_count_marked() u64 {
 	return total
 }
 
-// Update the GC trigger point for the next cycle.
-// Translated from Go's gcControllerState.endCycle() / heapGoal().
-// Uses GOGC logic: trigger when heap grows to (1 + GOGC/100) * marked
+// Adaptation thresholds for the #71 adaptive headroom (see the vgc_headroom
+// doc block): grow when the cycle cost exceeds ~1/10 (10%) of the mutator time
+// since the previous cycle, shrink below ~1/50 (2%). The dead band between them
+// prevents flapping; x2 steps traverse min..ceiling in a handful of cycles.
+// The band is deliberately TIME-generous (boehm-like: space stays proportional
+// unless GC time is severe). A tighter 2%-grow trigger measured WORSE on both
+// axes: on a dev-build (-O0) reactor under loopback hammer (pause ~3-5ms) it
+// rode the many-threaded ceiling to ~1.1 GB RSS, and on the t=4 pure-alloc
+// bench the 768 MB equilibrium it picked was slower than a pinned 256 MB
+// (12.07 vs 11.09 Mops/s) — headroom growth stops paying once the pause is
+// span-walk-dominated, so demanding <2% overhead just burns space for nothing.
+const vgc_overhead_grow_div = u64(10)
+const vgc_overhead_shrink_div = u64(50)
+
+// Update the GC trigger point for the next cycle. Runs under STW, right after
+// sweep — the only writer of next_gc / headroom / cycle timestamps.
+// Goal = marked + max(headroom, marked * GOGC/100), clamped to the soft limit.
+// The GOGC term is Go's gcControllerState.endCycle() proportional growth (it
+// dominates for large live sets — unchanged behavior). The headroom term is
+// the cx #71 adaptive replacement for the old fixed 256 MB absolute floor +
+// check-time per-thread additive: it decides how much DEAD transient growth a
+// small-live-set program accumulates between backstop cycles, sized by what
+// collections actually cost here and now rather than by a static guess.
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
 
-	mut goal := marked + marked * gc_percent / 100
-	// Avoid very small heap goals that force frequent full cycles on bursty workloads.
-	if goal < vgc_base_floor {
-		goal = vgc_base_floor
+	now := C.vgc_now_ns()
+	if !vgc_headroom_pinned {
+		// Cycle cost vs mutator progress. pause = this cycle (t0 stamped at the
+		// winning gc_phase CAS, so it includes the stop protocol + mark + sweep);
+		// interval = mutator wall time between the previous cycle's end and this
+		// cycle's start. Monotonic clock, but guard the subtractions anyway — a
+		// zero pause/interval just falls into the shrink/grow branch harmlessly.
+		mut pause := u64(0)
+		if vgc_gc_t0 != 0 && now > vgc_gc_t0 {
+			pause = now - vgc_gc_t0
+		}
+		mut interval := u64(0)
+		if vgc_gc_t0 > vgc_gc_last_end {
+			interval = vgc_gc_t0 - vgc_gc_last_end
+		}
+		mut hr := vgc_headroom
+		if pause * vgc_overhead_grow_div > interval {
+			hr *= 2 // GC overhead > ~2%: buy throughput with space
+		} else if pause * vgc_overhead_shrink_div < interval {
+			hr /= 2 // GC overhead < ~0.25%: collections are cheap, collect eagerly
+		}
+		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
+		// growing past it measured as pure space burn on every workload probed —
+		// the pause is span-walk-dominated up there, so more headroom does not
+		// reduce the overhead ratio). Floor = vgc_headroom_min (8 MB default).
+		mut hr_max := vgc_headroom_cap
+		if hr_max > vgc_heap_soft_limit {
+			hr_max = vgc_heap_soft_limit
+		}
+		if hr < vgc_headroom_min {
+			hr = vgc_headroom_min
+		}
+		if hr > hr_max {
+			hr = hr_max
+		}
+		vgc_headroom = hr
 	}
+	vgc_gc_last_end = now
+
+	mut extra := marked * gc_percent / 100
+	if extra < vgc_headroom {
+		extra = vgc_headroom
+	}
+	mut goal := marked + extra
 	// Clamp to the soft heap limit: the backstop must keep firing well before the
 	// physical arena ceiling regardless of how large the marked set gets (#57/#71).
 	if goal > vgc_heap_soft_limit {
