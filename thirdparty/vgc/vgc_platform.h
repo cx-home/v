@@ -437,6 +437,28 @@ static inline uint8_t vgc_size_class(uint32_t size) {
 #endif
 
 // ============================================================
+// Monotonic nanosecond clock — GC pacer overhead measurement (cx #71 adaptive
+// headroom). Called once per GC cycle (never on the allocation path), so a
+// plain syscall-backed read is fine.
+// ============================================================
+#ifdef _WIN32
+static inline uint64_t vgc_now_ns(void) {
+    static LARGE_INTEGER vgc__qpf = {0};
+    LARGE_INTEGER c;
+    if (vgc__qpf.QuadPart == 0) QueryPerformanceFrequency(&vgc__qpf);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)vgc__qpf.QuadPart);
+}
+#else
+#include <time.h>
+static inline uint64_t vgc_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
+// ============================================================
 // Simple mutex (adaptive spinlock with backoff)
 // ============================================================
 static inline void vgc_mutex_lock(volatile uint32_t* lock) {
@@ -1219,11 +1241,14 @@ static void vgc__wdec(uint64_t v) {
     (void)!write(2, b + i, 24 - i);
 }
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
-                             uint64_t narenas, uint64_t nspans, uint64_t lthreads) {
+                             uint64_t narenas, uint64_t nspans, uint64_t lthreads,
+                             uint64_t headroom_kb, uint64_t pause_us) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] marked="); vgc__wdec(marked / (1024 * 1024));
     vgc__ws("MB goal="); vgc__wdec(goal / (1024 * 1024));
-    vgc__ws("MB arenas="); vgc__wdec(narenas);
+    vgc__ws("MB headroom="); vgc__wdec(headroom_kb);
+    vgc__ws("KB pause="); vgc__wdec(pause_us);
+    vgc__ws("us arenas="); vgc__wdec(narenas);
     vgc__ws(" spans="); vgc__wdec(nspans);
     vgc__ws(" threads="); vgc__wdec(lthreads);
     vgc__ws("\n");
