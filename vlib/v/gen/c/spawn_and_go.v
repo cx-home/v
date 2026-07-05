@@ -378,6 +378,21 @@ fn (mut g Gen) spawn_and_go_expr(node ast.SpawnExpr, mode SpawnGoMode) {
 					g.gowrappers.writeln('\tif (ret_ptr == NULL) builtin___v_panic(_S("thread return allocation failed"));')
 				} else {
 					g.gowrappers.writeln('\t${wrapper_s_ret_typ}* ret_ptr = (${wrapper_s_ret_typ}*) builtin___v_malloc(sizeof(${wrapper_s_ret_typ}));')
+					if g.pref.gc_mode == .vgc {
+						// vgc: PIN the return box for the window where its ONLY
+						// reference is pthread's internal join value (after this
+						// thread exits+deregisters, before the waiter's
+						// pthread_join hands the pointer back) — memory the
+						// collector never scans, so an intervening GC swept the
+						// box and the waiter read (then _v_freed) a recycled
+						// slot: one poisoned word per join under a frequent-GC
+						// pacer (silent result corruption). Boehm avoids this
+						// only by interposing pthread_join; vgc uses its FFI
+						// pin primitive instead. Unpinned by the waiter right
+						// after the read. A never-waited joinable thread leaks
+						// its pin slot exactly like it already leaks the box.
+						g.gowrappers.writeln('\tbuiltin__vgc_pin(ret_ptr);')
+					}
 				}
 				$if tinyc && arm64 {
 					g.gowrappers.write_string('\t${wrapper_s_ret_typ} tcc_bug_tmp_var = ')
@@ -583,6 +598,11 @@ fn (mut g Gen) create_waiter_handler(call_ret_type ast.Type, s_ret_typ string, g
 		if g.pref.prealloc {
 			g.gowrappers.writeln('\tfree(ret_ptr);')
 		} else {
+			if g.pref.gc_mode == .vgc && g.pref.os != .windows {
+				// Release the return-box pin taken in the spawn wrapper (see
+				// the builtin__vgc_pin note there) now that the value is read.
+				g.gowrappers.writeln('\tbuiltin__vgc_unpin(ret_ptr);')
+			}
 			g.gowrappers.writeln('\tbuiltin___v_free(ret_ptr);')
 		}
 		g.gowrappers.writeln('\treturn ret;')

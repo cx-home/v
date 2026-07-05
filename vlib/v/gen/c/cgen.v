@@ -2183,6 +2183,13 @@ fn (mut g Gen) register_thread_wait_call(eltyp string) {
 		if g.pref.prealloc {
 			g.gowrappers.writeln('\tfree(ret_val);')
 		} else {
+			if g.pref.gc_mode == .vgc {
+				// Release the return-box pin taken in the spawn wrapper (see the
+				// builtin__vgc_pin note in spawn_and_go.v) now that the value is
+				// read — the box was reachable ONLY via pthread's join value
+				// after the thread exited, which the collector never scans.
+				g.gowrappers.writeln('\tbuiltin__vgc_unpin(ret_val);')
+			}
 			g.gowrappers.writeln('\tbuiltin___v_free(ret_val);')
 		}
 	}
