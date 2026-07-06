@@ -2,6 +2,7 @@ module mbedtls
 
 import io
 import net
+import sync
 import time
 
 const mbedtls_client_read_timeout_ms = $d('mbedtls_client_read_timeout_ms', 10_000)
@@ -156,6 +157,17 @@ pub mut:
 	alpn_list &&char = unsafe { nil }
 }
 
+// SSLIdentityGen is one rotated server-identity generation (rotate_certs).
+// A connection is set up against the generation current at its accept and
+// keeps pointing into that generation's conf for its whole lifetime — so
+// generations are retained until listener shutdown, never freed on rotation.
+@[heap]
+struct SSLIdentityGen {
+mut:
+	conf  C.mbedtls_ssl_config
+	certs &SSLCerts = unsafe { nil }
+}
+
 // SSLListener listens on a TCP port and accepts connection secured with TLS
 pub struct SSLListener {
 	saddr  string
@@ -172,6 +184,14 @@ mut:
 	// strings in config.alpn_protocols, advertised by accepted connections.
 	// It must outlive the SSL config and is freed in shutdown().
 	alpn_list &&char = unsafe { nil }
+	// Runtime certificate rotation (rotate_certs): `active` (nil → the
+	// init-time embedded conf) is the identity NEW connections are set up
+	// with; superseded generations park in `retained` until shutdown because
+	// live connections still reference them. rot_mu guards the swap and the
+	// accept-side read.
+	rot_mu   &sync.Mutex = unsafe { nil }
+	active   &SSLIdentityGen = unsafe { nil }
+	retained []&SSLIdentityGen
 	// handle		int
 	// duration	time.Duration
 }
@@ -195,6 +215,19 @@ pub fn (mut l SSLListener) shutdown() ! {
 	if unsafe { l.certs != nil } {
 		l.certs.cleanup()
 	}
+	// Rotated identity generations (rotate_certs) are freed only here — live
+	// connections referenced them until now.
+	if l.active != unsafe { nil } {
+		l.retained << l.active
+		l.active = unsafe { nil }
+	}
+	for mut gen in l.retained {
+		if gen.certs != unsafe { nil } {
+			gen.certs.cleanup()
+		}
+		C.mbedtls_ssl_config_free(&gen.conf)
+	}
+	l.retained.clear()
 	C.mbedtls_ssl_free(&l.ssl)
 	C.mbedtls_ssl_config_free(&l.conf)
 	free_rng(mut l.ctr_drbg, mut l.entropy)
@@ -222,6 +255,7 @@ fn (mut l SSLListener) init() ! {
 	if l.config.validate && l.config.verify == '' {
 		return error('net.mbedtls SSLListener.init, no root CA provided')
 	}
+	l.rot_mu = sync.new_mutex()
 	C.mbedtls_net_init(&l.server_fd)
 	C.mbedtls_ssl_init(&l.ssl)
 	C.mbedtls_ssl_config_init(&l.conf)
@@ -315,6 +349,97 @@ fn (mut l SSLListener) init() ! {
 	}
 }
 
+// rotate_certs installs a new server identity (cert/key + optional client-CA)
+// for connections accepted AFTER this call. Established and in-flight
+// connections keep the identity generation they were set up with; superseded
+// generations are retained until shutdown() so no live connection ever
+// dereferences freed material. Identity only: the listener's bound socket,
+// RNG, read timeout, and ALPN protocol list are shared across generations.
+// On error the running identity is untouched (validate-then-swap).
+pub fn (mut l SSLListener) rotate_certs(config SSLConnectConfig) ! {
+	$if trace_ssl ? {
+		eprintln(@METHOD)
+	}
+	if config.cert == '' || config.cert_key == '' {
+		return error('net.mbedtls SSLListener.rotate_certs, no certificate or key provided')
+	}
+	if config.validate && config.verify == '' {
+		return error('net.mbedtls SSLListener.rotate_certs, no root CA provided')
+	}
+	mut gen := &SSLIdentityGen{}
+	C.mbedtls_ssl_config_init(&gen.conf)
+	mut ok := false
+	defer {
+		if !ok {
+			if gen.certs != unsafe { nil } {
+				gen.certs.cleanup()
+			}
+			C.mbedtls_ssl_config_free(&gen.conf)
+		}
+	}
+	mut ret := C.mbedtls_ssl_config_defaults(&gen.conf, C.MBEDTLS_SSL_IS_SERVER,
+		C.MBEDTLS_SSL_TRANSPORT_STREAM, C.MBEDTLS_SSL_PRESET_DEFAULT)
+	if ret != 0 {
+		return error_with_code("net.mbedtls SSLListener.rotate_certs, mbedtls_ssl_config_defaults can't set config defaults ret: ${ret}",
+			ret)
+	}
+	C.mbedtls_ssl_conf_read_timeout(&gen.conf, mbedtls_server_read_timeout_ms)
+	unsafe {
+		C.mbedtls_ssl_conf_rng(&gen.conf, C.mbedtls_ctr_drbg_random, &l.ctr_drbg)
+	}
+	gen.certs = if config.in_memory_verification {
+		new_sslcerts_in_memory_with_rng(config.verify, config.cert, config.cert_key,
+			&l.ctr_drbg) or {
+			return error('net.mbedtls SSLListener.rotate_certs, cert failure (in-memory), err: ${err}')
+		}
+	} else {
+		new_sslcerts_from_file_with_rng(config.verify, config.cert, config.cert_key,
+			&l.ctr_drbg) or {
+			return error('net.mbedtls SSLListener.rotate_certs, cert failure (file), err: ${err}')
+		}
+	}
+	if config.validate {
+		C.mbedtls_ssl_conf_authmode(&gen.conf, C.MBEDTLS_SSL_VERIFY_REQUIRED)
+	}
+	C.mbedtls_ssl_conf_ca_chain(&gen.conf, &gen.certs.cacert, unsafe { nil })
+	ret = C.mbedtls_ssl_conf_own_cert(&gen.conf, &gen.certs.client_cert, &gen.certs.client_key)
+	if ret != 0 {
+		return error_with_code("net.mbedtls SSLListener.rotate_certs, mbedtls_ssl_conf_own_cert can't load certificate ret: ${ret}",
+			ret)
+	}
+	if l.alpn_list != unsafe { nil } {
+		ret = C.mbedtls_ssl_conf_alpn_protocols(&gen.conf, voidptr(l.alpn_list))
+		if ret != 0 {
+			return error_with_code('net.mbedtls SSLListener.rotate_certs, mbedtls_ssl_conf_alpn_protocols failed ret: ${ret}',
+				ret)
+		}
+	}
+	l.rot_mu.lock()
+	if l.active != unsafe { nil } {
+		l.retained << l.active
+	}
+	l.active = gen
+	l.rot_mu.unlock()
+	ok = true
+}
+
+// current_conf resolves the ssl config new connections are set up against:
+// the latest rotated generation, or the init-time embedded conf when no
+// rotation has happened.
+fn (mut l SSLListener) current_conf() &C.mbedtls_ssl_config {
+	if l.rot_mu == unsafe { nil } { // pre-init defensive: no rotation possible yet
+		return &l.conf
+	}
+	l.rot_mu.lock()
+	defer {
+		l.rot_mu.unlock()
+	}
+	if l.active != unsafe { nil } {
+		return &l.active.conf
+	}
+	return &l.conf
+}
+
 // setup SNI callback
 fn (mut l SSLListener) init_sni(get_cert_callback fn (mut SSLListener, string) !&SSLCerts) {
 	$if trace_ssl ? {
@@ -353,7 +478,7 @@ pub fn (mut l SSLListener) accept() !&SSLConn {
 
 	C.mbedtls_ssl_init(&conn.ssl)
 	C.mbedtls_ssl_config_init(&conn.conf)
-	ret = C.mbedtls_ssl_setup(&conn.ssl, &l.conf)
+	ret = C.mbedtls_ssl_setup(&conn.ssl, l.current_conf())
 	if ret != 0 {
 		return error_with_code('net.mbedtls SSLListener.accept, mbedtls_ssl_setup SSL setup failed ret: ${ret}',
 			ret)
