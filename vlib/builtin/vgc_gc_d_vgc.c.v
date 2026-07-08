@@ -1866,6 +1866,24 @@ fn vgc_update_trigger() {
 	if goal > vgc_heap_soft_limit {
 		goal = vgc_heap_soft_limit
 	}
+	// Guaranteed progress under the clamp (cx #272): once the marked set reaches
+	// the soft limit, a clamped goal sits AT or BELOW heap_live, so every
+	// allocation-side pacing check fires a full collection — a mutator livelock,
+	// not pacing (measured: marked 594 MB vs a 512 MB limit ran 3286 back-to-back
+	// cycles, 99.6% of wall time paused, on a workload that completes in ~1 s
+	// unclamped). The soft limit is a pacing target, not a hard cap (the hard cap
+	// stays the physical arena ceiling + span-exhaustion force-collect), so when
+	// the live set alone exceeds it, overshoot by a minimum mutator budget —
+	// 1/16th of the live set (Go's GOMEMLIMIT keeps an analogous minimum headroom
+	// under its limit) with the adaptive floor as the small-heap lower bound.
+	// Goals already more than that budget under the limit are untouched.
+	mut min_budget := marked / 16
+	if min_budget < vgc_headroom_min {
+		min_budget = vgc_headroom_min
+	}
+	if goal < marked + min_budget {
+		goal = marked + min_budget
+	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 }
 
