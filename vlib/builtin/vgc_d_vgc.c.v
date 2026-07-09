@@ -313,6 +313,15 @@ __global vgc_alloc_lock = u32(0)
 // Fast bounds check for pointer validation
 __global vgc_arena_lo = usize(0)
 __global vgc_arena_hi = usize(0)
+// Effective arena-count ceiling. Set by vgc_init (VGC_MAX_ARENAS lowers it,
+// clamped to [1, vgc_max_arenas]) so tests and ops can force terminal heap
+// exhaustion at a small heap instead of the full compiled ceiling (cx #277 —
+// the loud-OOM regression path needs exhaustion to be reachable in well under a
+// second). ZERO until vgc_init runs: V's _vinit zero-initializes globals
+// regardless of the source initializer (see the vgc_heap note above), and spans
+// ARE allocated during _vinit, before vgc_init — vgc_span_alloc treats <=0 as
+// "pre-init" and falls back to the compiled capacity.
+__global vgc_max_arenas_eff = int(0)
 
 // Spawn-argument roots. `spawn f(...)` heap-allocates a thread-argument struct
 // (builtin___v_malloc), fills it, and hands it to pthread_create. Between create
@@ -847,6 +856,18 @@ pub fn vgc_init() {
 			vgc_heap_soft_limit = u64(lmb) * 1024 * 1024
 		}
 	}
+	// Effective arena ceiling (cx #277): VGC_MAX_ARENAS lowers the physical
+	// capacity so exhaustion is test-reachable. Lower-only — the arenas array is a
+	// fixed [vgc_max_arenas] block, so raising past the compiled capacity is not
+	// representable. The soft-limit default above deliberately stays derived from
+	// the COMPILED capacity: this knob moves the hard wall, not the pacing target.
+	maxa_env := C.getenv(c'VGC_MAX_ARENAS')
+	if maxa_env != unsafe { nil } {
+		ma := C.atoll(maxa_env)
+		if ma > 0 && ma <= i64(vgc_max_arenas) {
+			vgc_max_arenas_eff = int(ma)
+		}
+	}
 	// Initial trigger = the (small) adaptive headroom, NOT the 256 MB ceiling:
 	// a short-lived or small-live-set program never builds hundreds of MB of
 	// dead transients before its first collection (cx #71 — boehm-matching
@@ -1260,7 +1281,14 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 			return unsafe { nil }
 		}
 		arena_idx = vgc_heap.narenas
-		if arena_idx >= vgc_max_arenas {
+		// <=0 means vgc_init has not run yet (the _vinit allocation window) —
+		// fall back to the compiled capacity; VGC_MAX_ARENAS cannot apply before
+		// the env is parsed and a boot-time arena carve must never fail early.
+		mut max_arenas := vgc_max_arenas_eff
+		if max_arenas <= 0 {
+			max_arenas = int(vgc_max_arenas)
+		}
+		if arena_idx >= max_arenas {
 			C.vgc_os_free(mem, asize)
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }
@@ -1764,7 +1792,12 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 		// vgc_heap.lock before returning, so no lock is held here.)
 		span = vgc_collect_and_retry_span(cache_idx, span_class)
 		if span == unsafe { nil } {
-			return unsafe { nil } // genuine OOM after reclaim
+			// Genuine OOM after reclaim. Die LOUDLY here — the single chokepoint
+			// covering every V entry point (malloc_uninit and friends do not all
+			// nil-check) — instead of returning nil into a caller deref (cx #277).
+			// No allocator lock is held (see above), so the panic path is safe.
+			vgc_oom_report(n)
+			_memory_panic(@FN, isize(n))
 		}
 	}
 
@@ -1807,6 +1840,30 @@ fn vgc_force_collect() {
 	} else {
 		vgc_gc_start()
 	}
+}
+
+// Terminal heap exhaustion (cx #277): every retry-and-reclaim path below funnels
+// here before the V-level memory panic. Print allocator forensics with C.fprintf
+// ONLY — the panic machinery may allocate, so this line must land on stderr first
+// no matter what happens after. Before this existed, exhaustion returned nil
+// silently and not every V allocation entry point nil-checks (malloc_uninit et
+// al.), so the process died with a misleading SIGSEGV inside the next array
+// growth (the xap-marine helm's crash signature: alloc_array_data_uninit+28,
+// the first write to the "allocated" block) instead of naming the real
+// condition. The forensics matter: "arenas 64/64" distinguishes the compiled
+// 4 GB ceiling from RAM exhaustion (vgc_os_alloc failure prints the same shape
+// with arenas below the cap).
+fn vgc_oom_report(n usize) {
+	mut max_arenas := vgc_max_arenas_eff
+	if max_arenas <= 0 {
+		max_arenas = int(vgc_max_arenas) // pre-vgc_init window (see vgc_span_alloc)
+	}
+	C.fprintf(C.stderr, c'vgc: out of memory: %llu bytes requested; arenas %d/%d, spans %d, heap_live %llu MB, marked %llu MB, next_gc %llu MB, soft limit %llu MB\n',
+		u64(n), vgc_heap.narenas, max_arenas, vgc_heap.nspans,
+		C.vgc_atomic_load_u64(&vgc_heap.heap_live) / (1024 * 1024),
+		C.vgc_atomic_load_u64(&vgc_heap.heap_marked) / (1024 * 1024),
+		C.vgc_atomic_load_u64(&vgc_heap.next_gc) / (1024 * 1024),
+		vgc_heap_soft_limit / (1024 * 1024))
 }
 
 // Span-allocation failed (arenas physically exhausted while the heap_live-driven
@@ -2036,7 +2093,10 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 		// the array/buffer alloc NULL -> caller null deref (the residual segv).
 		span = vgc_collect_and_retry_span(cache_idx, span_class)
 		if span == unsafe { nil } {
-			return unsafe { nil }
+			// Terminal exhaustion: loud panic, not a nil into a caller deref
+			// (cx #277; see the scan-path chokepoint note).
+			vgc_oom_report(n)
+			_memory_panic(@FN, isize(n))
 		}
 	}
 
@@ -2091,7 +2151,12 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 			}
 		}
 		if span == unsafe { nil } {
-			return unsafe { nil }
+			// Terminal exhaustion on the large path — the field signature of
+			// cx #277: the process's LARGEST allocations (multi-MB builder
+			// growth) need contiguous arena space, so they fail first at the
+			// ceiling. Loud panic, not a nil into the caller's first write.
+			vgc_oom_report(n)
+			_memory_panic(@FN, isize(n))
 		}
 	}
 
