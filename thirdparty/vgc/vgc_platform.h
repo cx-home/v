@@ -197,6 +197,16 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
       return count > 0 ? (int)count : 1;
   }
+  // Physical RAM in bytes; 0 = unknown. Used once, at vgc_init, to derive the
+  // default effective arena ceiling (cx #282) — the hard heap wall sits at RAM
+  // (where growth would become swap death anyway) unless VGC_MAX_ARENAS says
+  // otherwise.
+  static inline uint64_t vgc_phys_mem(void) {
+      MEMORYSTATUSEX st;
+      st.dwLength = sizeof(st);
+      if (!GlobalMemoryStatusEx(&st)) return 0;
+      return (uint64_t)st.ullTotalPhys;
+  }
 #else
   #include <sys/mman.h>
   #include <unistd.h>
@@ -209,6 +219,22 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   }
   static inline void vgc_os_decommit(void* ptr, size_t size) {
       madvise(ptr, size, MADV_DONTNEED);
+  }
+  // Physical RAM in bytes; 0 = unknown. Used once, at vgc_init, to derive the
+  // default effective arena ceiling (cx #282) — the hard heap wall sits at RAM
+  // (where growth would become swap death anyway) unless VGC_MAX_ARENAS says
+  // otherwise. _SC_PHYS_PAGES is POSIX-adjacent but present on linux, darwin
+  // and the BSDs; a platform without it reports 0 and the caller falls back to
+  // the compiled architectural maximum.
+  static inline uint64_t vgc_phys_mem(void) {
+  #ifdef _SC_PHYS_PAGES
+      long pages = sysconf(_SC_PHYS_PAGES);
+      long psize = sysconf(_SC_PAGE_SIZE);
+      if (pages <= 0 || psize <= 0) return 0;
+      return (uint64_t)pages * (uint64_t)psize;
+  #else
+      return 0;
+  #endif
   }
   static inline int vgc_num_cpus(void) {
       long count = sysconf(_SC_NPROCESSORS_ONLN);
