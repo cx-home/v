@@ -7,8 +7,8 @@
 // arena ceiling on multi-threaded runs — the cx #57 field OOM shape.
 //
 // Usage:
-//   v -gc e     -o /tmp/hot_e     bench/parallel-alloc/hot_loop_rss.v
-//   v -gc boehm -o /tmp/hot_boehm bench/parallel-alloc/hot_loop_rss.v
+//   v -gc e     -o /tmp/hot_e     bench/parallel-alloc/hot_loop_rss/hot_loop_rss.v
+//   v -gc boehm -o /tmp/hot_boehm bench/parallel-alloc/hot_loop_rss/hot_loop_rss.v
 //   /tmp/hot_e [nthreads] [iters_per_thread]     # prints ops/s + max RSS
 //
 // Pass criteria (vgc, post-pacer-fix): max RSS bounded well under the arena

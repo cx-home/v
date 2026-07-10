@@ -13,7 +13,7 @@
 // mark phase really walks it — a flat byte blob would understate mark cost.
 //
 // Usage:
-//   ./v -gc e -prod -o /tmp/hotlive_e bench/parallel-alloc/hot_live_rss.v
+//   ./v -gc e -prod -o /tmp/hotlive_e bench/parallel-alloc/hot_live_rss/hot_live_rss.v
 //   /tmp/hotlive_e [nthreads] [iters_per_thread] [live_mb]
 //   VGC_GCTRACE=1 /tmp/hotlive_e 4 2000000 2048   # per-cycle pause trace
 //
