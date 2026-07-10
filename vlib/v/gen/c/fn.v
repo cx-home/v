@@ -1043,8 +1043,8 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 		// every used body — duplicating the tested module's own cached `.o` and
 		// bloating the program TU so caching saved nothing.)
 		fn_in_test_file := node.file.ends_with('_test.v')
-		if node.mod != 'main' && node.mod != 'help' && !should_bundle_module
-			&& !fn_in_test_file && node.generic_names.len == 0 {
+		if node.mod != 'main' && node.mod != 'help' && !should_bundle_module && !fn_in_test_file
+			&& node.generic_names.len == 0 {
 			skip = true
 		}
 	}
@@ -2797,6 +2797,25 @@ fn (mut g Gen) gen_map_method_call(node ast.CallExpr, left_type ast.Type, left_s
 			g.write('builtin__map_${node.name}(')
 			g.gen_arg_from_type(left_type, node.left)
 			g.write(')')
+		}
+		.value_ptr {
+			// `unsafe { m.value_ptr(key) }` — by-ref get: map_get_check
+			// returns a pointer into the map storage (nil on miss); no
+			// value-sized zero literal and no copy, unlike `&m[key]` /
+			// `m[key] or {}`.
+			key_type_str := if left_sym.info is ast.Map {
+				g.styp(left_sym.info.key_type)
+			} else {
+				arg_type := g.unwrap_generic(g.resolved_expr_type(node.args[0].expr,
+					node.args[0].typ))
+				g.styp(arg_type)
+			}
+			ret_styp := g.styp(g.unwrap_generic(node.return_type))
+			g.write('((${ret_styp})builtin__map_get_check(')
+			g.gen_arg_from_type(left_type, node.left)
+			g.write(', &(${key_type_str}[]){')
+			g.expr(node.args[0].expr)
+			g.write('}))')
 		}
 		else {
 			return false

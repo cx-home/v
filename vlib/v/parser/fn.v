@@ -383,6 +383,9 @@ fn (mut p Parser) call_kind(fn_name string) ast.CallKind {
 				'push_many' {
 					.push_many
 				}
+				'value_ptr' {
+					.value_ptr
+				}
 				else {
 					.unknown
 				}

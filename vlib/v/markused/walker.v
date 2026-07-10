@@ -987,6 +987,12 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 			} else if node.is_method && node.name == 'clone' && !w.uses_arr_clone
 				&& node.left_type != 0 && w.table.final_sym(node.left_type).kind == .array {
 				w.uses_arr_clone = true
+			} else if node.is_method && node.name == 'value_ptr' && node.left_type != 0
+				&& w.table.final_sym(node.left_type).kind == .map {
+				// `m.value_ptr(k)` compiles to a direct map_get_check call —
+				// there is no V-level `value_ptr` method to resolve, so mark
+				// the underlying builtin explicitly.
+				w.mark_builtin_map_method_as_used('get_check')
 			} else if node.is_method && node.name == 'sorted' && !w.uses_arr_sorted
 				&& node.left_type != 0 && w.table.final_sym(node.left_type).kind == .array {
 				w.uses_arr_sorted = true
