@@ -925,6 +925,7 @@ pub enum CallKind {
 	push_many
 	malloc
 	writeln
+	value_ptr
 }
 
 // function or method call expr

@@ -1,0 +1,6 @@
+vlib/v/checker/tests/map_value_ptr_outside_unsafe_err.vv:3:8: error: `.value_ptr()` returns a reference into the map storage and must be called inside `unsafe {}`
+    1 | mut m := map[string]int{}
+    2 | m['a'] = 1
+    3 | p := m.value_ptr('a')
+      |        ~~~~~~~~~~~~~~
+    4 | println(*p)
