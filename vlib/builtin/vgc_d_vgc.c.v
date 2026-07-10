@@ -53,6 +53,7 @@ fn C.vgc_resume_thread(t u32)
 fn C.vgc_thread_regs(t u32, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_num_cpus() int
+fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default ceiling)
 
 // Optional diagnostic trace ring — no-ops unless built with `-cflags -DVGC_DIAG`.
 fn C.vgc_trace(ev int, slot int, a u64, b u64)
@@ -91,7 +92,17 @@ const vgc_pages_per_arena = vgc_arena_size / vgc_page_size
 // span that can fit in an arena is poolable (#52/#57: the old 32-page/256 KB bound
 // silently leaked larger transients).
 const vgc_max_pooled_pages = 8192
-const vgc_max_arenas = 64
+// Architectural arena-count ceiling: 1024 x 64 MB = 64 GB of heap address
+// capacity (cx #282; was 64 = 4 GB). Cheap to compile in because VGC_Arena no
+// longer embeds its page->span map (see the struct): the static arenas table
+// costs ~32 B per slot (~32 KB total), and per-arena map memory is only paid
+// when an arena is actually created. The DEFAULT effective ceiling is NOT this
+// constant — vgc_init derives it from physical RAM (see vgc_max_arenas_eff);
+// VGC_MAX_ARENAS can raise it up to here or lower it to [1].
+const vgc_max_arenas = 1024
+// Floor for the RAM-derived default ceiling: never below the historical
+// 64-arena (4 GB) capacity, however small the machine reports.
+const vgc_default_min_arenas = 64
 const vgc_max_threads = 64
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
 
@@ -213,8 +224,23 @@ mut:
 	base usize
 	size usize
 	used usize
-	// Map from page index to span (for finding which span owns an address)
-	page_span [8192]&VGC_Span // vgc_pages_per_arena entries
+	// Map from page index to owning span — `size / vgc_page_size` entries (an
+	// oversized arena backing a single object larger than vgc_arena_size gets a
+	// proportionally larger map, so interior pointers past 64 MB resolve too).
+	// OUT-OF-LINE (vgc_os_alloc'd, zero-filled, at arena creation; never freed —
+	// arenas are never released), NOT embedded (cx #282): an embedded
+	// [8192]&VGC_Span made every VGC_Arena 64 KB, so the [vgc_max_arenas] table
+	// at N=1024 would have been ~64 MB of BSS inside vgc_heap — which mark_roots
+	// conservatively scans EVERY cycle (the mcache tiny cursors in vgc_heap are
+	// load-bearing roots, so the whole struct must stay scanned) — i.e. tens of
+	// ms added to every STW pause. Moving the maps out of the scanned segment
+	// loses no rooting: the slots hold span DESCRIPTOR pointers only (bump-slab
+	// memory OUTSIDE the GC arenas — vgc_shade ignores non-heap addresses).
+	// Slot writes/reads keep their RELEASE/ACQUIRE atomics (vgc_span_alloc /
+	// vgc_find_span); the map POINTER itself is published by the same narenas
+	// RELEASE store that publishes base/size (new arenas), or was already
+	// published when the arena was (existing-arena span carves).
+	page_span &&VGC_Span = unsafe { nil }
 }
 
 // VGC_WorkBuf is a work buffer for the mark phase.
@@ -231,8 +257,12 @@ mut:
 struct VGC_Heap {
 mut:
 	lock u32 // spinlock
-	// Arenas (memory from OS)
-	arenas  [64]VGC_Arena
+	// Arenas (memory from OS). Dense ~32 B entries (page maps live out-of-line,
+	// see VGC_Arena), so the full architectural table is ~32 KB — cheap both as
+	// BSS and under the per-cycle mark_roots data-segment scan, and the
+	// vgc_find_span hint-miss linear fallback strides cache-friendly entries
+	// instead of 64 KB-apart base fields.
+	arenas  [vgc_max_arenas]VGC_Arena
 	narenas int
 	// Central free lists (one per span class)
 	central [136]VGC_Central
@@ -313,14 +343,18 @@ __global vgc_alloc_lock = u32(0)
 // Fast bounds check for pointer validation
 __global vgc_arena_lo = usize(0)
 __global vgc_arena_hi = usize(0)
-// Effective arena-count ceiling. Set by vgc_init (VGC_MAX_ARENAS lowers it,
-// clamped to [1, vgc_max_arenas]) so tests and ops can force terminal heap
-// exhaustion at a small heap instead of the full compiled ceiling (cx #277 —
-// the loud-OOM regression path needs exhaustion to be reachable in well under a
-// second). ZERO until vgc_init runs: V's _vinit zero-initializes globals
-// regardless of the source initializer (see the vgc_heap note above), and spans
-// ARE allocated during _vinit, before vgc_init — vgc_span_alloc treats <=0 as
-// "pre-init" and falls back to the compiled capacity.
+// Effective arena-count ceiling. Set by vgc_init: the DEFAULT is derived from
+// physical RAM (whole 64 MB arenas, clamped to [vgc_default_min_arenas,
+// vgc_max_arenas]) — the hard wall sits where further growth would be swap
+// death anyway, and the #277 loud-OOM forensics fire there instead of a
+// meaningless-much-later OS kill. VGC_MAX_ARENAS overrides in BOTH directions
+// within [1, vgc_max_arenas] (cx #277 lower-only semantics widened by #282):
+// lower it so tests can force terminal exhaustion at a small heap in well
+// under a second, raise it past RAM for deliberate overcommit. ZERO until
+// vgc_init runs: V's _vinit zero-initializes globals regardless of the source
+// initializer (see the vgc_heap note above), and spans ARE allocated during
+// _vinit, before vgc_init — vgc_span_alloc treats <=0 as "pre-init" and falls
+// back to the compiled capacity.
 __global vgc_max_arenas_eff = int(0)
 
 // Spawn-argument roots. `spawn f(...)` heap-allocates a thread-argument struct
@@ -446,10 +480,20 @@ __global vgc_gctrace = u32(0)
 // nothing. Big LIVE sets still get a proportional goal via the GOGC term.
 __global vgc_headroom_cap = u64(64 * 1024 * 1024)
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
-// here so collection always engages well before the physical arena ceiling
-// (vgc_max_arenas * vgc_arena_size = 4 GB). Default = half the arena capacity.
-// Go's GOMEMLIMIT analog for the backstop collector.
+// here so collection always engages well before the physical arena ceiling.
+// Go's GOMEMLIMIT analog for the backstop collector. The default is a PINNED
+// explicit constant (vgc_default_soft_limit = 2 GB), deliberately NOT derived
+// from the arena capacity any more: raising the architectural ceiling to 64 GB
+// (cx #282) must not silently move the pacing default from 2 GB to 32 GB. A
+// live set past the soft limit still makes guaranteed progress — the cx #272
+// progress guard paces at marked + marked/16 — just under tight collection;
+// genuinely multi-GB deployments raise VGC_MEMLIMIT_MB deliberately.
 __global vgc_heap_soft_limit = u64(2) * 1024 * 1024 * 1024
+
+// The pinned soft-limit default (see vgc_heap_soft_limit). vgc_init re-applies
+// it because _vinit zero-initializes __globals regardless of the source
+// initializer (the vgc_heap note above).
+const vgc_default_soft_limit = u64(2) * 1024 * 1024 * 1024
 // ── cx #71 ADAPTIVE PACER HEADROOM ──────────────────────────────────────────
 // vgc_headroom is how many bytes of net heap growth beyond the marked (live)
 // set the pacer allows before the next backstop cycle. It REPLACES the fixed
@@ -847,8 +891,9 @@ pub fn vgc_init() {
 			vgc_headroom_cap = u64(cmb) * 1024 * 1024
 		}
 	}
-	// Soft limit: half the physical arena capacity by default, env-overridable.
-	vgc_heap_soft_limit = u64(vgc_max_arenas) * u64(vgc_arena_size) / 2
+	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
+	// see vgc_heap_soft_limit / cx #282), env-overridable.
+	vgc_heap_soft_limit = vgc_default_soft_limit
 	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
 	if lim_env != unsafe { nil } {
 		lmb := C.atoll(lim_env)
@@ -856,18 +901,31 @@ pub fn vgc_init() {
 			vgc_heap_soft_limit = u64(lmb) * 1024 * 1024
 		}
 	}
-	// Effective arena ceiling (cx #277): VGC_MAX_ARENAS lowers the physical
-	// capacity so exhaustion is test-reachable. Lower-only — the arenas array is a
-	// fixed [vgc_max_arenas] block, so raising past the compiled capacity is not
-	// representable. The soft-limit default above deliberately stays derived from
-	// the COMPILED capacity: this knob moves the hard wall, not the pacing target.
+	// Effective arena ceiling (cx #277 knob, cx #282 semantics — see the
+	// vgc_max_arenas_eff doc). Default: physical RAM in whole arenas, clamped to
+	// [vgc_default_min_arenas, vgc_max_arenas]; 0/unknown RAM falls back to the
+	// compiled architectural max. VGC_MAX_ARENAS then overrides in either
+	// direction within [1, vgc_max_arenas]: lower for test-reachable exhaustion,
+	// raise past RAM for deliberate overcommit. This knob moves the hard wall,
+	// not the pacing target (VGC_MEMLIMIT_MB owns that).
+	mut eff := int(vgc_max_arenas)
+	phys := u64(C.vgc_phys_mem())
+	if phys > 0 {
+		pa := phys / u64(vgc_arena_size)
+		if pa < u64(vgc_default_min_arenas) {
+			eff = int(vgc_default_min_arenas)
+		} else if pa < u64(vgc_max_arenas) {
+			eff = int(pa)
+		}
+	}
 	maxa_env := C.getenv(c'VGC_MAX_ARENAS')
 	if maxa_env != unsafe { nil } {
 		ma := C.atoll(maxa_env)
 		if ma > 0 && ma <= i64(vgc_max_arenas) {
-			vgc_max_arenas_eff = int(ma)
+			eff = int(ma)
 		}
 	}
+	vgc_max_arenas_eff = eff
 	// Initial trigger = the (small) adaptive headroom, NOT the 256 MB ceiling:
 	// a short-lived or small-live-set program never builds hundreds of MB of
 	// dead transients before its first collection (cx #71 — boehm-matching
@@ -1293,10 +1351,21 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }
 		}
+		// Out-of-line page->span map (cx #282, see VGC_Arena.page_span): one slot
+		// per page of the ACTUAL arena size (an oversized single-object arena gets
+		// a proportionally larger map). mmap-zeroed; never freed.
+		nmap := asize / vgc_page_size
+		psmem := C.vgc_os_alloc(usize(sizeof(voidptr)) * nmap)
+		if psmem == unsafe { nil } {
+			C.vgc_os_free(mem, asize)
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			return unsafe { nil }
+		}
 		unsafe {
 			vgc_heap.arenas[arena_idx].base = usize(mem)
 			vgc_heap.arenas[arena_idx].size = asize
 			vgc_heap.arenas[arena_idx].used = nbytes
+			vgc_heap.arenas[arena_idx].page_span = &&VGC_Span(psmem)
 		}
 		// narenas is NOT bumped here: it is the publication point for this whole
 		// arena (base/size/used + the page_span map filled below) and must be
@@ -1338,12 +1407,15 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		// allocated (alloc_count 0). See vgc_sweep_span's sweep_gen guard.
 		span.sweep_gen = u32(vgc_heap.gc_cycle)
 	}
-	// Register span in arena's page map
+	// Register span in arena's page map (out-of-line — see VGC_Arena.page_span;
+	// sized size/vgc_page_size, so the bound is the arena's own page count, not
+	// the fixed vgc_pages_per_arena — oversized arenas are fully mapped).
 	if arena_idx >= 0 {
+		map_pages := vgc_heap.arenas[arena_idx].size / vgc_page_size
 		page_start := (base - vgc_heap.arenas[arena_idx].base) / vgc_page_size
 		for p in 0 .. npages {
 			pidx := page_start + p
-			if pidx < vgc_pages_per_arena {
+			if pidx < map_pages {
 				// RELEASE-store the page_span slot (paired with the ACQUIRE load in
 				// vgc_find_span). A span carved from an EXISTING arena does NOT bump
 				// narenas, so the narenas release/acquire publication does not cover
@@ -1850,9 +1922,10 @@ fn vgc_force_collect() {
 // al.), so the process died with a misleading SIGSEGV inside the next array
 // growth (the xap-marine helm's crash signature: alloc_array_data_uninit+28,
 // the first write to the "allocated" block) instead of naming the real
-// condition. The forensics matter: "arenas 64/64" distinguishes the compiled
-// 4 GB ceiling from RAM exhaustion (vgc_os_alloc failure prints the same shape
-// with arenas below the cap).
+// condition. The forensics matter: "arenas N/N" (used == cap) distinguishes
+// the arena-count ceiling (RAM-derived default or VGC_MAX_ARENAS — cx #282)
+// from RAM exhaustion (vgc_os_alloc failure prints the same shape with arenas
+// below the cap).
 fn vgc_oom_report(n usize) {
 	mut max_arenas := vgc_max_arenas_eff
 	if max_arenas <= 0 {
@@ -2747,9 +2820,10 @@ fn vgc_find_span(ptr voidptr) &VGC_Span {
 	// the object, while vgc_do_sweep walks allspans directly and frees it -> a
 	// live, reachable object is reclaimed (the residual P3 bug). So: use the hint,
 	// but if it does not actually contain addr, fall back to a linear scan over all
-	// arenas (narenas <= vgc_max_arenas = 64) so find_span is as complete as the
-	// allspans sweep. (Collection is rare behind the Perceus front line; the scan
-	// only runs on a hint miss.)
+	// arenas (narenas <= vgc_max_arenas; the entries are dense ~32 B structs now —
+	// cx #282 — so even the full table is a ~32 KB stride) so find_span is as
+	// complete as the allspans sweep. (Collection is rare behind the Perceus front
+	// line; the scan only runs on a hint miss.)
 	// ACQUIRE-load narenas (paired with the RELEASE store in vgc_span_alloc): if we
 	// observe a given count, we also observe the fully-initialized arenas[] entries
 	// + page maps it gates. A plain read here raced the locked writer (TSan).
@@ -2772,12 +2846,17 @@ fn vgc_find_span(ptr voidptr) &VGC_Span {
 	}
 	a := unsafe { &vgc_heap.arenas[arena_idx] }
 	page_idx := (addr - a.base) / vgc_page_size
-	if page_idx < vgc_pages_per_arena {
+	// Bound = the arena's own page count (maps are sized size/vgc_page_size —
+	// cx #282), so interior pointers into an oversized single-object arena
+	// resolve past the first 64 MB too (the old fixed bound returned nil there).
+	if page_idx < a.size / vgc_page_size {
 		// ACQUIRE-load the page_span slot (paired with vgc_span_alloc's RELEASE
 		// store). This reader is lock-free (the collector calls it during STW and
 		// the mutator calls it from vgc_free/vgc_realloc), so it cannot take
 		// vgc_heap.lock; the per-slot atomic gives the happens-before that the
-		// locked writer's plain store lacked for existing-arena span carves.
+		// locked writer's plain store lacked for existing-arena span carves. The
+		// one extra dependent load (the out-of-line map pointer) is on the
+		// free/realloc/shade path, NOT the mcache alloc fast path.
 		return unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[page_idx]))))) }
 	}
 	return unsafe { nil }
