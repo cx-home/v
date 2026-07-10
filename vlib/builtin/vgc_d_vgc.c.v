@@ -47,6 +47,8 @@ fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
+fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
 fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
 fn C.vgc_resume_thread(t u32)
@@ -104,6 +106,11 @@ const vgc_max_arenas = 1024
 // 64-arena (4 GB) capacity, however small the machine reports.
 const vgc_default_min_arenas = 64
 const vgc_max_threads = 64
+// cx #316: words captured per safe-region register snapshot. Sized to hold a
+// full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
+// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
+// zero-fills the tail so unused slots shade nothing.
+const vgc_safe_spill_words = 40
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
 
 // GC phases (translated from Go's _GCoff, _GCmark, _GCmarktermination)
@@ -197,6 +204,22 @@ mut:
 	// (#57/#58/#63/#145: the mid-GC mutator the forensics kept catching.)
 	park_seq   u32
 	mach_port  u32 // OS thread handle for OS-level suspend-the-world (darwin)
+	// GC-safe blocking region (cx #316): 1 while this thread is parked/blocked
+	// inside gc_safe_region_enter/exit. The cooperative collector treats a safe
+	// thread as already stopped — no park wait, no mach suspend/resume — and
+	// takes its roots from the ENTRY-time [stack_lo, stack_hi] prefix plus the
+	// safe_regs snapshot below. Level-triggered (no seq needed, unlike stopped/
+	// park_seq): safe==1 means the recorded state is valid RIGHT NOW and stays
+	// valid until exit, and exit's Dekker handshake (store safe=0, THEN load
+	// gc_stop_flag) makes a waking thread either visible as a straggler or
+	// blocked until the world resumes — there is no stale-flag window.
+	safe u32 // atomic
+	// Callee-saved register snapshot taken at region entry (setjmp words copied
+	// OFF-STACK — the enter frame dies before the blocking call, so an on-stack
+	// spill would be overwritten; see vgc_safe_enter_spill). Shaded by
+	// vgc_scan_suspended_roots for safe-covered threads; also conservatively
+	// covered by the vgc_heap data-segment scan.
+	safe_regs [vgc_safe_spill_words]usize
 	// Per-thread heap accounting (Go per-P style). The alloc/free fast path bumps
 	// these THREAD-PRIVATE counters (no shared atomic), flushing into the global
 	// heap_live/total_alloc only every ~vgc_acct_flush bytes. This removes the
@@ -995,6 +1018,13 @@ fn vgc_register_thread() {
 		vgc_heap.caches[idx].stopped = 0
 		vgc_heap.caches[idx].live_delta = 0
 		vgc_heap.caches[idx].alloc_delta = 0
+		// cx #316: a reused slot must not inherit the previous owner's safe-region
+		// state — a stale safe==1 would exempt the NEW thread from suspension with
+		// a dead range; a stale snapshot would pin the old owner's objects.
+		C.vgc_atomic_store_u32(&vgc_heap.caches[idx].safe, 0)
+		for w in 0 .. vgc_safe_spill_words {
+			vgc_heap.caches[idx].safe_regs[w] = 0
+		}
 	}
 
 	C.vgc_set_cache_idx(idx)
@@ -1071,6 +1101,7 @@ fn vgc_thread_exit_cb(idx int) {
 		vgc_heap.caches[idx].registered = false
 		vgc_heap.caches[idx].stack_lo = 0
 		vgc_heap.caches[idx].stack_hi = 0
+		C.vgc_atomic_store_u32(&vgc_heap.caches[idx].safe, 0) // cx #316 hygiene (also reset at register)
 	}
 	// Atomic decrement — see the bump in vgc_register_thread (lock-free PACE reader).
 	if C.vgc_atomic_load_u32(&vgc_heap.live_threads) > 0 {
@@ -2900,6 +2931,53 @@ fn vgc_safepoint() {
 			&vgc_heap.gc_stopped_count, &vgc_heap.caches[cache_idx].stopped,
 			&vgc_heap.caches[cache_idx].park_seq, &vgc_heap.caches[cache_idx].stack_lo,
 			&vgc_heap.caches[cache_idx].stack_hi, vgc_heap.caches[cache_idx].stack_base)
+	}
+}
+
+// ── GC-safe blocking regions (cx #316) ──────────────────────────────────────
+// vgc_safe_region_enter marks THIS thread as parked in a GC-safe blocking
+// region: it records its entry-time stack prefix [sp, stack_base] and spills
+// its callee-saved registers into the off-stack per-thread snapshot, then
+// publishes safe=1. While safe, the cooperative collector excludes the thread
+// from the STW park wait AND from mach suspend/resume — its roots are the
+// recorded prefix + snapshot, both immutable for the region's duration by the
+// caller contract (documented in full at vgc_safe_enter_spill in
+// vgc_platform.h: no allocation, no GC-pointer stores, no new GC references
+// carried across exit). Cheap: setjmp + a bounded word copy + one seq_cst
+// store — suitable for a per-park hot path. No-op for unregistered threads
+// (they are invisible to the collector anyway).
+fn vgc_safe_region_enter() {
+	cache_idx := C.vgc_get_cache_idx()
+	if cache_idx < 0 {
+		return
+	}
+	unsafe {
+		C.vgc_safe_enter_spill(&vgc_heap.caches[cache_idx].safe,
+			&vgc_heap.caches[cache_idx].stack_lo, &vgc_heap.caches[cache_idx].stack_hi,
+			vgc_heap.caches[cache_idx].stack_base, &vgc_heap.caches[cache_idx].safe_regs[0],
+			vgc_safe_spill_words)
+	}
+}
+
+// vgc_safe_region_exit leaves the safe region via the Dekker handshake
+// (vgc_safe_exit_handshake): announce safe=0 first, then block until any
+// in-progress cooperative STW resumes the world. The snapshot is cleared
+// afterwards so a long-running thread does not keep pinning objects it
+// referenced at its LAST park (the vgc_heap data-segment scan shades the
+// snapshot conservatively every cycle). Clearing after the handshake is
+// sound: no cycle is scanning the snapshot once the flag dropped, and a
+// back-to-back cycle that starts mid-clear covers this thread as a normal
+// running mutator (safe==0) — a torn snapshot is then at most over-retention.
+fn vgc_safe_region_exit() {
+	cache_idx := C.vgc_get_cache_idx()
+	if cache_idx < 0 {
+		return
+	}
+	unsafe {
+		C.vgc_safe_exit_handshake(&vgc_heap.caches[cache_idx].safe, &vgc_heap.gc_stop_flag)
+		for w in 0 .. vgc_safe_spill_words {
+			vgc_heap.caches[cache_idx].safe_regs[w] = 0
+		}
 	}
 }
 

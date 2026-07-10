@@ -9,6 +9,23 @@ module builtin
 // GC Orchestration (translated from Go's runtime.gcStart, gcMarkDone, gcMarkTermination)
 // ============================================================
 
+// cx #316: per-cycle safe-region coverage snapshot. Written ONLY by the
+// collector (exclusive under cache_lock across the whole cycle): reset in the
+// park-wait count loop (cooperative) / suspend loops (legacy, concurrent-mark),
+// set at the suspend loop's authoritative safe==1 read, consumed by
+// vgc_scan_suspended_roots and the vgc_passive coverage probe. A snapshot —
+// not a live re-read — so the scan and the probe see EXACTLY the set the
+// suspend loop exempted, even if a thread flips safe mid-cycle (it then spins
+// in its exit handshake; its recorded roots stay valid — see
+// vgc_safe_exit_handshake in vgc_platform.h).
+__global vgc_safe_cov = [64]bool{}
+
+// cx #316 observability: mach suspensions actually ACKed across all STW cycles
+// (collector-exclusive increments). The safe-region selftest asserts this does
+// NOT advance while the only other thread is parked in a safe region — i.e.
+// the STW suspend set really is the awake set.
+__global vgc_stat_mach_suspends = u64(0)
+
 // vgc_gc_start triggers a garbage collection cycle.
 // Translated from Go's gcStart() in mgc.go.
 // Flow: sweep termination (STW) -> full STW mark -> sweep -> resume.
@@ -95,10 +112,20 @@ fn vgc_gc_start() {
 		// and is signal-suspended like any straggler (#57/#58/#63/#145).
 		_ = C.vgc_atomic_add_u32(&vgc_heap.gc_stop_seq, 1)
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 1)
+		// cx #316: threads inside a GC-safe blocking region are excluded from the
+		// park-wait target — they never reach an alloc poll while parked, so
+		// counting them only burns the plateau budget every cycle. The load of
+		// `safe` is AFTER the seq_cst gc_stop_flag store above (the Dekker pairing
+		// with vgc_safe_exit_handshake), and this count is a wait HEURISTIC only:
+		// authoritative coverage is the suspend loop below, which re-derives every
+		// thread's state. vgc_safe_cov[] is reset here (collector-exclusive under
+		// cache_lock) and set at the authoritative read.
 		mut want := u32(0)
 		for i in 0 .. vgc_heap.ncaches {
+			vgc_safe_cov[i] = false
 			c := unsafe { &vgc_heap.caches[i] }
-			if c.registered && i != self_idx && c.mach_port != 0 {
+			if c.registered && i != self_idx && c.mach_port != 0
+				&& C.vgc_atomic_load_u32(&vgc_heap.caches[i].safe) == 0 {
 				want++
 			}
 		}
@@ -205,12 +232,30 @@ fn vgc_gc_start() {
 			if c.registered && i != self_idx && c.mach_port != 0
 				&& (C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0
 				|| c.park_seq != C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)) {
+				// cx #316: the AUTHORITATIVE safe-region read. A thread seen safe==1
+				// here holds no in-flight GC state (contract at vgc_safe_enter_spill):
+				// its roots are its entry-time stack prefix (already in stack_lo/hi)
+				// plus its safe_regs snapshot — skip suspension entirely. Ordering:
+				// this load is after the seq_cst gc_stop_flag store, so a thread
+				// waking concurrently either published safe=0 first (seen here ->
+				// mach-suspended below as a straggler mid-handshake, externally
+				// scanned) or reads gc_stop_flag==1 in its exit handshake and blocks
+				// until resume — it can never run through mark+sweep uncovered.
+				// vgc_safe_cov[] snapshots the decision so the root scan and the
+				// passive probe treat exactly the same set as covered.
+				if C.vgc_atomic_load_u32(&vgc_heap.caches[i].safe) != 0 {
+					vgc_safe_cov[i] = true
+					continue
+				}
 				// stopped==1 counts ONLY with a matching park_seq: a stale park from
 				// the previous cycle is a WAKING thread that will run through this
 				// GC — suspend it like any straggler. susp[i] reflects the ACK, not
 				// the attempt: an un-acked target is a gone thread (safe to skip),
 				// never a running mutator (the suspend waits for live targets).
 				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
+				if susp[i] {
+					vgc_stat_mach_suspends++
+				}
 				C.vgc_trace(7, i, u64(c.mach_port), 0)
 			}
 		}
@@ -233,12 +278,21 @@ fn vgc_gc_start() {
 		C.vgc_mutex_lock(&vgc_spawn_root_lock) // see the cooperative branch above
 
 		for i in 0 .. vgc_heap.ncaches {
+			// cx #316: the legacy mach-suspend collector deliberately IGNORES safe
+			// regions — it suspends every registered thread (a safe thread is just a
+			// blocked thread; suspending it is today's proven-sound behavior) and
+			// scans everyone externally. Reset the coverage snapshot so the shared
+			// root-scan path takes the external branch for all of them.
+			vgc_safe_cov[i] = false
 			c := unsafe { &vgc_heap.caches[i] }
 			reg := if c.registered { u64(1) } else { u64(0) }
 			C.vgc_trace(6, i, reg, u64(c.mach_port)) // SUSP? (decision inputs for EVERY slot)
 			if c.registered && i != self_idx && c.mach_port != 0 {
 				// susp[i] reflects the ACK (see the cooperative branch above).
 				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
+				if susp[i] {
+					vgc_stat_mach_suspends++
+				}
 				C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
 			}
 		}
@@ -256,7 +310,10 @@ fn vgc_gc_start() {
 			if c.registered && i != self_idx && c.mach_port != 0 {
 				parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
 					&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
-				if !parked_now && !susp[i] {
+				// cx #316: a safe-region thread is covered by its entry-time
+				// stack prefix + register snapshot (vgc_safe_cov, the suspend
+				// loop's authoritative decision), not by park or suspension.
+				if !parked_now && !susp[i] && !vgc_safe_cov[i] {
 					uncovered++
 				}
 			}
@@ -524,6 +581,11 @@ fn vgc_cm_stw_enter(self_idx int) {
 	C.vgc_mutex_lock(&vgc_spawn_root_lock) // dying-thread remove vs spawn-root scan (see vgc_gc_start)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0) // OS-suspend, not cooperative
 	for i in 0 .. vgc_heap.ncaches {
+		// cx #316: like the legacy collector, the concurrent-mark STW windows
+		// suspend EVERY registered thread (safe regions are a cooperative-STW
+		// optimization); reset the coverage snapshot so the shared root scan
+		// refreshes everyone externally.
+		vgc_safe_cov[i] = false
 		c := unsafe { &vgc_heap.caches[i] }
 		if c.registered && i != self_idx && c.mach_port != 0 {
 			_ = C.vgc_suspend_thread(c.mach_port)
@@ -699,6 +761,19 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			// covers its current frames).
 			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
 				&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq) {
+				continue
+			}
+			// cx #316: a safe-region thread (per the suspend loop's snapshot — NOT a
+			// live re-read: the thread may since have stored safe=0 and be spinning
+			// in its exit handshake, and thread_get_state on a spinning, unsuspended
+			// thread yields racy garbage) keeps its self-recorded entry-time range;
+			// shade its off-stack callee-saved snapshot here — the stack scan cannot
+			// see it (the enter frame died and the blocking call reused its
+			// addresses; that is exactly why the spill is off-stack).
+			if vgc_safe_cov[i] {
+				for k in 0 .. vgc_safe_spill_words {
+					vgc_shade(unsafe { vgc_heap.caches[i].safe_regs[k] })
+				}
 				continue
 			}
 		}

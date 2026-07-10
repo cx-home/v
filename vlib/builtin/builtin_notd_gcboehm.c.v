@@ -79,6 +79,36 @@ pub fn gc_unpin(p voidptr) {
 	}
 }
 
+// gc_safe_region_enter marks the calling thread as parked in a GC-SAFE blocking
+// region (cx #316): under the vgc collector (`-gc e`) the stop-the-world
+// rendezvous then excludes it from the suspend set — no park wait, no mach
+// suspend/resume, no signal-interrupted cond_wait — taking its roots from the
+// entry-time stack prefix plus a callee-saved register snapshot instead. Call
+// it immediately BEFORE an indefinite blocking primitive (a semaphore wait, a
+// long sleep) and pair it with gc_safe_region_exit immediately AFTER the
+// primitive returns. CONTRACT between the two calls (soundness — see
+// vgc_safe_enter_spill in vgc_platform.h for the full statement): no GC-heap
+// allocation, no stores of GC-heap pointers, and no new references to GC
+// objects carried across the exit. Exit blocks while a stop-the-world is in
+// progress (the world-resume handshake), so the region can never leak a
+// running mutator into a live mark/sweep. NOP under boehm/none and for
+// GC-unregistered threads.
+@[markused]
+pub fn gc_safe_region_enter() {
+	$if vgc ? {
+		vgc_safe_region_enter()
+	}
+}
+
+// gc_safe_region_exit leaves a region opened by gc_safe_region_enter, blocking
+// first if a vgc stop-the-world is currently in progress. NOP under boehm/none.
+@[markused]
+pub fn gc_safe_region_exit() {
+	$if vgc ? {
+		vgc_safe_region_exit()
+	}
+}
+
 pub type FnGC_WarnCB = fn (msg &char, arg usize)
 
 fn C.GC_get_warn_proc() FnGC_WarnCB
