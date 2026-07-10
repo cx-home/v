@@ -11605,6 +11605,58 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			return
 		}
 	}
+	// `return fn_call_res()!` — when the callee's result type is exactly the
+	// enclosing function's return type, propagation is the identity: the
+	// error branch forwards `.err` and the ok branch rewraps the same
+	// payload. Forward the callee's return value directly instead of the
+	// generic lowering, which emits three dead `_result_T` stack temporaries
+	// plus a payload-sized compound literal per call site — none coalesced
+	// at -O0, a real stack-depth cost on hot recursive chains. Contexts
+	// where propagation is NOT the identity keep the generic lowering: main
+	// (propagation panics), test fns (propagation reports a failing test),
+	// autofree builds (scope cleanup interleaves with the unwrap), and
+	// special builtin call kinds with bespoke codegen. (`return f()?` with a
+	// matching option type needs no twin: the checker rejects the redundant
+	// `?` outright.)
+	if exprs_len == 1 && expr0 is ast.CallExpr && expr0.kind == .unknown && fn_return_is_result
+		&& expr0.or_block.kind == .propagate_result && !g.is_autofree && g.fn_decl != unsafe { nil }
+		&& !g.fn_decl.is_main && !g.fn_decl.is_test {
+		mut resolved_call_return_type := g.resolve_return_type(expr0)
+		if resolved_call_return_type == ast.void_type {
+			resolved_call_return_type = expr0.return_type
+		}
+		resolved_call_return_type =
+			g.unwrap_generic(g.recheck_concrete_type(resolved_call_return_type))
+		// resolve_return_type strips the result flag for non-absent
+		// or-blocks, so compare payloads — but require the callee's declared
+		// wrapper to be exactly `!T` too (`?` propagation is legal on a
+		// result-returning call; the reverse would rewrap across distinct C
+		// structs).
+		call_wrapper_matches := expr0.return_type.has_flag(.result)
+			&& !expr0.return_type.has_flag(.option)
+		if call_wrapper_matches
+			&& resolved_call_return_type.clear_option_and_result() == ret_type.clear_option_and_result() {
+			mut fwd_call := expr0
+			fwd_call.or_block = ast.OrExpr{
+				kind:  .absent
+				pos:   expr0.or_block.pos
+				scope: expr0.or_block.scope
+			}
+			if g.defer_stmts.len > 0 || g.defer_profile_code.len > 0 || g.cur_lock.lockeds.len > 0 {
+				g.write('${ret_typ} ${tmpvar} = ')
+				g.expr(fwd_call)
+				g.writeln(';')
+				g.write_defer_stmts_when_needed(node.scope, true, node.pos)
+				g.writeln('return ${tmpvar};')
+			} else {
+				g.write_defer_stmts_when_needed(node.scope, true, node.pos)
+				g.write('return ')
+				g.expr(fwd_call)
+				g.writeln(';')
+			}
+			return
+		}
+	}
 	mut use_tmp_var := g.defer_stmts.len > 0 || g.defer_profile_code.len > 0
 		|| g.cur_lock.lockeds.len > 0 || return_needs_local_closure_cleanup
 		|| return_call_needs_closure_lifetime_arg_tmp
