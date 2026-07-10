@@ -1,0 +1,39 @@
+struct Node {
+	a [50]i64
+	s string
+}
+
+fn leaf(x int) !Node {
+	if x < 0 {
+		return error('neg')
+	}
+	return Node{
+		s: x.str()
+	}
+}
+
+fn fwd_same(x int) !Node {
+	match x {
+		0 { return leaf(x + 1)! }
+		else { return leaf(x)! }
+	}
+}
+
+fn small(x int) !int {
+	if x < 0 {
+		return error('small neg')
+	}
+	return x + 1
+}
+
+fn fwd_mismatch(x int) !i64 {
+	// callee `!int`, fn `!i64` — must keep the generic rewrap lowering
+	v := small(x)!
+	return i64(v) * 2
+}
+
+fn main() {
+	n := fwd_same(0) or { Node{} }
+	m := fwd_mismatch(20) or { -1 }
+	println(n.s.len + int(m))
+}
