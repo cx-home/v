@@ -1,0 +1,39 @@
+import sync
+
+__global (
+	bad_lock  sync.Mutex
+	good_lock &sync.Mutex
+	inferred  = sync.new_mutex()
+)
+
+struct BadHolder {
+mut:
+	mu sync.Mutex
+}
+
+struct GoodHolder {
+mut:
+	mu &sync.Mutex = sync.new_mutex()
+}
+
+// consume uses the holders, so that the structs are not dead code.
+fn consume(mut b BadHolder, mut g GoodHolder) {
+	b.mu.lock()
+	b.mu.unlock()
+	g.mu.lock()
+	g.mu.unlock()
+}
+
+fn main() {
+	mut local_bad := sync.Mutex{}
+	local_good := sync.new_mutex()
+	mut b := BadHolder{}
+	mut g := GoodHolder{}
+	consume(mut b, mut g)
+	local_bad.lock()
+	local_bad.unlock()
+	local_good.lock()
+	local_good.unlock()
+	good_lock.lock()
+	good_lock.unlock()
+}

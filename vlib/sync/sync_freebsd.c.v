@@ -122,21 +122,34 @@ fn (mut m RwMutex) lazy_init() {
 // If the mutex was already locked, it will block, till it is unlocked.
 @[inline]
 pub fn (mut m Mutex) lock() {
-	C.pthread_mutex_lock(&m.mutex)
+	res := C.pthread_mutex_lock(&m.mutex)
+	if res != 0 {
+		panic_on_lock_error('pthread_mutex_lock', res)
+	}
 }
 
 // try_lock try to lock the mutex instance and return immediately.
 // If the mutex was already locked, it will return false.
 @[inline]
 pub fn (mut m Mutex) try_lock() bool {
-	return C.pthread_mutex_trylock(&m.mutex) == 0
+	res := C.pthread_mutex_trylock(&m.mutex)
+	if res == 0 {
+		return true
+	}
+	if res != C.EBUSY && res != C.EDEADLK {
+		panic_on_lock_error('pthread_mutex_trylock', res)
+	}
+	return false
 }
 
 // unlock unlocks the mutex instance. The mutex is released, and one of
 // the other threads, that were blocked, because they called lock can continue.
 @[inline]
 pub fn (mut m Mutex) unlock() {
-	C.pthread_mutex_unlock(&m.mutex)
+	res := C.pthread_mutex_unlock(&m.mutex)
+	if res != 0 {
+		panic_on_lock_error('pthread_mutex_unlock', res)
+	}
 }
 
 // destroy frees the resources associated with the mutex instance.
@@ -160,7 +173,10 @@ pub fn (mut m RwMutex) rlock() {
 	if C.atomic_load_u32(&m.writer) == tid {
 		cpanic(C.EDEADLK)
 	}
-	should_be_zero(C.pthread_rwlock_rdlock(&m.mutex))
+	res := C.pthread_rwlock_rdlock(&m.mutex)
+	if res != 0 {
+		panic_on_lock_error('pthread_rwlock_rdlock', res)
+	}
 }
 
 // lock locks the given RwMutex instance for writing.
@@ -176,7 +192,10 @@ pub fn (mut m RwMutex) lock() {
 	if C.atomic_load_u32(&m.writer) == tid {
 		cpanic(C.EDEADLK)
 	}
-	should_be_zero(C.pthread_rwlock_wrlock(&m.mutex))
+	res := C.pthread_rwlock_wrlock(&m.mutex)
+	if res != 0 {
+		panic_on_lock_error('pthread_rwlock_wrlock', res)
+	}
 	C.atomic_store_u32(&m.writer, tid)
 }
 
@@ -184,16 +203,27 @@ pub fn (mut m RwMutex) lock() {
 // If the mutex was already locked, it will return false.
 @[inline]
 pub fn (mut m RwMutex) try_rlock() bool {
-	return C.pthread_rwlock_tryrdlock(&m.mutex) == 0
+	res := C.pthread_rwlock_tryrdlock(&m.mutex)
+	if res == 0 {
+		return true
+	}
+	if res != C.EBUSY && res != C.EAGAIN && res != C.EDEADLK {
+		panic_on_lock_error('pthread_rwlock_tryrdlock', res)
+	}
+	return false
 }
 
 // try_wlock try to lock the given RwMutex instance for writing and return immediately.
 // If the mutex was already locked, it will return false.
 @[inline]
 pub fn (mut m RwMutex) try_wlock() bool {
-	if C.pthread_rwlock_trywrlock(&m.mutex) == 0 {
+	res := C.pthread_rwlock_trywrlock(&m.mutex)
+	if res == 0 {
 		C.atomic_store_u32(&m.writer, u32(C.pthread_getthreadid_np()))
 		return true
+	}
+	if res != C.EBUSY && res != C.EDEADLK {
+		panic_on_lock_error('pthread_rwlock_trywrlock', res)
 	}
 	return false
 }
@@ -211,7 +241,10 @@ pub fn (mut m RwMutex) destroy() {
 // on !windows platforms.
 @[inline]
 pub fn (mut m RwMutex) runlock() {
-	C.pthread_rwlock_unlock(&m.mutex)
+	res := C.pthread_rwlock_unlock(&m.mutex)
+	if res != 0 {
+		panic_on_lock_error('pthread_rwlock_unlock', res)
+	}
 }
 
 // unlock unlocks the RwMutex instance, locked for writing.
@@ -222,7 +255,10 @@ pub fn (mut m RwMutex) runlock() {
 @[inline]
 pub fn (mut m RwMutex) unlock() {
 	C.atomic_store_u32(&m.writer, 0)
-	C.pthread_rwlock_unlock(&m.mutex)
+	res := C.pthread_rwlock_unlock(&m.mutex)
+	if res != 0 {
+		panic_on_lock_error('pthread_rwlock_unlock', res)
+	}
 }
 
 // new_semaphore creates a new initialised Semaphore instance on the heap, and returns a pointer to it.

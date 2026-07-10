@@ -20,6 +20,7 @@ mut:
 	notices        shared []VetError
 	file           string
 	mod            string
+	table          &ast.Table = unsafe { nil }
 	filtered_lines FilteredLines
 	analyze        VetAnalyze
 	regex_vars     map[string]bool
@@ -126,6 +127,7 @@ fn (mut vt Vet) vet_file(path string) {
 	vt.vprintln("vetting file '${path}'...")
 	file := parser.parse_file(path, mut table, .parse_comments, prefs)
 	vt.mod = file.mod.name
+	vt.table = table
 	vt.regex_vars = map[string]bool{}
 	vt.stmts(file.stmts)
 	source_lines := os.read_lines(vt.file) or { []string{} }
@@ -313,10 +315,43 @@ fn (mut vt Vet) stmt(stmt ast.Stmt) {
 			vt.regex_vars = old_regex_vars.clone()
 		}
 		ast.StructDecl {
+			for field in stmt.fields {
+				if !field.has_default_expr {
+					vt.vet_value_typed_mutex(field.typ, field.pos.line_nr,
+						'struct field `${field.name}`', '`&sync.Mutex = sync.new_mutex()`')
+				}
+			}
 			vt.exprs(stmt.fields.map(it.default_expr))
+		}
+		ast.GlobalDecl {
+			for field in stmt.fields {
+				vt.vet_value_typed_mutex(field.typ, field.pos.line_nr, '__global `${field.name}`',
+					'`&sync.Mutex`, initialized with `sync.new_mutex()` (e.g. in a module `init` fn)')
+			}
+			vt.exprs(stmt.fields.map(it.expr))
 		}
 		else {}
 	}
+}
+
+// vet_value_typed_mutex reports declarations of a *value typed* `sync.Mutex`.
+// Its zero value is not a valid initialized mutex everywhere: on macOS, a zeroed
+// pthread_mutex_t fails to lock with EINVAL (PTHREAD_MUTEX_INITIALIZER is not all
+// zeros there, unlike on Linux/glibc), so a never-init()-ed value mutex provides
+// no mutual exclusion at all. Every correct use starts with sync.new_mutex(), or
+// calls .init() once before any use — the reference form makes that explicit.
+fn (mut vt Vet) vet_value_typed_mutex(typ ast.Type, line int, what string, instead string) {
+	if vt.mod == 'sync' || vt.table == unsafe { nil } {
+		return
+	}
+	if typ == 0 || typ.is_ptr() {
+		return
+	}
+	if vt.table.type_to_str(typ) != 'sync.Mutex' {
+		return
+	}
+	vt.warn('${what} is a value typed `sync.Mutex`; its zero value is not a valid initialized mutex on every platform (on macOS, a zeroed pthread_mutex_t is invalid, so locking it panics at runtime with EINVAL). Use ${instead}, or call its `.init()` method once, before any use.',
+		line, .unknown)
 }
 
 fn (mut vt Vet) exprs(exprs []ast.Expr) {
@@ -391,6 +426,8 @@ fn (mut vt Vet) expr(expr ast.Expr) {
 			vt.expr(expr.expr)
 		}
 		ast.StructInit {
+			vt.vet_value_typed_mutex(expr.typ, expr.pos.line_nr, 'the `sync.Mutex{}` literal',
+				'`sync.new_mutex()`')
 			vt.expr(expr.update_expr)
 			vt.exprs(expr.init_fields.map(it.expr))
 		}

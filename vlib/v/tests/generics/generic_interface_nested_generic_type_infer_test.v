@@ -22,7 +22,10 @@ fn new_cache_item[K, V](key K, val V) &CacheItem[K, V] {
 struct Cache[K, V] {
 mut:
 	cache CacheStore[K, &CacheItem[K, V]]
-	mu    sync.Mutex
+	// Note: a *value typed* zeroed sync.Mutex is not a valid initialized
+	// mutex on macOS: sync.Mutex.lock() panics on it (and before that
+	// hardening, it silently provided no mutual exclusion at all there).
+	mu &sync.Mutex = sync.new_mutex()
 }
 
 type CacheOption[K, V] = fn (o &CacheOptions[K, V])
