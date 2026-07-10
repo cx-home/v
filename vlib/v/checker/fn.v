@@ -3136,7 +3136,8 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 		&& fixed_array_builtin_methods_chk.matches(method_name) && !(left_sym.kind == .alias
 		&& left_sym.has_method(method_name)) {
 		return c.fixed_array_builtin_method_call(mut node, left_type)
-	} else if final_left_sym.kind == .map && node.kind in [.clone, .keys, .values, .move, .delete]
+	} else if final_left_sym.kind == .map
+		&& node.kind in [.clone, .keys, .values, .move, .delete, .value_ptr]
 		&& !(left_sym.kind == .alias && left_sym.has_method(method_name)) {
 		unaliased_left_type := c.table.unaliased_type(left_type)
 		return c.map_builtin_method_call(mut node, unaliased_left_type)
@@ -4704,6 +4705,30 @@ fn (mut c Checker) map_builtin_method_call(mut node ast.CallExpr, left_type_ ast
 				arg_type := c.expr(mut node.args[0].expr)
 				c.check_expected_call_arg(arg_type, info.key_type, node.language, node.args[0]) or {
 					c.error('${err.msg()} in argument 1 to `Map.delete`', node.args[0].pos)
+				}
+			} else {
+				c.error('expected 1 argument, but got ${node.args.len}', node.pos)
+			}
+		}
+		.value_ptr {
+			// `unsafe { m.value_ptr(key) }` — by-ref map get: a reference to
+			// the value stored for `key`, `nil` when absent. The reference
+			// points INTO the map's storage; any subsequent write to the map
+			// (insert / delete / rehash) invalidates it — copy the value out
+			// before the map can change. Unsafe-only for that reason.
+			if !c.inside_unsafe {
+				c.error('`.value_ptr()` returns a reference into the map storage and must be called inside `unsafe {}`',
+					node.pos)
+			}
+			if node.args.len == 1 {
+				info := left_sym.info as ast.Map
+				arg_type := c.expr(mut node.args[0].expr)
+				c.check_expected_call_arg(arg_type, info.key_type, node.language, node.args[0]) or {
+					c.error('${err.msg()} in argument 1 to `Map.value_ptr`', node.args[0].pos)
+				}
+				ret_type = info.value_type.ref()
+				if info.value_type.has_flag(.generic) {
+					ret_type = ret_type.set_flag(.generic)
 				}
 			} else {
 				c.error('expected 1 argument, but got ${node.args.len}', node.pos)

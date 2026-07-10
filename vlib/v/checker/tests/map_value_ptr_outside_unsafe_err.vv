@@ -1,0 +1,4 @@
+mut m := map[string]int{}
+m['a'] = 1
+p := m.value_ptr('a')
+println(*p)
