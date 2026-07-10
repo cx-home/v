@@ -46,3 +46,9 @@ fn vgc_heap_usage() (usize, usize, usize, usize, usize) {
 fn vgc_memory_use() usize {
 	return 0
 }
+
+fn vgc_safe_region_enter() {
+}
+
+fn vgc_safe_region_exit() {
+}
