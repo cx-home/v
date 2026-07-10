@@ -263,6 +263,51 @@ fn test_main_error_propagation_panic_branches_do_not_fall_through() {
 	}
 }
 
+fn test_return_result_propagation_forwards_directly() {
+	// `return f(...)!` where the callee's result type is exactly the
+	// enclosing fn's must compile to a bare direct return — zero
+	// `_result_T` stack temporaries (cx #327); a mismatched payload
+	// must keep the generic rewrap lowering.
+	os.chdir(vroot) or {}
+	path := os.join_path(testdata_folder, 'return_result_propagation_forward.vv')
+	cmd := '${os.quoted_path(vexe)} -o - ${os.quoted_path(path)}'
+	compilation := os.execute(cmd)
+	ensure_compilation_succeeded(compilation, cmd)
+	lines := compilation.output.split_into_lines()
+	// the same-type propagation arms are bare direct returns
+	assert compilation.output.contains('return main__leaf(x + 1);')
+	assert compilation.output.contains('return main__leaf(x);')
+	// ... and the forwarding function's body carries no result temporaries
+	mut in_fwd_same := false
+	mut fwd_same_seen := false
+	mut in_fwd_mismatch := false
+	mut mismatch_has_tmp := false
+	for line in lines {
+		if line.contains('_result_main__Node main__fwd_same(') && line.ends_with('{') {
+			in_fwd_same = true
+			fwd_same_seen = true
+			continue
+		}
+		if line.contains(' main__fwd_mismatch(') && line.ends_with('{') {
+			in_fwd_mismatch = true
+			continue
+		}
+		if line == '}' {
+			in_fwd_same = false
+			in_fwd_mismatch = false
+			continue
+		}
+		if in_fwd_same {
+			assert !line.contains('_result_main__Node _t'), 'main__fwd_same must not allocate result temporaries, found: ${line}'
+		}
+		if in_fwd_mismatch && line.contains('_result_int _t') {
+			mismatch_has_tmp = true
+		}
+	}
+	assert fwd_same_seen
+	assert mismatch_has_tmp
+}
+
 fn test_imported_empty_interface_concat_does_not_emit_noop_array_cast_helper() {
 	os.chdir(vroot) or {}
 	path := os.join_path(vroot,
