@@ -633,6 +633,108 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     __asm__ __volatile__("" : : "r"(&buf) : "memory");
 }
 
+// ── GC-safe blocking regions (cx #316) ──────────────────────────────────────
+// A thread about to block indefinitely in an OS primitive (a parked executor's
+// private-semaphore wait) registers as a GC-SAFE REGION so the cooperative
+// collector treats it as already stopped: it is excluded from the park-wait
+// count, never mach-suspended/resumed, and its cond_wait is never signal-
+// interrupted — the STW suspend set becomes the AWAKE set, not the thread count.
+//
+// CONTRACT (soundness; every call site must satisfy it): between enter and
+// exit the thread must NOT (1) allocate from the GC heap (the collector also
+// reads+resets this thread's un-flushed live_delta accounting under STW),
+// (2) store a GC-heap POINTER anywhere (scalar stores to already-reachable
+// objects — semaphore counters, pthread internals — are fine), or (3) acquire
+// a reference to a GC object it uses after exit beyond what is reachable at
+// entry from [range_lo, stack_base], from the reg_save snapshot, or from other
+// roots that stay live for the whole region. The collector then scans the
+// ENTRY-time stack prefix conservatively plus the off-stack register snapshot;
+// frames the blocking call pushes BELOW range_lo are unscanned by construction
+// (per the contract they hold no GC state the thread relies on after exit).
+// Scanning the prefix while the thread wakes concurrently is sound: the region
+// above range_lo is quiescent by contract, aligned word loads cannot tear, and
+// anything newly observed is either a non-pointer (over-retention at worst) or
+// an already-reachable pointer.
+//
+// The callee-saved registers are spilled via setjmp exactly like
+// vgc_park_spill, but copied OFF-STACK into reg_save (this thread's slot in
+// vgc_heap.caches[]): unlike the parker — whose frame stays alive across the
+// whole spin — THIS frame dies when enter returns and the blocking call's
+// frames reuse its addresses, so a stack-resident spill would be overwritten
+// while the collector still needs it. That off-stack copy is the one delta
+// from the field-proven park_spill shape.
+// On BSD-lineage libcs (darwin included) plain setjmp SAVES THE SIGNAL MASK —
+// a sigprocmask SYSCALL per call. vgc_park_spill can afford that (it runs once
+// per thread per STW); this primitive runs at PARK FREQUENCY (every executor
+// park under load), where a per-call syscall measurably drags dispatch
+// throughput. _setjmp spills the same callee-saved registers without the
+// mask — and the mask is not a GC root.
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+  #define VGC_SPILL_SETJMP(b) _setjmp(b)
+#else
+  #define VGC_SPILL_SETJMP(b) setjmp(b) // glibc/musl setjmp does not save the mask
+#endif
+static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
+                                        uintptr_t* range_hi, uintptr_t stack_base,
+                                        uintptr_t* reg_save, int reg_max) {
+    jmp_buf buf;
+    memset(&buf, 0, sizeof(buf)); // deterministic tail below (unused slots shade nothing)
+    VGC_SPILL_SETJMP(buf);
+    // Real SP, not the frame pointer: the spilled-register jmp_buf lives below
+    // the frame pointer and must be inside the recorded range (see vgc_real_sp).
+    uintptr_t sp = vgc_real_sp();
+    if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
+    if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
+    else { *range_lo = stack_base; *range_hi = sp; }
+    int n = (int)(sizeof(buf) / sizeof(uintptr_t));
+    if (n > reg_max) { n = reg_max; }
+    const uintptr_t* w = (const uintptr_t*)&buf;
+    for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }
+    for (int i = n; i < reg_max; i++) { reg_save[i] = 0; }
+    // Publish LAST (seq_cst): a collector that loads safe==1 (its load is after
+    // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
+    // recorded range and the completed snapshot.
+    vgc_atomic_store_u32(my_safe, 1);
+    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+}
+
+// Leave the safe region. The order is load-bearing (the classic Dekker pairing
+// against STW initiation): (1) seq_cst store safe=0 announces "about to run";
+// (2) THEN load the stop flag. The collector does the mirror image — seq_cst
+// store gc_stop_flag=1, THEN load safe — so seq_cst forbids the unsound
+// interleaving where the collector still sees safe==1 (skips suspension) while
+// this thread sees stop_flag==0 (runs through mark+sweep unscanned). Either
+// the collector sees safe==0 and mach-suspends this thread as a straggler
+// (externally scanned — sound), or this thread sees stop_flag==1 and spins
+// here until the world resumes (its entry-time roots stay valid throughout —
+// it has created no new GC state since enter, per the contract).
+// Wait shape: a SLEEPING wait, not a burn. A wake that collides with an
+// in-flight STW must idle until the world resumes (multi-ms under load); a
+// cpu_pause busy-spin here put every collided waker on a core for the WHOLE
+// pause — measured (sample, no-op serve at CX_HTTP_HOT=16): the spin was the
+// 4th-hottest leaf in the process and throughput dropped ~20% vs baseline,
+// because the spinners starve the single-threaded collector (and the serve
+// plane) of cores exactly while the pause runs. A short pause-spin covers the
+// common tail-of-pause collision; past it, usleep hands the core back (the
+// resume latency cost is bounded by the sleep quantum and only paid by wakes
+// that collided with a GC). The Dekker ordering above is unaffected — how the
+// flag-drop is awaited is irrelevant to soundness.
+static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+    vgc_atomic_store_u32(my_safe, 0);
+    int spins = 0;
+    while (vgc_atomic_load_u32(stop_flag) != 0) {
+        if (++spins < 1000) {
+            vgc_cpu_pause();
+        } else {
+#ifdef _WIN32
+            Sleep(0);
+#else
+            usleep(100);
+#endif
+        }
+    }
+}
+
 #ifndef _WIN32
 extern void vgc_thread_exit_cb(int idx);
 static pthread_key_t _vgc_exit_key;

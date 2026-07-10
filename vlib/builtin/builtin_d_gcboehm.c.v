@@ -246,6 +246,18 @@ pub fn gc_pin(p voidptr) {}
 @[markused]
 pub fn gc_unpin(p voidptr) {}
 
+// gc_safe_region_enter / gc_safe_region_exit: NOPs under boehm. Boehm's own
+// stop-the-world already handles blocked threads without a cooperative
+// rendezvous, so there is nothing to exempt. The API exists so runtime code
+// (e.g. a parked executor's semaphore wait) can call it unconditionally
+// regardless of the active backend — under vgc (`-gc e`) it excludes the
+// parked thread from the STW suspend set (cx #316).
+@[markused]
+pub fn gc_safe_region_enter() {}
+
+@[markused]
+pub fn gc_safe_region_exit() {}
+
 // gc_enable explicitly enables the GC.
 // Note, that garbage collections are done automatically, when needed in most cases,
 // and also that by default the GC is on, so you do not need to enable it.
