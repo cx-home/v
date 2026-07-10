@@ -18,6 +18,40 @@ fn should_be_zero(res int) {
 	}
 }
 
+// errno_name maps the errno codes, that the pthread lock/unlock family of
+// functions can return, to their symbolic names, so that panic messages are
+// actionable. Note: an if chain is used instead of `match`, since some errno
+// values may be aliases for each other on some platforms.
+fn errno_name(res int) string {
+	return if res == C.EINVAL {
+		'EINVAL'
+	} else if res == C.EDEADLK {
+		'EDEADLK'
+	} else if res == C.EPERM {
+		'EPERM'
+	} else if res == C.EBUSY {
+		'EBUSY'
+	} else if res == C.EAGAIN {
+		'EAGAIN'
+	} else {
+		'errno ${res}'
+	}
+}
+
+// panic_on_lock_error reports a fatal error from a pthread lock/unlock class
+// operation `op`, that failed with the error code `res`. A lock operation
+// that fails, but is not checked, is a *silent no-op lock* — the worst
+// possible failure mode: it provides no mutual exclusion, and the data it
+// guards is corrupted quietly. EINVAL here usually means the lock was the
+// zero value, and was never initialized: on macOS a zeroed pthread_mutex_t
+// is invalid, since PTHREAD_MUTEX_INITIALIZER is not all zeros (unlike on
+// Linux/glibc, where a zeroed mutex happens to be valid — which is why this
+// class of bug presents as macOS-only).
+@[noreturn]
+fn panic_on_lock_error(op string, res int) {
+	panic('sync: ${op} failed with ${errno_name(res)} (${unsafe { tos_clone(&u8(C.strerror(res))) }}); an uninitialized (zero value) lock is not usable - create it with sync.new_mutex()/sync.new_rwmutex(), or call its .init() method once, before any use')
+}
+
 // SpinLock is a mutual exclusion lock that busy-waits (spins) when locked.
 // When one thread holds the lock, any other thread attempting to acquire it
 // will loop repeatedly until the lock becomes available.
