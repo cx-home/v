@@ -1,0 +1,16 @@
+// vtest vflags: -gc e -cc cc
+// A MAP-FREE program under `-gc e` must compile and run (cx #345): with
+// used_maps == 0 the emission gate elides `struct map` + the DenseArray
+// methods, so nothing retained may dereference map internals — previously
+// `map.free` (over-broad markused retention) and the always-on cx_envcheck
+// vgc probes were emitted anyway, producing orphaned over-incomplete-type C
+// that broke BOTH tcc and the tcc→cc fallback.
+fn main() {
+	mut a := []int{}
+	for i in 0 .. 5 {
+		a << i
+	}
+	mut s := 'total'
+	s += ': '
+	println('${s}${a.len}')
+}
