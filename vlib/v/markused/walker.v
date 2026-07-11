@@ -3855,6 +3855,17 @@ fn (mut w Walker) mark_resource_dependencies() {
 		}
 		if (w.pref.autofree || (w.uses_free.len > 0 && func.receiver.typ.idx() in w.used_syms))
 			&& k.ends_with('.free') {
+			// `map.free`'s BODY needs `struct map` + the DenseArray methods,
+			// whose emission gates on used_maps — a program with no map
+			// values (used_maps == 0) elides them, so retaining the free here
+			// emits an orphaned builtin__map_free over an incomplete type
+			// (the map's type SYMBOL lands in used_syms via mere signature
+			// mentions, e.g. the vgc runtime's C-interop). No map value can
+			// exist to be freed, so the method is dead — skip it.
+			if w.features.used_maps == 0
+				&& func.receiver.typ.set_nr_muls(0).idx() == ast.map_type_idx {
+				continue
+			}
 			w.fn_by_name(k)
 			continue
 		}

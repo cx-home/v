@@ -568,24 +568,34 @@ __global vgc_spchk_parked = [64]u64{}
 // array is the sweep-while-live UAF caught at its source. Packed result:
 // byte0 = keys status (bit0 alloc, bit1 span in_use, 0xff = not a heap ptr),
 // byte1 = values status, bytes2-5 = map len (u32).
+// The map-dereferencing body compiles only under -d cx_envcheck (its sole
+// callers are envcheck probes): always-on, it forced `struct map`/DenseArray
+// retention into MAP-FREE programs — where the emission gate (used_maps == 0)
+// correctly elides them, producing orphaned over-incomplete-type C (cx #345).
+// Without the define the probe answers "not a heap ptr" for both arrays.
 @[markused]
 pub fn vgc_map_backing_status(mp voidptr) u64 {
-	mut ks := u64(0xff)
-	mut vs := u64(0xff)
-	mut mlen := u64(0)
-	unsafe {
-		m := &map(mp)
-		mlen = u64(u32(m.len))
-		if usize(voidptr(m.key_values.keys)) >= vgc_arena_lo
-			&& usize(voidptr(m.key_values.keys)) < vgc_arena_hi {
-			ks = vgc_is_allocated(voidptr(m.key_values.keys)) & 3
+	$if cx_envcheck ? {
+		mut ks := u64(0xff)
+		mut vs := u64(0xff)
+		mut mlen := u64(0)
+		unsafe {
+			m := &map(mp)
+			mlen = u64(u32(m.len))
+			if usize(voidptr(m.key_values.keys)) >= vgc_arena_lo
+				&& usize(voidptr(m.key_values.keys)) < vgc_arena_hi {
+				ks = vgc_is_allocated(voidptr(m.key_values.keys)) & 3
+			}
+			if usize(voidptr(m.key_values.values)) >= vgc_arena_lo
+				&& usize(voidptr(m.key_values.values)) < vgc_arena_hi {
+				vs = vgc_is_allocated(voidptr(m.key_values.values)) & 3
+			}
 		}
-		if usize(voidptr(m.key_values.values)) >= vgc_arena_lo
-			&& usize(voidptr(m.key_values.values)) < vgc_arena_hi {
-			vs = vgc_is_allocated(voidptr(m.key_values.values)) & 3
-		}
+		return ks | (vs << 8) | (mlen << 16)
+	} $else {
+		_ := mp
+		return 0xff | (0xff << 8)
 	}
-	return ks | (vs << 8) | (mlen << 16)
 }
 
 // vgc_spchk_self: #58 cx_envcheck support — this thread's scanned-window shadow
@@ -639,11 +649,17 @@ pub fn vgc_explicit_free_ra(p voidptr) u64 {
 
 // vgc_map_keys_ptr: #58 cx_envcheck support — the raw keys backing pointer of a
 // map, for ring lookups / correlation from outside builtin.
+// Body compiles only under -d cx_envcheck — see vgc_map_backing_status (cx #345).
 @[markused]
 pub fn vgc_map_keys_ptr(mp voidptr) voidptr {
-	unsafe {
-		m := &map(mp)
-		return voidptr(m.key_values.keys)
+	$if cx_envcheck ? {
+		unsafe {
+			m := &map(mp)
+			return voidptr(m.key_values.keys)
+		}
+	} $else {
+		_ := mp
+		return unsafe { nil }
 	}
 }
 
