@@ -30,6 +30,7 @@ fn C.vgc_cpu_pause()
 fn C.vgc_os_alloc(size usize) voidptr
 fn C.vgc_os_free(ptr voidptr, size usize)
 fn C.vgc_os_decommit(ptr voidptr, size usize)
+fn C.vgc_os_recommit(ptr voidptr, size usize) // undo decommit before reuse (cx #360)
 fn C.vgc_get_sp() voidptr
 fn C.vgc_get_stack_bounds(lo &usize, hi &usize) int
 fn C.vgc_bitmap_get(bits &u8, idx u32) int
@@ -88,12 +89,25 @@ const vgc_num_classes = 68
 const vgc_num_span_classes = 136 // 68 * 2 (scan + noscan variants)
 const vgc_arena_size = usize(64) * 1024 * 1024 // 64MB per arena
 const vgc_pages_per_arena = vgc_arena_size / vgc_page_size
-// free_spans pool bound: spans of 1..vgc_max_pooled_pages-1 pages are recyclable.
-// A literal (not the computed vgc_pages_per_arena) because V needs a constant-literal
-// for the fixed-array size below. 8192 pages * 8 KB = 64 MB = one full arena, so every
-// span that can fit in an arena is poolable (#52/#57: the old 32-page/256 KB bound
-// silently leaked larger transients).
+// free_spans pool bound: spans of 1..vgc_max_pooled_pages pages (INCLUSIVE — the
+// free_spans array carries 8193 slots so a fully-coalesced 64 MB arena pools too)
+// are recyclable by exact size; anything larger (oversized single-object arenas)
+// goes on the free_oversized list (cx #360 — previously npages >= 8192 was never
+// pooled at all, so every swept-empty oversized buffer leaked its committed
+// pages). 8192 pages * 8 KB = 64 MB = one full arena (#52/#57: the old
+// 32-page/256 KB bound silently leaked larger transients).
 const vgc_max_pooled_pages = 8192
+// Coalescing participation floor (pages). Size-CLASS spans (1..~10 pages) have a
+// stable per-size population once the sweep relinks partial spans (#360 commit 1):
+// exact-fit serves them with zero pool churn, and letting them coalesce measured
+// as pure thrash — every cycle merged the freed small spans into big blocks that
+// the next cycle's demand split straight back (descriptor + page-repoint traffic
+// per span), which pushed the t4 hot_loop equilibrium from 44 MB back to ~151 MB.
+// Only spans of >= this many pages (large/varied-npages objects — the population
+// whose exact-fit misses actually ratchet the arena bump, cx #277/#283) merge;
+// both merge participants must qualify, so small per-size pools are never
+// depleted from the side either.
+const vgc_pool_merge_min = 16
 // Architectural arena-count ceiling: 1024 x 64 MB = 64 GB of heap address
 // capacity (cx #282; was 64 = 4 GB). Cheap to compile in because VGC_Arena no
 // longer embeds its page->span map (see the struct): the static arenas table
@@ -167,6 +181,17 @@ mut:
 	// chain is hijacked into free_spans -> a later vgc_central_get_span traverses a
 	// garbage node -> returns a wild span -> SIGSEGV in the allocation memset.
 	on_central u8
+	// cx #360 free-span pool state. `pooled` is true exactly while the span sits on
+	// a free_spans[npages] list (or the oversized list) — it is what the coalescer
+	// trusts when a page_span neighbor lookup lands on this descriptor, so it is
+	// set/cleared ONLY under free_spans_lock. `pool_gen` is the gc_cycle at pooling
+	// time (the decommit trim's age input). `decommitted` marks spans whose data
+	// pages were returned to the OS while pooled; the pool only coalesces spans of
+	// EQUAL decommit state (a merged span must have one truthful flag), and the
+	// pop path recommits (vgc_os_recommit) before handing a decommitted span out.
+	pooled      bool
+	decommitted bool
+	pool_gen    u32
 	// INLINE allocation / mark bitmaps. The max objects per span across all size
 	// classes is 1024 (vgc_class_nobjs[1]) -> 128 bytes; large spans use 1 byte.
 	// Inlining (vs a per-bitmap mmap) avoids rounding each ~128-byte bitmap up to a
@@ -304,13 +329,24 @@ mut:
 	nspans       int
 	// Free spans (completely empty, reusable by page count)
 	free_spans_lock u32
-	// free spans indexed by npages (1..vgc_pages_per_arena-1, 0=unused). Sized to a
+	// free spans indexed by npages (1..vgc_max_pooled_pages INCLUSIVE, 0=unused;
+	// the +1 slot lets a fully-coalesced 64 MB arena — exactly 8192 pages — pool).
+	// Doubly-linked per size (cx #360: the coalescer unlinks mid-list). Sized to a
 	// full arena so EVERY span that fits in one arena is recyclable. The old [32]
 	// bound (256 KB) silently leaked larger transients (e.g. a ~1 MB zstd dst buffer
 	// in a streaming-write hot loop): swept empty, but vgc_put_free_span/_get_free_span
 	// refused npages>=32, so the span was never pooled and the arena bump pointer
 	// (never rewound) kept advancing → unbounded RSS. cx-private #52/#57.
-	free_spans      [vgc_max_pooled_pages]&VGC_Span
+	// A get miss no longer carves: it best-fit SPLITS the smallest larger pooled
+	// span, and vgc_put_free_span coalesces same-arena pooled neighbors, so the
+	// pool serves varied page counts instead of ratcheting the arena bump on
+	// every previously-unseen npages (cx #360; the #277 field deaths were the
+	// large-object flavor of that ratchet).
+	free_spans      [8193]&VGC_Span
+	// Pooled spans LARGER than one arena (oversized single-object arenas, npages >
+	// vgc_max_pooled_pages). First-fit with split on reuse; no coalescing (an
+	// oversized arena hosts exactly its one span, so it has no in-arena neighbors).
+	free_oversized  &VGC_Span = unsafe { nil }
 	// Per-thread caches
 	caches       [64]VGC_Cache
 	ncaches      int // high-water mark of slots ever used
@@ -345,13 +381,25 @@ mut:
 	sweep_done u32 // atomic
 	// Default GC trigger: collect when heap doubles (GOGC=100 equivalent)
 	gc_percent int // like Go's GOGC, default 100
-	// Span-descriptor slab (bump allocator for VGC_Span metadata). Span descriptors are
-	// never individually freed (vgc_put_free_span pools them for reuse forever), so a
-	// bump slab is sound and removes a per-carve mmap() syscall from the vgc_heap.lock
-	// hold — that syscall lengthened the lock hold and drove the new-span-carve
-	// contention that makes alloc-heavy [par] anti-scale (B18). Bumped under vgc_heap.lock.
-	span_meta_cur usize
-	span_meta_end usize
+	// Span-descriptor slab (bump allocator for VGC_Span metadata), plus the cx #360
+	// descriptor recycle lists. A descriptor absorbed by pool coalescing is zeroed
+	// and pushed onto span_meta_pending (STW, sweep context); at the START of the
+	// next cycle vgc_span_meta_promote_pending moves pending -> span_meta_free,
+	// from which vgc_new_span_desc pops before bumping the slab. The one-cycle
+	// grace mirrors the sweep_gen in-flight guard: a mutator signal-frozen inside
+	// vgc_free between its vgc_find_span load and its field reads must never see
+	// the descriptor REDESCRIBED for different pages within its freeze window
+	// (strictly more conservative than the pre-existing same-pages span_init
+	// reuse, which re-purposes a pooled span's fields immediately post-resume).
+	// Recycled descriptors KEEP their allspans slot (the slot holds the descriptor
+	// ADDRESS, which never changes), so nspans — and with it every O(nspans) STW
+	// walk — is bounded by the peak simultaneous span count instead of growing
+	// monotonically (#360's pause↔headroom feedback fuel). All fields below are
+	// guarded by vgc_heap.lock. Bumped under vgc_heap.lock.
+	span_meta_cur     usize
+	span_meta_end     usize
+	span_meta_free    &VGC_Span = unsafe { nil }
+	span_meta_pending &VGC_Span = unsafe { nil }
 }
 
 // Global heap instance. NOTE: V emits a zero-initializing assignment for this
@@ -1254,35 +1302,196 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 // Span management (translated from Go's mspan operations)
 // ============================================================
 
-// Try to get a recycled span from the free list
+// vgc_arena_of resolves the arena index owning `addr`, or -1. Same hint +
+// linear-fallback discipline as vgc_find_span (the addr_map hint is 1 GB-coarse,
+// so older arenas sharing a chunk need the fallback). Slow-path only (pool
+// split/coalesce); arenas are never freed, so a resolved index stays valid.
+fn vgc_arena_of(addr usize) int {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	mut arena_idx := C.vgc_addr_to_arena(addr)
+	if arena_idx >= 0 && arena_idx < nar && addr >= vgc_heap.arenas[arena_idx].base
+		&& addr < vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
+		return arena_idx
+	}
+	for i in 0 .. nar {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if addr >= a.base && addr < a.base + a.size {
+			return i
+		}
+	}
+	return -1
+}
+
+// vgc_pool_push links a fully-empty span onto its free list (free_spans[npages],
+// or the oversized list for spans larger than one arena). Caller holds
+// free_spans_lock (mutator split-remainder path) or IS the collector with that
+// lock held across the cycle (sweep/coalesce path).
+fn vgc_pool_push(mut span VGC_Span) {
+	span.pooled = true
+	span.pool_gen = u32(vgc_heap.gc_cycle)
+	unsafe {
+		span.prev = nil
+		if span.npages > u32(vgc_max_pooled_pages) {
+			span.next = vgc_heap.free_oversized
+			if span.next != nil {
+				span.next.prev = span
+			}
+			vgc_heap.free_oversized = span
+		} else {
+			span.next = vgc_heap.free_spans[span.npages]
+			if span.next != nil {
+				span.next.prev = span
+			}
+			vgc_heap.free_spans[span.npages] = span
+		}
+	}
+}
+
+// vgc_pool_unlink removes a pooled span from whichever free list holds it.
+// Same locking contract as vgc_pool_push.
+fn vgc_pool_unlink(mut span VGC_Span) {
+	unsafe {
+		if span.prev != nil {
+			span.prev.next = span.next
+		} else if span.npages > u32(vgc_max_pooled_pages) {
+			vgc_heap.free_oversized = span.next
+		} else {
+			vgc_heap.free_spans[span.npages] = span.next
+		}
+		if span.next != nil {
+			span.next.prev = span.prev
+		}
+		span.next = nil
+		span.prev = nil
+	}
+	span.pooled = false
+}
+
+// vgc_span_repoint_pages RELEASE-stores `owner` into the page_span slots for
+// [base, base + npages pages) — split hands remainder pages to a fresh
+// descriptor, coalesce hands an absorbed span's pages to the survivor. Paired
+// with the ACQUIRE loads in vgc_find_span; a lock-free reader mid-rewrite sees
+// either descriptor, and both are !in_use pooled spans it correctly rejects.
+fn vgc_span_repoint_pages(arena_idx int, base usize, npages u32, owner &VGC_Span) {
+	a := unsafe { &vgc_heap.arenas[arena_idx] }
+	map_pages := a.size / vgc_page_size
+	page_start := (base - a.base) / vgc_page_size
+	for p in 0 .. npages {
+		pidx := page_start + usize(p)
+		if pidx < map_pages {
+			unsafe {
+				C.vgc_atomic_store_u64(&u64(voidptr(&a.page_span[pidx])), u64(voidptr(owner)))
+			}
+		}
+	}
+}
+
+// vgc_span_split shrinks `span` (pooled, already unlinked) to `want` pages and
+// pools the remainder under a fresh descriptor. Caller holds free_spans_lock;
+// the descriptor allocation takes vgc_heap.lock nested inside it — the same
+// free_spans -> heap order vgc_gc_start uses, so no lock cycle exists. The
+// remainder is pushed WITHOUT a coalesce attempt: put-side coalescing keeps the
+// pool free of adjacent pooled spans, so a just-split remainder cannot have a
+// pooled neighbor. Returns false (split refused, span unchanged) only when a
+// descriptor cannot be obtained.
+fn vgc_span_split(mut span VGC_Span, want u32) bool {
+	rem := span.npages - want
+	if rem == 0 {
+		return true
+	}
+	rem_base := span.base + usize(want) * vgc_page_size
+	arena_idx := vgc_arena_of(rem_base)
+	if arena_idx < 0 {
+		return true // untracked memory (cannot happen for pooled spans); hand out whole
+	}
+	C.vgc_mutex_lock(&vgc_heap.lock)
+	mut rspan := vgc_new_span_desc()
+	C.vgc_mutex_unlock(&vgc_heap.lock)
+	if rspan == unsafe { nil } {
+		return true // descriptor exhaustion: hand out the whole span rather than fail
+	}
+	unsafe {
+		C.memset(rspan, 0, sizeof(VGC_Span))
+		rspan.base = rem_base
+		rspan.npages = rem
+		rspan.decommitted = span.decommitted
+	}
+	vgc_span_repoint_pages(arena_idx, rem_base, rem, rspan)
+	span.npages = want
+	vgc_pool_push(mut rspan)
+	return true
+}
+
+// Try to get a recycled span from the free list: exact fit first, then best-fit
+// (smallest sufficient) with a split, then the oversized list (cx #360). A miss
+// here is the ONLY path that carves fresh arena space, so serving varied page
+// counts from the pool is what stops the arena bump pointer — which never
+// rewinds — from ratcheting on every previously-unseen npages.
 fn vgc_get_free_span(npages u32) &VGC_Span {
-	if npages == 0 || npages >= u32(vgc_max_pooled_pages) {
+	if npages == 0 {
 		return unsafe { nil }
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
-	span := vgc_heap.free_spans[npages]
-	if span != unsafe { nil } {
-		unsafe {
-			vgc_heap.free_spans[npages] = span.next
-			span.next = nil
-			span.prev = nil
+	if npages <= u32(vgc_max_pooled_pages) {
+		mut span := vgc_heap.free_spans[npages]
+		if span != unsafe { nil } {
 			// in_use stays FALSE: it is set true only once the span is fully
-			// (re)initialized (vgc_span_init / vgc_alloc_large). While in_use is false
-			// the collector's clear-mark / count-marked / sweep loops skip the span, so
-			// a mutator suspended mid-init can't have its half-built span touched. See
-			// the in_use="fully initialized" invariant in vgc_span_init.
+			// (re)initialized (vgc_span_init / vgc_alloc_large). While in_use is
+			// false the collector's clear-mark / count-marked / sweep loops skip
+			// the span, so a mutator suspended mid-init can't have its half-built
+			// span touched. See the in_use invariant in vgc_span_init.
+			vgc_pool_unlink(mut span)
+			vgc_span_pop_finish(mut span)
+			C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+			return span
 		}
-		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
-		return span
+		// Best fit: the smallest pooled span that covers the request, split down.
+		for n := npages + 1; n <= u32(vgc_max_pooled_pages); n++ {
+			mut cand := vgc_heap.free_spans[n]
+			if cand != unsafe { nil } {
+				vgc_pool_unlink(mut cand)
+				vgc_span_split(mut cand, npages)
+				vgc_span_pop_finish(mut cand)
+				C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+				return cand
+			}
+		}
+	}
+	// Oversized list: first fit, split the tail back into circulation.
+	mut o := vgc_heap.free_oversized
+	for o != unsafe { nil } {
+		if o.npages >= npages {
+			vgc_pool_unlink(mut o)
+			vgc_span_split(mut o, npages)
+			vgc_span_pop_finish(mut o)
+			C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+			return o
+		}
+		o = o.next
 	}
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	return unsafe { nil }
 }
 
-// Return a fully-empty span to the free list for reuse
+// vgc_span_pop_finish restores a just-popped span's data pages if a pool trim
+// decommitted them while it sat cold (cx #360). MADV_DONTNEED'd (or, on
+// Windows, MEM_DECOMMIT'd) pages must be recommitted before the span is handed
+// out; committed spans pay one branch.
+fn vgc_span_pop_finish(mut span VGC_Span) {
+	if span.decommitted {
+		C.vgc_os_recommit(voidptr(span.base), usize(span.npages) * vgc_page_size)
+		span.decommitted = false
+	}
+}
+
+// Return a fully-empty span to the free list for reuse, coalescing it with any
+// same-arena pooled neighbors first (cx #360) so the pool re-forms large
+// contiguous spans instead of fragmenting monotonically — the large-object
+// flavor of the arena ratchet ("no pooled span big enough, bump never rewinds")
+// is what killed the marine helm mid-persist in the cx #277 field traces.
 fn vgc_put_free_span(mut span VGC_Span) {
 	npages := span.npages
-	if npages == 0 || npages >= u32(vgc_max_pooled_pages) {
+	if npages == 0 {
 		return
 	}
 	// DIAGNOSTIC: did we just free the span holding the watched address?
@@ -1292,21 +1501,22 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			vgc_watch_decommit = 1
 		}
 	}
-	// KEEP the span's data pages committed (no decommit) for near-immediate reuse off
-	// the free list. The previous design madvise-decommitted the data pages on every
-	// pool, then page-faulted them back on every reuse; under the heavy span recycling
-	// that correct reuse produces (~tens of thousands of spans/cycle) that per-span
-	// syscall churn dominated wall-clock (≈190 s sys on g_churn 100 1 30). Bitmaps are
-	// inline in the span (alloc_buf/mark_buf), so there is nothing to free here either.
-	// Reuse is now pure pointer ops + a bitmap memset in vgc_span_init. RSS stays
-	// bounded by the peak committed working set (heap goal floor + the sweep_gen
-	// one-cycle grace), not the all-time allocation high-water.
+	// KEEP the span's data pages committed (no per-pool decommit) for near-immediate
+	// reuse off the free list. The previous design madvise-decommitted the data pages
+	// on every pool, then page-faulted them back on every reuse; under the heavy span
+	// recycling that correct reuse produces (~tens of thousands of spans/cycle) that
+	// per-span syscall churn dominated wall-clock (≈190 s sys on g_churn 100 1 30).
+	// Bitmaps are inline in the span (alloc_buf/mark_buf), so there is nothing to
+	// free here either. Cold pooled spans are decommitted LATER, aged and budgeted,
+	// by the STW pool trim (vgc_pool_trim, cx #360) — once per pool residence, so
+	// the syscall churn cannot return.
 	span.in_use = false
 	span.class_idx = 0
 	span.elem_size = 0
 	span.nelems = 0
 	span.alloc_count = 0
 	span.free_index = 0
+	span.is_tiny = false
 	// NO free_spans_lock here: vgc_put_free_span is collector-only (reached only via
 	// vgc_sweep_span during a collection), and vgc_gc_start holds free_spans_lock
 	// across the ENTIRE cycle (acquired before the world is stopped, so no mutator
@@ -1314,17 +1524,148 @@ fn vgc_put_free_span(mut span VGC_Span) {
 	// self-deadlock against that held lock. (The lock is NOT stolen/zeroed during
 	// STW any more — stealing it let a frozen vgc_get_free_span resume into a
 	// corrupted free list, handing out a span with a garbage base -> the object
-	// zero-fill memset wrote to an unmapped page = the residual segv.)
+	// zero-fill memset wrote to an unmapped page = the residual segv.) The same
+	// held-across-the-cycle lock is what makes the coalescing below exclusive.
+	if npages > u32(vgc_max_pooled_pages) {
+		// Oversized single-object arena: exactly one span per arena, no in-arena
+		// neighbors to coalesce with.
+		vgc_pool_push(mut span)
+		return
+	}
+	mut cur := unsafe { &VGC_Span(voidptr(&span)) }
+	if npages < u32(vgc_pool_merge_min) {
+		// Size-class span: exact-fit pools serve these with zero churn — merging
+		// them is measured thrash (see vgc_pool_merge_min).
+		vgc_pool_push(mut cur)
+		return
+	}
+	arena_idx := vgc_arena_of(span.base)
+	if arena_idx >= 0 {
+		a := unsafe { &vgc_heap.arenas[arena_idx] }
+		map_pages := a.size / vgc_page_size
+		// Merge with the pooled span ending exactly at our base (if any). Keep the
+		// LOWER-base descriptor; the absorbed one is retired to the pending list
+		// (reusable from the NEXT cycle — see span_meta_pending). Only equal
+		// decommit states merge, so the merged flag stays truthful.
+		if cur.base > a.base {
+			pidx := (cur.base - a.base) / vgc_page_size - 1
+			mut p := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[pidx]))))) }
+			if p != unsafe { nil } && p.pooled && !p.in_use && p.decommitted == cur.decommitted
+				&& p.npages >= u32(vgc_pool_merge_min) && p.npages <= u32(vgc_max_pooled_pages)
+				&& p.base + usize(p.npages) * vgc_page_size == cur.base {
+				vgc_pool_unlink(mut p)
+				vgc_span_repoint_pages(arena_idx, cur.base, cur.npages, p)
+				p.npages += cur.npages
+				vgc_retire_span_desc(mut cur)
+				cur = p
+			}
+		}
+		// Merge with the pooled span starting exactly at our end (if any). Only
+		// look inside the carved region — pages past a.used have nil slots.
+		end := cur.base + usize(cur.npages) * vgc_page_size
+		if end < a.base + a.used {
+			sidx := (end - a.base) / vgc_page_size
+			if sidx < map_pages {
+				mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[sidx]))))) }
+				if s != unsafe { nil } && s.pooled && !s.in_use && s.decommitted == cur.decommitted
+					&& s.npages >= u32(vgc_pool_merge_min)
+					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end {
+					vgc_pool_unlink(mut s)
+					vgc_span_repoint_pages(arena_idx, s.base, s.npages, cur)
+					cur.npages += s.npages
+					vgc_retire_span_desc(mut s)
+				}
+			}
+		}
+	}
+	vgc_pool_push(mut cur)
+}
+
+// vgc_retire_span_desc zeroes an absorbed span descriptor and parks it on the
+// pending recycle list. Collector-only (pool coalescing under STW); the caller
+// chain holds vgc_heap.lock across the cycle, which guards the pending list.
+// The descriptor KEEPS its allspans slot — the slot stores the descriptor's
+// address, the walks skip it via in_use==false (memset leaves it false), and
+// vgc_new_span_desc hands it back out already-registered.
+fn vgc_retire_span_desc(mut span VGC_Span) {
 	unsafe {
-		span.next = vgc_heap.free_spans[npages]
-		vgc_heap.free_spans[npages] = span
+		C.memset(&span, 0, sizeof(VGC_Span))
+		span.next = vgc_heap.span_meta_pending
+		vgc_heap.span_meta_pending = &span
 	}
 }
 
+// vgc_span_meta_promote_pending moves last cycle's retired descriptors onto the
+// reusable free list. Called ONCE per cycle, at cycle start under STW (from
+// vgc_clear_mark_bits), with vgc_heap.lock held — giving every descriptor
+// retired during cycle N a full mutator epoch before cycle N+1 can re-issue it
+// (see the span_meta_pending doc for the frozen-reader rationale).
+fn vgc_span_meta_promote_pending() {
+	for vgc_heap.span_meta_pending != unsafe { nil } {
+		mut p := vgc_heap.span_meta_pending
+		vgc_heap.span_meta_pending = p.next
+		unsafe {
+			p.next = vgc_heap.span_meta_free
+		}
+		vgc_heap.span_meta_free = p
+	}
+}
+
+// vgc_new_span_desc returns an allspans-REGISTERED span descriptor: a recycled
+// one off span_meta_free (already registered, zeroed at retire) or a fresh
+// bump-slab descriptor that it registers before returning. Caller MUST hold
+// vgc_heap.lock. Returns nil only on OS-alloc failure; aborts loudly (0xDEAD)
+// if the allspans registry itself is full, exactly like the old inline path.
+fn vgc_new_span_desc() &VGC_Span {
+	mut recycled := vgc_heap.span_meta_free
+	if recycled != unsafe { nil } {
+		unsafe {
+			vgc_heap.span_meta_free = recycled.next
+			recycled.next = nil
+		}
+		return recycled
+	}
+	span := vgc_alloc_span_meta()
+	if span == unsafe { nil } {
+		return unsafe { nil }
+	}
+	// Bring up the span registry on first use (we hold vgc_heap.lock). mmap-backed
+	// and lazily committed by the OS, so the reservation costs ~nothing until
+	// filled; the pointer never moves, so the collector's lock-free allspans walks
+	// (incl. lazy sweep outside STW) never see a relocated/freed buffer.
+	if vgc_heap.allspans == unsafe { nil } {
+		mut cap := 16 * 1024 * 1024 // 128 MB of address space; covers a multi-GB paced heap
+		cap_env := C.getenv(c'VGC_ALLSPANS_CAP')
+		if cap_env != unsafe { nil } {
+			c := C.atoll(cap_env)
+			if c > 0 {
+				cap = int(c)
+			}
+		}
+		vgc_heap.allspans = &&VGC_Span(C.vgc_os_alloc(usize(sizeof(voidptr)) * usize(cap)))
+		vgc_heap.allspans_cap = cap
+	}
+	// Track in allspans. Exceeding the (mmap-reserved) capacity is NOT silently
+	// ignored: an untracked span would never be marked/swept (leak) and never
+	// recycled, so we fail loudly rather than corrupt the heap accounting.
+	if vgc_heap.nspans >= vgc_heap.allspans_cap {
+		C.vgc_say(0xDEAD, u64(vgc_heap.nspans)) // span registry full — raise VGC_ALLSPANS_CAP
+		C.vgc_mutex_unlock(&vgc_heap.lock)
+		C.abort()
+	}
+	unsafe {
+		vgc_heap.allspans[vgc_heap.nspans] = span
+	}
+	vgc_heap.nspans++
+	return span
+}
+
 // Allocate a VGC_Span descriptor from the bump slab. Caller MUST hold vgc_heap.lock.
-// Descriptors are never individually freed (pooled via vgc_put_free_span), so a
-// forever-growing bump slab is sound; this replaces a per-carve mmap() of ~one struct
-// (a syscall under the heap lock) with a pointer bump + a rare bulk mmap.
+// Slab memory is never returned to the OS; descriptors absorbed by pool coalescing
+// are RECYCLED via span_meta_free instead (vgc_new_span_desc / vgc_retire_span_desc,
+// cx #360), so the slab grows with the PEAK simultaneous span count only. This
+// replaces a per-carve mmap() of ~one struct (a syscall under the heap lock) with a
+// pointer bump + a rare bulk mmap.
 @[inline]
 fn vgc_alloc_span_meta() &VGC_Span {
 	asz := (usize(sizeof(VGC_Span)) + 15) & ~usize(15)
@@ -1431,10 +1772,12 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		}
 	}
 
-	// Create span metadata from the bump slab (we hold vgc_heap.lock). Previously this
-	// was a per-carve mmap() — a syscall under the heap lock that lengthened the hold
+	// Create span metadata (we hold vgc_heap.lock): a recycled descriptor off the
+	// meta free list, else the bump slab — vgc_new_span_desc registers fresh ones
+	// in allspans, recycled ones kept their slot (cx #360). Previously this was a
+	// per-carve mmap() — a syscall under the heap lock that lengthened the hold
 	// and drove new-span-carve contention under alloc-heavy [par] (B18).
-	span := vgc_alloc_span_meta()
+	span := vgc_new_span_desc()
 	if span == unsafe { nil } {
 		C.vgc_mutex_unlock(&vgc_heap.lock)
 		return unsafe { nil }
@@ -1476,36 +1819,9 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		}
 	}
 
-	// Bring up the span registry on first use (we hold vgc_heap.lock here). mmap-backed
-	// and lazily committed by the OS, so the reservation costs ~nothing until filled;
-	// the pointer never moves, so the collector's lock-free allspans walks (incl. lazy
-	// sweep outside STW) never see a relocated/freed buffer.
-	if vgc_heap.allspans == unsafe { nil } {
-		mut cap := 16 * 1024 * 1024 // 128 MB of address space; covers a multi-GB paced heap
-		cap_env := C.getenv(c'VGC_ALLSPANS_CAP')
-		if cap_env != unsafe { nil } {
-			c := C.atoll(cap_env)
-			if c > 0 {
-				cap = int(c)
-			}
-		}
-		vgc_heap.allspans = &&VGC_Span(C.vgc_os_alloc(usize(sizeof(voidptr)) * usize(cap)))
-		vgc_heap.allspans_cap = cap
-	}
-	// Track in allspans. Exceeding the (mmap-reserved) capacity is NOT silently
-	// ignored: an untracked span would never be marked/swept (leak) and never
-	// recycled, so we fail loudly rather than corrupt the heap accounting. The cap is
-	// large (16M entries default), so this only fires on a genuinely enormous heap —
-	// the loud abort is kept as the backstop.
-	if vgc_heap.nspans >= vgc_heap.allspans_cap {
-		C.vgc_say(0xDEAD, u64(vgc_heap.nspans)) // span registry full — raise VGC_ALLSPANS_CAP
-		C.vgc_mutex_unlock(&vgc_heap.lock)
-		C.abort()
-	}
-	unsafe {
-		vgc_heap.allspans[vgc_heap.nspans] = span
-	}
-	vgc_heap.nspans++
+	// (allspans registration happened inside vgc_new_span_desc — fresh descriptors
+	// are appended there under the same vgc_heap.lock hold; recycled descriptors
+	// never left the registry.)
 
 	// Publish a newly-added arena to the LOCK-FREE readers (vgc_find_span /
 	// vgc_get_obj_size) with a RELEASE store, as the LAST write — after arenas[idx]
