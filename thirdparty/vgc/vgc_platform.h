@@ -193,6 +193,12 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void vgc_os_decommit(void* ptr, size_t size) {
       VirtualFree(ptr, size, MEM_DECOMMIT);
   }
+  // Undo vgc_os_decommit before a pooled span's pages are handed out again
+  // (cx #360). On Windows MEM_DECOMMIT actually unmaps the commit, so touching
+  // the pages without this call would fault.
+  static inline void vgc_os_recommit(void* ptr, size_t size) {
+      VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
+  }
   static inline int vgc_num_cpus(void) {
       DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
       return count > 0 ? (int)count : 1;
@@ -217,8 +223,26 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void vgc_os_free(void* ptr, size_t size) {
       munmap(ptr, size);
   }
+  // Return a cold pooled span's data pages to the OS (cx #360 pool trim). On
+  // darwin, MADV_DONTNEED is effectively a no-op for the task's physical
+  // footprint; MADV_FREE_REUSABLE is the variant that actually decrements it
+  // (the discipline jemalloc uses), paired with MADV_FREE_REUSE at recommit.
+  // Everywhere else, MADV_DONTNEED drops the pages and they fault back
+  // zero-filled on the next touch — no recommit call needed for correctness.
   static inline void vgc_os_decommit(void* ptr, size_t size) {
+  #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+      if (madvise(ptr, size, MADV_FREE_REUSABLE) != 0)
+          madvise(ptr, size, MADV_DONTNEED);
+  #else
       madvise(ptr, size, MADV_DONTNEED);
+  #endif
+  }
+  static inline void vgc_os_recommit(void* ptr, size_t size) {
+  #if defined(__APPLE__) && defined(MADV_FREE_REUSE)
+      madvise(ptr, size, MADV_FREE_REUSE);
+  #else
+      (void)ptr; (void)size; // pages fault back zero-filled; nothing to undo
+  #endif
   }
   // Physical RAM in bytes; 0 = unknown. Used once, at vgc_init, to derive the
   // default effective arena ceiling (cx #282) — the hard heap wall sits at RAM

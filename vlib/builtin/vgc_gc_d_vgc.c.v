@@ -809,6 +809,12 @@ fn vgc_scan_suspended_roots(self_idx int) {
 
 // Clear all mark bits before a new GC cycle
 fn vgc_clear_mark_bits() {
+	// Cycle start, under STW with vgc_heap.lock held (both the STW and concurrent
+	// collectors route through here once per cycle): promote descriptors retired
+	// by LAST cycle's pool coalescing to the reusable list — the one-cycle grace
+	// that keeps a retired descriptor's identity stable across any mutator frozen
+	// mid-vgc_free at the previous STW (cx #360, see span_meta_pending).
+	vgc_span_meta_promote_pending()
 	for i in 0 .. vgc_heap.nspans {
 		span := unsafe { vgc_heap.allspans[i] }
 		if span == unsafe { nil } || !span.in_use {
