@@ -1820,6 +1820,42 @@ fn vgc_sweep_span(span &VGC_Span) {
 			}
 		}
 		vgc_put_free_span(mut mspan)
+		return
+	}
+
+	// cx #360: a swept small span that still has BOTH survivors and free slots is
+	// re-linked onto its class's central partial list, so allocation refills from
+	// its free slots (vgc_central_get_span pops partial first) instead of carving
+	// fresh arena space. NOTHING else repopulates central.partial: the mcache
+	// drop-when-full path (B18) deliberately returns nothing, so before this
+	// relink any span evicted with >=1 survivor was stranded until fully empty —
+	// one 16 B long-lived object pinned an entire 8 KB span out of circulation
+	// (512x amplification), which is how a flat ~25 MB live set stranded hundreds
+	// of MB of committed spans and ratcheted arenas/RSS monotonically (#360).
+	// SAFE HERE: the collector holds every central[].lock across the cycle (taken
+	// in vgc_gc_start before the world stopped), so the list op is exclusive; the
+	// span passed the sweep_gen guard above, so it is NOT mcache-resident (those
+	// are stamped by vgc_protect_cached_spans and returned early) and not freshly
+	// acquired this cycle; on_central==0 means it has no list membership to
+	// corrupt. A span already on partial (on_central==1, relinked by an earlier
+	// cycle and not yet popped) keeps its place. Large spans (class_idx 0,
+	// nelems 1) never qualify — alloc_count>0 means they are full — but the
+	// class_idx guard makes the exclusion explicit.
+	if span.alloc_count > 0 && span.alloc_count < span.nelems && span.on_central == 0
+		&& span.class_idx != 0 {
+		sc := int(span.class_idx) * 2 + if span.noscan { 1 } else { 0 }
+		if sc < 136 {
+			mut pspan := unsafe { &VGC_Span(span) }
+			unsafe {
+				pspan.next = vgc_heap.central[sc].partial
+				pspan.prev = nil
+				if pspan.next != nil {
+					pspan.next.prev = pspan
+				}
+				vgc_heap.central[sc].partial = pspan
+				pspan.on_central = 1
+			}
+		}
 	}
 }
 
