@@ -1666,6 +1666,25 @@ pub fn (mut v Builder) cc() {
 		}
 		return
 	}
+	// cx fork #350: tcc on macOS has no Mach-O __thread TLS, so the vgc
+	// runtime header (thirdparty/vgc/vgc_platform.h) can NEVER compile under
+	// it — every `-gc e`/`-gc e-leak` build paid a doomed tcc attempt plus
+	// the loud "tcc compilation failed, falling back to cc" warning before
+	// landing on cc anyway (tcc also cannot link Apple `-framework` deps the
+	// tree uses, so teaching vgc a pthread_key TLS shim would not unlock tcc
+	// here either — evidence on the issue). Fail FAST instead: resolve to
+	// the non-tcc system compiler up front, silently (this is the expected
+	// permanent posture on this platform, not an error).
+	$if macos {
+		if v.pref.gc_mode == .vgc
+			&& (is_tcc_compiler_name(v.pref.ccompiler) || is_tcc_alias_compiler(v.pref.ccompiler)) {
+			old_cc := v.pref.ccompiler
+			v.pref.ccompiler = first_available_ccompiler([old_cc])
+			if v.pref.is_verbose {
+				eprintln('cx fork #350: -gc e cannot compile under tcc on macOS (no __thread); using ${v.pref.ccompiler} directly')
+			}
+		}
+	}
 	v.ensure_windows_icon_flag_is_valid()
 	if v.pref.should_output_to_stdout() {
 		// output to stdout
