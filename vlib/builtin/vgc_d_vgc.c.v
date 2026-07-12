@@ -289,8 +289,6 @@ mut:
 	narenas int
 	// Central free lists (one per span class)
 	central [136]VGC_Central
-	// Large object spans
-	large_alloc &VGC_Span = unsafe { nil }
 	// All spans, for iteration during GC. mmap-backed (lazily on first span_alloc),
 	// lazily committed by the OS so the reservation costs ~nothing until filled. The
 	// pointer is allocated ONCE and never moves, so the collector's lock-free allspans
@@ -1765,45 +1763,13 @@ fn vgc_central_get_span(span_class int) &VGC_Span {
 	return new_span
 }
 
-// Return a span to the central free list
-fn vgc_central_return_span(span_class int, mut span VGC_Span) {
-	central := unsafe { &vgc_heap.central[span_class] }
-	C.vgc_mutex_lock(&central.lock)
-
-	if span.alloc_count < span.nelems {
-		// Has free objects - add to partial
-		unsafe {
-			span.next = vgc_heap.central[span_class].partial
-			span.prev = nil
-		}
-		if span.next != unsafe { nil } {
-			unsafe {
-				span.next.prev = span
-			}
-		}
-		unsafe {
-			vgc_heap.central[span_class].partial = span
-			span.on_central = 1 // on the partial list
-		}
-	} else {
-		// Full - add to full list
-		unsafe {
-			span.next = vgc_heap.central[span_class].full
-			span.prev = nil
-		}
-		if span.next != unsafe { nil } {
-			unsafe {
-				span.next.prev = span
-			}
-		}
-		unsafe {
-			vgc_heap.central[span_class].full = span
-			span.on_central = 2 // on the full list
-		}
-	}
-
-	C.vgc_mutex_unlock(&central.lock)
-}
+// (vgc_central_return_span is gone — it had NO callers, which meant nothing
+// ever repopulated central.partial and any span evicted from a thread cache
+// with >=1 survivor was stranded until fully empty. The sweep now relinks
+// partially-free orphan spans onto central.partial under STW — see the #360
+// block at the end of vgc_sweep_span. Mutators still never push onto a
+// central list; the collector is the only writer, with every central lock
+// held across the cycle.)
 
 // ============================================================
 // Cache operations (translated from Go's mcache)
@@ -1828,12 +1794,13 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 		if span.alloc_count < span.nelems {
 			return span
 		}
-		// Span is full — DROP it instead of returning it to central.full (B18). The
-		// partial list is never reused (vgc_central_return_span only lands FULL spans on
-		// full; sweep relinks only fully-empty), so the per-fill return was pure
-		// central[].lock contention — a top serializer of alloc-heavy [par]. The dropped
-		// span stays in allspans, is marked/swept normally, and is reclaimed when empty
-		// via the on_central==0 path in vgc_sweep_span. SOUND: it is no longer referenced
+		// Span is full — DROP it instead of pushing it onto a central list (B18):
+		// the per-fill central return was pure central[].lock contention — a top
+		// serializer of alloc-heavy [par]. The dropped span stays in allspans, is
+		// marked/swept normally, and the SWEEP puts it back into circulation:
+		// fully-empty -> the free-span pool, partially-free -> relinked onto
+		// central.partial under STW (cx #360, see vgc_sweep_span) where the
+		// central_get_span below finds it. SOUND: it is no longer referenced
 		// by this mcache (alloc[span_class] is overwritten below) nor by any mutator
 		// local, so same-cycle reclaim is correct (this is NOT the residual-#4 case,
 		// which was a span STILL mcache-resident); while still referenced here it is
@@ -2299,13 +2266,11 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		// vgc_span_init; span_alloc/get_free_span leave in_use false until here).
 		span.in_use = true
 	}
-	// Add to large allocation list
-	C.vgc_mutex_lock(&vgc_heap.lock)
-	unsafe {
-		span.next = vgc_heap.large_alloc
-		vgc_heap.large_alloc = span
-	}
-	C.vgc_mutex_unlock(&vgc_heap.lock)
+	// (No large-allocation list: the old vgc_heap.large_alloc chain was write-only
+	// — prepended here, traversed nowhere — and its span.next links were silently
+	// hijacked whenever a swept-empty large span was pooled (vgc_put_free_span
+	// reuses .next). Large spans are tracked like every span: via allspans; the
+	// sweep reclaims them through the same empty-span path. Removed in cx #360.)
 
 	C.vgc_atomic_add_u64(&vgc_heap.heap_live, u64(n))
 	C.vgc_atomic_add_u64(&vgc_heap.total_alloc, u64(n))
@@ -2416,8 +2381,8 @@ fn vgc_free(ptr voidptr) {
 	obj_idx := u32((usize(ptr) - span.base) / usize(span.elem_size))
 	// Serialize the span-metadata mutation (alloc_bits / alloc_count / free_index)
 	// under the per-size-class central lock — the SAME lock the allocator
-	// (vgc_central_get_span / vgc_central_return_span) takes when it moves spans of
-	// this class between the partial/full lists and reads their alloc_count, and the
+	// (vgc_central_get_span) takes when it pops spans of this class off the
+	// partial list and reads their alloc_count, and the
 	// SAME lock the collector pre-acquires (for ALL 136 classes) before stopping the
 	// world. Without it, an eager Perceus free racing a concurrent allocation of the
 	// same class can interleave the bitmap clear / count decrement with the
@@ -2446,9 +2411,11 @@ fn vgc_free(ptr voidptr) {
 	// racy-but-safe hint (the two-pass scan in vgc_span_alloc_obj tolerates a stale
 	// value). on_central is stably 0 for a mutator-owned span: it is set to 0 at
 	// carve/central-pop BEFORE the span reaches the mutator (happens-before via handoff),
-	// and drop-return means registered threads never push a span onto a central list.
-	// Spans actually ON a central list (on_central != 0: only the unregistered-overflow-
-	// thread fallback path) keep the lock, preserving central-list consistency AND the
+	// and mutators never push a span onto a central list — only the COLLECTOR does,
+	// relinking swept partially-free orphans onto central.partial under STW (cx #360),
+	// which cannot race this path (the world is stopped, and a span it relinks is by
+	// construction not mutator-owned). Spans actually ON a central list (on_central
+	// != 0) keep the lock, preserving central-list consistency AND the
 	// collector's lock-before-suspend fence for them. Validated against the residual-#4
 	// churn reproducer + TSan (the exact race the lock was added for).
 	mask := u8(1) << (obj_idx & 7)
