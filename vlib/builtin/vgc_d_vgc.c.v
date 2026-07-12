@@ -69,7 +69,7 @@ fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
-fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -343,9 +343,26 @@ mut:
 	// every previously-unseen npages (cx #360; the #277 field deaths were the
 	// large-object flavor of that ratchet).
 	free_spans      [8193]&VGC_Span
+	// Tail of each free_spans chain. Push/pop work at the HEAD (LIFO — reuse
+	// stays cache-warm), so a chain's age grows monotonically toward the tail;
+	// vgc_pool_trim walks tails via .prev and stops at the first young span,
+	// which makes aged-span discovery O(work done) instead of O(chain length)
+	// (a head walk burned its whole examine budget on young nodes and starved
+	// the trim behind any long hot chain). Descriptor pointers only (non-arena
+	// slab memory) — same rooting posture as free_spans itself.
+	free_spans_tail [8193]&VGC_Span
+	// COLD pool: spans whose data pages the trim decommitted, segregated by size
+	// like free_spans. Segregation is load-bearing: while cold spans sat in the
+	// main chains, the trim's tail walk re-skipped every previously-decommitted
+	// span each cycle and its examine budget starved before reaching committed
+	// aged spans (measured: 81 MB of committed pool frozen behind ~2000 cold
+	// skips). Membership == span.decommitted. Reuse prefers hot; a cold pop
+	// recommits in vgc_span_pop_finish.
+	free_spans_cold [8193]&VGC_Span
 	// Pooled spans LARGER than one arena (oversized single-object arenas, npages >
 	// vgc_max_pooled_pages). First-fit with split on reuse; no coalescing (an
 	// oversized arena hosts exactly its one span, so it has no in-arena neighbors).
+	// Short by construction, so trim/reuse walk it whole.
 	free_oversized  &VGC_Span = unsafe { nil }
 	// Per-thread caches
 	caches       [64]VGC_Cache
@@ -400,6 +417,17 @@ mut:
 	span_meta_end     usize
 	span_meta_free    &VGC_Span = unsafe { nil }
 	span_meta_pending &VGC_Span = unsafe { nil }
+	// Pool occupancy accounting (cx #360; bytes, guarded by free_spans_lock like
+	// the lists themselves): pool_bytes = pooled spans whose data pages are still
+	// COMMITTED, pool_trimmed_bytes = pooled spans the trim processed onto the
+	// cold lists. Feeds the GCTRACE pool=/trimmed= fields and the trim's stop
+	// condition. NOTE: what the OS actually reclaims from a trimmed span is its
+	// HARDWARE-page-aligned inner subrange (vgc_os_decommit) — on 16 KB-page
+	// hardware a lone 8 KB span returns nothing (its inner range is empty), so
+	// trimmed= slightly overstates returned bytes there; on 4 KB-page hosts the
+	// two are equal.
+	pool_bytes         u64
+	pool_trimmed_bytes u64
 }
 
 // Global heap instance. NOTE: V emits a zero-initializing assignment for this
@@ -1329,6 +1357,12 @@ fn vgc_arena_of(addr usize) int {
 fn vgc_pool_push(mut span VGC_Span) {
 	span.pooled = true
 	span.pool_gen = u32(vgc_heap.gc_cycle)
+	sz := u64(span.npages) * u64(vgc_page_size)
+	if span.decommitted {
+		vgc_heap.pool_trimmed_bytes += sz
+	} else {
+		vgc_heap.pool_bytes += sz
+	}
 	unsafe {
 		span.prev = nil
 		if span.npages > u32(vgc_max_pooled_pages) {
@@ -1337,10 +1371,20 @@ fn vgc_pool_push(mut span VGC_Span) {
 				span.next.prev = span
 			}
 			vgc_heap.free_oversized = span
+		} else if span.decommitted {
+			// Cold pool: head-linked only (the trim never walks it, reuse pops
+			// the head), so no tail maintenance.
+			span.next = vgc_heap.free_spans_cold[span.npages]
+			if span.next != nil {
+				span.next.prev = span
+			}
+			vgc_heap.free_spans_cold[span.npages] = span
 		} else {
 			span.next = vgc_heap.free_spans[span.npages]
 			if span.next != nil {
 				span.next.prev = span
+			} else {
+				vgc_heap.free_spans_tail[span.npages] = span
 			}
 			vgc_heap.free_spans[span.npages] = span
 		}
@@ -1350,16 +1394,26 @@ fn vgc_pool_push(mut span VGC_Span) {
 // vgc_pool_unlink removes a pooled span from whichever free list holds it.
 // Same locking contract as vgc_pool_push.
 fn vgc_pool_unlink(mut span VGC_Span) {
+	sz := u64(span.npages) * u64(vgc_page_size)
+	if span.decommitted {
+		vgc_heap.pool_trimmed_bytes -= sz
+	} else {
+		vgc_heap.pool_bytes -= sz
+	}
 	unsafe {
 		if span.prev != nil {
 			span.prev.next = span.next
 		} else if span.npages > u32(vgc_max_pooled_pages) {
 			vgc_heap.free_oversized = span.next
+		} else if span.decommitted {
+			vgc_heap.free_spans_cold[span.npages] = span.next
 		} else {
 			vgc_heap.free_spans[span.npages] = span.next
 		}
 		if span.next != nil {
 			span.next.prev = span.prev
+		} else if span.npages <= u32(vgc_max_pooled_pages) && !span.decommitted {
+			vgc_heap.free_spans_tail[span.npages] = span.prev
 		}
 		span.next = nil
 		span.prev = nil
@@ -1419,6 +1473,12 @@ fn vgc_span_split(mut span VGC_Span, want u32) bool {
 	vgc_span_repoint_pages(arena_idx, rem_base, rem, rspan)
 	span.npages = want
 	vgc_pool_push(mut rspan)
+	// The remainder INHERITS the source span's pool age (vgc_pool_push stamped it
+	// fresh): its pages are the same cold memory — a small request nibbling the
+	// head off a cold block must not reset the block's trim clock, or steady
+	// small-alloc traffic starves the trim forever (measured: a 140 MB cold burst
+	// pool never trimmed under light tail churn).
+	rspan.pool_gen = span.pool_gen
 	return true
 }
 
@@ -1433,7 +1493,11 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
 	if npages <= u32(vgc_max_pooled_pages) {
+		// Exact fit, hot first (no recommit), then cold.
 		mut span := vgc_heap.free_spans[npages]
+		if span == unsafe { nil } {
+			span = vgc_heap.free_spans_cold[npages]
+		}
 		if span != unsafe { nil } {
 			// in_use stays FALSE: it is set true only once the span is fully
 			// (re)initialized (vgc_span_init / vgc_alloc_large). While in_use is
@@ -1446,8 +1510,12 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 			return span
 		}
 		// Best fit: the smallest pooled span that covers the request, split down.
+		// Hot preferred at equal size; cold is still far cheaper than carving.
 		for n := npages + 1; n <= u32(vgc_max_pooled_pages); n++ {
 			mut cand := vgc_heap.free_spans[n]
+			if cand == unsafe { nil } {
+				cand = vgc_heap.free_spans_cold[n]
+			}
 			if cand != unsafe { nil } {
 				vgc_pool_unlink(mut cand)
 				vgc_span_split(mut cand, npages)
@@ -1482,6 +1550,88 @@ fn vgc_span_pop_finish(mut span VGC_Span) {
 		C.vgc_os_recommit(voidptr(span.base), usize(span.npages) * vgc_page_size)
 		span.decommitted = false
 	}
+}
+
+// ── cx #360 POOL TRIM: aged, budgeted decommit of cold pooled spans ─────────
+// Runs once per cycle at the end of vgc_do_sweep (STW; free_spans_lock is held
+// across the cycle by the collector, so the lists and counters are exclusive).
+// A span must have sat pooled for >= vgc_pool_trim_age FULL cycles before its
+// data pages are returned to the OS — the working set a workload re-pops every
+// cycle never qualifies, which is what keeps the historical per-pool madvise
+// churn (~190 s sys on g_churn; see vgc_put_free_span) from coming back. Each
+// span decommits AT MOST ONCE per pool residence (the decommitted flag), the
+// per-cycle syscall count is capped, and the examine budget bounds the STW walk
+// cost with a resume cursor for fairness across sizes. Pool lists are LIFO
+// (push/pop at head, reuse stays cache-warm), so a chain's tail is its oldest
+// end; a long HOT chain can hide its aged tail from the examine budget for a
+// while — the trim converges on it as demand dips, and the budget guarantees
+// the cost stays flat meanwhile. RSS therefore tracks the recent working set
+// instead of the all-time high-water.
+const vgc_pool_trim_age = u32(2)
+const vgc_pool_trim_max_decommits = 128
+const vgc_pool_trim_max_examined = 2048
+
+fn vgc_pool_trim() {
+	if vgc_heap.pool_bytes == 0 {
+		return
+	}
+	cyc := u32(vgc_heap.gc_cycle)
+	mut decommits := 0
+	mut examined := 0
+	// Oversized spans first: multi-MB each, the highest RSS return per syscall.
+	// (Short list by construction — one span per oversized arena — so an age-
+	// unordered head walk is fine here.)
+	mut o := vgc_heap.free_oversized
+	for o != unsafe { nil } && decommits < vgc_pool_trim_max_decommits
+		&& examined < vgc_pool_trim_max_examined {
+		examined++
+		nxt := o.next // capture: a decommit re-pushes o at the list head
+		if !o.decommitted && cyc - o.pool_gen >= vgc_pool_trim_age {
+			vgc_pool_trim_decommit(mut o)
+			decommits++
+		}
+		o = unsafe { nxt }
+	}
+	// Sized lists, high npages -> low (larger spans return more per syscall).
+	// Walk each HOT chain from its TAIL: LIFO push/pop means age grows toward
+	// the tail, so the first insufficiently-aged span ends the chain's walk
+	// (decommitted spans live on the segregated cold lists and are never
+	// re-visited). The examine budget only pays for actual decommits plus one
+	// young-blocker probe per chain, never for a hot chain's young majority.
+	for idx := vgc_max_pooled_pages; idx >= 1; idx-- {
+		if decommits >= vgc_pool_trim_max_decommits || examined >= vgc_pool_trim_max_examined {
+			break
+		}
+		mut s := vgc_heap.free_spans_tail[idx]
+		for s != unsafe { nil } && decommits < vgc_pool_trim_max_decommits
+			&& examined < vgc_pool_trim_max_examined {
+			examined++
+			if cyc - s.pool_gen >= vgc_pool_trim_age {
+				prv := s.prev
+				vgc_pool_trim_decommit(mut s)
+				decommits++
+				s = unsafe { prv }
+				continue
+			}
+			// Committed and young: stop here. Push order makes everything toward
+			// the head younger still — except split remainders, which re-enter at
+			// the head with their INHERITED (older) gen; those are found once this
+			// blocker itself ages past vgc_pool_trim_age (<= 2 cycles), so the
+			// walk converges without paying for the young majority.
+			break
+		}
+	}
+}
+
+// vgc_pool_trim_decommit returns one pooled span's data pages to the OS and
+// moves it hot -> cold: unlink while still flagged committed (hot list,
+// pool_bytes), flip the flag, re-push (cold list, pool_trimmed_bytes). The
+// pool_gen restamp on the cold push is irrelevant — cold spans never age.
+fn vgc_pool_trim_decommit(mut span VGC_Span) {
+	vgc_pool_unlink(mut span)
+	C.vgc_os_decommit(voidptr(span.base), usize(span.npages) * vgc_page_size)
+	span.decommitted = true
+	vgc_pool_push(mut span)
 }
 
 // Return a fully-empty span to the free list for reuse, coalescing it with any
