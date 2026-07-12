@@ -521,7 +521,8 @@ fn vgc_gc_start() {
 			C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
 			C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas),
 			u64(vgc_heap.nspans), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
-			vgc_headroom / 1024, pause_us)
+			vgc_headroom / 1024, pause_us, vgc_heap.pool_bytes / 1024,
+			vgc_heap.pool_trimmed_bytes / 1024)
 	}
 	vgc_heap.gc_cycle++
 
@@ -1621,6 +1622,10 @@ fn vgc_do_sweep() {
 			}
 		}
 	}
+	// cx #360: return long-cold pooled spans' pages to the OS (aged + budgeted;
+	// see vgc_pool_trim). After the sweep so this cycle's fresh empties are
+	// pooled (and start aging) before the walk.
+	vgc_pool_trim()
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 1)
 }
 
