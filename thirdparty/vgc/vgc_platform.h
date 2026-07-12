@@ -223,23 +223,63 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void vgc_os_free(void* ptr, size_t size) {
       munmap(ptr, size);
   }
-  // Return a cold pooled span's data pages to the OS (cx #360 pool trim). On
-  // darwin, MADV_DONTNEED is effectively a no-op for the task's physical
-  // footprint; MADV_FREE_REUSABLE is the variant that actually decrements it
-  // (the discipline jemalloc uses), paired with MADV_FREE_REUSE at recommit.
-  // Everywhere else, MADV_DONTNEED drops the pages and they fault back
-  // zero-filled on the next touch — no recommit call needed for correctness.
+  // Return a cold pooled span's data pages to the OS (cx #360 pool trim):
+  // REPLACE the range with fresh untouched anonymous zero-fill pages via
+  // MAP_FIXED. This is the only variant that verifiably drops the task's
+  // physical footprint on darwin — measured on 25.x, both MADV_DONTNEED and
+  // MADV_FREE_REUSABLE left a 512 MB touched region's footprint unchanged,
+  // while the MAP_FIXED replace took it to ~1 MB with the address range
+  // preserved — and it behaves identically on linux/BSD. The pages stay
+  // mapped PROT_READ|PROT_WRITE and fault back zero-filled on the next
+  // touch, so no recommit call is needed for correctness (the madvise
+  // fallback covers a hypothetical mmap failure: pages then remain valid,
+  // merely not returned). Heavier than a madvise, which is why the caller
+  // (vgc_pool_trim) is aged + budgeted + once-per-pool-residence.
+  // HARDWARE-PAGE INNER RANGE (cx #360): vgc_page_size is 8 KB but the real MMU
+  // page can be larger (16 KB on Apple Silicon). The kernel rounds mprotect/
+  // mmap/madvise ranges OUT to hardware pages, so decommitting a span whose
+  // bounds are only 8 KB-aligned would take out the NEIGHBORING live half of a
+  // shared 16 KB page — measured as checksum corruption / thread-join failure
+  // (writes landing in a sibling span's zeroed object), and pinned by the
+  // VGC_TRIM_PROTECT detector: both fault addresses sat in the collateral half
+  // of a 16 K-rounded 8 K decommit. Only the hardware-aligned INNER subrange of
+  // a span may be returned; a span smaller than one hardware page (or whose
+  // inner range is empty) is simply kept committed.
+  static inline size_t vgc_os_page(void) {
+      static size_t pg = 0;
+      if (pg == 0) { long v = sysconf(_SC_PAGESIZE); pg = (v > 0) ? (size_t)v : 16384; }
+      return pg;
+  }
   static inline void vgc_os_decommit(void* ptr, size_t size) {
-  #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
-      if (madvise(ptr, size, MADV_FREE_REUSABLE) != 0)
-          madvise(ptr, size, MADV_DONTNEED);
+      size_t pg = vgc_os_page();
+      uintptr_t lo = ((uintptr_t)ptr + pg - 1) & ~(uintptr_t)(pg - 1);
+      uintptr_t hi = ((uintptr_t)ptr + size) & ~(uintptr_t)(pg - 1);
+      if (hi <= lo) return;
+  #ifdef VGC_TRIM_PROTECT
+      // DEBUG (-cflags -DVGC_TRIM_PROTECT): make trimmed pages INACCESSIBLE
+      // instead of replacing them — any reader of trimmed pool memory faults
+      // AT the offending access instead of silently reading zeros.
+      mprotect((void*)lo, hi - lo, PROT_NONE);
   #else
-      madvise(ptr, size, MADV_DONTNEED);
+      // REPLACE the inner range with fresh untouched anonymous zero-fill pages:
+      // the only variant that verifiably drops the task's physical footprint on
+      // darwin (MADV_DONTNEED and MADV_FREE_REUSABLE both left a 512 MB touched
+      // region's reported footprint unchanged on 25.x), and it behaves
+      // identically on linux/BSD. The pages stay PROT_READ|PROT_WRITE and fault
+      // back zero-filled on the next touch.
+      void* q = mmap((void*)lo, hi - lo, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      if (q == MAP_FAILED)
+          madvise((void*)lo, hi - lo, MADV_DONTNEED);
   #endif
   }
   static inline void vgc_os_recommit(void* ptr, size_t size) {
-  #if defined(__APPLE__) && defined(MADV_FREE_REUSE)
-      madvise(ptr, size, MADV_FREE_REUSE);
+  #ifdef VGC_TRIM_PROTECT
+      size_t pg = vgc_os_page();
+      uintptr_t lo = ((uintptr_t)ptr + pg - 1) & ~(uintptr_t)(pg - 1);
+      uintptr_t hi = ((uintptr_t)ptr + size) & ~(uintptr_t)(pg - 1);
+      if (hi <= lo) return;
+      mprotect((void*)lo, hi - lo, PROT_READ | PROT_WRITE);
   #else
       (void)ptr; (void)size; // pages fault back zero-filled; nothing to undo
   #endif
@@ -1394,7 +1434,8 @@ static void vgc__wdec(uint64_t v) {
 }
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
                              uint64_t narenas, uint64_t nspans, uint64_t lthreads,
-                             uint64_t headroom_kb, uint64_t pause_us) {
+                             uint64_t headroom_kb, uint64_t pause_us,
+                             uint64_t pool_kb, uint64_t trimmed_kb) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] marked="); vgc__wdec(marked / (1024 * 1024));
     vgc__ws("MB goal="); vgc__wdec(goal / (1024 * 1024));
@@ -1402,7 +1443,9 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
     vgc__ws("KB pause="); vgc__wdec(pause_us);
     vgc__ws("us arenas="); vgc__wdec(narenas);
     vgc__ws(" spans="); vgc__wdec(nspans);
-    vgc__ws(" threads="); vgc__wdec(lthreads);
+    vgc__ws(" pool="); vgc__wdec(pool_kb);
+    vgc__ws("KB trimmed="); vgc__wdec(trimmed_kb);
+    vgc__ws("KB threads="); vgc__wdec(lthreads);
     vgc__ws("\n");
 }
 
