@@ -563,6 +563,12 @@ __global vgc_base_floor = u64(256 * 1024 * 1024)
 // marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
 // gctrace analog) — costs one integer test per cycle when off.
 __global vgc_gctrace = u32(0)
+// Set by an explicit gc_collect() (vgc_force_collect_release_os) and consumed
+// by the next sweep's trim point: that one cycle runs the unbudgeted, age-blind
+// vgc_pool_trim_all instead of the aged/budgeted vgc_pool_trim, so an explicit
+// collection returns the whole free-span pool to the OS (cx #52). Atomic:
+// written by a mutator, read under STW by the collector.
+__global vgc_eager_trim_pending = u32(0)
 // Flat ceiling for the ADAPTIVE headroom (the pinned VGC_NEXT_GC_MB path is not
 // clamped by it). Deliberately small, and deliberately NOT scaled by thread
 // count: every probe of the old thread-scaled ceiling (256 MB + 128 MB per
@@ -1623,6 +1629,39 @@ fn vgc_pool_trim() {
 	}
 }
 
+// vgc_pool_trim_all is the explicit-collect variant of vgc_pool_trim: no age
+// gate, no decommit or examine budget — every committed pooled span (sized and
+// oversized) is returned to the OS in one pass. Only the sweep of a cycle
+// forced by an explicit gc_collect() runs it (vgc_eager_trim_pending), so the
+// per-pool decommit churn that vgc_put_free_span retired (~190 s sys on
+// g_churn) cannot come back through this path: the caller asked for memory
+// back NOW, and pays the recommit faults if allocation resumes. Same locking
+// contract as vgc_pool_trim (STW sweep, central locks held).
+fn vgc_pool_trim_all() {
+	if vgc_heap.pool_bytes == 0 {
+		return
+	}
+	mut o := vgc_heap.free_oversized
+	for o != unsafe { nil } {
+		nxt := o.next // capture: a decommit re-pushes o at the list head
+		if !o.decommitted {
+			vgc_pool_trim_decommit(mut o)
+		}
+		o = unsafe { nxt }
+	}
+	for idx := vgc_max_pooled_pages; idx >= 1; idx-- {
+		// Hot chains hold only committed spans (decommitted ones live on the
+		// segregated cold lists), so every node gets decommitted; each one is
+		// unlinked and re-pushed cold, leaving the captured next intact.
+		mut s := vgc_heap.free_spans[idx]
+		for s != unsafe { nil } {
+			nxt := s.next
+			vgc_pool_trim_decommit(mut s)
+			s = unsafe { nxt }
+		}
+	}
+}
+
 // vgc_pool_trim_decommit returns one pooled span's data pages to the OS and
 // moves it hot -> cold: unlink while still flagged committed (hot list,
 // pool_bytes), flip the flag, re-push (cold list, pool_trimmed_bytes). The
@@ -2392,6 +2431,19 @@ fn vgc_force_collect() {
 	} else {
 		vgc_gc_start()
 	}
+}
+
+// The public gc_collect() routes here: force a collection AND return the whole
+// free-span pool to the OS (vgc_pool_trim_all at the sweep's trim point), so
+// after an explicit collect RSS reflects the live set, not the pacer's reuse
+// pool (cx #52 — Go's debug.FreeOSMemory split). Internal retry-and-reclaim
+// forced cycles (heap exhaustion) deliberately stay on vgc_force_collect: they
+// are about to re-pop those very spans, and decommit+recommit on the OOM path
+// is pure fault churn. If another cycle is already in flight, the flag simply
+// rides to whichever sweep consumes it first — either way the pages go back.
+fn vgc_force_collect_release_os() {
+	C.vgc_atomic_store_u32(&vgc_eager_trim_pending, 1)
+	vgc_force_collect()
 }
 
 // Terminal heap exhaustion (cx #277): every retry-and-reclaim path below funnels

@@ -1624,8 +1624,14 @@ fn vgc_do_sweep() {
 	}
 	// cx #360: return long-cold pooled spans' pages to the OS (aged + budgeted;
 	// see vgc_pool_trim). After the sweep so this cycle's fresh empties are
-	// pooled (and start aging) before the walk.
-	vgc_pool_trim()
+	// pooled (and start aging) before the walk. An explicit gc_collect() cycle
+	// instead returns the WHOLE pool (cx #52; see vgc_force_collect_release_os).
+	if C.vgc_atomic_load_u32(&vgc_eager_trim_pending) != 0 {
+		C.vgc_atomic_store_u32(&vgc_eager_trim_pending, 0)
+		vgc_pool_trim_all()
+	} else {
+		vgc_pool_trim()
+	}
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 1)
 }
 
