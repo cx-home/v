@@ -49,10 +49,13 @@ pub fn gc_disable() {}
 
 // gc_collect explicitly performs a garbage collection.
 // When the GC is not on, (with `-gc none`), it is a NOP.
-// Under the vgc collector (`-gc e`) it forces a full STW collection now.
+// Under the vgc collector (`-gc e`) it forces a full STW collection now and
+// returns the collector's free-span pool to the OS, so RSS drops to the live
+// set (Go's debug.FreeOSMemory analog). Automatic (pacer-triggered) cycles
+// keep the pool committed for reuse and only trim it aged and budgeted.
 pub fn gc_collect() {
 	$if vgc ? {
-		vgc_force_collect()
+		vgc_force_collect_release_os()
 	}
 }
 
