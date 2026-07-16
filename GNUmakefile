@@ -7,6 +7,12 @@ VROOT  ?= .
 VC     ?= ./vc
 VEXE   ?= ./v
 VCREPO ?= https://github.com/vlang/vc
+# Pin the generated-C bootstrap sources to the vc commit produced from this
+# tree's upstream base (vlang/v a83aabb10f). vc master keeps moving with
+# upstream V master; a floating `git pull` eventually fetches a bootstrap
+# compiler that can no longer build this tree (fresh clones then die with
+# `v: unknown command 'cmd/v'`). Override with VC_COMMIT=... if needed.
+VC_COMMIT ?= 7eb8c54a3843e5107d5af06d7a8c3e928f322475
 TCCREPO ?= https://github.com/vlang/tccbin
 LEGACYREPO ?= https://github.com/macports/macports-legacy-support
 GIT ?= git
@@ -226,7 +232,7 @@ rebuild: clean all
 ifndef local
 latest_vc: $(VC)/.git/config
 ifeq ($(HAS_GIT),1)
-	cd $(VC) && $(GITCLEANPULL)
+	cd $(VC) && $(GIT) clean -xf && ($(GIT) checkout --quiet $(VC_COMMIT) 2>/dev/null || ($(GIT) fetch --quiet origin && $(GIT) checkout --quiet $(VC_COMMIT)))
 else
 	@echo "git not found; using existing $(VC)/$(VCFILE)"
 endif
