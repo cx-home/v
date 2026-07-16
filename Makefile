@@ -2,6 +2,12 @@ CC ?= cc
 VFLAGS ?=
 CFLAGS ?=
 LDFLAGS ?=
+# Pin the generated-C bootstrap sources to the vc commit produced from this
+# tree's upstream base (vlang/v a83aabb10f). vc master keeps moving with
+# upstream V master; a floating `git pull` eventually fetches a bootstrap
+# compiler that can no longer build this tree (fresh clones then die with
+# `v: unknown command 'cmd/v'`). Override with VC_COMMIT=... if needed.
+VC_COMMIT ?= e74ce48f0f64eaca0d261f7904f8aafeae6268d5
 
 all: download_vc v
 
@@ -9,19 +15,19 @@ all: download_vc v
 
 download_vc:
 	@set -e; \
-	if [ -f vc/v.c ]; then \
-		if command -v git >/dev/null 2>&1; then \
-			git -C vc/ pull --rebase; \
-		else \
-			echo "git not found; using existing vc/v.c"; \
-		fi; \
-	else \
+	if [ ! -f vc/v.c ]; then \
 		if command -v git >/dev/null 2>&1; then \
 			git clone --filter=blob:none https://github.com/vlang/vc vc/; \
 		else \
 			echo "git is required to download vc/. Please install git or provide vc/v.c."; \
 			exit 1; \
 		fi; \
+	fi; \
+	if command -v git >/dev/null 2>&1 && [ -d vc/.git ]; then \
+		git -C vc/ checkout --quiet $(VC_COMMIT) 2>/dev/null \
+			|| { git -C vc/ fetch --quiet origin && git -C vc/ checkout --quiet $(VC_COMMIT); }; \
+	else \
+		echo "git not found; using existing vc/v.c"; \
 	fi
 
 v:
