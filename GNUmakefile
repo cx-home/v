@@ -116,6 +116,33 @@ endif
 endif
 endif
 
+# Pin the remaining remote build-time dependencies the same way VC_COMMIT
+# pins vc (cx #504, same drift class as the vc float fixed for cx #491):
+# tccbin's per-platform branches and the macOS legacy-support repo keep
+# moving on remote HEAD relative to this tree's frozen base, so a floating
+# `git pull` makes the bootstrap nondeterministic. Known-good commits
+# recorded 2026-07-16. Override with TCCBIN_COMMIT=... / LEGACY_COMMIT=...;
+# a platform without a recorded TCCBIN_COMMIT falls back to the branch tip.
+LEGACY_COMMIT ?= 7afda7df02532fc1a4df176e851bfbdacfdf7b13
+ifeq ($(TCCOS)-$(TCCARCH),macos-arm64)
+TCCBIN_COMMIT ?= f995efa30f7fa81cc8f25633b352405bbe949141
+endif
+ifeq ($(TCCOS)-$(TCCARCH),macos-amd64)
+TCCBIN_COMMIT ?= 975f1ad84970d56f547981c0fc3a961a3836d7a8
+endif
+ifeq ($(TCCOS)-$(TCCARCH),linux-amd64)
+TCCBIN_COMMIT ?= 696c1d84ad12e3a5b68b50fb0210819ed3d56bb8
+endif
+ifeq ($(TCCOS)-$(TCCARCH),linux-arm64)
+TCCBIN_COMMIT ?= 125ad2e1153c7cb86f19ac4aa070063d18504462
+endif
+ifeq ($(TCCOS)-$(TCCARCH),linuxmusl-amd64)
+TCCBIN_COMMIT ?= a3e24da26ec42a005d6990618d20d5d955ff4a0b
+endif
+ifeq ($(TCCOS)-$(TCCARCH),windows-amd64)
+TCCBIN_COMMIT ?= b9cfff43ed46db626004853f6e5198b6cdd27072
+endif
+
 TCCBUILDSCRIPT = $(VROOT)/thirdparty/build_scripts/thirdparty-$(TCCOS)-$(TCCARCH)_tcc.sh
 
 .PHONY: all clean rebuild check fresh_vc fresh_tcc fresh_legacy latest_tcc_source check_for_working_tcc etags ctags
@@ -261,7 +288,11 @@ ifdef WIN32
 		cd "$(TMPTCC)" && $(GIT) checkout -- lib/advapi32.def > /dev/null 2> /dev/null || true; \
 	fi
 endif
+ifneq ($(strip $(TCCBIN_COMMIT)),)
+	cd $(TMPTCC) && $(GIT) clean -xf && ($(GIT) checkout --quiet $(TCCBIN_COMMIT) 2>/dev/null || ($(GIT) fetch --quiet origin && $(GIT) checkout --quiet $(TCCBIN_COMMIT)))
+else
 	cd $(TMPTCC) && $(GITCLEANPULL)
+endif
 ifdef WIN32
 	@if [ -f "$(TMPTCC)/lib/advapi32.def" ]; then \
 		for sym in RegEnumKeyExW RegEnumValueW RegQueryInfoKeyW; do \
@@ -352,7 +383,11 @@ ifndef local
 latest_legacy: $(TMPLEGACY)/.git/config
 ifdef LEGACY
 ifeq ($(HAS_GIT),1)
+ifneq ($(strip $(LEGACY_COMMIT)),)
+	cd $(TMPLEGACY) && $(GIT) clean -xf && ($(GIT) checkout --quiet $(LEGACY_COMMIT) 2>/dev/null || ($(GIT) fetch --quiet origin && $(GIT) checkout --quiet $(LEGACY_COMMIT)))
+else
 	cd $(TMPLEGACY) && $(GITCLEANPULL)
+endif
 else
 	@echo "git not found; using existing $(TMPLEGACY)"
 endif
