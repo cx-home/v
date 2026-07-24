@@ -442,7 +442,10 @@ fn closure_try_destroy(closure voidptr) {
 			data = p[0]
 		}
 		if !isnil(data) {
-			free(data)
+			// ctx blocks come from memdup_uncollectable (closure_create's caller)
+			// — under vgc they are pinned GC roots, so route through the paired
+			// release (unpin + free); a plain free would strand the pin.
+			free_uncollectable(data)
 		}
 		p[0] = g_closure.free_closure_ptr
 		if is_ppc64() {

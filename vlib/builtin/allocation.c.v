@@ -215,6 +215,20 @@ pub fn malloc_uncollectable(n isize) &u8 {
 	} $else $if vgc ? {
 		unsafe {
 			res = &u8(vgc_malloc(usize(n)))
+			// Honor BOTH halves of the uncollectable contract (Boehm's
+			// GC_MALLOC_UNCOLLECTABLE): the block is never collected AND acts
+			// as a ROOT whose contents are scanned. A plain vgc_malloc here is
+			// unsound: the flagship caller is closure_create's captured-context
+			// struct, whose ONLY reference lives in the closure's mmap'd
+			// metadata page — memory the collector never scans — so the first
+			// GC cycle swept every live closure context (and everything
+			// reachable only through it, e.g. the interface box a `fn [b]`
+			// capture holds), and the next closure invocation read freed
+			// memory. Pinning registers the block in the collector's explicit
+			// root set: shaded every cycle, so it and its transitive referents
+			// survive for the process lifetime — exactly the Boehm semantics
+			// (uncollectable blocks are immortal unless explicitly freed).
+			vgc_pin(res)
 		}
 	} $else $if gcboehm ? {
 		unsafe {
@@ -529,6 +543,24 @@ pub fn memdup_uncollectable(src voidptr, sz isize) voidptr {
 		mem := malloc_uncollectable(sz)
 		return C.memcpy(mem, src, sz)
 	}
+}
+
+// free_uncollectable releases a block obtained from malloc_uncollectable /
+// memdup_uncollectable — the ONLY correct way to free one. Under vgc the block
+// is registered as an explicit GC root (see malloc_uncollectable), so a plain
+// free() would leave a stale pin behind: harmless while the slot stays free,
+// but once the allocator reuses it the pin silently immortalizes an unrelated
+// object. Unpin first, then free. Under the other allocators this is plain
+// free() (Boehm's GC_FREE handles uncollectable blocks natively).
+@[unsafe]
+pub fn free_uncollectable(ptr voidptr) {
+	if ptr == unsafe { nil } {
+		return
+	}
+	$if vgc ? {
+		vgc_unpin(ptr)
+	}
+	unsafe { free(ptr) }
 }
 
 // memdup_align dynamically allocates a memory block of `sz` bytes on the heap,
