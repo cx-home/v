@@ -1873,7 +1873,13 @@ fn (mut g Gen) gen_anon_fn(mut node ast.AnonFn) {
 	ctx_struct := g.closure_ctx(node.decl)
 	// it may be possible to optimize `memdup` out if the closure never leaves current scope
 	// TODO: in case of an assignment, this should only call "closure_set_data" and "closure_set_function" (and free the former data)
-	g.write('builtin__closure__closure_create_with_data(${fn_name}, (${ctx_struct}*) builtin__memdup(&(${ctx_struct}){')
+	// cx #613 / #657: the ctx block MUST be memdup_uncollectable — a pinned GC
+	// root the collector shades every cycle. Upstream's #27483 rewrite switched
+	// this emission to plain memdup, leaving ctx retention to g_closure.live
+	// alone; under vgc that chain loses races at high mutator counts (captured
+	// envs swept while the closure is callable — the N=24 churn UAF). The paired
+	// release (closure_release_no_lock → free_uncollectable) unpins on reclaim.
+	g.write('builtin__closure__closure_create_with_data(${fn_name}, (${ctx_struct}*) builtin__memdup_uncollectable(&(${ctx_struct}){')
 	g.indent++
 	for var in node.inherited_vars {
 		mut has_inherited := false
