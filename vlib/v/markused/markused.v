@@ -114,6 +114,9 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 		}
 		if table.used_features.anon_fn {
 			core_fns << 'memdup'
+			// cx #613/#657: closure ctx blocks are memdup_uncollectable'd (pinned
+			// GC roots under vgc) — the cgen emission references it by name.
+			core_fns << 'memdup_uncollectable'
 			core_fns << 'builtin.closure.closure_alloc'
 			core_fns << 'builtin.closure.closure_init'
 			core_fns << 'builtin.closure.closure_create'

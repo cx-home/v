@@ -482,7 +482,12 @@ fn closure_release_no_lock(exec_ptr voidptr, generation u64) bool {
 	data := closure_slot_data(exec_ptr)
 	_ := closure_live_delete(exec_ptr)
 	if info.owns_data && !isnil(data) {
-		unsafe { free(data) }
+		// ctx blocks come from memdup_uncollectable (closure_create's caller)
+		// — under vgc they are pinned GC roots, so route through the paired
+		// release (unpin + free); a plain free would strand the pin. This is
+		// the ONE reclamation point (try_destroy and the scoped-lifetime
+		// generation reclaim both funnel here). No-op difference outside vgc.
+		unsafe { free_uncollectable(data) }
 	}
 	unsafe {
 		mut p := closure_slot_meta(exec_ptr)
