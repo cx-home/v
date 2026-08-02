@@ -483,6 +483,13 @@ fn c_error_bug_report_url(flag_url string) string {
 }
 
 fn should_submit_c_error_bug_report(flag_url string) bool {
+	// cx fork: reporting is OPT-IN (V_C_ERROR_BUG_REPORT=1), never opt-out.
+	// This tree carries fork-modified codegen, so auto-posting generated C to
+	// the upstream tracker leaks fork internals and files noise upstream —
+	// a fork C error is not upstream's bug until reproduced on stock V.
+	if !c_error_bug_reports_enabled() {
+		return false
+	}
 	if c_error_bug_reports_disabled() {
 		return false
 	}
@@ -490,6 +497,11 @@ fn should_submit_c_error_bug_report(flag_url string) bool {
 		return c_error_bug_report_url(flag_url) != default_c_error_bug_report_url
 	}
 	return true
+}
+
+fn c_error_bug_reports_enabled() bool {
+	return os.getenv('V_C_ERROR_BUG_REPORT').trim_space().to_lower() in ['1', 'true', 'yes',
+		'on']
 }
 
 fn c_error_bug_reports_disabled() bool {
