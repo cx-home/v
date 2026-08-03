@@ -190,6 +190,16 @@ fn __new_array(mylen int, cap int, elm_size int) array {
 	} else if cap_ > 0 {
 		data = alloc_array_data(total_size)
 	}
+	// vgc conservative-retention contract (cx #657): zero-cap arrays keep a real
+	// (1-byte + header) allocation instead of nil data. Fork paths and the
+	// conservative scan assume `.managed` arrays carry a live managed buffer;
+	// the nil-data variant proved deadly in combination with multi-mutator
+	// churn (see array.delete). Cost: one 16-byte block per empty literal.
+	$if vgc ? {
+		if data == unsafe { nil } {
+			data = alloc_array_data(total_size)
+		}
+	}
 	arr := array{
 		element_size: elm_size
 		data:         data
@@ -219,6 +229,12 @@ fn __new_array_with_default(mylen int, cap int, elm_size int, val voidptr) array
 		arr.data = alloc_array_data_uninit(total_size)
 	} else if cap_ > 0 {
 		arr.data = alloc_array_data(total_size)
+	}
+	// vgc conservative-retention contract (cx #657) — see __new_array.
+	$if vgc ? {
+		if arr.data == unsafe { nil } {
+			arr.data = alloc_array_data(total_size)
+		}
 	}
 	if val != 0 {
 		mut eptr := &u8(arr.data)
@@ -259,6 +275,12 @@ fn __new_array_with_multi_default(mylen int, cap int, elm_size int, val voidptr)
 	if cap_ > 0 {
 		arr.data = alloc_array_data(total_size)
 	}
+	// vgc conservative-retention contract (cx #657) — see __new_array.
+	$if vgc ? {
+		if arr.data == unsafe { nil } {
+			arr.data = alloc_array_data(total_size)
+		}
+	}
 	if val != 0 {
 		mut eptr := &u8(arr.data)
 		unsafe {
@@ -286,6 +308,12 @@ fn __new_array_with_array_default(mylen int, cap int, elm_size int, val array, d
 	if cap_ > 0 {
 		arr.data = alloc_array_data(u64(cap_) * u64(elm_size))
 	}
+	// vgc conservative-retention contract (cx #657) — see __new_array.
+	$if vgc ? {
+		if arr.data == unsafe { nil } {
+			arr.data = alloc_array_data(u64(cap_) * u64(elm_size))
+		}
+	}
 	mut eptr := &u8(arr.data)
 	unsafe {
 		if eptr != nil {
@@ -311,6 +339,12 @@ fn __new_array_with_map_default(mylen int, cap int, elm_size int, val map) array
 	}
 	if cap_ > 0 {
 		arr.data = alloc_array_data(u64(cap_) * u64(elm_size))
+	}
+	// vgc conservative-retention contract (cx #657) — see __new_array.
+	$if vgc ? {
+		if arr.data == unsafe { nil } {
+			arr.data = alloc_array_data(u64(cap_) * u64(elm_size))
+		}
 	}
 	mut eptr := &u8(arr.data)
 	unsafe {
@@ -595,8 +629,18 @@ pub fn (mut a array) delete(i int) {
 	}
 	if i == a.len - 1 && !a.needs_unique_shrink() {
 		a.len--
-		unsafe {
-			vmemset(&u8(a.data) + u64(a.len) * u64(a.element_size), 0, u64(a.element_size))
+		// vgc CONSERVATIVE-RETENTION CONTRACT (cx #657): do NOT zero the vacated
+		// slot. Under a conservative collector the stale copy in a still-scanned
+		// buffer legitimately retains the element's referents until the buffer is
+		// reused or collected — mutator code (V-wide) takes an element out, deletes
+		// the slot, and keeps using the copy; precise-liveness zeroing here swept
+		// live objects under multi-mutator load (the N=24 churn UAF). Zeroing is
+		// only an over-retention optimization — never required for correctness —
+		// so vgc keeps the conservative semantics.
+		$if !vgc ? {
+			unsafe {
+				vmemset(&u8(a.data) + u64(a.len) * u64(a.element_size), 0, u64(a.element_size))
+			}
 		}
 		return
 	}
@@ -636,8 +680,11 @@ pub fn (mut a array) delete_many(i int, size int) {
 		unsafe {
 			vmemmove(&u8(a.data) + u64(i) * u64(a.element_size), &u8(a.data) + u64(i +
 				size) * u64(a.element_size), u64(a.len - i - size) * u64(a.element_size))
-			vmemset(&u8(a.data) + u64(new_len) * u64(a.element_size), 0,
-				u64(size) * u64(a.element_size))
+			// vgc conservative-retention contract (cx #657) — see array.delete.
+			$if !vgc ? {
+				vmemset(&u8(a.data) + u64(new_len) * u64(a.element_size), 0,
+					u64(size) * u64(a.element_size))
+			}
 		}
 		a.len = new_len
 		return
@@ -938,8 +985,11 @@ pub fn (mut a array) delete_last() {
 		return
 	}
 	a.len--
-	unsafe {
-		vmemset(&u8(a.data) + u64(a.len) * u64(a.element_size), 0, u64(a.element_size))
+	// vgc conservative-retention contract (cx #657) — see array.delete.
+	$if !vgc ? {
+		unsafe {
+			vmemset(&u8(a.data) + u64(a.len) * u64(a.element_size), 0, u64(a.element_size))
+		}
 	}
 }
 
