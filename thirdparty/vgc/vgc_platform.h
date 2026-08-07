@@ -14,25 +14,36 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
 // ============================================================
 // Global / BSS data-segment roots
 // V `__global` variables (e.g. rand.default_rng, and any user global holding a
-// heap pointer) compile to C globals in the main executable's writable data
-// segments. The collector must scan them as roots; otherwise an object reachable
-// ONLY through a global is reclaimed, and code that later touches it (e.g. a
-// module's at-exit _deinit) dereferences freed memory -> SIGSEGV. Boehm scans the
-// data/bss segments for exactly this reason. We enumerate the main image's
-// writable segments (data + bss live inside them: getsegmentdata's size is the
-// segment vmsize, which spans bss) and hand the ranges to the conservative scan.
-// (vgc's own globals in here — vgc_heap.allspans/caches/central — hold pointers to
-// span STRUCTS allocated outside the GC arenas, which vgc_shade ignores, so
-// scanning them cannot over-retain heap objects.)
+// heap pointer) compile to C globals in writable data segments. The collector
+// must scan them as roots; otherwise an object reachable ONLY through a global
+// is reclaimed, and code that later touches it (e.g. a module's at-exit
+// _deinit) dereferences freed memory -> SIGSEGV. Boehm scans the data/bss
+// segments for exactly this reason.
+//
+// TWO images are scanned (deduplicated when they are the same):
+//   1. The MAIN executable (image 0 / the first dl_iterate_phdr object) — an
+//      embedder that stores a V-handed handle (cx table reader/writer, events
+//      writer, ...) in one of ITS globals keeps that object alive, matching
+//      the Boehm root behavior the C ABI contract was written against.
+//   2. The image CONTAINING THE VGC RUNTIME ITSELF, located via dladdr on a
+//      static marker. When V code ships as a SHARED LIBRARY (-shared, e.g.
+//      libcx), every V `__global` lives in the dylib's data segment, not the
+//      main executable's — scanning only image 0 reclaimed objects reachable
+//      only through those globals (rand.default_rng UAF in the dylib's
+//      at-exit _deinit; cx abi-gc-gate pins the class).
+// Data + bss both covered: getsegmentdata's size is the segment vmsize and
+// p_memsz spans .bss. (vgc's own globals — vgc_heap.allspans/caches/central —
+// hold pointers to span STRUCTS allocated outside the GC arenas, which
+// vgc_shade ignores, so scanning them cannot over-retain heap objects.)
 // ============================================================
 #if defined(__APPLE__)
   #include <mach-o/dyld.h>
   #include <mach-o/getsect.h>
-  static inline int vgc_data_segments(uintptr_t* los, uintptr_t* his, int max_ranges) {
-      const struct mach_header_64* mh = (const struct mach_header_64*)_dyld_get_image_header(0);
-      if (mh == 0) return 0;
+  #include <dlfcn.h>
+  static char vgc__image_marker; // dladdr anchor: resolves to the image carrying THIS vgc
+  static int vgc__image_segments(const struct mach_header_64* mh, uintptr_t* los,
+                                 uintptr_t* his, int max_ranges, int n) {
       static const char* const seg_names[] = {"__DATA", "__DATA_CONST", "__DATA_DIRTY"};
-      int n = 0;
       for (int i = 0; i < 3 && n < max_ranges; i++) {
           unsigned long sz = 0;
           uint8_t* p = getsegmentdata(mh, seg_names[i], &sz);
@@ -44,23 +55,49 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
       }
       return n;
   }
+  static inline int vgc_data_segments(uintptr_t* los, uintptr_t* his, int max_ranges) {
+      const struct mach_header_64* mh0 = (const struct mach_header_64*)_dyld_get_image_header(0);
+      int n = 0;
+      if (mh0 != 0) {
+          n = vgc__image_segments(mh0, los, his, max_ranges, n);
+      }
+      Dl_info info;
+      if (dladdr((const void*)&vgc__image_marker, &info) != 0 && info.dli_fbase != 0
+          && info.dli_fbase != (const void*)mh0) {
+          n = vgc__image_segments((const struct mach_header_64*)info.dli_fbase, los, his,
+                                  max_ranges, n);
+      }
+      return n;
+  }
 #elif defined(__linux__)
-  // Linux: enumerate the MAIN executable's writable PT_LOAD segments via
-  // dl_iterate_phdr (the ELF analog of mach-o getsegmentdata). p_memsz — NOT
-  // p_filesz — is used so the range spans .bss (zero-initialized globals live
-  // there, and a heap pointer parked in an uninitialized-at-link global must
-  // still be scanned). dl_iterate_phdr's FIRST callback is always the main
-  // program object (dlpi_name == ""), matching darwin's "image 0 only" scope:
-  // V `__global`s and vgc's own globals compile into the main binary, and the
-  // program's static deps (mbedtls, etc.) link in there too. Shared-library .data is not
-  // scanned (same as darwin) — V places no GC roots there. dl_iterate_phdr takes
-  // the loader lock, but the collector calls this with the world stopped during a
-  // RARE backstop cycle, not from a signal handler, so it is safe here.
+  // Linux: dl_iterate_phdr (the ELF analog of mach-o getsegmentdata). p_memsz —
+  // NOT p_filesz — is used so the range spans .bss (zero-initialized globals
+  // live there, and a heap pointer parked in an uninitialized-at-link global
+  // must still be scanned). dl_iterate_phdr's FIRST callback is always the main
+  // program object (dlpi_name == ""); iteration continues so the object whose
+  // PT_LOAD range covers the marker (the V shared library, when vgc rides in
+  // one) is collected too. dl_iterate_phdr takes the loader lock, but the
+  // collector calls this with the world stopped during a RARE backstop cycle,
+  // not from a signal handler, so it is safe here.
   #include <link.h>
-  typedef struct { uintptr_t* los; uintptr_t* his; int max; int n; } vgc_seg_ctx;
+  static char vgc__image_marker; // dl_iterate_phdr anchor: the image carrying THIS vgc
+  typedef struct { uintptr_t* los; uintptr_t* his; int max; int n; int idx; uintptr_t marker; } vgc_seg_ctx;
   static int vgc__phdr_cb(struct dl_phdr_info* info, size_t size, void* data) {
       (void)size;
       vgc_seg_ctx* ctx = (vgc_seg_ctx*)data;
+      int is_main = (ctx->idx == 0);
+      ctx->idx++;
+      int contains_marker = 0;
+      for (int i = 0; i < info->dlpi_phnum; i++) {
+          const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+          if (ph->p_type != PT_LOAD) continue;
+          uintptr_t lo = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+          if (ctx->marker >= lo && ctx->marker < lo + (uintptr_t)ph->p_memsz) {
+              contains_marker = 1;
+              break;
+          }
+      }
+      if (!is_main && !contains_marker) return 0; // keep iterating
       for (int i = 0; i < info->dlpi_phnum && ctx->n < ctx->max; i++) {
           const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
           if (ph->p_type != PT_LOAD) continue;
@@ -71,10 +108,10 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
           ctx->his[ctx->n] = hi;
           ctx->n++;
       }
-      return 1; // stop after the first (main program) object
+      return 0; // continue: main comes first, the marker image may come later
   }
   static inline int vgc_data_segments(uintptr_t* los, uintptr_t* his, int max_ranges) {
-      vgc_seg_ctx ctx = { los, his, max_ranges, 0 };
+      vgc_seg_ctx ctx = { los, his, max_ranges, 0, 0, (uintptr_t)&vgc__image_marker };
       dl_iterate_phdr(vgc__phdr_cb, &ctx);
       return ctx.n;
   }
