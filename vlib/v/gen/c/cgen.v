@@ -12449,6 +12449,13 @@ fn (mut g Gen) write_init_function() {
 			g.gen_windows_stdio_setup(false)
 		}
 		g.writeln('\t_vinit(0,0);')
+		if g.pref.gc_mode == .vgc {
+			// after _vinit(): _vinit zero-inits all globals incl. vgc_heap —
+			// same ordering rule as gen_c_main_header. Without this call a
+			// no-main artifact runs with gc_enabled=0: the collector never
+			// fires and the heap grows without bound (cx abi-gc-gate).
+			g.writeln('\tbuiltin__vgc_init();')
+		}
 		g.writeln('\tatexit(_vno_main_cleanup_caller);')
 		g.writeln('}')
 	}
@@ -12466,6 +12473,15 @@ fn (mut g Gen) write_init_function() {
 		g.writeln('\tstatic bool once = false; if (once) {return;} once = true;')
 		g.gen_shared_library_boehm_init()
 		g.writeln('\t_vinit(0,0);')
+		if g.pref.gc_mode == .vgc {
+			// after _vinit(): _vinit zero-inits all globals incl. vgc_heap —
+			// same ordering rule as gen_c_main_header. Without this call a
+			// shared library ran with gc_enabled=0: the collector never fired
+			// for ANY dlopen/link embedder, so the heap grew without bound and
+			// the permanently-empty span pool degraded every large allocation
+			// into a full free-list scan (cx abi-gc-gate pins this).
+			g.writeln('\tbuiltin__vgc_init();')
+		}
 		g.writeln('}')
 
 		if g.pref.os != .windows {
