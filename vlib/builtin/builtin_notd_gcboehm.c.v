@@ -20,6 +20,7 @@ fn C.GC_get_heap_usage_safe(pheap_size &usize, pfree_bytes &usize, punmapped_byt
 	ptotal_bytes &usize)
 
 fn C.GC_get_memory_use() usize
+fn C.GC_get_total_bytes() usize
 
 fn C.GC_gcollect()
 

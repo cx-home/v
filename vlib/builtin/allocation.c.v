@@ -664,6 +664,22 @@ pub fn gc_heap_usage() GCHeapUsage {
 	}
 }
 
+// gc_total_allocated returns the MONOTONE count of bytes the program has
+// allocated since start — it never decreases at a collection (unlike
+// gc_memory_use, which reports live/used bytes). Cost: one atomic load under
+// vgc; GC_get_total_bytes under Boehm; 0 with no collector. Consumers that
+// meter an activity's allocation take a baseline and subtract — the counter
+// being monotone makes the meter immune to collection dips.
+pub fn gc_total_allocated() u64 {
+	$if vgc ? {
+		return u64(C.vgc_atomic_load_u64(&vgc_heap.total_alloc))
+	} $else $if gcboehm ? {
+		return u64(C.GC_get_total_bytes())
+	} $else {
+		return 0
+	}
+}
+
 // gc_memory_use returns the total memory use in bytes by all allocated blocks.
 pub fn gc_memory_use() usize {
 	$if vgc ? {
