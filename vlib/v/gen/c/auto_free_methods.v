@@ -311,7 +311,16 @@ fn (mut g Gen) gen_free_for_struct(typ ast.Type, info ast.Struct, styp string, o
 				fn_builder.writeln('\t\t${field_styp_fn_name}((${opt_field_styp}*)${prefix}((${opt_styp}*)&it->data)->${field_name}${suffix});')
 				fn_builder.writeln('\t}')
 			} else {
-				fn_builder.writeln('\t${field_styp_fn_name}(${prefix}((${opt_styp}*)&it->data)->${field_name});')
+				if field.typ.is_ptr() {
+					// A reference field may still hold its `unsafe { nil }`
+					// default — freeing through it unguarded dereferences
+					// NULL (cx-home/v#2; root cause of cx-private#737).
+					fn_builder.writeln('\tif (((${opt_styp}*)&it->data)->${field_name} != 0) {')
+					fn_builder.writeln('\t\t${field_styp_fn_name}(((${opt_styp}*)&it->data)->${field_name});')
+					fn_builder.writeln('\t}')
+				} else {
+					fn_builder.writeln('\t${field_styp_fn_name}(${prefix}((${opt_styp}*)&it->data)->${field_name});')
+				}
 			}
 		} else {
 			if is_field_option {
@@ -326,8 +335,18 @@ fn (mut g Gen) gen_free_for_struct(typ ast.Type, info ast.Struct, styp string, o
 				fn_builder.writeln('\t\t${field_styp_fn_name}((${opt_field_styp}*)&(it->${field_name}${suffix}));')
 				fn_builder.writeln('\t}')
 			} else {
-				prefix := if field.typ.is_ptr() { '' } else { '&' }
-				fn_builder.writeln('\t${field_styp_fn_name}(${prefix}(it->${field_name}));')
+				if field.typ.is_ptr() {
+					// A reference field may still hold its `unsafe { nil }`
+					// default — freeing through it unguarded dereferences
+					// NULL (cx-home/v#2; root cause of cx-private#737:
+					// `Element_free` called `ElementMeta_free(it->meta)`
+					// with meta nil on nearly every parsed element).
+					fn_builder.writeln('\tif (it->${field_name} != 0) {')
+					fn_builder.writeln('\t\t${field_styp_fn_name}(it->${field_name});')
+					fn_builder.writeln('\t}')
+				} else {
+					fn_builder.writeln('\t${field_styp_fn_name}(&(it->${field_name}));')
+				}
 			}
 		}
 	}
