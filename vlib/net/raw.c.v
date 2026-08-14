@@ -85,12 +85,13 @@ pub fn (mut c RawConn) write_string(s string) !int {
 pub fn (mut c RawConn) write_to_ptr(addr Addr, b &u8, len int) !int {
 	res := C.sendto(c.sock.handle, b, len, 0, voidptr(&addr), addr.len())
 	if res >= 0 {
-		return res
+		// C.sendto returns isize; the count fits int (len is int) — cx-home/v#3.
+		return int(res)
 	}
 	code := error_code()
 	if code == int(error_ewouldblock) {
 		c.wait_for_write()!
-		socket_error(C.sendto(c.sock.handle, b, len, 0, voidptr(&addr), addr.len()))!
+		socket_error(int(C.sendto(c.sock.handle, b, len, 0, voidptr(&addr), addr.len())))!
 	} else {
 		wrap_error(code)!
 	}
