@@ -6,6 +6,11 @@
 module builtin
 
 #flag -I @VEXEROOT/thirdparty/vgc
+// cx #743: `-d vgc_suspend_signal=N` overrides the suspend-signal number for
+// the signal-suspension paths (linux default SIGRTMIN+6; darwin only under
+// -DVGC_SIGNAL_SUSPEND, default SIGXCPU — the darwin DEFAULT is signal-free
+// mach suspension). 0 = keep the platform default.
+#flag -DVGC_SUSPEND_SIGNAL_D=$d('vgc_suspend_signal', 0)
 #include "vgc_platform.h"
 
 // C interop declarations for platform header
@@ -217,6 +222,14 @@ mut:
 	stack_base usize // fixed stack boundary for this thread
 	stack_lo   usize // lowest stack address (for root scanning)
 	stack_hi   usize // highest stack address
+	// Registration-time TRUE stack bounds of the underlying OS thread (cx #743).
+	// A registered thread suspended while running on a FOREIGN stack (a host
+	// runtime's green-thread stack, e.g. a Go M executing goroutine code between
+	// libcx calls) reports an SP outside these; the scan range must then NOT be
+	// re-derived from that SP (see vgc_refresh_stack_range_for_sp). 0/0 when the
+	// platform cannot report bounds (validation disabled, prior behavior).
+	stack_limit_lo usize
+	stack_limit_hi usize
 	thread_id  u64
 	stopped    u32 // 1 if stopped for GC
 	// Which stop-cycle this park belongs to (== gc_stop_seq at park time). A
@@ -1142,6 +1155,11 @@ fn vgc_register_thread() {
 	unsafe {
 		vgc_heap.caches[idx].registered = true
 		vgc_heap.caches[idx].stack_base = stack_base
+		// cx #743: keep the TRUE bounds too (0/0 when unknown) — the scan-range
+		// refresh validates externally-captured SPs against them, so a thread
+		// suspended on a foreign (host-runtime) stack never poisons its range.
+		vgc_heap.caches[idx].stack_limit_lo = if stack_lo < stack_hi { stack_lo } else { usize(0) }
+		vgc_heap.caches[idx].stack_limit_hi = if stack_lo < stack_hi { stack_hi } else { usize(0) }
 		vgc_heap.caches[idx].mach_port = C.vgc_thread_self_port() // for OS-level STW
 	}
 	vgc_refresh_stack_range_for_sp(idx, sp)
@@ -1316,6 +1334,21 @@ fn vgc_refresh_stack_range() {
 
 fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 	if cache_idx < 0 || cache_idx >= vgc_max_threads {
+		return
+	}
+	// cx #743: a registered thread suspended while executing on a FOREIGN stack
+	// (a host runtime's green-thread stack — e.g. a Go M running goroutine code
+	// between libcx calls) reports an SP outside its registered C stack.
+	// Deriving [sp, stack_base] from it spans unrelated address space and the
+	// root scan SIGBUSes on the first unmapped page. Keep the last VALID
+	// recorded range instead: while the thread runs foreign code its C stack
+	// holds only dead cx frames (over-retention at worst), the range stays
+	// mapped for the thread's lifetime, and its captured registers are still
+	// shaded by the caller. Bounds 0/0 (platform can't report) disable the
+	// check — prior behavior.
+	limit_lo := unsafe { vgc_heap.caches[cache_idx].stack_limit_lo }
+	limit_hi := unsafe { vgc_heap.caches[cache_idx].stack_limit_hi }
+	if limit_lo < limit_hi && (sp < limit_lo || sp > limit_hi) {
 		return
 	}
 	stack_base := unsafe { vgc_heap.caches[cache_idx].stack_base }
