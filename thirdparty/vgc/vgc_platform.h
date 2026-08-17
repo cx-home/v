@@ -874,89 +874,201 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #include <errno.h> // ESRCH: distinguish a genuinely-gone thread from a transient pthread_kill failure
 
 #if defined(VGC_MACH_SUSPEND)
-  // ---- LEGACY async mach-suspend STW (build with -DVGC_MACH_SUSPEND to revert). ----
-  // Retained as a fallback. This is the path that exhibited the macOS-only #145
-  // multi-reactor sweep-while-live UAF: thread_suspend() is ASYNCHRONOUS and the
-  // register/SP capture comes from an external thread_get_state() gated only by a
-  // heuristic spin-until-(SP,PC)-stable — a strictly weaker stop-settle than a
-  // kernel-delivered signal point, with a window where a peer's in-flight live
-  // pointer is missed. Proven sound on Linux (signal-suspend), NOT on macOS-arm64.
+  #error "VGC_MACH_SUSPEND (legacy heuristic-settle mach STW) was removed by cx #743: mach suspension IS the darwin default now, with a kernel-authoritative settle replacing the SP/PC-stability heuristic (which a 1-instruction spin loop defeats while still running). Build without the flag, or -DVGC_SIGNAL_SUSPEND for the signal path."
+#endif
+#if !defined(VGC_SIGNAL_SUSPEND)
+  // ---- darwin DEFAULT: signal-free mach suspension (cx #743) -----------------
+  // The suspend signal is DEAD under a signal-owning host runtime. libcx ships
+  // as a -shared artifact linked/dlopened into foreign hosts; Go (>=1.14) owns
+  // SIGURG for goroutine preemption, and Go >=1.26 initsig() installs its
+  // handler over EVERY notify-class signal at runtime init (which runs AFTER
+  // our dyld load-constructor vgc_init) and its sigfwdgo() never forwards
+  // user-generated (SI_USER) signals to a pre-existing C handler — so a
+  // pthread_kill-based suspend on ANY signal number is consumed by the host
+  // and the ack never arrives (the 0x0acd unbounded wait observed in the Go
+  // conformance lane). The reverse install order is as bad: our handler over
+  // the host's breaks the host's async preemption, and the host's own STW then
+  // wedges the whole process. Both directions + the mach control are pinned by
+  // tools/vgc-debug/probes/go_host_suspend_probe (cx-private).
+  //
+  // thread_suspend/thread_get_state needs no signal delivery at all — the
+  // structurally right suspension for a shared-library collector (Boehm does
+  // the same on darwin). Under the DEFAULT cooperative-safepoint collector
+  // this path only ever stops STRAGGLERS: threads blocked in a syscall
+  // (external capture PROVEN complete for that class — GAP-1,
+  // probes/neon_syscall_probe.c) or in tight non-allocating loops. The legacy
+  // heuristic settle (spin until SP/PC stable across two reads — defeated by a
+  // 1-instruction spin loop that is STILL RUNNING; the #145 capture window) is
+  // replaced by a KERNEL-AUTHORITATIVE settle: after thread_suspend() returns,
+  // poll thread_info() until run_state leaves TH_STATE_RUNNING — the target is
+  // then off-CPU with suspend_count > 0, its user register file frozen until
+  // thread_resume, and thread_get_state reads a stable snapshot at an
+  // instruction boundary. The soundness invariant is unchanged: NEVER proceed
+  // with a still-running mutator (a stale scanned window is a use-after-free
+  // class) — the settle wait is unbounded with a loud periodic diagnostic
+  // (0x0ace), and only a genuinely-gone thread (dead port) is skipped.
+  #define VGC_MAC_MAXTH 128   // >= caches[64]
+  #define VGC_MAC_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95
+  typedef struct {
+      volatile uint32_t port;    // mach-port key (0 = free); == caches[].mach_port
+      volatile uint32_t acked;   // suspended, settled, registers captured
+      volatile uintptr_t sp;     // captured stack pointer
+      uintptr_t regs[VGC_MAC_MAXREG];
+      volatile int nregs;
+  } vgc_mac_susp;
+  static vgc_mac_susp vgc_mac_slots[VGC_MAC_MAXTH];
+
+  // #58 forensic: is `val` present in ANY currently-suspended thread's captured
+  // register file? Returns slot index+1, or 0. Collector-context only (slots
+  // are stable while the world is stopped).
+  static inline int vgc_captured_regs_contain(uintptr_t val) {
+      for (int i = 0; i < VGC_MAC_MAXTH; i++) {
+          if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == 0) continue;
+          if (!__atomic_load_n(&vgc_mac_slots[i].acked, __ATOMIC_ACQUIRE)) continue;
+          int n = vgc_mac_slots[i].nregs;
+          for (int r = 0; r < n; r++)
+              if (vgc_mac_slots[i].regs[r] == val) return i + 1;
+      }
+      return 0;
+  }
+
+  // #58 forensic: is the thread with mach-port `t` currently suspended with a
+  // captured (covered) register file? Collector-context only.
+  static inline int vgc_port_is_acked(uint32_t t) {
+      for (int i = 0; i < VGC_MAC_MAXTH; i++) {
+          if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) != t) continue;
+          if (__atomic_load_n(&vgc_mac_slots[i].acked, __ATOMIC_ACQUIRE)) return 1;
+      }
+      return 0;
+  }
+
+  // Thread registration key. Signal-free: no handler install, no sigmask edit —
+  // a shared-library collector must not touch the host process's signal state
+  // (the old install over Go's SIGURG handler silently broke the HOST's
+  // preemption even when no collection ever ran).
   static inline uint32_t vgc_thread_self_port(void) {
       return (uint32_t)pthread_mach_thread_np(pthread_self());
   }
-  static inline int vgc_suspend_thread(uint32_t t) {
-      if (thread_suspend((thread_act_t)t) != KERN_SUCCESS) return 0;
-      uintptr_t prev_sp = 0, prev_pc = 0;
-      for (int i = 0; i < 200000; i++) {
-        #if defined(__arm64__) || defined(__aarch64__)
-          arm_thread_state64_t st;
-          mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
-          if (thread_get_state((thread_act_t)t, ARM_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return 1;
-          uintptr_t sp = (uintptr_t)arm_thread_state64_get_sp(st);
-          uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(st);
-        #elif defined(__x86_64__)
-          x86_thread_state64_t st;
-          mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
-          if (thread_get_state((thread_act_t)t, x86_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return 1;
-          uintptr_t sp = (uintptr_t)st.__rsp;
-          uintptr_t pc = (uintptr_t)st.__rip;
-        #else
-          return 1;
-        #endif
-          if (i > 0 && sp == prev_sp && pc == prev_pc) return 1; // frozen => stopped
-          prev_sp = sp;
-          prev_pc = pc;
-      }
-      return 1; // kernel-suspended (settle heuristic exhausted; thread IS suspended)
+  static inline vgc_mac_susp* vgc_mac_find(uint32_t t) {
+      for (int i = 0; i < VGC_MAC_MAXTH; i++)
+          if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == t) return &vgc_mac_slots[i];
+      return 0;
   }
-  static inline void vgc_resume_thread(uint32_t t) { thread_resume((thread_act_t)t); }
-  static inline int vgc_thread_regs(uint32_t t, uintptr_t* sp_out, uintptr_t* regs, int max) {
+  // Suspend = thread_suspend + kernel settle + frozen register capture.
+  // Single collector under STW, so slot claiming is single-threaded vs other
+  // suspends. Returns 1 once the target is provably frozen with its register
+  // file captured; 0 ONLY if the target is genuinely GONE (dead port) or — the
+  // impossible-by-construction backstops (slot table full, capture failure) —
+  // after resuming it, so a live thread is never left frozen NOR reported
+  // covered.
+  static inline int vgc_suspend_thread(uint32_t t) {
+      if (t == 0) return 0;
+      vgc_mac_susp* s = 0;
+      for (int i = 0; i < VGC_MAC_MAXTH; i++)
+          if (__atomic_load_n(&vgc_mac_slots[i].port, __ATOMIC_ACQUIRE) == 0) { s = &vgc_mac_slots[i]; break; }
+      if (s == 0) { vgc_say(0xdead3, (uint64_t)t); return 0; } // table full (should not happen: MAXTH >= caches)
+      if (thread_suspend((thread_act_t)t) != KERN_SUCCESS) {
+          vgc_say(0xdea52, (uint64_t)t); // target genuinely gone (dead port)
+          return 0;
+      }
+      // Kernel-authoritative settle: suspend_count is already > 0, so once the
+      // target is observed off-CPU it cannot be dispatched again until resume.
+      // Unbounded for a live thread (never scan a maybe-running mutator), loud
+      // if abnormally long; a port that dies mid-settle is a gone thread.
+      for (uint64_t spins = 1;; spins++) {
+          struct thread_basic_info info;
+          mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+          if (thread_info((thread_act_t)t, THREAD_BASIC_INFO, (thread_info_t)&info, &cnt) != KERN_SUCCESS) {
+              vgc_say(0xdead5, (uint64_t)t); // port died under us: nothing to scan or resume
+              return 0;
+          }
+          if (info.run_state != TH_STATE_RUNNING) break; // off-CPU => user context frozen
+          if ((spins & 0xfffff) == 0) vgc_say(0x0ace, (uint64_t)t); // abnormal: still running (visible, not silent)
+          sched_yield();
+      }
+      int c = 0;
+      uintptr_t sp = 0;
     #if defined(__arm64__) || defined(__aarch64__)
       arm_thread_state64_t st;
       mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
-      if (thread_get_state((thread_act_t)t, ARM_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return 0;
-      *sp_out = (uintptr_t)arm_thread_state64_get_sp(st);
-      int c = 0;
-      for (int i = 0; i < 29 && c < max; i++) regs[c++] = (uintptr_t)st.__x[i];
-      if (c < max) regs[c++] = (uintptr_t)arm_thread_state64_get_fp(st);
-      if (c < max) regs[c++] = (uintptr_t)arm_thread_state64_get_lr(st);
+      if (thread_get_state((thread_act_t)t, ARM_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) {
+          vgc_say(0xdead6, (uint64_t)t); // capture failed: resume, report uncovered-and-gone
+          thread_resume((thread_act_t)t);
+          return 0;
+      }
+      sp = (uintptr_t)arm_thread_state64_get_sp(st);
+      for (int i = 0; i < 29 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = (uintptr_t)st.__x[i];
+      if (c < VGC_MAC_MAXREG) s->regs[c++] = (uintptr_t)arm_thread_state64_get_fp(st);
+      if (c < VGC_MAC_MAXREG) s->regs[c++] = (uintptr_t)arm_thread_state64_get_lr(st);
       arm_neon_state64_t ns;
       mach_msg_type_number_t nn = ARM_NEON_STATE64_COUNT;
       if (thread_get_state((thread_act_t)t, ARM_NEON_STATE64, (thread_state_t)&ns, &nn) == KERN_SUCCESS) {
           const uint64_t* q = (const uint64_t*)&ns.__v[0]; // 32 × 128-bit = 64 × u64 lanes
-          for (int i = 0; i < 64 && c < max; i++) regs[c++] = (uintptr_t)q[i];
+          for (int i = 0; i < 64 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = (uintptr_t)q[i];
       }
-      return c;
     #elif defined(__x86_64__)
       x86_thread_state64_t st;
       mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
-      if (thread_get_state((thread_act_t)t, x86_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) return 0;
-      *sp_out = (uintptr_t)st.__rsp;
+      if (thread_get_state((thread_act_t)t, x86_THREAD_STATE64, (thread_state_t)&st, &n) != KERN_SUCCESS) {
+          vgc_say(0xdead6, (uint64_t)t);
+          thread_resume((thread_act_t)t);
+          return 0;
+      }
+      sp = (uintptr_t)st.__rsp;
       uintptr_t r[15] = { st.__rax, st.__rbx, st.__rcx, st.__rdx, st.__rsi, st.__rdi,
                           st.__rbp, st.__r8, st.__r9, st.__r10, st.__r11, st.__r12,
                           st.__r13, st.__r14, st.__r15 };
-      int c = 0;
-      for (int i = 0; i < 15 && c < max; i++) regs[c++] = r[i];
-      return c;
+      for (int i = 0; i < 15 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = r[i];
     #else
-      (void)t; (void)sp_out; (void)regs; (void)max; return 0;
+      vgc_say(0xdead6, (uint64_t)t);
+      thread_resume((thread_act_t)t);
+      return 0;
     #endif
+      s->sp = sp;
+      s->nregs = c;
+      __atomic_store_n(&s->acked, 1, __ATOMIC_RELEASE);
+      __atomic_store_n(&s->port, t, __ATOMIC_RELEASE); // publish key (forensic helpers + regs reader)
+      return 1;
+  }
+  static inline void vgc_resume_thread(uint32_t t) {
+      vgc_mac_susp* s = vgc_mac_find(t);
+      if (s == 0) return; // never suspended this cycle (gone/skipped): nothing to undo
+      __atomic_store_n(&s->acked, 0, __ATOMIC_RELEASE);
+      __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE); // free the slot
+      thread_resume((thread_act_t)t);
+  }
+  // Read the SP + registers captured at suspend time. The thread has been
+  // frozen since, so the snapshot is stable. Returns 0 if this port was never
+  // suspended this cycle (gone thread, skipped).
+  static inline int vgc_thread_regs(uint32_t t, uintptr_t* sp_out, uintptr_t* regs, int max) {
+      vgc_mac_susp* s = vgc_mac_find(t);
+      if (s == 0 || __atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) == 0) return 0;
+      *sp_out = s->sp;
+      int n = s->nregs < max ? s->nregs : max;
+      for (int i = 0; i < n; i++) regs[i] = s->regs[i];
+      return n;
   }
 
 #else
-  // ---- macOS SIGNAL-based STW (DEFAULT; #145 fix) ----------------------------------
-  // Mirrors the Linux signal-suspend that is PROVEN sound for multi-reactor http:serve
-  // under -gc e churn (session-4: macOS mach-suspend fails, Linux signal-suspend at
-  // 20x throughput is clean). The async mach_suspend + external thread_get_state
-  // captured a peer at a weaker stop point than a kernel-delivered signal; the
-  // residual macOS-only sweep-while-live UAF lived in that window. Here each target
-  // captures its OWN interrupted register file from the signal ucontext at a clean
-  // instruction boundary, ACKs, and PARKS inside the handler until released — a
-  // precise, frozen capture identical in shape to the sound Linux path. The collector
-  // spins on the ACK before trusting the captured SP/regs. SIGURG is used (as Go does
-  // for the same purpose): unused by the HTTP/net path, so it never collides.
+  // ---- macOS SIGNAL-based STW (-DVGC_SIGNAL_SUSPEND; the #145 fix lineage) --
+  // Retained for A/B against the default mach path above. Mirrors the Linux
+  // signal-suspend: each target captures its OWN interrupted register file
+  // from the signal ucontext at a clean instruction boundary, ACKs, and PARKS
+  // inside the handler until released; the collector spins on the ACK before
+  // trusting the captured SP/regs.
+  // NOT viable in a shared library under a signal-owning host runtime (the
+  // cx #743 class — see the default branch): whichever of host/vgc installed
+  // its handler last, one side loses — the host consumes the suspend signal
+  // (the ack never arrives, 0x0acd forever) or vgc consumes the host's (the
+  // host's own preemption/STW wedges). Default signal: SIGXCPU (Boehm
+  // precedent; SIGURG — the previous default — is owned by Go >=1.14 for
+  // goroutine preemption). Override with -DVGC_SUSPEND_SIGNAL=N, or
+  // -d vgc_suspend_signal=N (plumbed through as VGC_SUSPEND_SIGNAL_D).
+  #if defined(VGC_SUSPEND_SIGNAL_D) && (VGC_SUSPEND_SIGNAL_D) > 0 && !defined(VGC_SUSPEND_SIGNAL)
+    #define VGC_SUSPEND_SIGNAL (VGC_SUSPEND_SIGNAL_D)
+  #endif
   #ifndef VGC_SUSPEND_SIGNAL
-    #define VGC_SUSPEND_SIGNAL SIGURG
+    #define VGC_SUSPEND_SIGNAL SIGXCPU
   #endif
   #define VGC_MAC_MAXTH 128   // >= caches[64]
   #define VGC_MAC_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95
@@ -1192,7 +1304,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       for (int i = 0; i < n; i++) regs[i] = s->regs[i];
       return n;
   }
-#endif // VGC_MACH_SUSPEND
+#endif // VGC_SIGNAL_SUSPEND
 #elif defined(__linux__)
   // ----------------------------------------------------------------------------
   // Linux OS-level stop-the-world via signal-based suspension.
@@ -1223,7 +1335,16 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   // Private suspend signal. SIGRTMIN+6 mirrors Boehm's default GC_SIG_SUSPEND so
   // it does not clobber an application's SIGUSR1/SIGUSR2 handlers. (SIGRTMIN is a
   // runtime value on glibc/musl, so it is only ever used at runtime, never in a
-  // constant context.)
+  // constant context.) Override with -DVGC_SUSPEND_SIGNAL=N or
+  // -d vgc_suspend_signal=N (plumbed through as VGC_SUSPEND_SIGNAL_D).
+  // KNOWN LIMIT (cx #743 class): under a host runtime that owns the process's
+  // signal handlers (Go >=1.26 installs over every notify-class signal and
+  // never forwards SI_USER signals to pre-existing C handlers), NO signal
+  // number makes this path work in a shared library — linux has no mach-style
+  // signal-free suspension, so the exposure is structural there.
+  #if defined(VGC_SUSPEND_SIGNAL_D) && (VGC_SUSPEND_SIGNAL_D) > 0 && !defined(VGC_SUSPEND_SIGNAL)
+    #define VGC_SUSPEND_SIGNAL (VGC_SUSPEND_SIGNAL_D)
+  #endif
   #ifndef VGC_SUSPEND_SIGNAL
     #define VGC_SUSPEND_SIGNAL (SIGRTMIN + 6)
   #endif
