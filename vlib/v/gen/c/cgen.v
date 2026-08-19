@@ -2175,7 +2175,7 @@ fn (mut g Gen) register_thread_void_wait_call() {
 			return
 		}
 		g.waiter_fns << '__v_thread_wait'
-		g.waiter_fn_definitions.writeln('void __v_thread_wait(__v_thread thread);')
+		g.waiter_fn_definitions.writeln('${g.static_non_parallel}void __v_thread_wait(__v_thread thread);')
 	}
 	g.gowrappers.writeln('void __v_thread_wait(__v_thread thread) {')
 	if g.pref.os == .windows {
@@ -2196,7 +2196,7 @@ fn (mut g Gen) register_thread_wait_call(eltyp string) {
 			return
 		}
 		g.waiter_fns << fn_name
-		g.waiter_fn_definitions.writeln('${eltyp} ${fn_name}(${thread_typ} thread);')
+		g.waiter_fn_definitions.writeln('${g.static_non_parallel}${eltyp} ${fn_name}(${thread_typ} thread);')
 	}
 	g.gowrappers.writeln('${eltyp} ${fn_name}(${thread_typ} thread) {')
 	g.gowrappers.writeln('\t${eltyp} res;')
@@ -2267,7 +2267,7 @@ fn (mut g Gen) register_thread_array_wait_call(thread_ret_type ast.Type) string 
 	if should_register {
 		thread_ret_styp := g.styp(thread_ret_type)
 		g.create_waiter_handler(thread_ret_type, thread_ret_styp, thread_typ)
-		g.waiter_fn_definitions.writeln('${ret_styp} ${fn_name}(${thread_arr_typ} a);')
+		g.waiter_fn_definitions.writeln('${g.static_non_parallel}${ret_styp} ${fn_name}(${thread_arr_typ} a);')
 		g.gowrappers.writeln('
 ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 		if !is_void_payload {
@@ -2398,7 +2398,7 @@ fn (mut g Gen) register_thread_fixed_array_wait_call(node ast.CallExpr, thread_r
 	if should_register {
 		thread_ret_styp := g.styp(thread_ret_type)
 		g.create_waiter_handler(thread_ret_type, thread_ret_styp, thread_typ)
-		g.waiter_fn_definitions.writeln('${ret_styp} ${fn_name}(${thread_arr_typ} a);')
+		g.waiter_fn_definitions.writeln('${g.static_non_parallel}${ret_styp} ${fn_name}(${thread_arr_typ} a);')
 		g.gowrappers.writeln('
 ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 		if !is_void_payload {
