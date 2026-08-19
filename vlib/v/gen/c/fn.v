@@ -1044,7 +1044,11 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 		// bloating the program TU so caching saved nothing.)
 		fn_in_test_file := node.file.ends_with('_test.v')
 		if node.mod != 'main' && node.mod != 'help' && !should_bundle_module && !fn_in_test_file
-			&& node.generic_names.len == 0 {
+			&& node.generic_names.len == 0 && node.mod !in g.pref.usecache_invalid_mods {
+			// cx-private#864: a module whose cached layer failed type-table
+			// validation keeps its bodies in THIS unit (skip stays false) —
+			// its .o is not linked, so the ids its code bakes in are this
+			// build's own.
 			skip = true
 		}
 	}
@@ -1493,7 +1497,7 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 	}
 	arg_str := g.out.after(arg_start_pos)
 	if node.no_body || ((g.pref.use_cache && g.pref.build_mode != .build_module) && node.is_builtin
-		&& !g.pref.is_test) || skip {
+		&& !g.pref.is_test && node.mod !in g.pref.usecache_invalid_mods) || skip {
 		// Just a function header. Builtin function bodies are defined in builtin.o
 		g.definitions.writeln(');') // NO BODY')
 		if g.inside_c_extern {
