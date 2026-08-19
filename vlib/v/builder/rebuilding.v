@@ -320,14 +320,14 @@ fn (mut b Builder) rebuild_cached_module(vexe string, imp_path string) string {
 	return rebuilt_o
 }
 
-fn (mut b Builder) handle_usecache(vexe string) {
-	if !b.pref.use_cache || b.pref.build_mode == .build_module {
-		return
-	}
-	mut libs := []string{} // builtin.o os.o http.o etc
-	mut built_modules := []string{}
-	builtin_obj_path := b.rebuild_cached_module(vexe, 'vlib/builtin')
-	libs << builtin_obj_path
+// usecache_candidate_modules enumerates every module a -usecache build would
+// link as a cached layer object, as (module name, module path) pairs, in the
+// same order and under the same guards handle_usecache links them. Factored so
+// the pre-cgen type-table validation (cx-private#864) and the cc-stage linking
+// agree on the candidate set by construction.
+fn (mut b Builder) usecache_candidate_modules() ([]string, []string) {
+	mut mods := []string{}
+	mut paths := []string{}
 	for ast_file in b.parsed_files {
 		// Cache the test's own non-main modules. Apply the same guards as the import
 		// loop below: builtin (and its parts: strconv/strings/math.bits/...) are already
@@ -336,15 +336,14 @@ fn (mut b Builder) handle_usecache(vexe string) {
 		// (a086..module.builtin.o AND 7c16..module.<abspath>.builtin.o), linking both and
 		// duplicating every builtin symbol (~9000 "duplicate symbol" errors at link).
 		if b.pref.is_test && ast_file.mod.name != 'main' && ast_file.mod.name != 'help'
-			&& !util.module_is_builtin(ast_file.mod.name) && ast_file.mod.name !in built_modules
+			&& !util.module_is_builtin(ast_file.mod.name) && ast_file.mod.name !in mods
 			&& !util.should_bundle_module(ast_file.mod.name) {
 			imp_path := b.find_module_path(ast_file.mod.name, ast_file.path) or {
 				verror('cannot import module "${ast_file.mod.name}" (not found)')
 				break
 			}
-			obj_path := b.rebuild_cached_module(vexe, imp_path)
-			libs << obj_path
-			built_modules << ast_file.mod.name
+			mods << ast_file.mod.name
+			paths << imp_path
 		}
 		for imp_stmt in ast_file.imports {
 			imp := imp_stmt.mod
@@ -354,7 +353,7 @@ fn (mut b Builder) handle_usecache(vexe string) {
 			if util.module_is_builtin(imp) {
 				continue
 			}
-			if imp in built_modules {
+			if imp in mods {
 				continue
 			}
 			if util.should_bundle_module(imp) {
@@ -370,10 +369,95 @@ fn (mut b Builder) handle_usecache(vexe string) {
 				verror('cannot import module "${imp}" (not found)')
 				break
 			}
-			obj_path := b.rebuild_cached_module(vexe, imp_path)
-			libs << obj_path
-			built_modules << imp
+			mods << imp
+			paths << imp_path
 		}
+	}
+	return mods, paths
+}
+
+// validate_usecache_type_tables (cx-private#864) — runs AFTER the checker and
+// BEFORE cgen. A cached module layer is compiled in its OWN type universe
+// (module + its deps); this program's universe (all modules + the test file's
+// extra imports) can assign the same types DIFFERENT ids. Both objects carry
+// generated helpers that dispatch on the numeric `_typ` (sumtype str/free/
+// compare) and construction sites that write it, and values cross the object
+// boundary freely — so any disagreement is a silent type-pun: the measured
+// failure was every cx.ProgramNode variant differing (main 139-181 vs layer
+// 137-155) with a SIGSEGV in a generated walker as the visible tip.
+//
+// The rule is prefix agreement: every (idx, name) the layer recorded must be
+// EXACTLY this build's (idx, name). Any deviation puts the module on
+// pref.usecache_invalid_mods: its .o is not linked and cgen emits its bodies
+// inline — correctness always, the compile-time win only where it is sound.
+// A layer without a fingerprint (predating this check) is rebuilt once to
+// produce one; if it still has none it is invalidated.
+pub fn (mut b Builder) validate_usecache_type_tables() {
+	if !b.pref.use_cache || b.pref.build_mode == .build_module {
+		return
+	}
+	// The vcache key carries a cc-derived salt (set_temporary_options inside
+	// setup_ccompiler_options) that normally first appears at cc time — this
+	// pass runs pre-cgen, so set it NOW or every lookup below lands in an
+	// unsalted bucket and misses (measured: the first draft of this fn rm'd
+	// and rebuilt every layer into one bucket and then panicked looking in
+	// the other). setup_ccompiler_options is re-entrant; cc() recomputes the
+	// same salt later.
+	b.setup_ccompiler_options(b.pref.ccompiler)
+	vexe := pref.vexe_path()
+	mods, paths := b.usecache_candidate_modules()
+	for i, imp_path in paths {
+		b.rebuild_cached_module(vexe, imp_path)
+		mut fp := b.pref.cache_manager.mod_load(imp_path, '.types.txt', imp_path) or { '' }
+		if fp == '' {
+			// pre-fingerprint cache entry: rebuild once so the layer records one.
+			if stale := b.pref.cache_manager.mod_exists(imp_path, '.o', imp_path) {
+				os.rm(stale) or {}
+			}
+			b.rebuild_cached_module(vexe, imp_path)
+			fp = b.pref.cache_manager.mod_load(imp_path, '.types.txt', imp_path) or { '' }
+		}
+		mut ok := fp != ''
+		if ok {
+			for line in fp.split_into_lines() {
+				ci := line.index(':') or { continue }
+				idx := line[..ci].int()
+				name := line[ci + 1..]
+				if b.table.type_idxs[name] or { -1 } != idx {
+					ok = false
+					$if trace_usecache_types ? {
+						eprintln('> usecache type-table mismatch in ${mods[i]}: layer ${idx}:${name} vs program ${b.table.type_idxs[name] or { -1 }}')
+					}
+					break
+				}
+			}
+		}
+		if !ok {
+			b.pref.usecache_invalid_mods << mods[i]
+			if b.pref.is_verbose {
+				eprintln('> -usecache: module ${mods[i]} cached layer type table does not match this build — emitting it inline (cx-private#864)')
+			}
+		}
+	}
+}
+
+fn (mut b Builder) handle_usecache(vexe string) {
+	if !b.pref.use_cache || b.pref.build_mode == .build_module {
+		return
+	}
+	mut libs := []string{} // builtin.o os.o http.o etc
+	builtin_obj_path := b.rebuild_cached_module(vexe, 'vlib/builtin')
+	libs << builtin_obj_path
+	mods, paths := b.usecache_candidate_modules()
+	for i, imp_path in paths {
+		// cx-private#864: a module whose cached layer failed type-table
+		// validation is emitted inline by cgen — linking its .o too would
+		// both duplicate symbols and re-introduce the type-pun.
+		if mods[i] in b.pref.usecache_invalid_mods {
+			continue
+		}
+		obj_path := b.rebuild_cached_module(vexe, imp_path)
+		libs << obj_path
 	}
 	b.ccoptions.post_args << libs
 }

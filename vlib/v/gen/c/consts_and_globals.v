@@ -533,7 +533,10 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 		'extern '
 	} else if
 		(g.pref.use_cache || (g.pref.build_mode == .build_module && g.module_built != node.mod))
-		&& !is_bundled_mod && !is_program_module_global {
+		&& !is_bundled_mod && !is_program_module_global
+		&& node.mod !in g.pref.usecache_invalid_mods {
+		// cx-private#864: an invalidated module's layer is not linked, so its
+		// globals are DEFINED here, not referenced extern.
 		'extern '
 	} else {
 		''
@@ -553,6 +556,10 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 	// bundled-module globals: the program TU is their single definition site
 	// (cached objects reference them `extern` — see visibility_kw above)
 	|| (g.pref.use_cache && g.pref.build_mode != .build_module && is_bundled_mod)
+	// cx-private#864: invalidated-layer modules are inline — their globals
+	// initialize here like any non-cached build.
+	|| (g.pref.use_cache && g.pref.build_mode != .build_module
+	&& node.mod in g.pref.usecache_invalid_mods)
 	mut attributes := ''
 	first_field := node.fields[0]
 	if first_field.is_weak {

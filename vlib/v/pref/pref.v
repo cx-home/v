@@ -245,6 +245,11 @@ pub mut:
 	use_color           ColorOutput // whether the warnings/errors should use ANSI color escapes.
 	cleanup_files       []string    // list of temporary *.tmp.c and *.tmp.c.rsp files. Cleaned up on successful builds.
 	build_options       []string    // list of options, that should be passed down to `build-module`, if needed for -usecache
+	// cx-private#864: -usecache modules whose cached layer's TYPE TABLE does not
+	// prefix-match this build's table. Their cached .o is NOT linked and cgen
+	// emits their bodies inline — correctness first, the cache win only where
+	// the type universes provably agree. Filled by validate_usecache_type_tables.
+	usecache_invalid_mods []string
 	cache_manager       vcache.CacheManager
 	gc_mode             GarbageCollectionMode = .unknown // .no_gc, .boehm, .boehm_leak, ...
 	gc_set_by_flag      bool              // true when the compiler receives `-gc`

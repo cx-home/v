@@ -5,6 +5,7 @@ module builder
 
 import hash.fnv1a
 import os
+import strings
 import v.ast
 import v.cflag
 import v.pref
@@ -1308,6 +1309,14 @@ fn (mut v Builder) setup_output_name() {
 		// asset changes (embedded assets are invisible to the .v source hashes).
 		v.pref.cache_manager.mod_save(v.pref.path, '.embeds.txt', v.pref.path,
 			embeds_manifest(v.parsed_files)) or { panic(err) }
+		// cx-private#864: record this module-build's TYPE TABLE (idx:name per
+		// symbol). A cached layer bakes these ids into its generated helpers
+		// (sumtype str/free dispatch on _typ) and its construction sites; a
+		// program whose own table assigns them differently must NOT link this
+		// object — the consumer validates this fingerprint before cgen and
+		// falls back to inline emission on any mismatch.
+		v.pref.cache_manager.mod_save(v.pref.path, '.types.txt', v.pref.path,
+			types_fingerprint(v.table)) or { panic(err) }
 	}
 	if os.is_dir(v.pref.out_name) {
 		verror('${os.quoted_path(v.pref.out_name)} is a directory')
@@ -2840,6 +2849,17 @@ fn write_response_file(response_file string, response_file_content string) {
 
 fn write_response_file_error(response_file string, err IError) {
 	verror('Unable to write to C response file "${response_file}", error: ${err}')
+}
+
+// types_fingerprint renders the table's (idx, name) pairs, one per line —
+// the ABI surface a cached module object bakes into its generated code
+// (cx-private#864). Consumers compare it against their own table.
+fn types_fingerprint(table &ast.Table) string {
+	mut sb := strings.new_builder(64 * 1024)
+	for i, sym in table.type_symbols {
+		sb.writeln('${i}:${sym.name}')
+	}
+	return sb.str()
 }
 
 fn get_dsc_content(suffix string) string {

@@ -11248,7 +11248,10 @@ fn (mut g Gen) gen_hash_stmts(mut sb strings.Builder, node &ast.HashStmtNode, se
 					owned_here := if g.pref.build_mode == .build_module {
 						node.mod == g.module_built
 					} else {
+						// cx-private#864: an invalidated-layer module is compiled
+						// into THIS TU, so the TU owns its C definition-includes.
 						node.mod in ['main', 'help'] || util.should_bundle_module(node.mod)
+							|| node.mod in g.pref.usecache_invalid_mods
 					}
 					if is_def_include && (g.pref.use_cache || g.pref.build_mode == .build_module)
 						&& !owned_here {
@@ -12320,6 +12323,12 @@ fn (mut g Gen) write_init_function() {
 				continue
 			}
 			if icmod != 'builtin' && util.module_is_builtin(icmod) {
+				continue
+			}
+			if icmod in g.pref.usecache_invalid_mods {
+				// cx-private#864: no cached object is linked for this module —
+				// its consts live in THIS TU and _vinit's inline inits cover
+				// them; an extern ${mod}__init_consts would not resolve.
 				continue
 			}
 			icmod_c := util.no_dots(icmod)

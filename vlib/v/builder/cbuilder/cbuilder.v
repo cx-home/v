@@ -81,6 +81,11 @@ pub fn gen_c(mut b builder.Builder, v_files []string) strings.Builder {
 		builder.verror(err.msg())
 	}
 
+	// cx-private#864: with -usecache, decide BEFORE cgen which cached module
+	// layers are type-table-compatible with this build; the incompatible ones
+	// are emitted inline instead of linked (pref.usecache_invalid_mods).
+	b.validate_usecache_type_tables()
+
 	util.timing_start('C GEN')
 	result := c.gen(b.parsed_files, mut b.table, b.pref)
 	util.timing_measure('C GEN')
