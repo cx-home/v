@@ -578,7 +578,7 @@ fn (mut g Gen) create_waiter_handler(call_ret_type ast.Type, s_ret_typ string, g
 	if !should_register {
 		return
 	}
-	g.waiter_fn_definitions.writeln('${s_ret_typ} ${waiter_fn_name}(${gohandle_name} thread);')
+	g.waiter_fn_definitions.writeln('${g.static_non_parallel}${s_ret_typ} ${waiter_fn_name}(${gohandle_name} thread);')
 	g.gowrappers.writeln('\n${s_ret_typ} ${waiter_fn_name}(${gohandle_name} thread) {')
 	mut c_ret_ptr_ptr := 'NULL'
 	if call_ret_type != ast.void_type {
