@@ -1994,6 +1994,25 @@ fn vgc_update_trigger() {
 	if goal > vgc_heap_soft_limit {
 		goal = vgc_heap_soft_limit
 	}
+	// Clamp to the effective PHYSICAL capacity too (cx-private#937). The soft
+	// limit is a fixed 2 GB default deliberately NOT derived from the arena
+	// ceiling — but when VGC_MAX_ARENAS lowers the physical capacity BELOW the
+	// soft limit, an unclamped goal (marked + the GOGC term) can exceed what
+	// the arenas can ever hold: paced collection then never engages, and every
+	// allocation past capacity rides the span-exhaustion force-collect — the
+	// fragmentation-sensitive lane (measured: 143 MB live under a 4-arena
+	// 256 MB cap paced to a 286 MB goal, and a 2 MB large alloc died in
+	// vgc_alloc_large after retry). Pace to 7/8 of capacity so the backstop
+	// fires before the wall; the cx #272 minimum-progress budget below still
+	// lifts the goal for live sets AT the cap, so they overshoot by marked/16
+	// and hit the honest hard wall instead of livelocking.
+	phys_cap := u64(vgc_max_arenas_eff) * u64(vgc_arena_size)
+	if phys_cap > 0 {
+		pace_cap := phys_cap - phys_cap / 8
+		if goal > pace_cap {
+			goal = pace_cap
+		}
+	}
 	// Guaranteed progress under the clamp (cx #272): once the marked set reaches
 	// the soft limit, a clamped goal sits AT or BELOW heap_live, so every
 	// allocation-side pacing check fires a full collection — a mutator livelock,
