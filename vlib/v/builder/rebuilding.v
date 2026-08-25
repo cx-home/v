@@ -33,6 +33,16 @@ pub fn (mut b Builder) rebuild_modules() {
 	}
 	mut stale_object_might_survive := false
 	if invalidations.len > 0 {
+		// The cached objects live under the cc-salted key (set_temporary_options
+		// inside setup_ccompiler_options), which normally first appears at cc
+		// time. This runs at parse end — set the salt NOW, or the stale-object
+		// guard below computes an UNSALTED path, finds nothing there, declares
+		// the failure harmless and saves the new hashes anyway (measured: the
+		// guard looked in ac/… while the object sat in 87/…, resurrecting the
+		// cx #151 poisoning it exists to prevent). setup_ccompiler_options is
+		// re-entrant; validate_usecache_type_tables and cc() recompute the same
+		// salt later (the cx-private#864 precedent).
+		b.setup_ccompiler_options(b.pref.ccompiler)
 		vexe := pref.vexe_path()
 		for imp in invalidations {
 			rc := b.v_build_module(vexe, imp)
@@ -69,9 +79,22 @@ pub fn (mut b Builder) rebuild_modules() {
 		// Persist the new source hashes only now — after every invalidated module was
 		// rebuilt (or its stale object provably removed) — so a failed rebuild can
 		// never poison the cache state.
-		mut cm := vcache.new_cache_manager(all_files)
+		mut cm := b.source_hashes_cache_manager(all_files)
 		cm.save('.hashes', 'all_files', snew_hashes) or {}
 	}
+}
+
+// source_hashes_cache_manager keys the global source-hash record by the full
+// build configuration as well as the file set. Keyed by file set alone, one
+// configuration's save convinced every OTHER configuration of the same
+// program that nothing changed — while their namespaces still held objects
+// built from the old sources (measured cross-config staleness; the
+// provenance manifests are the serve-time backstop, this keeps the
+// invalidation fast path per-config so they rarely have to fire).
+fn (b &Builder) source_hashes_cache_manager(all_files []string) vcache.CacheManager {
+	mut opts := [b.pref.cache_manager.original_vopts]
+	opts << all_files
+	return vcache.new_cache_manager(opts)
 }
 
 pub fn (mut b Builder) find_invalidated_modules_by_files(all_files []string) ([]string, string) {
@@ -80,7 +103,7 @@ pub fn (mut b Builder) find_invalidated_modules_by_files(all_files []string) ([]
 	mut old_hashes := map[string]string{}
 	mut sb_new_hashes := strings.new_builder(1024)
 
-	mut cm := vcache.new_cache_manager(all_files)
+	mut cm := b.source_hashes_cache_manager(all_files)
 	sold_hashes := cm.load('.hashes', 'all_files') or { ' ' }
 	// eprintln(sold_hashes)
 	sold_hashes_lines := sold_hashes.split('\n')
@@ -293,19 +316,167 @@ fn (mut b Builder) cached_module_embeds_fresh(imp_path string) bool {
 	return true
 }
 
+// provenance_manifest_version versions the .srcs.txt format; a manifest with
+// a different (or missing) version line is treated as absent, so format
+// changes degrade to one rebuild instead of misreading old records.
+const provenance_manifest_version = 'provenance_v1'
+
+// provenance_manifest serialises, for a just-built module object, every input
+// that shaped its bytes: an `o:` line binding the object file itself
+// (size + content hash), an `f:` line per file dependency (every parsed .v
+// source, every $tmpl template, every local #include/#insert C header), and
+// an `e:` line per $env comptime read (hash of the resolved value). Written
+// next to the cached object ONLY on build-module success; verified by
+// cached_module_provenance_fresh before the object is ever served. This is
+// what makes a cached object self-evidencing: without it, serve time trusted
+// a global source-hash record that other configurations could update
+// (cross-config staleness) and that bound the object to nothing (a planted
+// or torn object was linked as-is).
+fn (mut b Builder) provenance_manifest(obj_path string) string {
+	mut seen := map[string]bool{}
+	mut env_seen := map[string]bool{}
+	mut file_deps := map[string]bool{}
+	mut lines := []string{}
+	for pf in b.parsed_files {
+		if !pf.is_parse_text && !pf.is_template_text && !seen[pf.path] {
+			seen[pf.path] = true
+			file_deps[pf.path] = true
+		}
+		for tp in pf.template_paths {
+			if !seen[tp] {
+				seen[tp] = true
+				file_deps[tp] = true
+			}
+		}
+		for stmt in pf.stmts {
+			// the crun dependency collector already resolves local
+			// #include/#preinclude/#postinclude/#insert paths (and skips
+			// system <...> headers); module provenance needs exactly that set
+			b.collect_crun_stmt_dependencies(mut file_deps, stmt)
+		}
+		for name, val in pf.env_reads {
+			if !env_seen[name] {
+				env_seen[name] = true
+				lines << 'e:${hash.sum64_string(val, 7).hex_full()} ${name}'
+			}
+		}
+	}
+	for fpath, _ in file_deps {
+		lines << 'f:${embed_file_content_hash(fpath)} ${fpath}'
+	}
+	lines.sort()
+	obj := os.read_bytes(obj_path) or { []u8{} }
+	oline := 'o:${obj.len}:${hash.sum64(obj, 7).hex_full()}'
+	return provenance_manifest_version + '\n' + oline + '\n' + lines.join('\n') + '\n'
+}
+
+// provenance_file_hash hashes a manifest file dependency, memoised so each
+// file is read at most once per build no matter how many module manifests
+// list it.
+fn (mut b Builder) provenance_file_hash(fpath string) string {
+	if cached := b.provenance_hash_memo[fpath] {
+		return cached
+	}
+	h := embed_file_content_hash(fpath)
+	b.provenance_hash_memo[fpath] = h
+	return h
+}
+
+// cached_module_provenance_fresh reports whether the cached object at
+// obj_path is still the product of the CURRENT inputs: its manifest must
+// exist, bind these exact object bytes, and every recorded file dependency
+// and $env value must hash to what was recorded at build time. A missing or
+// mismatching manifest means the object cannot prove where it came from and
+// is rebuilt — this closes cross-config staleness, template/header/env
+// staleness, and planted or torn objects, in one serve-time check.
+fn (mut b Builder) cached_module_provenance_fresh(imp_path string, obj_path string) bool {
+	manifest := b.pref.cache_manager.mod_load(imp_path, '.srcs.txt', imp_path) or {
+		vcache.dlog('| Builder.' + @FN, 'no provenance manifest for ${imp_path} — rebuilding')
+		return false
+	}
+	lines := manifest.split_into_lines()
+	if lines.len == 0 || lines[0] != provenance_manifest_version {
+		vcache.dlog('| Builder.' + @FN, 'unknown manifest version for ${imp_path} — rebuilding')
+		return false
+	}
+	for line in lines[1..] {
+		if line.len < 2 {
+			continue
+		}
+		rest := line[2..]
+		match line[..2] {
+			'o:' {
+				parts := rest.split(':')
+				if parts.len != 2 {
+					return false
+				}
+				obj := os.read_bytes(obj_path) or { return false }
+				if obj.len.str() != parts[0] || hash.sum64(obj, 7).hex_full() != parts[1] {
+					vcache.dlog('| Builder.' + @FN, 'object bytes do not match manifest binding: ${obj_path}')
+					return false
+				}
+			}
+			'f:' {
+				recorded := rest.all_before(' ')
+				fpath := rest.all_after(' ')
+				if b.provenance_file_hash(fpath) != recorded {
+					vcache.dlog('| Builder.' + @FN, 'stale file dependency: ${fpath} (module ${imp_path})')
+					return false
+				}
+			}
+			'e:' {
+				recorded := rest.all_before(' ')
+				name := rest.all_after(' ')
+				if hash.sum64_string(os.getenv(name), 7).hex_full() != recorded {
+					vcache.dlog('| Builder.' + @FN, 'stale \$env value: ${name} (module ${imp_path})')
+					return false
+				}
+			}
+			else {
+				// unknown row kind from a future format — fail closed
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// publish_built_module_object finalises a successful build-module compile:
+// it writes the provenance manifest binding the just-produced object bytes,
+// then atomically renames the temporary object into its final cache path.
+// The rename is the commit point — a concurrent consumer either sees the old
+// complete object (whose manifest check decides its fate) or the new
+// complete one, never a partial write; and no object becomes servable before
+// its manifest exists.
+fn (mut b Builder) publish_built_module_object() {
+	if b.pref.build_mode != .build_module || b.build_module_final_o == '' {
+		return
+	}
+	built := b.pref.out_name
+	if !os.exists(built) {
+		return
+	}
+	manifest := b.provenance_manifest(built)
+	b.pref.cache_manager.mod_save(b.pref.path, '.srcs.txt', b.pref.path, manifest) or { panic(err) }
+	if built != b.build_module_final_o {
+		os.mv(built, b.build_module_final_o) or { panic(err) }
+	}
+}
+
 fn (mut b Builder) rebuild_cached_module(vexe string, imp_path string) string {
 	mut existing := ''
 	if res := b.pref.cache_manager.mod_exists(imp_path, '.o', imp_path) {
 		existing = res
 	}
-	if existing != '' && b.cached_module_embeds_fresh(imp_path) {
+	if existing != '' && b.cached_module_embeds_fresh(imp_path)
+		&& b.cached_module_provenance_fresh(imp_path, existing) {
 		return existing
 	}
 	if b.pref.is_verbose {
 		if existing == '' {
 			println('Cached ${imp_path} .o file not found... Building .o file for ${imp_path}')
 		} else {
-			println('Cached ${imp_path} .o file has stale embedded assets... Rebuilding .o file for ${imp_path}')
+			println('Cached ${imp_path} .o file is stale (embedded assets or provenance)... Rebuilding .o file for ${imp_path}')
 		}
 	}
 	rc := b.v_build_module(vexe, imp_path)

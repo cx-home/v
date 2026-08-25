@@ -1168,6 +1168,7 @@ pub mut:
 	implied_imports       []string                  // ​imports that the user's code uses but omitted to import explicitly, used by `vfmt`
 	embedded_files        []EmbeddedFile            // list of files to embed in the binary
 	embedded_apaths       []string                  // absolute paths of $embed_file targets (deduped, checker-resolved); drives -usecache invalidation of embedded assets
+	env_reads             map[string]string         // $env('NAME') -> resolved value at check time; drives -usecache invalidation of baked env values
 	imported_symbols      map[string]string         // used for `import {symbol}`, it maps symbol => module.symbol
 	imported_symbols_trie token.KeywordsMatcherTrie // constructed from imported_symbols, to accelerate presense checks
 	imported_symbols_used map[string]bool

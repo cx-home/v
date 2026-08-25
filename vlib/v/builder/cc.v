@@ -1295,8 +1295,18 @@ fn (mut v Builder) setup_output_name() {
 		}
 	}
 	if v.pref.build_mode == .build_module {
-		v.pref.out_name = v.pref.cache_manager.mod_postfix_with_key2cpath(v.pref.path, '.o',
-			v.pref.path) // v.out_name
+		v.build_module_final_o = v.pref.cache_manager.mod_postfix_with_key2cpath(v.pref.path,
+			'.o', v.pref.path)
+		v.pref.out_name = v.build_module_final_o
+		if !v.pref.parallel_cc && v.ccoptions.cc != .msvc {
+			// Compile to a temporary name; publish_built_module_object renames
+			// it into place AFTER the provenance manifest is written, so a
+			// concurrent consumer can never link a partially written object
+			// and no object is servable before its manifest exists. The msvc
+			// and parallel_cc paths return before the publish step runs, so
+			// they keep writing the final name directly.
+			v.pref.out_name = '${v.build_module_final_o}.tmp${os.getpid()}'
+		}
 		if v.pref.is_verbose {
 			println('Building ${v.pref.path} to ${v.pref.out_name} ...')
 		}
@@ -1883,6 +1893,7 @@ pub fn (mut v Builder) cc() {
 						if retry_res.exit_code != 0 {
 							exit(retry_res.exit_code)
 						}
+						v.publish_built_module_object()
 						return
 					}
 				}
@@ -1904,6 +1915,7 @@ pub fn (mut v Builder) cc() {
 		}
 		break
 	}
+	v.publish_built_module_object()
 	v.apply_windows_icon_to_executable() or { verror(err.msg()) }
 	if v.pref.compress {
 		ret := os.system('strip ${os.quoted_path(v.pref.out_name)}')
