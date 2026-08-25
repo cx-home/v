@@ -60,6 +60,8 @@ pub mut:
 	last_cc_cmd              string              // the most recently executed C compiler command; reused to regenerate a #line annotated report
 	disable_flto             bool
 	thirdparty_header_mtimes map[string]i64
+	provenance_hash_memo     map[string]string // file path -> content hash; each file is hashed at most once per build while verifying cached-module provenance manifests
+	build_module_final_o     string            // build-module mode: the final cache path of the object; the compile targets a temporary name and publish_built_module_object renames it here
 }
 
 struct CFunctionCallCollector {

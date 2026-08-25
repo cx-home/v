@@ -423,6 +423,10 @@ fn (mut c Checker) comptime_call(mut node ast.ComptimeCall) ast.Type {
 			return ast.string_type
 		}
 		node.env_value = env_value
+		// The value is baked into the generated code, invisibly to source
+		// hashing — record the read so -usecache can invalidate a cached
+		// module object when the environment value changes.
+		c.file.env_reads[node.args_var] = env_value
 		return ast.string_type
 	}
 	if node.kind == .d {
