@@ -169,6 +169,37 @@ pub fn (mut p Preferences) defines_map_unique_keys() string {
 	return skeys.join(',')
 }
 
+// ccompiler_identity_salt resolves the configured C compiler to the actual
+// binary and returns a cache-salt component identifying that exact build
+// (real path + size + mtime). When the compiler cannot be resolved (cross
+// setups, msvc-by-name), it falls back to the bare name, preserving the old
+// behavior for exactly the cases where no better identity is available.
+pub fn (p &Preferences) ccompiler_identity_salt() string {
+	mut cc_path := p.ccompiler
+	if !os.is_abs_path(cc_path) {
+		cc_path = os.find_abs_path_of_executable(p.ccompiler) or { '' }
+	}
+	if cc_path != '' && os.exists(cc_path) {
+		real := os.real_path(cc_path)
+		return 'ccexe:${real}:${os.file_size(real)}:${os.file_last_mod_unix(real)}'
+	}
+	return 'ccname:${p.ccompiler}'
+}
+
+// compile_values_salt serializes every `-d name=value` pair (sorted), so that
+// builds differing only in a compile-time value get distinct cache namespaces.
+pub fn (p &Preferences) compile_values_salt() string {
+	if p.compile_values.len == 0 {
+		return ''
+	}
+	mut pairs := []string{cap: p.compile_values.len}
+	for k, v in p.compile_values {
+		pairs << '${k}=${v}'
+	}
+	pairs.sort()
+	return 'dvals:' + pairs.join(',')
+}
+
 fn (mut p Preferences) disable_tcc_shared_backtraces() {
 	if p.is_shared && p.ccompiler_type == .tinyc && 'no_backtrace' !in p.compile_defines_all {
 		// TCC shared libraries should not depend on TCC's backtrace runtime symbols.
@@ -322,6 +353,18 @@ pub fn (mut p Preferences) fill_with_defaults() {
 		// ensure that different v versions use separate build artefacts
 		'${p.backend} | ${final_os} | ${p.ccompiler} | ${p.is_prod} | ${p.sanitize}',
 		p.defines_map_unique_keys(),
+		// C-COMPILER-IDENTITY SALT: `p.ccompiler` above is only the NAME the
+		// compiler was invoked by ('cc'); two different compiler builds behind
+		// the same name (a toolchain upgrade, a nix wrapper vs the system cc)
+		// otherwise share one cache namespace and link each other's objects —
+		// the same silent-miscompile class the vexe salt closes for V itself.
+		// Salting with the resolved binary's real path + size + mtime gives
+		// each compiler build its own namespace.
+		p.ccompiler_identity_salt(),
+		// `-d name=value` VALUES: defines_map_unique_keys() carries only the
+		// NAMES, but `$d('name', ...)` bakes the VALUE into generated code, so
+		// two builds differing only in a define value must not share objects.
+		p.compile_values_salt(),
 		p.cflags.trim_space(),
 		p.third_party_option.trim_space(),
 		p.lookup_path.str(),
