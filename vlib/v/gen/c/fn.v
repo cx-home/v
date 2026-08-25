@@ -1497,8 +1497,28 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 	}
 	arg_str := g.out.after(arg_start_pos)
 	if node.no_body || ((g.pref.use_cache && g.pref.build_mode != .build_module) && node.is_builtin
-		&& !g.pref.is_test && node.mod !in g.pref.usecache_invalid_mods) || skip {
-		// Just a function header. Builtin function bodies are defined in builtin.o
+		&& !util.should_bundle_module(node.mod) && !g.pref.is_test
+		&& node.mod !in g.pref.usecache_invalid_mods) || skip {
+		// Just a function header. Builtin function bodies are defined in builtin.o —
+		// EXCEPT the bundled builtin submodules (util.bundle_modules: builtin.closure,
+		// builtin.overflow), whose bodies are in NO object at all:
+		//   • they are not compiled into builtin.o (builtin does not import them; the
+		//     consumer's need is invisible to `build-module vlib/builtin`),
+		//   • their own cached object omits them (closure_init/closure_try_destroy are
+		//     module-PRIVATE compiler hooks, so an isolated module build eliminates
+		//     them as unused — measured: closure.o exports only init_consts),
+		//   • and handle_usecache never links that object anyway, because
+		//     util.module_is_builtin() is true for them (builder/rebuilding.v).
+		// Three mechanisms agreeing the bodies are "in builtin.o" when they exist
+		// nowhere: emitting a header here yields `ld: symbol(s) not found` for
+		// builtin__closure__closure_init on any -usecache build that uses a closure.
+		// bundle_modules already declares these as bundle-into-the-consumer; this
+		// makes the code generator honour that instead of contradicting it.
+		// The defect stayed hidden because of the `!g.pref.is_test` clause above:
+		// every -usecache consumer to date was a `v test` build, which takes that
+		// escape hatch and emits the bodies inline. The first ordinary `-o bin`
+		// build with -usecache hits it deterministically (9-line repro: return a
+		// closure from a fn, compile with -usecache).
 		g.definitions.writeln(');') // NO BODY')
 		if g.inside_c_extern {
 			g.definitions.writeln('#endif')
