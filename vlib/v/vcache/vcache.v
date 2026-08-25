@@ -29,6 +29,7 @@ pub struct CacheManager {
 pub:
 	basepath       string
 	original_vopts string
+	vroot          string // dir of the v executable; canonicalises module-path spellings
 pub mut:
 	vopts   string
 	k2cpath map[string]string // key -> filesystem cache path for the object
@@ -88,11 +89,46 @@ pub fn new_cache_manager(opts []string) CacheManager {
 		vexe_salt = 'vexe:${os.file_size(vexe_ident)}:${os.file_last_mod_unix(vexe_ident)}'
 	}
 	original_vopts := deduped_opts_keys.join('|') + '|' + vexe_salt
+	mut vroot := ''
+	if vexe_ident != '' {
+		vroot = os.dir(os.real_path(vexe_ident))
+	}
 	return CacheManager{
 		basepath:       vcache_basepath
 		vopts:          original_vopts
 		original_vopts: original_vopts
+		vroot:          vroot
 	}
+}
+
+// canonical_mod collapses the different spellings one module path can arrive
+// under ('vlib/builtin' relative to vroot, its absolute path, a symlinked
+// path) into ONE canonical form, so one module occupies ONE cache key. Two
+// spellings used to mean two full builds of the same module per cold cache,
+// and — worse — two linkable objects with identical symbols (the duplicate-
+// symbol class of cx-private#151/#572; see the ~9000-duplicate incident note
+// in builder/rebuilding.v). Non-path module names (plain 'os') pass through.
+fn (cm &CacheManager) canonical_mod(mod string) string {
+	mut m := mod
+	if !os.is_abs_path(m) {
+		if cm.vroot != '' {
+			candidate := os.join_path(cm.vroot, m)
+			if os.exists(candidate) {
+				m = candidate
+			}
+		}
+		if !os.is_abs_path(m) && os.exists(m) {
+			// a path relative to the current directory
+			m = os.real_path(m)
+		}
+	}
+	if os.is_abs_path(m) {
+		m = os.real_path(m)
+		if cm.vroot != '' && m.starts_with(cm.vroot + os.path_separator) {
+			m = m[cm.vroot.len + 1..]
+		}
+	}
+	return m
 }
 
 // set_temporary_options can be used to add temporary options to the hash salt
@@ -144,8 +180,10 @@ fn normalise_mod(mod string) string {
 }
 
 pub fn (mut cm CacheManager) mod_postfix_with_key2cpath(mod string, postfix string, key string) string {
-	prefix := cm.key2cpath(key)
-	res := '${prefix}.module.${normalise_mod(mod)}${postfix}'
+	cmod := cm.canonical_mod(mod)
+	ckey := if key == mod { cmod } else { cm.canonical_mod(key) }
+	prefix := cm.key2cpath(ckey)
+	res := '${prefix}.module.${normalise_mod(cmod)}${postfix}'
 	return res
 }
 
