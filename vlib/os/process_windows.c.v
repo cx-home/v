@@ -54,6 +54,25 @@ pub mut:
 	child_stderr_write &u32 = unsafe { nil }
 }
 
+// inheritable_std_handle returns the parent's own standard handle for `std_id`,
+// marked inheritable, for a child stream that is *not* being redirected through
+// a pipe of ours - the child then reads/writes the same stream as the parent.
+// It is needed because STARTF_USESTDHANDLES makes CreateProcessW take all three
+// handles from the StartupInfo, even when only some of them are our pipes.
+fn inheritable_std_handle(std_id u32) voidptr {
+	handle := C.GetStdHandle(std_id)
+	if handle == unsafe { nil } || handle == voidptr(-1) {
+		// This process has no such stream (a detached or GUI parent), so there
+		// is nothing for the child to inherit either.
+		return unsafe { nil }
+	}
+	// Only an inheritable handle survives into the child. Marking our own
+	// standard handle so is a no-op in the usual case: a console handle, or a
+	// handle that we inherited ourselves, already is.
+	C.SetHandleInformation(handle, C.HANDLE_FLAG_INHERIT, C.HANDLE_FLAG_INHERIT)
+	return handle
+}
+
 @[manualfree]
 fn (mut p Process) win_spawn_process() int {
 	mut to_be_freed := []voidptr{cap: 5}
@@ -86,27 +105,44 @@ fn (mut p Process) win_spawn_process() int {
 		sa.n_length = sizeof(C.SECURITY_ATTRIBUTES)
 		sa.b_inherit_handle = true
 
-		create_pipe_ok0 := C.CreatePipe(voidptr(&wdata.child_stdin_read),
-			voidptr(&wdata.child_stdin_write), voidptr(&sa), 65536)
-		failed_cfn_report_error(create_pipe_ok0, 'CreatePipe stdin')
-		set_handle_info_ok0 := C.SetHandleInformation(wdata.child_stdin_write,
-			C.HANDLE_FLAG_INHERIT, 0)
-		failed_cfn_report_error(set_handle_info_ok0, 'SetHandleInformation')
-		create_pipe_ok1 := C.CreatePipe(voidptr(&wdata.child_stdout_read),
-			voidptr(&wdata.child_stdout_write), voidptr(&sa), 65536)
-		failed_cfn_report_error(create_pipe_ok1, 'CreatePipe stdout')
-		set_handle_info_ok1 := C.SetHandleInformation(wdata.child_stdout_read,
-			C.HANDLE_FLAG_INHERIT, 0)
-		failed_cfn_report_error(set_handle_info_ok1, 'SetHandleInformation')
-		create_pipe_ok2 := C.CreatePipe(voidptr(&wdata.child_stderr_read),
-			voidptr(&wdata.child_stderr_write), voidptr(&sa), 65536)
-		failed_cfn_report_error(create_pipe_ok2, 'CreatePipe stderr')
-		set_handle_info_ok2 := C.SetHandleInformation(wdata.child_stderr_read,
-			C.HANDLE_FLAG_INHERIT, 0)
-		failed_cfn_report_error(set_handle_info_ok2, 'SetHandleInformation stderr')
-		start_info.h_std_input = wdata.child_stdin_read
-		start_info.h_std_output = wdata.child_stdout_write
-		start_info.h_std_error = wdata.child_stderr_write
+		// A pipe is created only for the streams that were selected for
+		// redirection with p.set_redirect_pipe/p.set_redirect_stdio. For the
+		// rest, the child is given the parent's own standard handle, so it
+		// inherits the parent's stream: STARTF_USESTDHANDLES requires *all
+		// three* handles to be valid, so leaving them empty is not an option.
+		if p.stdio_ctl[0] {
+			create_pipe_ok0 := C.CreatePipe(voidptr(&wdata.child_stdin_read),
+				voidptr(&wdata.child_stdin_write), voidptr(&sa), 65536)
+			failed_cfn_report_error(create_pipe_ok0, 'CreatePipe stdin')
+			set_handle_info_ok0 := C.SetHandleInformation(wdata.child_stdin_write,
+				C.HANDLE_FLAG_INHERIT, 0)
+			failed_cfn_report_error(set_handle_info_ok0, 'SetHandleInformation')
+			start_info.h_std_input = wdata.child_stdin_read
+		} else {
+			start_info.h_std_input = inheritable_std_handle(C.STD_INPUT_HANDLE)
+		}
+		if p.stdio_ctl[1] {
+			create_pipe_ok1 := C.CreatePipe(voidptr(&wdata.child_stdout_read),
+				voidptr(&wdata.child_stdout_write), voidptr(&sa), 65536)
+			failed_cfn_report_error(create_pipe_ok1, 'CreatePipe stdout')
+			set_handle_info_ok1 := C.SetHandleInformation(wdata.child_stdout_read,
+				C.HANDLE_FLAG_INHERIT, 0)
+			failed_cfn_report_error(set_handle_info_ok1, 'SetHandleInformation')
+			start_info.h_std_output = wdata.child_stdout_write
+		} else {
+			start_info.h_std_output = inheritable_std_handle(C.STD_OUTPUT_HANDLE)
+		}
+		if p.stdio_ctl[2] {
+			create_pipe_ok2 := C.CreatePipe(voidptr(&wdata.child_stderr_read),
+				voidptr(&wdata.child_stderr_write), voidptr(&sa), 65536)
+			failed_cfn_report_error(create_pipe_ok2, 'CreatePipe stderr')
+			set_handle_info_ok2 := C.SetHandleInformation(wdata.child_stderr_read,
+				C.HANDLE_FLAG_INHERIT, 0)
+			failed_cfn_report_error(set_handle_info_ok2, 'SetHandleInformation stderr')
+			start_info.h_std_error = wdata.child_stderr_write
+		} else {
+			start_info.h_std_error = inheritable_std_handle(C.STD_ERROR_HANDLE)
+		}
 		start_info.dw_flags = u32(C.STARTF_USESTDHANDLES)
 	}
 	mut cmd := requote_arg(p.filename)

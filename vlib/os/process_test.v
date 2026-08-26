@@ -16,6 +16,10 @@ const stdin_exit_exe_filename = os.join_path(tfolder, 'stdin_exit.exe')
 const stdin_exit_source_filename = os.join_path(tfolder, 'stdin_exit.v')
 const argv_echo_exe_filename = os.join_path(tfolder, 'argv_echo.exe')
 const argv_echo_source_filename = os.join_path(tfolder, 'argv_echo.v')
+const per_stream_exe_filename = os.join_path(tfolder, 'per_stream.exe')
+const per_stream_source_filename = os.join_path(tfolder, 'per_stream.v')
+const slurp_guard_exe_filename = os.join_path(tfolder, 'slurp_guard.exe')
+const slurp_guard_source_filename = os.join_path(tfolder, 'slurp_guard.v')
 const echo_process_source_code = '
 module main
 import io
@@ -76,6 +80,54 @@ fn main() {
 }
 '
 
+// per_stream redirects just ONE of its child's streams through a pipe, and
+// lets the other be inherited. It reports what it captured on its own stdout,
+// wrapped in CAPTURED[...] with the newlines folded, so that its caller can
+// tell the captured text apart from whatever the grandchild wrote directly to
+// the inherited descriptors - which are per_stream's own, and therefore its
+// caller's pipes.
+const per_stream_source_code = '
+module main
+import os
+
+fn main() {
+	unbuffer_stdout()
+	child_exe := os.args[1]
+	which := os.args[2]
+	mut p := os.new_process(child_exe)
+	p.set_args(["-target", "both", "-timeout_ms", "150", "-period_ms", "40"])
+	if which == "stdout" {
+		p.set_redirect_pipe(.stdout)
+	} else {
+		p.set_redirect_pipe(.stderr)
+	}
+	p.wait()
+	captured := if which == "stdout" { p.stdout_slurp() } else { p.stderr_slurp() }
+	p.close()
+	println("CAPTURED[" + captured.replace("\\n", "|") + "]")
+}
+'
+
+// slurp_guard redirects only .stderr, then slurps .stdout - the stream that
+// was never a pipe of its own. That must abort loudly, instead of quietly
+// reading nothing (or worse, the parent`s own descriptor).
+const slurp_guard_source_code = '
+module main
+import os
+
+fn main() {
+	unbuffer_stdout()
+	child_exe := os.args[1]
+	mut p := os.new_process(child_exe)
+	p.set_args(["-target", "both", "-timeout_ms", "80", "-period_ms", "40"])
+	p.set_redirect_pipe(.stderr)
+	p.wait()
+	println("about to slurp a stream that was not redirected")
+	_ = p.stdout_slurp()
+	println("UNREACHABLE")
+}
+'
+
 const echo_wait_timeout = 5 // seconds
 
 fn testsuite_begin() {
@@ -111,6 +163,14 @@ fn testsuite_begin() {
 	os.write_file(argv_echo_source_filename, argv_echo_source_code)!
 	os.system('${os.quoted_path(vexe)} -o ${os.quoted_path(argv_echo_exe_filename)} ${os.quoted_path(argv_echo_source_filename)}')
 	assert os.exists(argv_echo_exe_filename)
+
+	os.write_file(per_stream_source_filename, per_stream_source_code)!
+	os.system('${os.quoted_path(vexe)} -o ${os.quoted_path(per_stream_exe_filename)} ${os.quoted_path(per_stream_source_filename)}')
+	assert os.exists(per_stream_exe_filename)
+
+	os.write_file(slurp_guard_source_filename, slurp_guard_source_code)!
+	os.system('${os.quoted_path(vexe)} -o ${os.quoted_path(slurp_guard_exe_filename)} ${os.quoted_path(slurp_guard_source_filename)}')
+	assert os.exists(slurp_guard_exe_filename)
 }
 
 fn testsuite_end() {
@@ -430,6 +490,94 @@ fn test_pipe_read_returns_none_after_eof() {
 		assert false, 'expected none after stderr EOF, got `${err}`'
 	}
 	p.close()
+}
+
+// The four tests below pin p.set_redirect_pipe/1: redirecting SOME of a child's
+// standard streams, while the rest keep the parent's descriptors.
+//
+// They are two levels deep on purpose. `per_stream` is the process under test -
+// it is the one calling set_redirect_pipe - and this test process is its
+// parent, capturing all three of ITS streams the ordinary way. That is what
+// makes "the stream that was not redirected is inherited" observable at all:
+// the grandchild's uncaptured output arrives here, on `per_stream`'s own
+// stream, rather than through any pipe of `per_stream`'s.
+
+fn test_redirect_only_stdout_lets_stderr_pass_through() {
+	eprintln(@FN)
+	mut p := os.new_process(per_stream_exe_filename)
+	p.set_args([test_os_process, 'stdout'])
+	p.set_redirect_stdio()
+	p.wait()
+	assert p.code == 0
+	output := p.stdout_slurp()
+	errors := p.stderr_slurp()
+	p.close()
+	$if trace_process_output ? {
+		eprintln('p output: "${output}" | errors: "${errors}"')
+	}
+	captured := output.find_between('CAPTURED[', ']')
+	rest := output.replace('CAPTURED[${captured}]', '')
+	// the selected stream went through the pipe ...
+	assert captured.contains('stdout, start'), captured
+	assert !captured.contains('stderr, '), captured
+	// ... and only through the pipe: it did not also reach the parent's stdout
+	assert !rest.contains('stdout, '), rest
+	// the stream that was not selected was inherited, so it arrived here
+	assert errors.contains('stderr, start'), errors
+	assert !errors.contains('stdout, '), errors
+}
+
+fn test_redirect_only_stderr_lets_stdout_pass_through() {
+	eprintln(@FN)
+	mut p := os.new_process(per_stream_exe_filename)
+	p.set_args([test_os_process, 'stderr'])
+	p.set_redirect_stdio()
+	p.wait()
+	assert p.code == 0
+	output := p.stdout_slurp()
+	errors := p.stderr_slurp()
+	p.close()
+	$if trace_process_output ? {
+		eprintln('p output: "${output}" | errors: "${errors}"')
+	}
+	captured := output.find_between('CAPTURED[', ']')
+	rest := output.replace('CAPTURED[${captured}]', '')
+	assert captured.contains('stderr, start'), captured
+	assert !captured.contains('stdout, '), captured
+	// stdout was not selected, so it was inherited and arrived here directly
+	assert rest.contains('stdout, start'), rest
+	// stderr was selected, so nothing of it reached the parent's stderr
+	assert !errors.contains('stderr, '), errors
+	assert !errors.contains('stdout, '), errors
+}
+
+fn test_redirect_only_stdin() {
+	eprintln(@FN)
+	mut p := os.new_process(stdin_exit_exe_filename)
+	p.set_redirect_pipe(.stdin)
+	p.run()
+	p.stdin_write('a line for the child\n')
+	p.wait()
+	assert p.code == 7
+	p.close()
+}
+
+// Note: run through os.execute, NOT os.new_process + p.wait(). The guard here
+// aborts with a panic, and a panic backtrace is written while the parent is
+// still inside waitpid - a parent that only drains its pipes *after* the child
+// exits deadlocks against exactly that. os.execute reads to EOF, so the child
+// can always finish writing.
+fn test_slurping_a_stream_that_was_not_redirected_is_refused() {
+	eprintln(@FN)
+	res :=
+		os.execute('${os.quoted_path(slurp_guard_exe_filename)} ${os.quoted_path(test_os_process)}')
+	$if trace_process_output ? {
+		eprintln('guard output: "${res.output}"')
+	}
+	assert res.exit_code != 0, 'the guarded slurp should have aborted, got code ${res.exit_code}: ${res.output}'
+	assert res.output.contains('about to slurp a stream that was not redirected'), res.output
+	assert !res.output.contains('UNREACHABLE'), res.output
+	assert res.output.contains('set_redirect_pipe'), res.output
 }
 
 fn test_slurping_utf16le_output_on_windows() {
