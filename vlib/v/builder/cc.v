@@ -1089,14 +1089,29 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 	ccoptions.pre_args << others
 	ccoptions.linker_flags << libs
 	v.fixup_tcc_macos_comma_path_flags(mut ccoptions)
-	if v.pref.use_cache && v.pref.build_mode != .build_module {
-		if ccoptions.cc != .tcc {
-			$if linux {
-				ccoptions.linker_flags << '-Xlinker -z'
-				ccoptions.linker_flags << '-Xlinker muldefs'
-			}
-		}
-	}
+	// NOTE: `-usecache` linux builds used to add `-Xlinker -z -Xlinker muldefs`
+	// here. That told the linker to accept a symbol defined by more than one of
+	// the linked objects and silently bind the FIRST definition — so on linux
+	// (and only there; macOS/ld has never had the flag) a build with duplicated
+	// definitions across cache layers produced a working-looking binary that ran
+	// whichever copy the linker happened to see first, instead of failing.
+	//
+	// Every producer of such duplicates is now removed at the source, so the
+	// masking flag is gone with them and a genuine collision fails loud again:
+	//   * one module = one cache key (CacheManager.canonical_mod), so `builtin`
+	//     can no longer be linked twice under two spellings of its path;
+	//   * `usecache_candidate_modules` skips builtin parts, bundled modules and
+	//     already-queued modules, so no object enters the link set twice;
+	//   * a module whose cached layer is emitted inline instead (bundled
+	//     modules, and layers invalidated by the type-table check) never has its
+	//     object linked as well — cgen and handle_usecache agree on one side;
+	//   * per-object provenance verification rebuilds a stale layer rather than
+	//     serving it, which is what used to put two generations of the same
+	//     module in one link;
+	//   * the code that IS generated independently per object (generic
+	//     instantiations, sumtype casting fns, embedded-file blobs) gets
+	//     internal linkage under `use_cache`, so each object owns a private copy
+	//     and no external symbol is duplicated at all.
 	if ccoptions.cc == .tcc && 'no_backtrace' !in v.pref.compile_defines {
 		ccoptions.post_args << '-bt25'
 	}
