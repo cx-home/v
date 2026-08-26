@@ -132,17 +132,45 @@ pub fn (mut p Process) is_alive() bool {
 	return res
 }
 
-//
+// set_redirect_stdio - redirect *all three* of the child's standard streams
+// through pipes, so that you can use p.stdin_write(), p.stdout_slurp() and
+// p.stderr_slurp().
+// Note: use p.set_redirect_pipe(pkind), when you want to redirect just some of
+// them, and let the child inherit the parent's descriptors for the rest.
 pub fn (mut p Process) set_redirect_stdio() {
-	p.use_stdio_ctl = true
+	p.set_redirect_pipe(.stdin)
+	p.set_redirect_pipe(.stdout)
+	p.set_redirect_pipe(.stderr)
 	$if trace_process_pipes ? {
 		eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}')
 	}
 }
 
+// set_redirect_pipe - redirect just the child's `pkind` standard stream through
+// a pipe. The streams that you do *not* select this way are not redirected at
+// all: the child inherits the parent's descriptors for them, so for example the
+// child's diagnostics can keep going to the same terminal as the parent's,
+// while its output is captured. Call it once per stream that you want to
+// control:
+// ```v ignore
+// p.set_redirect_pipe(.stdout) // capture stdout; stderr goes where the parent's does
+// p.run()
+// output := p.stdout_slurp()
+// ```
+// Note: the pipe methods for a stream that was not selected (p.stdin_write for
+// .stdin, p.stdout_slurp/p.stdout_read for .stdout, and so on) will panic -
+// there is no pipe of ours behind that descriptor to use.
+pub fn (mut p Process) set_redirect_pipe(pkind ChildProcessPipeKind) {
+	p.use_stdio_ctl = true
+	p.stdio_ctl[int(pkind)] = true
+	$if trace_process_pipes ? {
+		eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}, pkind: ${pkind}')
+	}
+}
+
 // stdin_write will write the string `s`, to the stdin pipe of the child process.
 pub fn (mut p Process) stdin_write(s string) {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(.stdin, @METHOD)
 	$if trace_process_pipes ? {
 		eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}, s.len: ${s.len}, s: `${s}`')
 	}
@@ -152,7 +180,7 @@ pub fn (mut p Process) stdin_write(s string) {
 // stdout_slurp will read from the stdout pipe.
 // It will block until it either reads all the data, or until the pipe is closed (end of file).
 pub fn (mut p Process) stdout_slurp() string {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(.stdout, @METHOD)
 	res := p._slurp_from(.stdout)
 	$if trace_process_pipes ? {
 		eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}, res.len: ${res.len}, res: `${res}`')
@@ -163,7 +191,7 @@ pub fn (mut p Process) stdout_slurp() string {
 // stderr_slurp will read from the stderr pipe.
 // It will block until it either reads all the data, or until the pipe is closed (end of file).
 pub fn (mut p Process) stderr_slurp() string {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(.stderr, @METHOD)
 	res := p._slurp_from(.stderr)
 	$if trace_process_pipes ? {
 		eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}, res.len: ${res.len}, res: `${res}`')
@@ -174,7 +202,7 @@ pub fn (mut p Process) stderr_slurp() string {
 // stdout_read reads a block of data from the child process stdout pipe.
 // It returns `''` immediately when there is currently no data to be read.
 pub fn (mut p Process) stdout_read() string {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(.stdout, @METHOD)
 	if !p._is_pending(.stdout) {
 		return ''
 	}
@@ -188,7 +216,7 @@ pub fn (mut p Process) stdout_read() string {
 // stderr_read reads a block of data from the child process stderr pipe.
 // It returns `''` immediately when there is currently no data to be read.
 pub fn (mut p Process) stderr_read() string {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(.stderr, @METHOD)
 	if !p._is_pending(.stderr) {
 		return ''
 	}
@@ -202,7 +230,7 @@ pub fn (mut p Process) stderr_read() string {
 // pipe_read reads a block of data, from the given pipe of the child process.
 // It will return `none`, if there is no data to be read, *without blocking*.
 pub fn (mut p Process) pipe_read(pkind ChildProcessPipeKind) ?string {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(pkind, @METHOD)
 	if !p._is_pending(pkind) {
 		$if trace_process_pipes ? {
 			eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}, no pending data')
@@ -222,7 +250,7 @@ pub fn (mut p Process) pipe_read(pkind ChildProcessPipeKind) ?string {
 // is_pending returns whether there is data to be read from child process's pipe corresponding to `pkind`.
 // For example `if p.is_pending(.stdout) { dump( p.stdout_read() ) }` will not block indefinitely.
 pub fn (mut p Process) is_pending(pkind ChildProcessPipeKind) bool {
-	p._check_redirection_call(@METHOD)
+	p._check_redirection_call(pkind, @METHOD)
 	res := p._is_pending(pkind)
 	$if trace_process_pipes ? {
 		eprintln('${@LOCATION}, pid: ${p.pid}, status: ${p.status}, pkind: ${pkind}, res: ${res}')
@@ -270,9 +298,16 @@ fn (mut p Process) _is_pending(pkind ChildProcessPipeKind) bool {
 }
 
 // _check_redirection_call should be called just by stdxxx methods.
-fn (mut p Process) _check_redirection_call(fn_name string) {
-	if !p.use_stdio_ctl {
-		panic('Call p.set_redirect_stdio() before calling p.' + fn_name)
+// It checks the stream that the method actually uses: a stream that was not
+// redirected has no pipe of ours behind it, just the parent's inherited
+// descriptor, so reading or writing it here is a programming error - and a
+// silent one, since that descriptor may well be a live terminal.
+fn (mut p Process) _check_redirection_call(pkind ChildProcessPipeKind, fn_name string) {
+	if !p.stdio_ctl[int(pkind)] {
+		if !p.use_stdio_ctl {
+			panic('Call p.set_redirect_stdio() before calling p.' + fn_name)
+		}
+		panic('Call p.set_redirect_pipe(.${pkind}) before calling p.' + fn_name)
 	}
 	if p.status == .not_started {
 		panic('Call p.' + fn_name + '() after you have called p.run()')

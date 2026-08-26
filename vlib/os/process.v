@@ -27,7 +27,8 @@ pub mut:
 	work_folder      string   // the initial working folder of the process. When '', reuse the same folder as the parent process.
 	env_is_custom    bool     // true, when the environment was customized with .set_environment
 	env              []string // the environment with which the process was started  (list of 'var=val')
-	use_stdio_ctl    bool     // when true, then you can use p.stdin_write(), p.stdout_slurp() and p.stderr_slurp()
+	use_stdio_ctl    bool     // when true, at least one of the child's standard streams is redirected through a pipe
+	stdio_ctl        [3]bool  // which of the child's standard streams are redirected, indexed by ChildProcessPipeKind; the streams that are not, are inherited from the parent
 	use_pgroup       bool     // when true, the process will create a new process group, enabling .signal_pgkill()
 	stdio_fd         [3]int   // the stdio file descriptors for the child process, used only by the nix implementation
 	wdata            voidptr  // the WProcess; used only by the windows implementation
