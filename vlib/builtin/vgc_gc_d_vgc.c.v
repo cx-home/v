@@ -26,6 +26,29 @@ __global vgc_safe_cov = [64]bool{}
 // the STW suspend set really is the awake set.
 __global vgc_stat_mach_suspends = u64(0)
 
+// cx #973: data-segment root ranges, CACHED at vgc_init (single-threaded,
+// load-constructor context) instead of re-derived inside every STW window.
+// vgc_data_segments calls the platform loader (_dyld_get_image_header/dladdr
+// on darwin, dl_iterate_phdr on linux), which takes the LOADER LOCK — and a
+// mach-suspended straggler can be frozen HOLDING that lock (the committed #973
+// sample has one frozen in libSystem_atfork_parent mid-fork), deadlocking the
+// collector inside vgc_mark_roots. The ranges are static per loaded image
+// (main executable + the image carrying vgc), so deriving them once outside
+// STW removes every loader-lock acquisition from the collector. 8 slots: 3
+// mach-o data segments x 2 images, or the writable ELF PT_LOADs of both.
+__global vgc_seg_lo = [8]usize{}
+__global vgc_seg_hi = [8]usize{}
+__global vgc_nseg = int(0)
+
+// cx #973: derive + cache the data-segment root ranges. Called from vgc_init
+// (before any second thread exists). The mark-time fallback in vgc_mark_roots
+// exists only for the _vinit-before-vgc_init ordering quirk (spans can be
+// allocated before vgc_init runs) and would fire in a still-single-threaded
+// world, where the loader lock cannot be held by a frozen peer.
+fn vgc_cache_data_segments() {
+	vgc_nseg = C.vgc_data_segments(&vgc_seg_lo[0], &vgc_seg_hi[0], 8)
+}
+
 // vgc_gc_start triggers a garbage collection cycle.
 // Translated from Go's gcStart() in mgc.go.
 // Flow: sweep termination (STW) -> full STW mark -> sweep -> resume.
@@ -939,9 +962,14 @@ fn vgc_mark_roots() {
 	// object reachable only through a global (e.g. rand.default_rng) is reclaimed,
 	// and a later access — typically a module's at-exit _deinit — dereferences
 	// freed memory and SIGSEGVs. Conservative, like the stack scan.
-	mut seg_lo := [8]usize{}
-	mut seg_hi := [8]usize{}
-	nseg := C.vgc_data_segments(&seg_lo[0], &seg_hi[0], 8)
+	// cx #973: read the init-time cache — NEVER call into the loader from here.
+	// This runs under STW, and the loader lock can be held by a mach-suspended
+	// straggler (see the vgc_seg_lo doc above); acquiring it deadlocks the
+	// collector. The fallback fires only if a cycle precedes vgc_init.
+	if vgc_nseg == 0 {
+		vgc_cache_data_segments()
+	}
+	nseg := vgc_nseg
 	// Scan the WHOLE data segment, including the collector's own `vgc_heap` struct.
 	// It is tempting to skip vgc_heap (it is large and is "just" collector metadata),
 	// but doing so intermittently reclaims live data: vgc_heap's per-thread caches
@@ -958,14 +986,14 @@ fn vgc_mark_roots() {
 			vgc_segdump_done = true
 			C.vgc_say(0x5e60, u64(nseg)) // SEG count
 			for k in 0 .. nseg {
-				C.vgc_say(0x5e61, u64(seg_lo[k])) // SEG lo
-				C.vgc_say(0x5e62, u64(seg_hi[k])) // SEG hi
+				C.vgc_say(0x5e61, u64(vgc_seg_lo[k])) // SEG lo
+				C.vgc_say(0x5e62, u64(vgc_seg_hi[k])) // SEG hi
 			}
 		}
 	}
 	for k in 0 .. nseg {
-		if seg_lo[k] > 0 && seg_hi[k] > seg_lo[k] {
-			vgc_scan_range(seg_lo[k], seg_hi[k])
+		if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
+			vgc_scan_range(vgc_seg_lo[k], vgc_seg_hi[k])
 		}
 	}
 
