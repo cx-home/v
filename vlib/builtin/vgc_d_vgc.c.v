@@ -992,9 +992,79 @@ fn C.vgc_now_ns() u64
 // vgc_init initializes the vgc heap: it fills the size-class tables, enables the
 // collector and reads the `VGC_NEXT_GC_MB` environment override for the initial
 // GC trigger. It is called once during runtime startup, before the first allocation.
+fn C.pthread_atfork(prepare fn (), parent fn (), child fn ()) int
+
+// ============================================================
+// cx #973: fork vs STW exclusion.
+//
+// The cooperative collector mach-suspends stragglers at ARBITRARY PCs. A
+// straggler frozen mid-fork inside libSystem's atfork machinery holds system
+// locks (dyld loaders lock, corecrypto, malloc zones) that never release —
+// the committed #973 samples show both consequences: (a) the collector itself
+// deadlocking when a collector-path API needs such a lock, and (b) a child
+// forked during the window inheriting a permanently-locked lock from a
+// suspended thread that does not exist in the child, hanging before exec (its
+// parent then blocks forever in read() on the child's pipe — the "blocking
+// syscall" surface symptom).
+//
+// Exclusion: prepare takes cache_lock, which the collector holds across its
+// ENTIRE cycle and registration takes for its critical section. So prepare
+// returning means no cycle is in flight and none can start until parent/child
+// release — no thread is ever mach-suspended during any fork window. User
+// atfork prepare handlers run BEFORE libSystem's own subsystem locking, so
+// the exclusion brackets the whole native atfork sequence.
+//
+// A thread blocked in prepare's vgc_mutex_lock spin holds nothing and may
+// itself be mach-suspended and resumed like any straggler — no lock cycle.
+// ============================================================
+fn vgc_atfork_prepare() {
+	C.vgc_mutex_lock(&vgc_heap.cache_lock)
+}
+
+fn vgc_atfork_parent() {
+	C.vgc_mutex_unlock(&vgc_heap.cache_lock)
+}
+
+fn vgc_atfork_child() {
+	// The child is single-threaded: any vgc lock word held by a thread that did
+	// not survive the fork would stay locked forever. cache_lock is held by the
+	// forking thread itself (prepare above); the allocator locks can be held by
+	// a mutator that was mid-allocation at fork time. All are plain CAS words
+	// (vgc_mutex_lock), so re-initialization is a store of 0. NOTE: this makes
+	// the LOCKS usable, not the mid-mutation allocator METADATA consistent — a
+	// fork-without-exec child that keeps allocating from vgc inherits the same
+	// residual hazard every multithreaded fork does; the V/cx spawn path execs
+	// immediately. Dead peers' cache slots are harmless: their mach ports are
+	// invalid in the child, and the suspend loop already treats an un-ACKed
+	// suspend as a gone thread.
+	C.vgc_mutex_unlock(&vgc_heap.cache_lock)
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	C.vgc_mutex_unlock(&vgc_heap.lock)
+	for i in 0 .. 136 {
+		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
+	}
+	C.vgc_mutex_unlock(&vgc_spawn_root_lock)
+	C.vgc_mutex_unlock(&vgc_pin_lock)
+	C.vgc_mutex_unlock(&vgc_alloc_lock)
+	C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0)
+}
+
 @[markused]
 pub fn vgc_init() {
 	C.vgc_init_size_tables()
+	// cx #973: cache the data-segment root ranges while still single-threaded
+	// (the collector must never take the loader lock under STW — see
+	// vgc_cache_data_segments / vgc_mark_roots), and register the fork-vs-STW
+	// exclusion handlers (doc above).
+	vgc_cache_data_segments()
+	$if !windows {
+		// -d vgc_no_atfork: attribution/red-proof lever — drops the fork-vs-STW
+		// exclusion while keeping the loader-lock fix, so the #973 child-side
+		// inheritance mode can be demonstrated in isolation.
+		$if !vgc_no_atfork ? {
+			_ = C.pthread_atfork(vgc_atfork_prepare, vgc_atfork_parent, vgc_atfork_child)
+		}
+	}
 	vgc_heap.gc_enabled = 1
 	vgc_heap.gc_percent = 100
 	mb_env := C.getenv(c'VGC_NEXT_GC_MB')
