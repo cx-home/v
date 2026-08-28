@@ -129,12 +129,12 @@ pub fn compress(data []u8, format CompressParams) ![]u8 {
 	return match format.format {
 		.zlib { compress_zlib(data) }
 		.gzip { compress_gzip(data) }
-		.raw_deflate { deflate_compress_fixed(data)! }
+		.raw_deflate { deflate_compress_best(data)! }
 	}
 }
 
 pub fn compress_zlib(data []u8) ![]u8 {
-	mut payload := deflate_compress_fixed(data)!
+	mut payload := deflate_compress_best(data)!
 	defer {
 		unsafe { payload.free() }
 	}
@@ -149,7 +149,7 @@ pub fn compress_zlib(data []u8) ![]u8 {
 
 // compress_gzip compresses data into a gzip stream (RFC 1952).
 pub fn compress_gzip(data []u8) ![]u8 {
-	mut payload := deflate_compress_fixed(data)!
+	mut payload := deflate_compress_best(data)!
 	defer {
 		unsafe { payload.free() }
 	}
@@ -164,7 +164,7 @@ pub fn compress_gzip(data []u8) ![]u8 {
 
 // compress_raw compresses data to a raw RFC 1951 DEFLATE stream.
 pub fn compress_raw(data []u8) ![]u8 {
-	return deflate_compress_fixed(data)!
+	return deflate_compress_best(data)!
 }
 
 // decompress decompresses a zlib (RFC 1950), gzip (RFC 1952), or raw DEFLATE (RFC 1951) stream.
