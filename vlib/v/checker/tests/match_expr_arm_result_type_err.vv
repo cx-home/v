@@ -1,0 +1,24 @@
+struct Leaf {
+	x int
+}
+
+struct Twig {
+	y int
+}
+
+type Branch = Leaf | Twig
+
+fn mk() !Leaf {
+	return Leaf{1}
+}
+
+fn g(i int) !Branch {
+	return match i {
+		0 { Branch(Twig{2}) }
+		else { mk() }
+	}
+}
+
+fn main() {
+	println(g(1) or { panic(err) })
+}

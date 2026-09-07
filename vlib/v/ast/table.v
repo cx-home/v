@@ -2168,8 +2168,20 @@ fn (t &Table) sumtype_variant_is_handled(variant Type, handled []Type) bool {
 	return false
 }
 
+// A declared sumtype variant never itself carries `.option` or `.result`, so
+// comparing those flags can only ever REJECT a flagged `got` — which is the
+// point. cx-private#1213: `.option` was compared and `.result` was not, and
+// `Type.idx()` masks both off, so a `!Leaf` and a plain `Leaf` were called the
+// same variant. `checker/match.v`'s `check_match_branch_last_stmt` accepts a
+// match-expression arm whose type `is_sumtype_or_in_variant` the declared
+// return type, so an arm yielding `!Leaf` was accepted where the sumtype was
+// wanted and cgen then assigned a `_result_Leaf` into it — a C-level type
+// error naming generated identifiers and a line in a temporary .c file, with
+// no source location. The same mismatch in STATEMENT position, and the same
+// arm spelled `?Leaf`, were both already caught; only result-in-arm was not.
 fn (t &Table) same_sumtype_variant(expected Type, got Type, is_as bool) bool {
 	return expected.idx() == got.idx() && expected.has_flag(.option) == got.has_flag(.option)
+		&& expected.has_flag(.result) == got.has_flag(.result)
 		&& (!is_as || expected.nr_muls() == got.nr_muls())
 }
 
