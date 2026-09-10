@@ -1500,6 +1500,56 @@ fn vgc_pool_push(mut span VGC_Span) {
 	}
 }
 
+// vgc_pool_push_aged pools a span that INHERITS a trim clock older than now —
+// a split remainder (its pages are the parent's cold memory) or a coalesced
+// region (its oldest part's) — and files it in AGE ORDER on its hot sized
+// list rather than at the head (cx-private #1295 / cx-home/v#6).
+//
+// vgc_pool_trim walks each hot list from its TAIL and stops at the first span
+// younger than vgc_pool_trim_age, on the invariant that LIFO pushes put age
+// toward the tail. A head-pushed span with an old gen breaks that invariant,
+// and on a monotone build-up it breaks it every cycle: every cold region gains
+// a neighbour, is re-pushed at the head, and the tail is left to the spans
+// pooled THIS cycle — so the walk broke at once and `trimmed` stayed 0 KB for
+// the whole run (measured: a 300k-record --from=json --to=json, pool 7 →
+// 117 MB over ten cycles, trimmed 0 on every one, gen fix alone included).
+// Filing the span tailward of every younger span restores the invariant; the
+// scan from the tail passes only spans at least as old as this one, which are
+// the ones the next trim decommits anyway. Oversized and decommitted spans are
+// not age-walked, so they keep the plain push.
+fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
+	vgc_pool_push(mut span)
+	span.pool_gen = gen
+	if span.decommitted || span.npages > u32(vgc_max_pooled_pages) {
+		return
+	}
+	unsafe {
+		if span.next == nil {
+			return // alone on its list: head is tail
+		}
+		// find, from the tail, the first span YOUNGER than this one
+		mut t := vgc_heap.free_spans_tail[span.npages]
+		for t != nil && t != span && t.pool_gen <= gen {
+			t = t.prev
+		}
+		if t == nil || t == span {
+			return // every other span is at least as old: the head is right
+		}
+		// unlink from the head …
+		vgc_heap.free_spans[span.npages] = span.next
+		span.next.prev = nil
+		// … and insert tailward of t
+		span.prev = t
+		span.next = t.next
+		if t.next != nil {
+			t.next.prev = span
+		} else {
+			vgc_heap.free_spans_tail[span.npages] = span
+		}
+		t.next = span
+	}
+}
+
 // vgc_pool_unlink removes a pooled span from whichever free list holds it.
 // Same locking contract as vgc_pool_push.
 fn vgc_pool_unlink(mut span VGC_Span) {
@@ -1581,13 +1631,13 @@ fn vgc_span_split(mut span VGC_Span, want u32) bool {
 	}
 	vgc_span_repoint_pages(arena_idx, rem_base, rem, rspan)
 	span.npages = want
-	vgc_pool_push(mut rspan)
-	// The remainder INHERITS the source span's pool age (vgc_pool_push stamped it
-	// fresh): its pages are the same cold memory — a small request nibbling the
-	// head off a cold block must not reset the block's trim clock, or steady
-	// small-alloc traffic starves the trim forever (measured: a 140 MB cold burst
-	// pool never trimmed under light tail churn).
-	rspan.pool_gen = span.pool_gen
+	// The remainder INHERITS the source span's pool age: its pages are the same
+	// cold memory — a small request nibbling the head off a cold block must not
+	// reset the block's trim clock, or steady small-alloc traffic starves the
+	// trim forever (measured: a 140 MB cold burst pool never trimmed under light
+	// tail churn). Filed in age order so the trim's tail walk can see it
+	// (vgc_pool_push_aged, #1295).
+	vgc_pool_push_aged(mut rspan, span.pool_gen)
 	return true
 }
 
@@ -1831,6 +1881,17 @@ fn vgc_put_free_span(mut span VGC_Span) {
 		vgc_pool_push(mut cur)
 		return
 	}
+	// The merged region's trim clock is that of its OLDEST part (cx-private
+	// #1295 / cx-home/v#6): vgc_pool_push below stamps pool_gen = now, which
+	// reset the age of a cold pooled region every time a neighbour joined it —
+	// on a monotone build-up a region gaining a neighbour at least every
+	// vgc_pool_trim_age cycles never aged, and `trimmed` stayed 0 KB on every
+	// ordinary cycle. The freshly freed span counts as `now`; each absorbed
+	// neighbour lowers the stamp to its own. The mirror of the split-remainder
+	// rule (cx #360): a cold block nibbled by small requests keeps its age, and
+	// so does a cold region grown by frees. The sized-list tail walk already
+	// tolerates an old-gen span re-entering at the head (see vgc_pool_trim).
+	mut gen := u32(vgc_heap.gc_cycle)
 	arena_idx := vgc_arena_of(span.base)
 	if arena_idx >= 0 {
 		a := unsafe { &vgc_heap.arenas[arena_idx] }
@@ -1845,6 +1906,9 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			if p != unsafe { nil } && p.pooled && !p.in_use && p.decommitted == cur.decommitted
 				&& p.npages >= u32(vgc_pool_merge_min) && p.npages <= u32(vgc_max_pooled_pages)
 				&& p.base + usize(p.npages) * vgc_page_size == cur.base {
+				if p.pool_gen < gen {
+					gen = p.pool_gen
+				}
 				vgc_pool_unlink(mut p)
 				vgc_span_repoint_pages(arena_idx, cur.base, cur.npages, p)
 				p.npages += cur.npages
@@ -1862,6 +1926,9 @@ fn vgc_put_free_span(mut span VGC_Span) {
 				if s != unsafe { nil } && s.pooled && !s.in_use && s.decommitted == cur.decommitted
 					&& s.npages >= u32(vgc_pool_merge_min)
 					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end {
+					if s.pool_gen < gen {
+						gen = s.pool_gen
+					}
 					vgc_pool_unlink(mut s)
 					vgc_span_repoint_pages(arena_idx, s.base, s.npages, cur)
 					cur.npages += s.npages
@@ -1870,7 +1937,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			}
 		}
 	}
-	vgc_pool_push(mut cur)
+	vgc_pool_push_aged(mut cur, gen)
 }
 
 // vgc_retire_span_desc zeroes an absorbed span descriptor and parks it on the
