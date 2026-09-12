@@ -638,6 +638,13 @@ pub:
 	// (hermetic tests); leave 0 in production.
 	dtls_handshake_min_ms u32
 	dtls_handshake_max_ms u32
+	// is_server configures the SSLConn for the SERVER role: the handshake it
+	// performs is the server side (MBEDTLS_SSL_IS_SERVER), `cert`/`cert_key` are
+	// the SERVER's identity, and `verify` is the CLIENT CA. This is what
+	// accept_conn (the explicit-upgrade / STARTTLS path) needs and what
+	// SSLListener does not cover, because a listener owns the socket it bound
+	// and an upgrade happens on a socket that was already accepted.
+	is_server bool
 }
 
 fn ssl_read_timeout_ms(timeout time.Duration) u32 {
@@ -700,6 +707,80 @@ pub fn new_ssl_conn(config SSLConnectConfig) !&SSLConn {
 	}
 	conn.init()!
 	return conn
+}
+
+// new_ssl_server_conn returns a new SERVER-role SSLConn with the given config,
+// ready for accept_conn over a socket this process has already accepted (the
+// explicit-upgrade path: SMTP/IMAP STARTTLS, RFC 3207 / RFC 9051 §6.2.1).
+//
+// `config.cert` / `config.cert_key` are the SERVER's identity and are REQUIRED
+// — the same precondition SSLListener.init enforces, checked here for the same
+// reason: a server that reaches the handshake with no certificate fails with an
+// mbedTLS internal code that says nothing about what the operator got wrong.
+// `config.verify` (with `config.validate`) is the CLIENT CA for mutual TLS.
+pub fn new_ssl_server_conn(config SSLConnectConfig) !&SSLConn {
+	$if trace_ssl ? {
+		eprintln(@METHOD)
+	}
+	if config.cert == '' || config.cert_key == '' {
+		return error('net.mbedtls new_ssl_server_conn, no certificate or key provided')
+	}
+	if config.validate && config.verify == '' {
+		return error('net.mbedtls new_ssl_server_conn, no client CA provided')
+	}
+	mut conn := &SSLConn{
+		config:       SSLConnectConfig{
+			...config
+			is_server: true
+		}
+		duration:     config.read_timeout
+		read_timeout: config.read_timeout
+	}
+	conn.init()!
+	return conn
+}
+
+// accept_conn performs the SERVER side of the TLS handshake over an EXISTING,
+// already-accepted TCP connection, the mirror of `connect` (which performs the
+// client side over an existing TCP connection). It is the third combination
+// this module needs and the one it did not have: SSLListener.accept does the
+// server handshake only on a socket the listener itself bound, and an upgrade
+// by definition happens on a socket that was accepted in the clear and has
+// already carried cleartext application traffic.
+//
+// No hostname is set: a server sends no SNI and has no peer name to verify.
+// The connection is NOT owned (owns_socket stays false) — the caller keeps the
+// net.TcpConn and closes the file descriptor with it, exactly as after connect.
+pub fn (mut s SSLConn) accept_conn(mut tcp_conn net.TcpConn) ! {
+	$if trace_ssl ? {
+		eprintln(@METHOD)
+	}
+	if s.opened {
+		return error('net.mbedtls SSLConn.accept_conn, ssl connection was already open')
+	}
+	if !s.config.is_server {
+		return error('net.mbedtls SSLConn.accept_conn, this SSLConn is client-role; build it with new_ssl_server_conn')
+	}
+	s.handle = tcp_conn.sock.handle
+	s.set_read_timeout(tcp_conn.read_timeout())
+	s.server_fd.fd = s.handle
+	C.mbedtls_ssl_set_bio(&s.ssl, &s.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
+		C.mbedtls_net_recv_timeout)
+	// WANT_READ/WANT_WRITE are not errors -- mbedtls's own docs require every
+	// caller to retry the handshake call on them. On this blocking BIO each
+	// retry's internal recv already blocks up to read_timeout (via
+	// mbedtls_net_recv_timeout), so a client that opened the connection and
+	// then went silent surfaces as MBEDTLS_ERR_SSL_TIMEOUT rather than
+	// spinning here forever.
+	mut ret := C.mbedtls_ssl_handshake(&s.ssl)
+	for ret == C.MBEDTLS_ERR_SSL_WANT_READ || ret == C.MBEDTLS_ERR_SSL_WANT_WRITE {
+		ret = C.mbedtls_ssl_handshake(&s.ssl)
+	}
+	if ret != 0 {
+		return error_with_code('net.mbedtls SSLConn.accept_conn, mbedtls_ssl_handshake failed; ret: ${ret}',
+			ret)
+	}
+	s.opened = true
 }
 
 // Select operation
@@ -781,8 +862,9 @@ fn (mut s SSLConn) init() ! {
 	C.mbedtls_ssl_config_init(&s.conf)
 	init_rng(mut s.ctr_drbg, mut s.entropy)!
 	mut ret := 0
-	ret = C.mbedtls_ssl_config_defaults(&s.conf, C.MBEDTLS_SSL_IS_CLIENT,
-		C.MBEDTLS_SSL_TRANSPORT_STREAM, C.MBEDTLS_SSL_PRESET_DEFAULT)
+	role := if s.config.is_server { C.MBEDTLS_SSL_IS_SERVER } else { C.MBEDTLS_SSL_IS_CLIENT }
+	ret = C.mbedtls_ssl_config_defaults(&s.conf, role, C.MBEDTLS_SSL_TRANSPORT_STREAM,
+		C.MBEDTLS_SSL_PRESET_DEFAULT)
 	if ret != 0 {
 		return error_with_code('net.mbedtls SSLConn.init, mbedtls_ssl_config_defaults failed to set SSL configuration ret: ${ret}',
 			ret)
@@ -878,6 +960,14 @@ fn (mut s SSLConn) init() ! {
 
 	if s.config.validate {
 		C.mbedtls_ssl_conf_authmode(&s.conf, C.MBEDTLS_SSL_VERIFY_REQUIRED)
+	} else if s.config.is_server {
+		// A server's authmode governs whether it REQUESTS a client certificate.
+		// VERIFY_NONE, not VERIFY_OPTIONAL: OPTIONAL still sends a
+		// CertificateRequest, so an ordinary (non-mTLS) server would ask every
+		// client for a certificate it has already decided not to check — which
+		// breaks clients that treat the request as mandatory and tells a peer
+		// nothing true about this server's policy.
+		C.mbedtls_ssl_conf_authmode(&s.conf, C.MBEDTLS_SSL_VERIFY_NONE)
 	} else {
 		C.mbedtls_ssl_conf_authmode(&s.conf, C.MBEDTLS_SSL_VERIFY_OPTIONAL)
 	}
