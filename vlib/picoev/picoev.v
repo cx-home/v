@@ -232,10 +232,14 @@ pub fn (mut pv Picoev) close_conn(fd int) {
 @[direct_array_access]
 fn raw_callback(fd int, events int, context voidptr) {
 	mut pv := unsafe { &Picoev(context) }
-	defer {
-		pv.idx[fd] = 0
-	}
+	// pv.idx[fd] is the number of request bytes already read for this fd. It is
+	// reset when a request has been handed to the callback, on a parse error,
+	// on timeout and on close — NOT when a read returns EAGAIN with the request
+	// still incomplete, so a head or body that arrives across several read
+	// events is assembled rather than dropped (cx-private#1394: a >4 KB form
+	// POST was never answered).
 	if events & picoev_timeout != 0 {
+		pv.idx[fd] = 0
 		trace_fd('timeout ${fd}')
 		if !isnil(pv.raw_callback) {
 			pv.raw_callback(mut pv, fd, events)
@@ -247,6 +251,7 @@ fn raw_callback(fd int, events int, context voidptr) {
 		pv.set_timeout(fd, pv.timeout_secs)
 		if !isnil(pv.raw_callback) {
 			pv.raw_callback(mut pv, fd, events)
+			pv.idx[fd] = 0
 			return
 		}
 		mut request_buffer := pv.buf
@@ -267,17 +272,27 @@ fn raw_callback(fd int, events int, context voidptr) {
 		}
 		for {
 			// Request parsing loop
+			if pv.idx[fd] >= pv.max_read {
+				// the head alone, or head + declared body, cannot fit one request buffer
+				pv.idx[fd] = 0
+				pv.error_callback(pv.user_data, req, mut &res, error('RequestIsTooLongError'))
+				return
+			}
 			r := req_read(fd, request_buffer, pv.max_read, pv.idx[fd]) // Get data from socket
 			if r == 0 {
 				// connection closed by peer
+				pv.idx[fd] = 0
 				pv.close_conn(fd)
 				return
 			} else if r == -1 {
 				if fatal_socket_error(fd) == false {
+					// nothing more to read yet: keep what has arrived, wait for the
+					// next read event (the timeout, if it comes first, resets it)
 					return
 				}
 				elog('Error during req_read')
 				// fatal error
+				pv.idx[fd] = 0
 				pv.close_conn(fd)
 				return
 			}
@@ -285,21 +300,31 @@ fn raw_callback(fd int, events int, context voidptr) {
 			mut s := unsafe { tos(request_buffer, pv.idx[fd]) }
 			pret := req.parse_request(s) or {
 				// Parse error
+				pv.idx[fd] = 0
 				pv.error_callback(pv.user_data, req, mut &res, err)
 				return
 			}
-			if pret > 0 { // Success
-				break
+			if pret > 0 { // the head is complete
+				// A body is declared by Content-Length; the request is handed on
+				// only once every declared byte is in the buffer, so the callback
+				// never sees a truncated body.
+				need := pret + request_content_length(req)
+				if need > pv.max_read {
+					pv.idx[fd] = 0
+					pv.error_callback(pv.user_data, req, mut &res, error('RequestIsTooLongError'))
+					return
+				}
+				if pv.idx[fd] >= need {
+					break
+				}
+				continue
 			}
 			assert pret == -2
-			// request is incomplete, continue the loop
-			if pv.idx[fd] == sizeof(request_buffer) {
-				pv.error_callback(pv.user_data, req, mut &res, error('RequestIsTooLongError'))
-				return
-			}
+			// the head is incomplete, continue the loop
 		}
 		// Callback (should call .end() itself)
 		pv.cb(pv.user_data, req, mut &res)
+		pv.idx[fd] = 0
 	} else if events & picoev_write != 0 {
 		pv.set_timeout(fd, pv.timeout_secs)
 		if !isnil(pv.raw_callback) {
@@ -307,6 +332,18 @@ fn raw_callback(fd int, events int, context voidptr) {
 			return
 		}
 	}
+}
+
+// request_content_length reads the declared body length off a parsed head:
+// 0 when the request declares none (GET, or a POST with an empty body).
+fn request_content_length(req pico_http_parser.Request) int {
+	for i in 0 .. req.num_headers {
+		if req.headers[i].name.to_lower() == 'content-length' {
+			n := req.headers[i].value.trim_space().int()
+			return if n > 0 { n } else { 0 }
+		}
+	}
+	return 0
 }
 
 fn default_error_callback(_data voidptr, _req pico_http_parser.Request, mut res pico_http_parser.Response, error IError) {
