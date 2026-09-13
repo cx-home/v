@@ -70,9 +70,12 @@ mut:
 	timeouts         map[int]i64
 	num_loops        int
 
-	buf &u8 = unsafe { nil }
-	idx [max_fds]int
-	out &u8 = unsafe { nil }
+	// One request buffer per LIVE connection, allocated on the fd's first read
+	// and freed when it closes: `max_fds * max_read` up front was 64 MiB of
+	// resident memory per reactor at a 64 KiB request bound (cx-private#1394).
+	bufs [max_fds]&u8
+	idx  [max_fds]int
+	out  &u8 = unsafe { nil }
 
 	date string
 pub:
@@ -226,6 +229,30 @@ pub fn (mut pv Picoev) close_conn(fd int) {
 		elog('Error during del')
 	}
 	close_socket(fd)
+	pv.release_request_buffer(fd)
+}
+
+// request_buffer_of answers the fd's request buffer, allocating it on the
+// connection's first read. It holds bytes, never pointers, so it lives outside
+// the collector and is freed explicitly by release_request_buffer.
+@[direct_array_access]
+fn (mut pv Picoev) request_buffer_of(fd int) &u8 {
+	if isnil(pv.bufs[fd]) {
+		pv.bufs[fd] = unsafe { &u8(C.malloc(pv.max_read + 1)) }
+	}
+	return pv.bufs[fd]
+}
+
+@[direct_array_access]
+fn (mut pv Picoev) release_request_buffer(fd int) {
+	if fd < 0 || fd >= max_fds {
+		return
+	}
+	if !isnil(pv.bufs[fd]) {
+		unsafe { C.free(pv.bufs[fd]) }
+		pv.bufs[fd] = unsafe { nil }
+	}
+	pv.idx[fd] = 0
 }
 
 // raw_callback handles raw events (read, write, timeout) for a file descriptor.
@@ -254,10 +281,7 @@ fn raw_callback(fd int, events int, context voidptr) {
 			pv.idx[fd] = 0
 			return
 		}
-		mut request_buffer := pv.buf
-		unsafe {
-			request_buffer += fd * pv.max_read // pointer magic
-		}
+		mut request_buffer := pv.request_buffer_of(fd)
 		mut req := pico_http_parser.Request{}
 		// Response init
 		mut response_buffer := pv.out
@@ -369,7 +393,6 @@ pub fn new(config Config) !&Picoev {
 		max_write:      config.max_write
 	}
 	if isnil(pv.raw_callback) {
-		pv.buf = unsafe { malloc_noscan(max_fds * config.max_read + 1) }
 		pv.out = unsafe { malloc_noscan(max_fds * config.max_write + 1) }
 	}
 	// epoll on linux
