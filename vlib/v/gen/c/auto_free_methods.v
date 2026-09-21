@@ -64,6 +64,19 @@ fn (mut g Gen) gen_free_method(typ ast.Type) string {
 	g.generated_free_methods[deref_typ] = true
 	g.generated_free_fn_names[fn_name] = true
 
+	// `?&T` — an OPTION whose data slot holds a POINTER. The generic struct/
+	// array/... paths below assume the option payload is the value itself and
+	// inline its field frees; for a pointer payload that yields a wrong-arity
+	// cast (`((T**)&it->data)->field` -> "base type 'T*' is not a structure").
+	// Instead free the POINTEE's heap fields via the base type's own `_free`,
+	// exactly as the non-option `&T` field case does. (`it->data` holds the `T*`;
+	// `*(T**)&it->data` recovers it.) Only the option-of-pointer combination is
+	// special-cased — `?T` value-options still flow through the paths below.
+	if typ.has_flag(.option) && typ.is_ptr() {
+		g.gen_free_for_option_ptr(typ, styp, fn_name)
+		return fn_name
+	}
+
 	objtyp := g.unwrap_generic(typ)
 	mut sym := g.table.sym(objtyp)
 	if mut sym.info is ast.Alias {
@@ -80,7 +93,7 @@ fn (mut g Gen) gen_free_method(typ ast.Type) string {
 			g.gen_free_for_struct(objtyp, sym.info, styp, fn_name, sym.is_builtin())
 		}
 		ast.Array {
-			g.gen_free_for_array(sym.info, styp, fn_name)
+			g.gen_free_for_array(objtyp, sym.info, styp, fn_name)
 		}
 		ast.Map {
 			g.gen_free_for_map(objtyp, styp, fn_name)
@@ -89,7 +102,7 @@ fn (mut g Gen) gen_free_method(typ ast.Type) string {
 			g.gen_free_for_interface(sym, sym.info, styp, fn_name)
 		}
 		ast.SumType {
-			g.gen_free_for_sumtype(sym.info, styp, fn_name)
+			g.gen_free_for_sumtype(objtyp, sym.info, styp, fn_name)
 		}
 		else {
 			println(g.table.type_str(typ))
@@ -129,13 +142,32 @@ fn (mut g Gen) gen_free_for_interface(sym ast.TypeSymbol, info ast.Interface, st
 	fn_builder.writeln('}')
 }
 
-fn (mut g Gen) gen_free_for_sumtype(info ast.SumType, styp string, fn_name string) {
+fn (mut g Gen) gen_free_for_sumtype(typ ast.Type, info ast.SumType, styp string, fn_name string) {
 	g.definitions.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it);')
 	mut fn_builder := strings.new_builder(256)
 	defer {
 		g.auto_fn_definitions << fn_builder.str()
 	}
 	fn_builder.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it) {')
+	if typ.has_flag(.option) {
+		// `?SumType`: `it` is the option wrapper {data, state, err}, NOT the sum
+		// type itself, so `it->_typ`/`it->_<variant>` do not exist here. The active
+		// sum-type payload lives in `it->data`. Unwrap to the base sum type and
+		// delegate to its (non-option) free method. (Mirrors the `is_struct_option`
+		// handling in gen_free_for_struct; the sum-type path previously assumed
+		// `it` was the unwrapped value and emitted invalid member accesses.)
+		base_typ := typ.clear_flag(.option)
+		base_styp := g.base_type(typ)
+		mut base_fn_name := g.gen_free_method(base_typ)
+		if g.table.sym(g.unwrap_generic(base_typ)).is_builtin() {
+			base_fn_name = 'builtin__${base_fn_name}'
+		}
+		fn_builder.writeln('\tif (it->state != 2) {')
+		fn_builder.writeln('\t\t${base_fn_name}((${base_styp}*)&it->data);')
+		fn_builder.writeln('\t}')
+		fn_builder.writeln('}')
+		return
+	}
 	mut idxs := []ast.Type{}
 	for variant in info.variants {
 		if variant in idxs {
@@ -191,6 +223,37 @@ fn (mut g Gen) gen_free_for_sumtype(info ast.SumType, styp string, fn_name strin
 		// Sumtypes box their active payload in heap memory via memdup/HEAP.
 		fn_builder.writeln('\t\tbuiltin___v_free(${variant_ptr});')
 		fn_builder.writeln('\t\treturn;')
+		fn_builder.writeln('\t}')
+	}
+	fn_builder.writeln('}')
+}
+
+// gen_free_for_option_ptr generates the free method for an option-of-pointer
+// type (`?&T`). The option wrapper's `data` slot holds a `T*`; we free the
+// POINTEE's heap fields by delegating to the base type's `_free`, mirroring the
+// non-option `&T` field handling in gen_free_for_struct. Nothing is emitted for
+// a pointee that has no heap content (so it remains a sound no-op).
+fn (mut g Gen) gen_free_for_option_ptr(typ ast.Type, styp string, fn_name string) {
+	g.definitions.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it);')
+	mut fn_builder := strings.new_builder(128)
+	defer {
+		g.auto_fn_definitions << fn_builder.str()
+	}
+	fn_builder.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it) {')
+	pointee := typ.clear_flag(.option).set_nr_muls(0)
+	psym := g.table.sym(g.unwrap_generic(pointee))
+	if psym.kind in [.string, .array, .map, .struct, .sum_type, .interface] {
+		mut pfree := if psym.has_method_with_generic_parent('free') {
+			'${g.gen_type_name_for_free_call(typ)}_free'
+		} else {
+			g.gen_free_method(pointee)
+		}
+		if psym.is_builtin() {
+			pfree = 'builtin__${pfree}'
+		}
+		pointee_styp := g.gen_type_name_for_free_call(typ)
+		fn_builder.writeln('\tif (it->state != 2) {')
+		fn_builder.writeln('\t\t${pfree}(*((${pointee_styp}**)&it->data));')
 		fn_builder.writeln('\t}')
 	}
 	fn_builder.writeln('}')
@@ -279,13 +342,31 @@ fn (mut g Gen) gen_type_name_for_free_call(typ ast.Type) string {
 	return styp
 }
 
-fn (mut g Gen) gen_free_for_array(info ast.Array, styp string, fn_name string) {
+fn (mut g Gen) gen_free_for_array(typ ast.Type, info ast.Array, styp string, fn_name string) {
 	g.definitions.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it);')
 	mut fn_builder := strings.new_builder(128)
 	defer {
 		g.auto_fn_definitions << fn_builder.str()
 	}
 	fn_builder.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it) {')
+
+	if typ.has_flag(.option) {
+		// `?[]T`: `it` is the option wrapper {data, state, err}, so `it->len`/
+		// `it->data` (array fields) do not exist on it. Unwrap the option payload
+		// and delegate to the base array free. (Mirrors gen_free_for_map's option
+		// handling; the array path previously assumed `it` was the unwrapped array.)
+		base_typ := typ.clear_flag(.option)
+		base_styp := g.base_type(typ)
+		mut base_fn_name := g.gen_free_method(base_typ)
+		if g.table.sym(g.unwrap_generic(base_typ)).is_builtin() {
+			base_fn_name = 'builtin__${base_fn_name}'
+		}
+		fn_builder.writeln('\tif (it->state != 2) {')
+		fn_builder.writeln('\t\t${base_fn_name}((${base_styp}*)&it->data);')
+		fn_builder.writeln('\t}')
+		fn_builder.writeln('}')
+		return
+	}
 
 	sym := g.table.sym(g.unwrap_generic(info.elem_type))
 	if sym.kind in [.string, .array, .map, .struct, .sum_type] {

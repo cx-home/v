@@ -34,6 +34,21 @@ fn new_app() App {
 }
 
 fn main() {
+	// FORK GUARD. This is a patched V fork whose default GC is architecture E
+	// (Perceus-disciplined RC front line + precise STW vgc tracing backstop).
+	// `v up` does `git pull --rebase` from upstream master onto the fork's patch
+	// series and rebuilds — which would rebase-conflict against / clobber those
+	// patches and overwrite the new memory model. The fork is maintained through
+	// its own git workflow (it is vendored as a submodule and pinned by its
+	// parent repository), NOT via `v up`. Refuse by default; set
+	// V_FORK_ALLOW_VUP=1 to force the upstream-rebase behavior anyway.
+	if os.getenv('V_FORK_ALLOW_VUP') == '' {
+		eprintln('`v up` is disabled on this patched V fork (architecture-E default GC).')
+		eprintln('It would rebase onto upstream vlang/v master and overwrite the fork')
+		eprintln('patch series (the custom memory model). Update the fork through its own')
+		eprintln('git workflow instead. Set V_FORK_ALLOW_VUP=1 to override.')
+		exit(1)
+	}
 	app := new_app()
 	recompilation.must_be_enabled(app.vroot, 'Please install V from source, to use `v up` .')
 	os.chdir(app.vroot)!
