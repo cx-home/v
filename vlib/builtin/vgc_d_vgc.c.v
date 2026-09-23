@@ -2575,8 +2575,25 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 	if ptr != unsafe { nil } {
 		// Track actual object bytes, not page bytes (per-thread; see vgc_acct_alloc)
 		vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
+		// A SCAN slot is handed out holding no word its new occupant did not
+		// write (cx-private #1605). The marker scans the whole `elem_size` of a
+		// scannable slot conservatively — there is no per-object size or type
+		// map at runtime — so bytes past `n` that still hold the PREVIOUS
+		// occupant's pointers are read as live pointers: a live object born in
+		// a recycled slot keeps whatever the dead one pointed at, and that
+		// graph keeps the one before it (in cx: every finished env's parsed
+		// module graph, ~13 MB per `cx-platform/connector` load, linear). So
+		// the tail `[n, elem_size)` is zeroed on EVERY scan allocation; a
+		// zero-filling one clears the whole slot, and a non-zero-filling one
+		// (memdup, realloc — callers that write `[0, n)` themselves) clears
+		// only the tail. Boehm's GC_MALLOC clears the whole object for the
+		// same reason. Noscan slots are never scanned and keep their cheaper
+		// `n`-byte fill.
+		slot := usize(span.elem_size)
 		if zero_fill {
-			unsafe { C.memset(ptr, 0, n) }
+			unsafe { C.memset(ptr, 0, slot) }
+		} else if slot > n {
+			unsafe { C.memset(voidptr(usize(ptr) + n), 0, slot - n) }
 		}
 		// Periodic GC check - only when span fills up (amortize cost)
 		if span.alloc_count >= span.nelems {
@@ -3020,6 +3037,12 @@ fn vgc_realloc(old_ptr voidptr, new_size usize) voidptr {
 			vgc_wb_store(new_ptr)
 		}
 		unsafe { C.memcpy(new_ptr, old_ptr, copy_size) }
+		// #1605: a grown SCAN object must not expose the recycled slot's stale
+		// words between what was copied and what was asked for (the tail past
+		// `new_size` is already cleared by the allocation above).
+		if !old_span.noscan && new_size > copy_size {
+			unsafe { C.memset(voidptr(usize(new_ptr) + copy_size), 0, new_size - copy_size) }
+		}
 	}
 	return new_ptr
 }

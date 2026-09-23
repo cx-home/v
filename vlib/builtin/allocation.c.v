@@ -168,7 +168,14 @@ fn malloc_uninit(n isize) &u8 {
 		return &u8(unsafe { nil })
 	}
 	$if vgc ? {
-		return unsafe { &u8(vgc_malloc_typed_opts(usize(n), 0, 0, false)) }
+		// Zero-filled under vgc despite the name (cx-private #1605): the block
+		// is SCANNED conservatively as a whole, and an uninit caller does not
+		// promise to write all `n` bytes — `array.ensure_cap` copies only
+		// `[0, len)` into its grown buffer, so the spare capacity `[len, cap)`
+		// would carry the recycled slot's previous pointers into a live array.
+		// Callers that do not need scanning use malloc_noscan_uninit, which
+		// stays uninitialised.
+		return unsafe { &u8(vgc_malloc_typed_opts(usize(n), 0, 0, true)) }
 	}
 	return malloc(n)
 }
