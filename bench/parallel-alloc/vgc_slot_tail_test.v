@@ -27,8 +27,9 @@
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_slot_tail_test.v
 // Requires -gc e: `gc_heap_usage().total_bytes` is read as the bytes vgc MARKED
-// in the last collection. Before the fix (dev2, 2026-09-23): 12.07 MB and
-// 8.33 MB of the 16.78 MB of payload retained — red against a 4.19 MB bound.
+// in the last collection. Before the fix (dev2, 2026-09-23): the struct shape
+// retained 8.38 MB and the array shape 16.77 MB of the 16.78 MB of payload —
+// red against a 4.19 MB bound; after it, both retain nothing (<= 0).
 module main
 
 const payload_count = 256
@@ -187,11 +188,13 @@ fn make_grown_arrays(mut r Roots) {
 	}
 }
 
-// retained_after runs one scenario and returns the marked bytes above the
-// baseline once the payloads' only root is gone — i.e. what stale words hold.
+// retained_after runs one scenario and returns the payload bytes still marked
+// once the payloads' only root is gone — i.e. what stale words hold. It is read
+// as the payload's share of `mid - after`: `mid` is marked with the payloads
+// rooted and the re-users alive, `after` the same moment with the root dropped,
+// so the live structure (keepers, re-users, their arrays) cancels.
 fn retained_after(make_victims fn (mut Roots), make_reusers fn (mut Roots)) i64 {
 	mut r := &Roots{}
-	base := live_bytes()
 	make_blobs(mut r)
 	make_victims(mut r)
 	// The holders die; the payloads stay live through r.blobs, so the dead
@@ -200,11 +203,14 @@ fn retained_after(make_victims fn (mut Roots), make_reusers fn (mut Roots)) i64 
 	r.arrays = [][]voidptr{}
 	live_bytes()
 	make_reusers(mut r)
+	mid := live_bytes()
 	// The root goes: nothing but a stale word should reach a payload now.
 	r.blobs = []&Blob{}
 	after := live_bytes()
-	retained := i64(after) - i64(base)
-	println('[vgc-slot-tail] base=${base} after=${after} retained=${retained} payload=${payload_count * payload_bytes}')
+	payload := i64(payload_count) * payload_bytes
+	freed := i64(mid) - i64(after)
+	retained := payload - freed
+	println('[vgc-slot-tail] mid=${mid} after=${after} freed=${freed} payload=${payload} retained=${retained}')
 	// keep the live objects live through the measurement
 	assert r.keepers.len > 0
 	assert r.smalls.len + r.grown.len > 0
