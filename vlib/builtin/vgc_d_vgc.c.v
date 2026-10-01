@@ -267,6 +267,15 @@ mut:
 	// the collector reads/resets all slots under STW.
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
+	// The large-object span this thread acquired LAST (vgc_alloc_large), held
+	// for vgc_protect_cached_spans exactly like the alloc[] slots: a thread
+	// frozen inside vgc_alloc_large after the span went in_use but before its
+	// address reached a scanned register or stack word is covered by this slot
+	// instead of by an acquisition stamp that outlived the allocation by a whole
+	// mutator epoch (RTMEM-1, cx-home/v#6). Descriptor pointer only (slab
+	// memory outside the arenas — the data-segment scan ignores it); overwritten
+	// by the thread's next large allocation, so it protects at most one span.
+	large_inflight &VGC_Span = unsafe { nil }
 }
 
 // VGC_Central is a central free list for one span class.
@@ -1285,6 +1294,7 @@ fn vgc_thread_exit_cb(idx int) {
 		vgc_heap.caches[idx].registered = false
 		vgc_heap.caches[idx].stack_lo = 0
 		vgc_heap.caches[idx].stack_hi = 0
+		vgc_heap.caches[idx].large_inflight = nil // RTMEM-1: no stale protection for the slot's next owner
 		C.vgc_atomic_store_u32(&vgc_heap.caches[idx].safe, 0) // cx #316 hygiene (also reset at register)
 	}
 	// Atomic decrement — see the bump in vgc_register_thread (lock-free PACE reader).
@@ -1826,6 +1836,166 @@ fn vgc_pool_trim_decommit(mut span VGC_Span) {
 	vgc_pool_push(mut span)
 }
 
+// ── RTMEM-1: retention on a monotone build-up (cx-home/v#6) ─────────────────
+// The bar (cx-private 1226-a): peak RSS ÷ the live set ≤ 2.5 on a monotone
+// build-up through interleaved transients — a parse, then an emit. The pacer
+// lets the heap reach marked × (1 + GOGC/100) = 2× the live set before it
+// collects, so 2× is the floor and 0.5 is what retention, fragmentation and
+// the collector's own footprint may cost together. Measured on cx-private's
+// 300k-record corpora (`--from=json --to=json`, `--from=xml --to=xml`) the
+// pinned collector read 4.08× and 3.69× against that 2× floor, from three
+// sources, each now closed without touching the pacer, the size classes or
+// any program-visible semantics:
+//
+// 1. The acquisition stamp outlived the acquisition (vgc_span_release_
+//    acquisition). Every span handed out during an epoch kept sweep_gen ==
+//    gc_cycle and skipped the sweep that ended the epoch, so a whole epoch of
+//    transients (≈1.0× the live set: 176 MB in 24k spans at the JSON
+//    convert's last cycle) survived one extra cycle and the next epoch carved
+//    beside it. INVARIANT kept: a span a mutator may be mid-claim in, or hold
+//    between acquiring it and publishing a reference the collector scans, is
+//    never swept — the stamp covers the acquisition window, the mcache slot
+//    or the thread's large_inflight slot (vgc_protect_cached_spans) every
+//    moment after it, and the stamp is released only after the slot store
+//    (a RELEASE store). COST: one atomic store per span acquisition.
+//
+// 2. A large carve beside an idle pool (vgc_pool_compensate). A request of
+//    >= vgc_pool_merge_min pages that no pooled span covers carves fresh
+//    arena pages; after a transient-heavy epoch the pool is long address runs
+//    of the 1–15-page size-class spans the transients emptied, committed and
+//    idle while the emitter's growing output buffer carved 85 MB (JSON)
+//    beside 113 MB of them. Such a carve now decommits as much committed
+//    pool, whole address-adjacent runs at a time (one decommit per run, so the
+//    8 KB spans that a 16 KB hardware page cannot return alone are returned
+//    with their neighbours). INVARIANT: a carve does not grow the committed
+//    footprint while the hot pool holds an equal amount in runs of at least
+//    one hardware page; every decommitted span stays pooled (cold) and
+//    reusable exactly as a trimmed one. COST: at most one scan of the arenas'
+//    page maps per large carve, only while the hot pool holds runs (a dry
+//    scan is remembered until the next sweep), one decommit per run, and a
+//    zero-fill fault per hardware page when the pool is reused.
+//
+// 3. Mark work buffers one hardware page each (vgc_workbuf_carve): 1175
+//    buffers, 18.4 MB resident for 2.4 MB of queue. Now carved 64 to a chunk.
+//
+// After: 2.40× (JSON) and 2.37× (XML) on the same reads; the trace's
+// `trimmed=` counts what (2) returned. (1) is the STW collector's alone: under
+// -d vgc_concurrent, which does not run vgc_protect_cached_spans, the
+// acquisition stamp stays that collector's only in-flight protection.
+
+// The gc_cycle at which a compensation scan found no hot run left: until the
+// next sweep (the only point at which the pool gains runs) further carves skip
+// the scan. Guarded by free_spans_lock.
+__global vgc_compensate_dry_cycle = u64(0xffffffffffffffff)
+
+// The shortest run a compensation decommits: one 16 KB hardware page, the
+// largest the supported hosts use; a shorter run returns nothing there.
+const vgc_compensate_min_run = u64(2)
+// The first pass takes only runs this long (512 KB), so a carve is offset by
+// as few decommits as the pool allows before shorter runs are taken.
+const vgc_compensate_long_run = u64(64)
+
+// vgc_pool_compensate decommits up to `nbytes` of committed pooled memory,
+// whole address-adjacent runs of hot pooled spans at a time (see the RTMEM-1
+// block above). Mutator context, called by vgc_span_alloc right after a carve
+// of >= vgc_pool_merge_min pages, holding no allocator lock; it takes
+// free_spans_lock, which every pool mutation holds and the collector holds
+// across its cycle, so the pool is exclusive while it runs.
+fn vgc_pool_compensate(nbytes u64) {
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	if vgc_heap.pool_bytes < vgc_compensate_min_run * u64(vgc_page_size)
+		|| vgc_compensate_dry_cycle == vgc_heap.gc_cycle {
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+		return
+	}
+	mut done := u64(0)
+	for pass in 0 .. 2 {
+		min_run := if pass == 0 { vgc_compensate_long_run } else { vgc_compensate_min_run }
+		for i in 0 .. vgc_heap.narenas {
+			if done >= nbytes {
+				break
+			}
+			done += vgc_pool_compensate_arena(i, min_run, nbytes - done)
+		}
+	}
+	if done < nbytes {
+		// every run the pool held is cold now: nothing for later carves to
+		// take until a sweep pools more
+		vgc_compensate_dry_cycle = vgc_heap.gc_cycle
+	}
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+}
+
+// vgc_pool_compensate_arena walks one arena's page map span by span and
+// decommits its hot pooled runs of >= min_run pages until `want` bytes are
+// returned; it reports the bytes it took. Oversized single-object arenas are
+// skipped (one span, no runs). Caller holds free_spans_lock: `pooled`, the
+// hot/cold state and every pooled span's base and npages change only under it;
+// an in-use span's base and npages never change, and pages past the arena's
+// carved end have nil slots.
+fn vgc_pool_compensate_arena(arena_idx int, min_run u64, want u64) u64 {
+	a := unsafe { &vgc_heap.arenas[arena_idx] }
+	if a.size > vgc_arena_size || a.page_span == unsafe { nil } {
+		return 0
+	}
+	used_pages := a.used / vgc_page_size
+	mut took := u64(0)
+	mut p := usize(0)
+	mut run_start := usize(0)
+	mut run := u64(0)
+	for p <= used_pages && took < want {
+		mut s := unsafe { &VGC_Span(nil) }
+		if p < used_pages {
+			s = unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[p]))))) }
+		}
+		head := s != unsafe { nil } && s.npages > 0 && s.base >= a.base
+			&& (s.base - a.base) / vgc_page_size == p
+		if head && s.pooled && !s.in_use && !s.decommitted
+			&& s.npages <= u32(vgc_max_pooled_pages) {
+			if run == 0 {
+				run_start = p
+			}
+			run += u64(s.npages)
+			p += usize(s.npages)
+			continue
+		}
+		if run >= min_run {
+			vgc_pool_decommit_run(arena_idx, run_start, run)
+			took += run * u64(vgc_page_size)
+		}
+		run = 0
+		if head {
+			p += usize(s.npages)
+		} else {
+			p++ // a nil slot (past the carved end) or, defensively, a non-head page
+		}
+	}
+	return took
+}
+
+// vgc_pool_decommit_run returns the pages [start, start + npages) of one arena
+// — a run of address-adjacent hot pooled spans — to the OS with ONE decommit
+// (vgc_os_decommit returns the hardware-page-aligned inner range), then moves
+// every span of the run hot -> cold exactly as vgc_pool_trim_decommit does for
+// one: unlink while flagged committed, flag, re-push. A span at either end of
+// the run whose pages share a hardware page with an in-use neighbour keeps
+// that page resident; its flag only makes its next pop call vgc_os_recommit,
+// which is a no-op on unix and harmless on committed pages under Windows.
+fn vgc_pool_decommit_run(arena_idx int, start usize, npages u64) {
+	a := unsafe { &vgc_heap.arenas[arena_idx] }
+	C.vgc_os_decommit(voidptr(a.base + start * vgc_page_size), usize(npages) * vgc_page_size)
+	end := start + usize(npages)
+	mut p := start
+	for p < end {
+		mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[p]))))) }
+		n := usize(s.npages)
+		vgc_pool_unlink(mut s)
+		s.decommitted = true
+		vgc_pool_push(mut s)
+		p += n
+	}
+}
+
 // Return a fully-empty span to the free list for reuse, coalescing it with any
 // same-arena pooled neighbors first (cx #360) so the pool re-forms large
 // contiguous spans instead of fragmenting monotonically — the large-object
@@ -2043,6 +2213,35 @@ fn vgc_alloc_span_meta() &VGC_Span {
 	return unsafe { &VGC_Span(voidptr(p)) }
 }
 
+// Mark work buffers come from a bump slab too (RTMEM-1). Each used to be its own
+// vgc_os_alloc — a ~2 KB VGC_WorkBuf rounded up to a whole hardware page, 16 KB
+// on Apple Silicon, so 87 % of every buffer was resident padding: measured, a
+// 300k-record convert's mark queue peaked at 1175 buffers = 18.4 MB of RSS for
+// 2.4 MB of queue, never returned (buffers recycle through work_empty and are
+// never freed). Carving them 64 to a chunk makes the resident cost the queue's
+// own size. Collector-only: the caller holds work_lock, or is the only mark
+// worker (vgc_can_use_work_fastpath), which is what makes the bump exclusive.
+const vgc_workbuf_chunk_bufs = 64
+
+__global vgc_workbuf_cur = usize(0)
+__global vgc_workbuf_end = usize(0)
+
+fn vgc_workbuf_carve() &VGC_WorkBuf {
+	bsz := (usize(sizeof(VGC_WorkBuf)) + 15) & ~usize(15)
+	if vgc_workbuf_cur == 0 || vgc_workbuf_cur + bsz > vgc_workbuf_end {
+		csz := bsz * usize(vgc_workbuf_chunk_bufs)
+		mem := C.vgc_os_alloc(csz)
+		if mem == unsafe { nil } {
+			return unsafe { nil }
+		}
+		vgc_workbuf_cur = usize(mem)
+		vgc_workbuf_end = usize(mem) + csz
+	}
+	p := vgc_workbuf_cur
+	vgc_workbuf_cur += bsz
+	return unsafe { &VGC_WorkBuf(voidptr(p)) }
+}
+
 // Allocate a new span with the given number of pages
 fn vgc_span_alloc(npages u32) &VGC_Span {
 	// First try to reuse a free span
@@ -2201,6 +2400,13 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 
 	C.vgc_mutex_unlock(&vgc_heap.lock)
+	if npages >= u32(vgc_pool_merge_min) {
+		// A large carve: vgc_get_free_span found no pooled span covering the
+		// request, so these fresh pages would sit beside whatever the pool holds
+		// idle — offset them (RTMEM-1 (2), vgc_pool_compensate). No lock is held
+		// here; the in_use=false span is invisible to the sweep meanwhile.
+		vgc_pool_compensate(u64(nbytes))
+	}
 	return span
 }
 
@@ -2450,6 +2656,30 @@ fn vgc_central_get_span(span_class int) &VGC_Span {
 // Cache operations (translated from Go's mcache)
 // ============================================================
 
+// vgc_span_release_acquisition ends a span's in-flight window (RTMEM-1,
+// cx-home/v#6). vgc_span_alloc and vgc_central_get_span stamp a span they hand
+// out with sweep_gen = gc_cycle so the next sweep cannot reclaim it while it is
+// in flight to its owner (vgc_sweep_span's guard). Left in place, that stamp
+// also exempted every span acquired during the epoch from the sweep that ends
+// it — on a monotone build-up a whole epoch of transients (measured: 176 MB of
+// garbage in 24k spans, 1.0× the live set, at the last cycle of a 300k-record
+// JSON convert) survived one extra cycle and the next epoch carved arena space
+// beside it. Once the owner's protecting reference is published — the mcache
+// slot (vgc_cache_get_span) or the thread's large_inflight slot
+// (vgc_alloc_large), both stamped at every cycle by vgc_protect_cached_spans —
+// the stamp is released: a RELEASE store, so the slot store before it is
+// visible first and a thread frozen between the two is still covered by the
+// stamp. `gc_cycle - 1` can never equal the cycle the next sweep runs at
+// (gc_cycle only grows), so the span is swept normally from then on. Not used
+// under -d vgc_concurrent: that collector does not run vgc_protect_cached_spans
+// and keeps the acquisition stamp as its only in-flight protection.
+@[inline]
+fn vgc_span_release_acquisition(span &VGC_Span) {
+	unsafe {
+		C.vgc_atomic_store_u32(&span.sweep_gen, u32(vgc_heap.gc_cycle) - 1)
+	}
+}
+
 fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	if cache_idx < 0 {
 		// Unregistered thread: the fixed [vgc_max_threads] cache table is exhausted
@@ -2486,6 +2716,14 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	new_span := vgc_central_get_span(span_class)
 	unsafe {
 		vgc_heap.caches[cache_idx].alloc[span_class] = new_span
+	}
+	$if !vgc_concurrent ? {
+		if new_span != unsafe { nil } {
+			// The cache slot now protects the span (vgc_protect_cached_spans):
+			// drop the acquisition stamp so the span is swept like any other
+			// once it leaves the cache (see vgc_span_release_acquisition).
+			vgc_span_release_acquisition(new_span)
+		}
 	}
 	return new_span
 }
@@ -2967,6 +3205,23 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		span.alloc_bits[0] = 1
 		span.mark_bits[0] = 0
 		vgc_alloc_black_hook(span, 0) // concurrent mark: alloc-black this large object
+	}
+	$if !vgc_concurrent ? {
+		lidx := C.vgc_get_cache_idx()
+		if lidx >= 0 {
+			// Hand the in-flight protection from the acquisition stamp to this
+			// thread's large_inflight slot BEFORE the span goes in_use: the slot
+			// store is ordered before the stamp release (a release store), so a
+			// thread frozen anywhere from here to the caller holding the address
+			// is covered by one of the two (RTMEM-1).
+			unsafe {
+				C.vgc_atomic_store_u64(&u64(voidptr(&vgc_heap.caches[lidx].large_inflight)),
+					u64(voidptr(span)))
+			}
+			vgc_span_release_acquisition(span)
+		}
+	}
+	unsafe {
 		// Fully initialized -> publish as live (see the in_use invariant in
 		// vgc_span_init; span_alloc/get_free_span leave in_use false until here).
 		span.in_use = true

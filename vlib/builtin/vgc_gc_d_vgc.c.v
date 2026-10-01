@@ -888,6 +888,14 @@ fn vgc_protect_cached_spans() {
 				}
 			}
 		}
+		// RTMEM-1: the thread's most recent large-object span — the in-flight
+		// protection vgc_alloc_large hands over from its acquisition stamp.
+		ls := unsafe { c.large_inflight }
+		if ls != unsafe { nil } {
+			unsafe {
+				ls.sweep_gen = u32(vgc_heap.gc_cycle)
+			}
+		}
 		// #58: protect the TINY-cursor block's owning span too. Once the tiny
 		// block's span fills, it is evicted from c.alloc[] to central and the loop
 		// above no longer reaches it — yet the cursor still carves from it. The
@@ -1240,7 +1248,7 @@ fn vgc_work_put(addr usize) {
 					vgc_heap.work_empty = new_buf.next
 				}
 			} else {
-				new_buf = unsafe { &VGC_WorkBuf(C.vgc_os_alloc(usize(sizeof(VGC_WorkBuf)))) }
+				new_buf = vgc_workbuf_carve()
 				if new_buf == unsafe { nil } {
 					return
 				}
@@ -1271,7 +1279,7 @@ fn vgc_work_put(addr usize) {
 				vgc_heap.work_empty = new_buf.next
 			}
 		} else {
-			new_buf = unsafe { &VGC_WorkBuf(C.vgc_os_alloc(usize(sizeof(VGC_WorkBuf)))) }
+			new_buf = vgc_workbuf_carve()
 			if new_buf == unsafe { nil } {
 				C.vgc_mutex_unlock(&vgc_heap.work_lock)
 				return
