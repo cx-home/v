@@ -215,6 +215,17 @@ pub fn new_ssl_listener(saddr string, config SSLConnectConfig) !&SSLListener {
 	return listener
 }
 
+// addr retrieves the local ip address and port number the listener is bound
+// to — for a listener bound to port 0, the port the kernel chose
+// (cx-home/cx-private#1551, decision 1551-b). It is the same getsockname a
+// `TcpListener.addr()` makes, on the listener's own server socket.
+pub fn (l &SSLListener) addr() !net.Addr {
+	if !l.opened {
+		return error('net.mbedtls: SSLListener.addr: the listener is not open')
+	}
+	return net.addr_from_socket_handle(l.server_fd.fd)
+}
+
 // finish the listener and clean up resources
 pub fn (mut l SSLListener) shutdown() ! {
 	$if trace_ssl ? {
