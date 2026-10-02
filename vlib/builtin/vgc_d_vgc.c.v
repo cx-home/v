@@ -1887,6 +1887,10 @@ fn vgc_pool_trim_decommit(mut span VGC_Span) {
 // next sweep (the only point at which the pool gains runs) further carves skip
 // the scan. Guarded by free_spans_lock.
 __global vgc_compensate_dry_cycle = u64(0xffffffffffffffff)
+// Page-map slots the compensation walks have visited, cumulative — the cost the
+// walk must keep proportional to the heap per cycle, not per carve (read by
+// vgc_rtmem_compensation_stats). Guarded by free_spans_lock.
+__global vgc_compensate_scanned = u64(0)
 
 // The shortest run a compensation decommits: one 16 KB hardware page, the
 // largest the supported hosts use; a shorter run returns nothing there.
@@ -1944,6 +1948,7 @@ fn vgc_pool_compensate_arena(arena_idx int, min_run u64, want u64) u64 {
 	mut run_start := usize(0)
 	mut run := u64(0)
 	for p <= used_pages && took < want {
+		vgc_compensate_scanned++
 		mut s := unsafe { &VGC_Span(nil) }
 		if p < used_pages {
 			s = unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[p]))))) }

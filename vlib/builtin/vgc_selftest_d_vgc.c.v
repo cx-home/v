@@ -101,3 +101,19 @@ pub fn vgc_residual4_selftest() u32 {
 	unsafe { vgc_put_free_span(mut span) }
 	return rc
 }
+
+// vgc_rtmem_compensation_stats — white-box readings for
+// bench/parallel-alloc/vgc_monotone_retention_test.v (RTMEM-1): the page-map
+// slots vgc_pool_compensate has visited so far, the collection count, and the
+// pages the arenas have carved now. Same posture as vgc_residual4_selftest: no
+// ordinary program calls it, so -skip-unused prunes it.
+pub fn vgc_rtmem_compensation_stats() (u64, u64, u64) {
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	scanned := vgc_compensate_scanned
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	mut pages := u64(0)
+	for i in 0 .. vgc_heap.narenas {
+		pages += u64(vgc_heap.arenas[i].used / vgc_page_size)
+	}
+	return scanned, vgc_heap.gc_cycle, pages
+}
