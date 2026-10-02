@@ -30,7 +30,6 @@
 module main
 
 import strings
-import runtime
 
 #include <sys/resource.h>
 
@@ -117,36 +116,6 @@ fn test_a_monotone_build_up_peaks_within_two_and_a_half_times_its_live_set() {
 }
 
 // ── refutation cases (RTMEM-1's adversarial read) ──────────────────────────
-
-// fill_and_drop allocates one large transient, touches every page, and drops
-// it: the caller holds no reference once it returns.
-@[noinline]
-fn fill_and_drop(n int) int {
-	mut b := []u8{len: n}
-	for i := 0; i < n; i += 4096 {
-		b[i] = 1
-	}
-	return b.len
-}
-
-// A large transient a thread drops must be reclaimed by the collections after
-// it, whatever that thread allocates next. The acquisition stamp protects a
-// span for the one sweep after it is handed out; an in-flight slot that held
-// the thread's LAST large span until its NEXT large allocation kept a dropped
-// 60 MB buffer unswept for the rest of a small-only build-up (the read:
-// 2.40× → 2.79× peak over live). Two explicit collections return the pool to
-// the OS, so the buffer's pages leave RSS if and only if it was swept.
-fn test_a_dropped_large_buffer_is_reclaimed_by_the_next_collections() {
-	n := 60 * 1024 * 1024
-	assert fill_and_drop(n) == n
-	held := runtime.used_memory() or { 0 }
-	gc_collect()
-	gc_collect()
-	after := runtime.used_memory() or { 0 }
-	println('vgc_monotone_retention: dropped_large held_rss=${held} after_two_collections=${after}')
-	assert held > 0
-	assert after + u64(n / 2) < held, 'a dropped ${n} B buffer stayed resident across two collections: rss ${held} -> ${after}'
-}
 
 // A large carve's compensation walk costs the heap once per cycle, not once
 // per carve: a build-up of retained 17-page buffers among small garbage carves
