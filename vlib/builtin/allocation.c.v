@@ -424,7 +424,9 @@ pub fn vcalloc_noscan(n isize) &u8 {
 		if n < 0 {
 			_memory_panic(@FN, n)
 		}
-		return unsafe { &u8(vgc_calloc(usize(n))) }
+		// a noscan span, zero-filled (cx-private #1629: this was vgc_calloc, a
+		// SCANNED block, so every caller's pointer-free buffer was read as pointers)
+		return unsafe { &u8(vgc_malloc_noscan(usize(n))) }
 	} $else $if gcboehm ? {
 		if n < 0 {
 			_memory_panic(@FN, n)

@@ -72,9 +72,18 @@ fn (a array) uses_noscan_data() bool {
 	return a.flags.has(.noscan_data)
 }
 
+// alloc_array_data_like allocates a buffer with `a`'s scan policy: a
+// `.noscan_data` array keeps a no-scan buffer across growth and clones under
+// -gc boehm_*_opt and under vgc (cx-private #1629: under vgc the flag was
+// never consulted, so a grown pointer-free buffer became scannable).
 @[inline]
 fn (a array) alloc_array_data_like(total_size u64) voidptr {
 	$if gcboehm_opt ? {
+		if a.uses_noscan_data() {
+			return alloc_array_data_noscan(total_size)
+		}
+	}
+	$if vgc ? {
 		if a.uses_noscan_data() {
 			return alloc_array_data_noscan(total_size)
 		}
@@ -85,6 +94,11 @@ fn (a array) alloc_array_data_like(total_size u64) voidptr {
 @[inline]
 fn (a array) alloc_array_data_like_uninit(total_size u64) voidptr {
 	$if gcboehm_opt ? {
+		if a.uses_noscan_data() {
+			return alloc_array_data_noscan_uninit(total_size)
+		}
+	}
+	$if vgc ? {
 		if a.uses_noscan_data() {
 			return alloc_array_data_noscan_uninit(total_size)
 		}
