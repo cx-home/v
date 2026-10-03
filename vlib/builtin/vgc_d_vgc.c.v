@@ -3098,8 +3098,12 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 				return ptr
 			}
 		}
-		// Allocate a new tiny block
-		span_class := int(class_idx) * 2 + 1 // noscan
+		// Allocate a new tiny block: ALWAYS a vgc_tiny_size slot, whatever size
+		// opened it — the packing above carves up to vgc_tiny_size bytes from it.
+		// (cx-private #1628: with exact size classes, a block opened by a 1..8-byte
+		// object would be an 8-byte slot and the next packed object would write
+		// into the slot after it.)
+		span_class := int(C.vgc_size_class(u32(vgc_tiny_size))) * 2 + 1 // noscan
 		span := vgc_cache_get_span(cache_idx, span_class)
 		if span != unsafe { nil } {
 			ptr := unsafe { vgc_span_alloc_obj(mut span) }
@@ -3266,8 +3270,16 @@ fn vgc_realloc(old_ptr voidptr, new_size usize) voidptr {
 		// Unknown object - just malloc new
 		return vgc_malloc(new_size)
 	}
-	old_size := usize(old_span.elem_size)
-	if new_size <= old_size {
+	// The bytes old_ptr may use run from old_ptr to the END of its slot, not
+	// elem_size from old_ptr; and a slot the tiny allocator packed is shared
+	// with siblings, so a packed object never grows in place (cx-private #1628:
+	// a 4-byte object grown to 12 overwrote the objects packed after it).
+	mut old_size := usize(old_span.elem_size)
+	if old_span.elem_size > 0 && usize(old_ptr) >= old_span.base {
+		slot_off := (usize(old_ptr) - old_span.base) % usize(old_span.elem_size)
+		old_size -= slot_off
+	}
+	if new_size <= old_size && !old_span.is_tiny {
 		return old_ptr // fits in current allocation
 	}
 	// Preserve the original scan policy so raw buffers do not become scan objects.

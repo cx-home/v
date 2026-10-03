@@ -506,7 +506,11 @@ static const uint32_t vgc_class_nobjs[68] = {
     1,    3,    2,    1
 };
 
-// Size-to-class lookup tables (computed at init)
+// Size-to-class lookup tables (computed at init). Entry i holds the smallest
+// class whose size is >= the LARGEST size that maps to index i — i * 8 for
+// vgc_s2c8, 1024 + i * 128 for vgc_s2c128 — so an exact class size lands in
+// its own class (cx-private #1628: entry i used to hold (i + 1) * 8's class,
+// one table step above every lookup, and 8 took a 16-byte slot).
 static uint8_t vgc_s2c8[129];   // sizes 1..1024: index = (size+7)/8
 static uint8_t vgc_s2c128[249]; // sizes 1025..32768: index = (size-1024+127)/128
 
@@ -517,7 +521,7 @@ static inline uint32_t vgc_get_class_nobjs(int cls) { return vgc_class_nobjs[cls
 static void vgc_init_size_tables(void) {
     int cls = 1;
     for (int i = 0; i < 129; i++) {
-        uint32_t size = (uint32_t)(i + 1) * 8;
+        uint32_t size = (uint32_t)i * 8; // index (size+7)>>3 == i covers sizes (i-1)*8+1 .. i*8
         while (cls < 67 && vgc_class_sizes[cls] < size) {
             cls++;
         }
@@ -525,7 +529,7 @@ static void vgc_init_size_tables(void) {
     }
     cls = 33;
     for (int i = 0; i < 249; i++) {
-        uint32_t size = 1024 + (uint32_t)(i + 1) * 128;
+        uint32_t size = 1024 + (uint32_t)i * 128; // index i covers 1024+(i-1)*128+1 .. 1024+i*128
         while (cls < 67 && vgc_class_sizes[cls] < size) {
             cls++;
         }
