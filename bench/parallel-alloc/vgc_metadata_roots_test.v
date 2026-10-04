@@ -46,8 +46,10 @@ fn scrub_stack() u64 {
 	return buf[8191]
 }
 
+// Called from the test function itself, right after the dropping call, so the
+// scrub's frame covers the stack the dropping call used (a helper between them
+// would leave that region as the helper's own uninitialised slots).
 fn collect_and_read() u64 {
-	_ := scrub_stack()
 	gc_collect()
 	gc_collect()
 	return u64(gc_heap_usage().total_bytes)
@@ -81,6 +83,7 @@ fn build_and_drop_list(n int) int {
 fn test_a_region_end_does_not_root_the_object_at_the_next_arena() {
 	for round in 0 .. 3 {
 		_ := build_and_drop_list(30000)
+		_ := scrub_stack()
 		retained := collect_and_read()
 		println('vgc_metadata_roots: round ${round} list dropped, retained=${retained} carved=${gc_memory_use()}')
 		assert retained < retained_bound, 'round ${round}: ${retained} bytes stay marked after the list was dropped: a collector word equal to an arena base roots it'
@@ -100,6 +103,7 @@ fn alloc_and_drop_big() u64 {
 
 fn test_dropped_objects_larger_than_an_arena_are_reclaimed() {
 	_ := alloc_and_drop_big()
+	_ := scrub_stack()
 	retained := collect_and_read()
 	println('vgc_metadata_roots: oversized dropped, retained=${retained}')
 	assert retained < retained_bound, '${retained} bytes stay marked: an object at its own arena base is rooted'
