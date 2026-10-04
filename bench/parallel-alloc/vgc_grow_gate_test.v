@@ -12,6 +12,12 @@
 // 4660968c34 and 2.68× on 62bcd55cf (one arena more, the same live set), and
 // a sweep of the first trigger moved both between 2.2× and 2.7×.
 //
+// Since Letter 190 the gate stands down while the live set still grows (the
+// last collection marked more than vgc_grow_gate_growth_pct over the one
+// before it; vgc_grow_gate_growing_test.v), so the retained set is settled by
+// two collections before the stream: the gate serves a live set that has
+// stopped growing.
+//
 // The rule under test: carving a NEW arena while the heap holds at least
 // vgc_grow_gate_pct of its goal is deferred to one collection first (at most
 // once per cycle), so the collection's garbage serves the growth from the
@@ -43,6 +49,9 @@ fn test_the_heap_collects_before_it_carves_an_arena_near_its_goal() {
 	for _ in 0 .. live_bytes / chunk {
 		live << []u8{len: chunk, init: 7}
 	}
+	// two collections that agree: the live set has stopped growing, the state the
+	// gate serves (Letter 190: it stands down while the marked set still grows)
+	gc_collect()
 	gc_collect()
 	marked := gc_heap_usage().total_bytes
 	carved0 := gc_memory_use()

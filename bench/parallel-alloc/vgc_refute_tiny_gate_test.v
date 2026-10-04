@@ -23,6 +23,9 @@ fn tiny_stream_ratio() f64 {
 	for _ in 0 .. live_bytes / chunk {
 		live << []u8{len: chunk, init: 7}
 	}
+	// two collections that agree: the live set has stopped growing, the state the
+	// gate serves (Letter 190: it stands down while the marked set still grows)
+	gc_collect()
 	gc_collect()
 	marked := gc_heap_usage().total_bytes
 	mut high := gc_memory_use()
@@ -64,6 +67,9 @@ fn test_a_malformed_gate_setting_keeps_the_default() {
 		for _ in 0 .. live_bytes / chunk {
 			live << []u8{len: chunk, init: 7}
 		}
+		// two collections that agree: the live set has stopped growing, the state the
+		// gate serves (Letter 190: it stands down while the marked set still grows)
+		gc_collect()
 		gc_collect()
 		marked := gc_heap_usage().total_bytes
 		mut high := gc_memory_use()

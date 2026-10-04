@@ -659,11 +659,24 @@ __global vgc_headroom_pinned = false
 // cx's convert gauges at 30 % (peak RSS / marked, VGC_NEXT_GC_MB default and
 // 36/40/48/56/64): JSON 1.84-2.07x and XML 2.01-2.33x, against 2.24-2.68x and
 // 2.29-2.39x without it; vgc_grow_gate_test.v 2.03x -> 1.39x.
-// VGC_GROW_GATE_PCT overrides (0 disables).
+// The gate stands down while the live set still grows (below), so it
+// serves a set that has stopped growing. VGC_GROW_GATE_PCT overrides
+// (0 disables).
 __global vgc_grow_gate_pct = u64(30)
 __global vgc_grow_gate_cycle = u64(0)
 __global vgc_grow_gate_fired = false
 __global vgc_grow_gate_hold = u32(0) // atomic: reclaim-and-retry loops in flight
+// The gate pays only where a collection finds garbage the growth can reuse —
+// a live set that has stopped growing. While the live set still grows (the
+// last collection marked more than vgc_grow_gate_growth_pct % over the one
+// before it), a deferred carve buys a full collection of a set that is
+// mostly still live, and the trigger recompute after it shortens the next
+// cycle: `cx fmt` of an 8k-record document took 15 collections instead of 10
+// (+15 % wall, perf-ratchet tooling.fmt_8k_ms, cx-private batch I-1). So the
+// gate stands down until a collection shows the growth has flattened.
+// VGC_GROW_GATE_GROWTH_PCT overrides (decimal 0..100).
+__global vgc_grow_gate_growth_pct = u64(10)
+__global vgc_grow_gate_prev_marked = u64(0) // the marked set one collection back
 // Cycle timestamps for the overhead measurement (collector-only writes: t0 is
 // stamped by the thread that won the gc_phase CAS; last_end in the STW
 // trigger recompute — never touched on the allocation path).
@@ -1114,24 +1127,10 @@ pub fn vgc_init() {
 	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
 		vgc_gctrace = 1
 	}
-	gg_env := C.getenv(c'VGC_GROW_GATE_PCT')
-	if gg_env != unsafe { nil } {
-		// decimal digits only, 0..100; anything else keeps the default (atoll
-		// read `abc`, `0x1e` and an empty value as 0 — the gate silently off)
-		mut gg := u64(0)
-		mut ok := unsafe { gg_env[0] } != 0
-		for k := 0; ok && unsafe { gg_env[k] } != 0; k++ {
-			ch := unsafe { gg_env[k] }
-			if ch < `0` || ch > `9` || k >= 3 {
-				ok = false
-			} else {
-				gg = gg * 10 + u64(ch - `0`)
-			}
-		}
-		if ok && gg <= 100 {
-			vgc_grow_gate_pct = gg
-		}
-	}
+	// decimal digits only, 0..100; anything else keeps the default (atoll read
+	// `abc`, `0x1e` and an empty value as 0 — the gate silently off)
+	vgc_grow_gate_pct = vgc_env_pct(c'VGC_GROW_GATE_PCT', vgc_grow_gate_pct)
+	vgc_grow_gate_growth_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWTH_PCT', vgc_grow_gate_growth_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
 		cmb := C.atoll(cap_env)
@@ -2304,6 +2303,26 @@ fn vgc_workbuf_carve() &VGC_WorkBuf {
 }
 
 // Allocate a new span with the given number of pages
+// vgc_env_pct reads a percentage setting: decimal digits only, 0..100; an
+// unset, empty or malformed value keeps `cur`.
+fn vgc_env_pct(name &char, cur u64) u64 {
+	env := C.getenv(name)
+	if env == unsafe { nil } {
+		return cur
+	}
+	mut v := u64(0)
+	mut ok := unsafe { env[0] } != 0
+	for k := 0; ok && unsafe { env[k] } != 0; k++ {
+		ch := unsafe { env[k] }
+		if ch < `0` || ch > `9` || k >= 3 {
+			ok = false
+		} else {
+			v = v * 10 + u64(ch - `0`)
+		}
+	}
+	return if ok && v <= 100 { v } else { cur }
+}
+
 // vgc_grow_gate_defers answers whether vgc_span_alloc defers an arena carve
 // to a collection (the VGCG-1 grow gate above). Called with vgc_heap.lock held.
 fn vgc_grow_gate_defers() bool {
@@ -2325,6 +2344,11 @@ fn vgc_grow_gate_defers() bool {
 	// a goal clamped toward the marked set (the soft limit, the arena
 	// ceiling) leaves a growth budget under half the live set: no gate there
 	if goal <= marked || live <= marked || (goal - marked) * 2 < marked {
+		return false
+	}
+	// the live set still grows: a collection now would find little to reuse
+	prev := vgc_grow_gate_prev_marked
+	if prev == 0 || marked * 100 > prev * (100 + vgc_grow_gate_growth_pct) {
 		return false
 	}
 	if (live - marked) * 100 < (goal - marked) * vgc_grow_gate_pct {

@@ -450,6 +450,7 @@ fn vgc_gc_start() {
 
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
+	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
 	// Reset heap_live to match what we actually found alive. The per-thread
 	// live_delta/alloc_delta (un-flushed accounting) are now stale — `marked` is
@@ -740,6 +741,7 @@ fn vgc_gc_start_concurrent() {
 
 	// Compute live bytes from mark bits; rebase heap_live (same as the STW path).
 	marked := vgc_count_marked()
+	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
