@@ -993,7 +993,7 @@ fn vgc_mark_roots() {
 	}
 	for k in 0 .. nseg {
 		if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
-			vgc_scan_range(vgc_seg_lo[k], vgc_seg_hi[k])
+			vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k])
 		}
 	}
 
@@ -1021,6 +1021,48 @@ fn vgc_mark_roots() {
 	np := vgc_npins
 	for k in 0 .. np {
 		vgc_shade(usize(unsafe { vgc_pins[k] }))
+	}
+}
+
+// vgc_scan_data_range scans a data-segment range as vgc_scan_range does, minus
+// the collector's arena bookkeeping: the arena table (vgc_heap.arenas — each
+// entry's base is an arena's first address) and vgc_arena_lo / vgc_arena_hi.
+// Those words are metadata, never references, but an arena's base is also the
+// address of the first object carved there, so scanning them rooted that object
+// and everything it reaches for the life of the process (cx-private #1783: the
+// VGCG-1 grow gate moved one carve, the streaming bench's finished 24 MB result
+// landed at the second arena's base and was marked every later cycle;
+// bench/parallel-alloc/vgc_arena_base_root_test.v). The rest of vgc_heap stays
+// scanned: the per-thread caches hold real roots (see vgc_mark_roots).
+fn vgc_scan_data_range(lo usize, hi usize) {
+	tab_lo := usize(voidptr(&vgc_heap.arenas[0]))
+	tab_hi := tab_lo + usize(sizeof(VGC_Arena)) * usize(vgc_max_arenas)
+	alo := usize(voidptr(&vgc_arena_lo))
+	ahi := usize(voidptr(&vgc_arena_hi))
+	mut cur := lo
+	for cur < hi {
+		// the nearest excluded range starting at or after cur (or covering it)
+		mut ex_lo := hi
+		mut ex_hi := hi
+		if tab_hi > cur && tab_lo < ex_lo {
+			ex_lo = tab_lo
+			ex_hi = tab_hi
+		}
+		if alo + sizeof(usize) > cur && alo < ex_lo {
+			ex_lo = alo
+			ex_hi = alo + sizeof(usize)
+		}
+		if ahi + sizeof(usize) > cur && ahi < ex_lo {
+			ex_lo = ahi
+			ex_hi = ahi + sizeof(usize)
+		}
+		if ex_lo > cur {
+			vgc_scan_range(cur, if ex_lo < hi { ex_lo } else { hi })
+		}
+		if ex_hi <= cur {
+			break
+		}
+		cur = ex_hi
 	}
 }
 
