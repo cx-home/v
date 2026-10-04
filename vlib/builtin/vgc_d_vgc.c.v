@@ -636,6 +636,33 @@ const vgc_default_soft_limit = u64(2) * 1024 * 1024 * 1024
 __global vgc_headroom = u64(8) * 1024 * 1024
 __global vgc_headroom_min = u64(8) * 1024 * 1024
 __global vgc_headroom_pinned = false
+// ── VGCG-1 GROW GATE: collect before carving an arena near the goal ─────────
+// An arena is never released, so the arena the heap carves for the LAST
+// stretch of a cycle's growth stays resident for the life of the process —
+// and the cycle's garbage, freed a moment later, sits pooled beside it. Which
+// cycle lands on an arena boundary is a phase of the workload: cx's 300k-record
+// JSON convert read 2.49x peak RSS / marked on 4660968c34 and 2.68x on
+// 62bcd55cf (one arena more over the same live set), and a sweep of the first
+// trigger moved both between 2.2x and 2.7x (cx-private batch I-1; the bar is
+// 1226-a's 2.5x). The gate: when vgc_span_alloc finds no pooled span and no
+// room in the carved arenas, and the heap has already grown
+// vgc_grow_gate_pct % of the way from the last marked set to the goal, the
+// carve is deferred to ONE collection (vgc_span_alloc returns nil; its callers'
+// reclaim-and-retry path collects and retries), so the cycle's garbage serves
+// the growth from the arenas the heap has. Bounded cost: it fires at most once
+// per cycle, only when an arena would be carved, never while a
+// reclaim-and-retry loop runs (vgc_grow_gate_hold: the retry after the gate's
+// own collection carves if it must, so the loop's OOM verdict is unchanged),
+// never while the goal is clamped near the marked set, and never before
+// vgc_init or during a collection. Measured on
+// cx's convert gauges at 30 % (peak RSS / marked, VGC_NEXT_GC_MB default and
+// 36/40/48/56/64): JSON 1.84-2.07x and XML 2.01-2.33x, against 2.24-2.68x and
+// 2.29-2.39x without it; vgc_grow_gate_test.v 2.03x -> 1.39x.
+// VGC_GROW_GATE_PCT overrides (0 disables).
+__global vgc_grow_gate_pct = u64(30)
+__global vgc_grow_gate_cycle = u64(0)
+__global vgc_grow_gate_fired = false
+__global vgc_grow_gate_hold = u32(0) // atomic: reclaim-and-retry loops in flight
 // Cycle timestamps for the overhead measurement (collector-only writes: t0 is
 // stamped by the thread that won the gc_phase CAS; last_end in the STW
 // trigger recompute — never touched on the allocation path).
@@ -1085,6 +1112,13 @@ pub fn vgc_init() {
 	trace_env := C.getenv(c'VGC_GCTRACE')
 	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
 		vgc_gctrace = 1
+	}
+	gg_env := C.getenv(c'VGC_GROW_GATE_PCT')
+	if gg_env != unsafe { nil } {
+		gg := C.atoll(gg_env)
+		if gg >= 0 && gg <= 100 {
+			vgc_grow_gate_pct = u64(gg)
+		}
 	}
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
@@ -2258,6 +2292,37 @@ fn vgc_workbuf_carve() &VGC_WorkBuf {
 }
 
 // Allocate a new span with the given number of pages
+// vgc_grow_gate_defers answers whether vgc_span_alloc defers an arena carve
+// to a collection (the VGCG-1 grow gate above). Called with vgc_heap.lock held.
+fn vgc_grow_gate_defers() bool {
+	if vgc_grow_gate_pct == 0 || vgc_heap.narenas == 0
+		|| C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0
+		|| C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		return false
+	}
+	if C.vgc_atomic_load_u32(&vgc_grow_gate_hold) != 0 {
+		return false // a reclaim-and-retry loop is running: it carves if it must
+	}
+	cycle := vgc_heap.gc_cycle
+	if vgc_grow_gate_fired && cycle == vgc_grow_gate_cycle {
+		return false
+	}
+	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
+	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
+	// a goal clamped toward the marked set (the soft limit, the arena
+	// ceiling) leaves a growth budget under half the live set: no gate there
+	if goal <= marked || live <= marked || (goal - marked) * 2 < marked {
+		return false
+	}
+	if (live - marked) * 100 < (goal - marked) * vgc_grow_gate_pct {
+		return false
+	}
+	vgc_grow_gate_fired = true
+	vgc_grow_gate_cycle = cycle
+	return true
+}
+
 fn vgc_span_alloc(npages u32) &VGC_Span {
 	// First try to reuse a free span
 	recycled := vgc_get_free_span(npages)
@@ -2291,6 +2356,10 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 	// Allocate new arena if needed
 	if base == 0 {
+		if vgc_grow_gate_defers() {
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			return unsafe { nil }
+		}
 		asize := if nbytes > vgc_arena_size { nbytes } else { vgc_arena_size }
 		mem := C.vgc_os_alloc(asize)
 		if mem == unsafe { nil } {
@@ -2918,6 +2987,10 @@ fn vgc_oom_report(n usize) {
 // reuses. Bounded retries so a genuine OOM still terminates.
 @[markused]
 fn vgc_collect_and_retry_span(cache_idx int, span_class int) &VGC_Span {
+	C.vgc_atomic_add_u32(&vgc_grow_gate_hold, 1)
+	defer {
+		C.vgc_atomic_sub_u32(&vgc_grow_gate_hold, 1)
+	}
 	for _ in 0 .. 8 {
 		vgc_force_collect()
 		// If another thread won the collector CAS, our force was a no-op; wait for
@@ -3210,6 +3283,7 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		// HTTP-reactor OOM-panic. The small-object path already waits; the large path did
 		// not — this closes that asymmetry. Single-threaded is unaffected: no contender,
 		// so gc_phase is already off after our own force_collect.)
+		C.vgc_atomic_add_u32(&vgc_grow_gate_hold, 1)
 		for _ in 0 .. 8 {
 			vgc_force_collect()
 			for C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
@@ -3220,6 +3294,7 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 				break
 			}
 		}
+		C.vgc_atomic_sub_u32(&vgc_grow_gate_hold, 1)
 		if span == unsafe { nil } {
 			// Terminal exhaustion on the large path — the field signature of
 			// cx #277: the process's LARGEST allocations (multi-MB builder
