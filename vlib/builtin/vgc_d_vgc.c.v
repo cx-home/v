@@ -3070,6 +3070,7 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 
 	class_idx := C.vgc_size_class(u32(n))
 	if class_idx == 0 {
+		vgc_maybe_gc()
 		return vgc_alloc_large(n, true, zero_fill)
 	}
 
@@ -3137,6 +3138,9 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 					vgc_heap.caches[cache_idx].tiny_allocs++
 				}
 				vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
+				if span.alloc_count >= span.nelems {
+					vgc_maybe_gc() // the pacer's check per filled span (see below)
+				}
 				return ptr
 			}
 		}
@@ -3162,6 +3166,15 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 		vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
 		if zero_fill {
 			unsafe { C.memset(ptr, 0, n) }
+		}
+		// The pacer's check, as on the scan path: once per filled span. Without
+		// it a stream of pointer-free allocations never reached vgc_maybe_gc and
+		// the heap grew past its goal until span exhaustion forced a collection
+		// (batch I-1, VGCG-1: every pointer-free array buffer is no-scan since
+		// cx-private #1629, so a []u8 / []int / strings.Builder stream starved
+		// the pacer — vgc_noscan_pacer_test.v carved 5.02x its live set).
+		if span.alloc_count >= span.nelems {
+			vgc_maybe_gc()
 		}
 		$if vgc_verify ? {
 			// DEBUG-ONLY: zero the FULL slot (not just n) so the mark-closure
