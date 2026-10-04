@@ -1,0 +1,98 @@
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:29:3: error: `count` is captured by value: `[mut count]` gives the closure its own copy, so this write never reaches the `count` outside it; capture a reference instead (`mut r := &count` before the closure, then `[mut r]`)
+   27 |     mut p := &Acc{}
+   28 |     f := fn [mut count, mut acc, mut cur, mut list, mut fixed, mut tags, mut p] (v int) {
+   29 |         count = v
+      |         ~~~~~
+   30 |         count += v
+   31 |         count++
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:30:3: error: `count` is captured by value: `[mut count]` gives the closure its own copy, so this write never reaches the `count` outside it; capture a reference instead (`mut r := &count` before the closure, then `[mut r]`)
+   28 |     f := fn [mut count, mut acc, mut cur, mut list, mut fixed, mut tags, mut p] (v int) {
+   29 |         count = v
+   30 |         count += v
+      |         ~~~~~
+   31 |         count++
+   32 |         acc.n = v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:31:3: error: `count` is captured by value: `[mut count]` gives the closure its own copy, so this write never reaches the `count` outside it; capture a reference instead (`mut r := &count` before the closure, then `[mut r]`)
+   29 |         count = v
+   30 |         count += v
+   31 |         count++
+      |         ~~~~~
+   32 |         acc.n = v
+   33 |         acc.items << v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:32:7: error: `acc` is captured by value: `[mut acc]` gives the closure its own copy, so this write never reaches the `acc` outside it; capture a reference instead (`mut r := &acc` before the closure, then `[mut r]`)
+   30 |         count += v
+   31 |         count++
+   32 |         acc.n = v
+      |             ^
+   33 |         acc.items << v
+   34 |         acc.bump()
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:33:7: error: `acc` is captured by value: `[mut acc]` gives the closure its own copy, so this write never reaches the `acc` outside it; capture a reference instead (`mut r := &acc` before the closure, then `[mut r]`)
+   31 |         count++
+   32 |         acc.n = v
+   33 |         acc.items << v
+      |             ~~~~~
+   34 |         acc.bump()
+   35 |         bump_acc(mut acc)
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:34:3: error: `acc` is captured by value: `[mut acc]` gives the closure its own copy, so this write never reaches the `acc` outside it; capture a reference instead (`mut r := &acc` before the closure, then `[mut r]`)
+   32 |         acc.n = v
+   33 |         acc.items << v
+   34 |         acc.bump()
+      |         ~~~
+   35 |         bump_acc(mut acc)
+   36 |         if c := cur {
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:35:16: error: `acc` is captured by value: `[mut acc]` gives the closure its own copy, so this write never reaches the `acc` outside it; capture a reference instead (`mut r := &acc` before the closure, then `[mut r]`)
+   33 |         acc.items << v
+   34 |         acc.bump()
+   35 |         bump_acc(mut acc)
+      |                      ~~~
+   36 |         if c := cur {
+   37 |             cur = c + v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:37:4: error: `cur` is captured by value: `[mut cur]` gives the closure its own copy, so this write never reaches the `cur` outside it; capture a reference instead (`mut r := &cur` before the closure, then `[mut r]`)
+   35 |         bump_acc(mut acc)
+   36 |         if c := cur {
+   37 |             cur = c + v
+      |             ~~~
+   38 |         }
+   39 |         list << v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:39:3: error: `list` is captured by value: `[mut list]` gives the closure its own copy, so this write never reaches the `list` outside it; capture a reference instead (`mut r := &list` before the closure, then `[mut r]`)
+   37 |             cur = c + v
+   38 |         }
+   39 |         list << v
+      |         ~~~~
+   40 |         list.delete(0)
+   41 |         fixed[0] = v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:40:3: error: `list` is captured by value: `[mut list]` gives the closure its own copy, so this write never reaches the `list` outside it; capture a reference instead (`mut r := &list` before the closure, then `[mut r]`)
+   38 |         }
+   39 |         list << v
+   40 |         list.delete(0)
+      |         ~~~~
+   41 |         fixed[0] = v
+   42 |         fixed.sort()
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:41:8: error: `fixed` is captured by value: `[mut fixed]` gives the closure its own copy, so this write never reaches the `fixed` outside it; capture a reference instead (`mut r := &fixed` before the closure, then `[mut r]`)
+   39 |         list << v
+   40 |         list.delete(0)
+   41 |         fixed[0] = v
+      |              ~~~
+   42 |         fixed.sort()
+   43 |         tags['k'] = v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:42:3: error: `fixed` is captured by value: `[mut fixed]` gives the closure its own copy, so this write never reaches the `fixed` outside it; capture a reference instead (`mut r := &fixed` before the closure, then `[mut r]`)
+   40 |         list.delete(0)
+   41 |         fixed[0] = v
+   42 |         fixed.sort()
+      |         ~~~~~
+   43 |         tags['k'] = v
+   44 |         p = &Acc{
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:43:7: error: `tags` is captured by value: `[mut tags]` gives the closure its own copy, so this write never reaches the `tags` outside it; capture a reference instead (`mut r := &tags` before the closure, then `[mut r]`)
+   41 |         fixed[0] = v
+   42 |         fixed.sort()
+   43 |         tags['k'] = v
+      |             ~~~~~
+   44 |         p = &Acc{
+   45 |             n: p.n + v
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:44:3: error: `p` is captured by value: `[mut p]` gives the closure its own copy, so this write never reaches the `p` outside it; capture a reference instead (`mut r := &p` before the closure, then `[mut r]`)
+   42 |         fixed.sort()
+   43 |         tags['k'] = v
+   44 |         p = &Acc{
+      |         ^
+   45 |             n: p.n + v
+   46 |         }

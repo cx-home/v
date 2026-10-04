@@ -1,0 +1,89 @@
+// A `[mut x]` capture copies `x` into the closure; a write to that copy never
+// reaches the `x` outside it (cx-private #1440, RULED: VCAP-1).
+struct Acc {
+mut:
+	n     int
+	items []int
+	tags  map[string]int
+	inner &Acc = unsafe { nil }
+	seen  shared []int
+}
+
+fn (mut a Acc) bump() {
+	a.n++
+}
+
+fn bump_acc(mut a Acc) {
+	a.n++
+}
+
+fn lost_writes() {
+	mut count := 0
+	mut acc := Acc{}
+	mut cur := ?int(none)
+	mut list := [1, 2, 3]
+	mut fixed := [3, 1, 2]!
+	mut tags := map[string]int{}
+	mut p := &Acc{}
+	f := fn [mut count, mut acc, mut cur, mut list, mut fixed, mut tags, mut p] (v int) {
+		count = v
+		count += v
+		count++
+		acc.n = v
+		acc.items << v
+		acc.bump()
+		bump_acc(mut acc)
+		if c := cur {
+			cur = c + v
+		}
+		list << v
+		list.delete(0)
+		fixed[0] = v
+		fixed.sort()
+		tags['k'] = v
+		p = &Acc{
+			n: p.n + v
+		}
+	}
+	f(1)
+	println('${count} ${acc.n} ${cur} ${list} ${fixed} ${tags} ${p.n}')
+}
+
+// none of these is reported: each write reaches the outer object
+fn kept_writes(mut param Acc) {
+	mut list := [1, 2, 3]
+	mut p := &Acc{}
+	mut q := &list
+	mut list_box := Acc{}
+	g := fn [mut param, mut list, mut p, mut q, mut list_box] (v int) {
+		param.n = v
+		param.items << v
+		param.bump()
+		param = Acc{}
+		list[0] = v
+		list.sort()
+		list.sort_with_compare(fn (a &int, b &int) int {
+			return *a - *b
+		})
+		list.reverse_in_place()
+		p.n = v
+		p.items << v
+		p.bump()
+		q << v
+		lock list_box.seen {
+			list_box.seen << v
+		}
+	}
+	g(2)
+	mut counter := 0
+	h := fn [counter] () int {
+		return counter + 1
+	}
+	println('${list} ${p.n} ${h()}')
+}
+
+fn main() {
+	lost_writes()
+	mut a := Acc{}
+	kept_writes(mut a)
+}
