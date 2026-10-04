@@ -205,6 +205,7 @@ mut:
 	ternary_level_names                  map[string][]string
 	arraymap_set_pos                     int              // map or array set value position
 	stmt_path_pos                        []int            // positions of each statement start, for inserting C statements before the current statement
+	out_restructures                     int              // bumped whenever text is cut from before the end of `out` and written back behind an insertion; a position saved earlier is then stale (cx-private #1642)
 	skip_stmt_pos                        bool             // for handling if expressions + autofree (since both prepend C statements)
 	left_is_opt                          bool             // left hand side on assignment is an option
 	right_is_opt                         bool             // right hand side on assignment is an option
@@ -1725,10 +1726,26 @@ fn (mut g Gen) generic_fn_name(types []ast.Type, before string) string {
 
 fn (mut g Gen) expr_string(expr ast.Expr) string {
 	pos := g.out.len
+	restructures := g.out_restructures
 	// pos2 := 	g.out_parallel[g.out_idx].len
 	g.expr(expr)
 	// g.out_parallel[g.out_idx].cut_to(pos2)
-	return g.out.cut_to(pos).trim_space()
+	return g.cut_expr_string(pos, restructures)
+}
+
+// cut_expr_string takes back the text an expression wrote since `pos`. It is
+// trimmed only while `pos` still marks where the expression began: when the
+// expression hoisted a statement (go_before_last_stmt and its kin cut the
+// statement so far and write it back behind the hoisted temporary), `pos` now
+// falls inside the moved text, and trimming the cut there deleted a byte of it
+// — a string literal's space, `' '` emitted as `_S("")` (cx-private #1642).
+// Untrimmed, the cut is written back exactly where it was taken.
+fn (mut g Gen) cut_expr_string(pos int, restructures int) string {
+	s := g.out.cut_to(pos)
+	if g.out_restructures != restructures {
+		return s
+	}
+	return s.trim_space()
 }
 
 fn (mut g Gen) expr_string_opt(typ ast.Type, expr ast.Expr) string {
@@ -1741,10 +1758,11 @@ fn (mut g Gen) expr_string_opt(typ ast.Type, expr ast.Expr) string {
 
 fn (mut g Gen) expr_string_with_cast(expr ast.Expr, typ ast.Type, exp ast.Type) string {
 	pos := g.out.len
+	restructures := g.out_restructures
 	// pos2 := 	g.out_parallel[g.out_idx].len
 	g.expr_with_cast(expr, typ, exp)
 	// g.out_parallel[g.out_idx].cut_to(pos2)
-	return g.out.cut_to(pos).trim_space()
+	return g.cut_expr_string(pos, restructures)
 }
 
 // Surround a potentially multi-statement expression safely with `prepend` and `append`.

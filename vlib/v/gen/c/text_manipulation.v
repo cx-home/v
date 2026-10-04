@@ -132,21 +132,25 @@ fn (mut g Gen) set_current_pos_as_last_stmt_pos() {
 
 @[inline]
 fn (mut g Gen) go_before_last_stmt() string {
+	g.out_restructures++
 	return g.out.cut_to(g.nth_stmt_pos(0))
 }
 
 @[inline]
 fn (mut g Gen) go_before_ternary() string {
+	g.out_restructures++
 	return g.out.cut_to(g.nth_stmt_pos(g.inside_ternary))
 }
 
 fn (mut g Gen) insert_before_stmt(s string) {
+	g.out_restructures++
 	cur_line := g.out.cut_to(g.nth_stmt_pos(g.inside_ternary))
 	g.writeln(s)
 	g.write(cur_line)
 }
 
 fn (mut g Gen) insert_at(pos int, s string) {
+	g.out_restructures++
 	cur_line := g.out.cut_to(pos)
 	// g.out_parallel[g.out_idx].cut_to(pos)
 	g.writeln(s)
