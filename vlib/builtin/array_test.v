@@ -78,6 +78,22 @@ fn test_slice_delete() {
 	assert c == [3.75, 4.25, -1.5]
 }
 
+// vacated_slot_value is what an in-place delete leaves in a removed slot.
+// Upstream (boehm, none) zeroes it. The cx fork's vgc keeps the slot's bytes:
+// the conservative-retention contract for arrays (cx #657, fork ad8ffd1b2d),
+// because zeroing a vacated slot swept live referents under multi-mutator
+// churn (the N=24 UAF). So under -gc e the removed element stays readable in
+// [len, cap) until the buffer is reused; these asserts pin that contract, and
+// a rebase that brings upstream's zeroing back under vgc reds them (cx-private
+// #1640).
+fn vacated_slot_value(removed int) int {
+	$if vgc ? {
+		return removed
+	} $else {
+		return 0
+	}
+}
+
 fn test_delete_last_uses_in_place_fast_path_for_unique_arrays() {
 	mut a := [1, 2, 3, 4]
 	old_data := a.data
@@ -86,7 +102,7 @@ fn test_delete_last_uses_in_place_fast_path_for_unique_arrays() {
 	assert a.data == old_data
 	assert a.cap == 4
 	unsafe {
-		assert (&int(a.data))[a.len] == 0
+		assert (&int(a.data))[a.len] == vacated_slot_value(4)
 	}
 }
 
@@ -108,7 +124,7 @@ fn test_delete_last_clears_removed_slot_for_unique_arrays() {
 	assert a.data == old_data
 	assert a.cap == 4
 	unsafe {
-		assert (&int(a.data))[a.len] == 0
+		assert (&int(a.data))[a.len] == vacated_slot_value(4)
 	}
 }
 
@@ -143,8 +159,9 @@ fn test_delete_many_unique_arrays_use_in_place_fast_path() {
 	assert a.data == old_data
 	assert a.cap == 8
 	unsafe {
-		assert (&int(a.data))[a.len] == 0
-		assert (&int(a.data))[a.len + 1] == 0
+		// the in-place shift moved 4 and 5 down; [len, len+2) held 4 and 5
+		assert (&int(a.data))[a.len] == vacated_slot_value(4)
+		assert (&int(a.data))[a.len + 1] == vacated_slot_value(5)
 	}
 }
 
