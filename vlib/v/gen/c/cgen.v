@@ -15144,6 +15144,21 @@ pub fn (mut g Gen) contains_ptr(el_typ ast.Type) bool {
 	if typ.is_ptr() {
 		return true
 	}
+	// An alias can BE a pointer (`type BigRef = &Big`, `type P = &u8`): final_sym
+	// below resolves to the pointee's symbol and drops the alias's pointer level,
+	// which classified `[]BigRef` as pointer-free and allocated it no-scan — a
+	// use-after-free under -gc e (cx-private #1629, the refutation read). Walk the
+	// alias chain and check each parent's pointer level and wrappers first.
+	mut alias_sym := g.table.sym(typ)
+	for alias_sym.kind == .alias {
+		parent := (alias_sym.info as ast.Alias).parent_type
+		if parent.is_any_kind_of_pointer() || parent.is_ptr() || parent.has_flag(.option)
+			|| parent.has_flag(.result) {
+			g.contains_ptr_cache[el_typ] = true
+			return true
+		}
+		alias_sym = g.table.sym(parent)
+	}
 	sym := g.table.final_sym(typ)
 	if sym.language != .v {
 		g.contains_ptr_cache[typ] = true

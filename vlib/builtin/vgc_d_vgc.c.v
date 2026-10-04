@@ -3088,6 +3088,14 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 			}
 			if off + n <= vgc_tiny_size {
 				ptr := unsafe { voidptr(cache.tiny + off) }
+				// The block may have been opened by an UNINIT allocation, so its
+				// bytes are whatever the slot held: a zero-filling caller gets its
+				// n bytes cleared here (cx-private #1629's refutation read:
+				// vcalloc_noscan(3) returned stale bytes, and a cap-1 channel's
+				// status words made its writer spin forever).
+				if zero_fill {
+					unsafe { C.memset(ptr, 0, n) }
+				}
 				unsafe {
 					vgc_heap.caches[cache_idx].tiny_offset = off + n
 					vgc_heap.caches[cache_idx].tiny_allocs++
