@@ -1115,9 +1115,20 @@ pub fn vgc_init() {
 	}
 	gg_env := C.getenv(c'VGC_GROW_GATE_PCT')
 	if gg_env != unsafe { nil } {
-		gg := C.atoll(gg_env)
-		if gg >= 0 && gg <= 100 {
-			vgc_grow_gate_pct = u64(gg)
+		// decimal digits only, 0..100; anything else keeps the default (atoll
+		// read `abc`, `0x1e` and an empty value as 0 — the gate silently off)
+		mut gg := u64(0)
+		mut ok := unsafe { gg_env[0] } != 0
+		for k := 0; ok && unsafe { gg_env[k] } != 0; k++ {
+			ch := unsafe { gg_env[k] }
+			if ch < `0` || ch > `9` || k >= 3 {
+				ok = false
+			} else {
+				gg = gg * 10 + u64(ch - `0`)
+			}
+		}
+		if ok && gg <= 100 {
+			vgc_grow_gate_pct = gg
 		}
 	}
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
@@ -3186,7 +3197,15 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 		// object would be an 8-byte slot and the next packed object would write
 		// into the slot after it.)
 		span_class := int(C.vgc_size_class(u32(vgc_tiny_size))) * 2 + 1 // noscan
-		span := vgc_cache_get_span(cache_idx, span_class)
+		mut span := vgc_cache_get_span(cache_idx, span_class)
+		if span == unsafe { nil } {
+			// No span: the reclaim-and-retry path, as the size-class paths take it
+			// — the grow gate's deferral is a collection here too (batch I-1's
+			// reader: falling through spent the cycle's deferral and the
+			// size-class request below carved; a tiny stream reached 2.01x). Nil
+			// after the retries still falls through to that path's own verdict.
+			span = vgc_collect_and_retry_span(cache_idx, span_class)
+		}
 		if span != unsafe { nil } {
 			ptr := unsafe { vgc_span_alloc_obj(mut span) }
 			if ptr != unsafe { nil } {
