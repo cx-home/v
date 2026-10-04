@@ -2430,6 +2430,7 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 		node.args[i] = call_arg
 		if call_arg.is_mut {
 			to_lock, pos := c.fail_if_immutable(mut call_arg.expr)
+			c.check_mut_capture_write(call_arg.expr, .mutate)
 			call_arg_expr_pos := call_arg.expr.pos()
 			if !call_arg.expr.is_lvalue() {
 				if call_arg.expr is ast.StructInit {
@@ -3393,6 +3394,7 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 					node.args[i] = arg
 					if arg.is_mut {
 						to_lock, pos := c.fail_if_immutable(mut arg.expr)
+						c.check_mut_capture_write(arg.expr, .mutate)
 						if !param.is_mut {
 							tok := arg.share.str()
 							c.error('`${node.name}` parameter ${i + 1} is not `${tok}`, `${tok}` is not needed`',
@@ -3613,7 +3615,14 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 	requires_mut_receiver := method.params[0].is_mut
 		&& (!is_used_outside_receiver_module || c.fn_has_visible_mutation_for_param(method, 0))
 	if requires_mut_receiver {
-		to_lock, pos := c.check_for_mut_receiver(mut node.left)
+		// these array methods write only the buffer a closure copy shares (VCAP-1)
+		receiver_write := if c.table.final_sym(left_type).kind == .array
+			&& method_name in ['reverse_in_place', 'reset'] {
+			MutCaptureWrite.buffer
+		} else {
+			MutCaptureWrite.mutate
+		}
+		to_lock, pos := c.check_for_mut_receiver_write(mut node.left, receiver_write)
 		// node.is_mut = true
 		if to_lock != '' && rec_share != .shared_t {
 			c.error('${to_lock} is `shared` and must be `lock`ed to be passed as `mut`', pos)
@@ -3780,6 +3789,7 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 		node.args[i] = arg
 		if arg.is_mut {
 			to_lock, pos := c.fail_if_immutable(mut arg.expr)
+			c.check_mut_capture_write(arg.expr, .mutate)
 			if !param_is_mut {
 				tok := arg.share.str()
 				c.error('`${node.name}` parameter `${param.name}` is not `${tok}`, `${tok}` is not needed`',
@@ -4966,7 +4976,7 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 				}
 			}
 			if node.kind == .sort_with_compare {
-				c.check_for_mut_receiver(mut node.left)
+				c.check_for_mut_receiver_write(mut node.left, .buffer)
 				node.return_type = ast.void_type
 				node.receiver_type = node.left_type.ref()
 			} else {
@@ -4980,7 +4990,7 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 				c.error('the `sort()` method can be called only on mutable receivers, but `${ast.Expr(node.left)}` is a call expression',
 					node.pos)
 			}
-			c.check_for_mut_receiver(mut node.left)
+			c.check_for_mut_receiver_write(mut node.left, .buffer)
 		}
 		// position of `a` and `b` doesn't matter, they're the same
 		scope_register_a_b(mut node.scope, node.pos, elem_typ)
@@ -5507,7 +5517,14 @@ fn (mut c Checker) fixed_array_builtin_method_call(mut node ast.CallExpr, left_t
 }
 
 fn (mut c Checker) check_for_mut_receiver(mut expr ast.Expr) (string, token.Pos) {
+	return c.check_for_mut_receiver_write(mut expr, .mutate)
+}
+
+// check_for_mut_receiver_write is check_for_mut_receiver for a method whose
+// write to its receiver is `kind` (a `[mut x]` closure capture, VCAP-1).
+fn (mut c Checker) check_for_mut_receiver_write(mut expr ast.Expr, kind MutCaptureWrite) (string, token.Pos) {
 	to_lock, pos := c.fail_if_immutable(mut expr)
+	c.check_mut_capture_write(expr, kind)
 	if !expr.is_lvalue() {
 		c.error('cannot pass expression as `mut`', expr.pos())
 	}

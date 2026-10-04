@@ -49,6 +49,7 @@ fn (mut c Checker) postfix_expr(mut node ast.PostfixExpr) ast.Type {
 	} else {
 		if node.op != .question {
 			node.auto_locked, _ = c.fail_if_immutable(mut node.expr)
+			c.check_mut_capture_write(node.expr, .rebind)
 		} else {
 			node.typ = unwrapped_question_type
 			return node.typ

@@ -405,10 +405,11 @@ fn windows_disabled_fasthttp_veb_tests(vroot string) []string {
 		if !os.is_dir(dir) {
 			continue
 		}
-		os.walk(dir, fn [mut files] (path string) {
+		mut found := &files
+		os.walk(dir, fn [mut found] (path string) {
 			if path.ends_with('_test.v') || path.ends_with('_test.c.v')
 				|| path.ends_with('_test.js.v') {
-				files << path
+				found << path
 			}
 		})
 	}
