@@ -976,9 +976,11 @@ fn vgc_mark_roots() {
 	// hold pointers (the tiny-allocator cursor / the in-flight mcache spans' object
 	// memory) that conservatively root objects the stack+register scan does not fully
 	// cover during thread create/exit churn. Excluding it removes that protection and
-	// G-CHURN fails ~1-in-3 with reclaimed anchor nodes (verified by isolation). The
-	// scan is cheap now that span reuse is fixed (vgc_heap stays small and bounded),
-	// so correctness wins: scan it all.
+	// G-CHURN fails ~1-in-3 with reclaimed anchor nodes (verified by isolation). So
+	// the caches stay scanned; the rest of vgc_heap and the collector's other
+	// region-address words do NOT (vgc_scan_data_range, cx-private #1783): an
+	// arena's base or a slab's end is also the address of the object carved there,
+	// and scanning those words rooted it for the life of the process.
 	$if vgc_verify ? {
 		// DEBUG: dump the data-segment ranges once so we can check whether a given
 		// __global's address is actually covered by the conservative root scan.
@@ -1025,36 +1027,43 @@ fn vgc_mark_roots() {
 }
 
 // vgc_scan_data_range scans a data-segment range as vgc_scan_range does, minus
-// the collector's arena bookkeeping: the arena table (vgc_heap.arenas — each
-// entry's base is an arena's first address) and vgc_arena_lo / vgc_arena_hi.
-// Those words are metadata, never references, but an arena's base is also the
-// address of the first object carved there, so scanning them rooted that object
-// and everything it reaches for the life of the process (cx-private #1783: the
-// VGCG-1 grow gate moved one carve, the streaming bench's finished 24 MB result
-// landed at the second arena's base and was marked every later cycle;
-// bench/parallel-alloc/vgc_arena_base_root_test.v). The rest of vgc_heap stays
-// scanned: the per-thread caches hold real roots (see vgc_mark_roots).
+// the collector's own bookkeeping words: every field of vgc_heap except the
+// per-thread caches, plus the vgc_arena_lo and vgc_workbuf_cur/_end globals.
+// Those words hold region addresses and counters, never object references: the
+// arena table holds each arena's base, span_meta_cur/_end and the workbuf
+// cursor/end hold the ends of mmapped slabs, and the central and free-span lists
+// hold span DESCRIPTORS (bump-slab memory outside the arenas). But a region's
+// base, or the end of a slab mmapped directly below an arena, is also the
+// address of the first object carved in that arena, so scanning them rooted that
+// object and everything it reaches for the life of the process. The first such
+// root found was the arena table: once the VGCG-1 grow gate moved one carve,
+// the streaming bench's finished 24 MB result landed at the second arena's base
+// and was marked in every later cycle (cx-private #1783;
+// bench/parallel-alloc/vgc_arena_base_root_test.v). The second reader then found
+// span_meta_end (vgc_metadata_roots_test.v). vgc_arena_hi is not excluded
+// because vgc_shade already refuses addresses at or above it. The caches stay
+// scanned: their tiny cursor and in-flight spans are load-bearing roots during
+// thread create/exit churn (see vgc_mark_roots).
 fn vgc_scan_data_range(lo usize, hi usize) {
-	tab_lo := usize(voidptr(&vgc_heap.arenas[0]))
-	tab_hi := tab_lo + usize(sizeof(VGC_Arena)) * usize(vgc_max_arenas)
-	alo := usize(voidptr(&vgc_arena_lo))
-	ahi := usize(voidptr(&vgc_arena_hi))
+	heap_lo := usize(voidptr(&vgc_heap))
+	caches_lo := usize(voidptr(&vgc_heap.caches[0]))
+	caches_hi := caches_lo + usize(sizeof(vgc_heap.caches))
+	heap_hi := heap_lo + usize(sizeof(VGC_Heap))
+	w := usize(sizeof(usize))
+	ex_los := [heap_lo, caches_hi, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
+		usize(voidptr(&vgc_workbuf_end))]!
+	ex_his := [caches_lo, heap_hi, usize(voidptr(&vgc_arena_lo)) + w,
+		usize(voidptr(&vgc_workbuf_cur)) + w, usize(voidptr(&vgc_workbuf_end)) + w]!
 	mut cur := lo
 	for cur < hi {
-		// the nearest excluded range starting at or after cur (or covering it)
+		// the excluded range that starts first among those ending past cur
 		mut ex_lo := hi
 		mut ex_hi := hi
-		if tab_hi > cur && tab_lo < ex_lo {
-			ex_lo = tab_lo
-			ex_hi = tab_hi
-		}
-		if alo + sizeof(usize) > cur && alo < ex_lo {
-			ex_lo = alo
-			ex_hi = alo + sizeof(usize)
-		}
-		if ahi + sizeof(usize) > cur && ahi < ex_lo {
-			ex_lo = ahi
-			ex_hi = ahi + sizeof(usize)
+		for k in 0 .. ex_los.len {
+			if ex_his[k] > cur && ex_los[k] < ex_lo {
+				ex_lo = ex_los[k]
+				ex_hi = ex_his[k]
+			}
 		}
 		if ex_lo > cur {
 			vgc_scan_range(cur, if ex_lo < hi { ex_lo } else { hi })

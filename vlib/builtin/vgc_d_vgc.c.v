@@ -292,8 +292,9 @@ mut:
 	// arenas are never released), NOT embedded (cx #282): an embedded
 	// [8192]&VGC_Span made every VGC_Arena 64 KB, so the [vgc_max_arenas] table
 	// at N=1024 would have been ~64 MB of BSS inside vgc_heap — which mark_roots
-	// conservatively scans EVERY cycle (the mcache tiny cursors in vgc_heap are
-	// load-bearing roots, so the whole struct must stay scanned) — i.e. tens of
+	// conservatively scanned EVERY cycle when it was written (the mcache tiny cursors
+	// in vgc_heap.caches are load-bearing roots; since cx-private #1783 only the
+	// caches are scanned, vgc_scan_data_range) — i.e. tens of
 	// ms added to every STW pause. Moving the maps out of the scanned segment
 	// loses no rooting: the slots hold span DESCRIPTOR pointers only (bump-slab
 	// memory OUTSIDE the GC arenas — vgc_shade ignores non-heap addresses).
