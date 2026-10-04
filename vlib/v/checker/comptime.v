@@ -367,6 +367,7 @@ fn (mut c Checker) check_comptime_method_call_args(mut node ast.ComptimeCall) {
 		param_share := param.typ.share()
 		if arg.is_mut {
 			to_lock, pos := c.fail_if_immutable(mut arg.expr)
+			c.check_mut_capture_write(arg.expr, .mutate)
 			if !param.is_mut {
 				tok := arg.share.str()
 				c.error('`${method.name}` parameter `${param.name}` is not `${tok}`, `${tok}` is not needed`',

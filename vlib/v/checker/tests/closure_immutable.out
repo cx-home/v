@@ -12,6 +12,13 @@ vlib/v/checker/tests/closure_immutable.vv:7:16: error: original `a` is immutable
       |                   ^
     8 |         a++
     9 |         println(a)
+vlib/v/checker/tests/closure_immutable.vv:8:3: error: `a` is captured by value: `[mut a]` gives the closure its own copy, so this write never reaches the `a` outside it; capture a reference instead (`mut r := &a` before the closure, then `[mut r]`)
+    6 |     }
+    7 |     f2 := fn [mut a] () {
+    8 |         a++
+      |         ^
+    9 |         println(a)
+   10 |     }
 vlib/v/checker/tests/closure_immutable.vv:13:3: error: the closure copy of `b` is immutable, declare it with `mut` to make it mutable
    11 |     mut b := 2
    12 |     f3 := fn [b] () {

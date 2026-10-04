@@ -5,3 +5,10 @@ vlib/v/checker/tests/assign_generic_closure_fn_err.vv:12:10: error: cannot assig
       |             ~~~~~~~~~~~~~~~~~~~~
    13 |         use_cmd(mut cmd)
    14 |     }
+vlib/v/checker/tests/assign_generic_closure_fn_err.vv:13:15: error: `cmd` is captured by value: `[mut cmd]` gives the closure its own copy, so this write never reaches the `cmd` outside it; capture a reference instead (`mut r := &cmd` before the closure, then `[mut r]`)
+   11 |     mut cmd := Cmd[string]{}
+   12 |     anon := fn [mut cmd] [T]() {
+   13 |         use_cmd(mut cmd)
+      |                     ~~~
+   14 |     }
+   15 |     anon()

@@ -1155,6 +1155,7 @@ fn (mut c Checker) check_append(mut node ast.InfixExpr, left_type ast.Type, righ
 	// `array << elm`
 	c.check_expr_option_or_result_call(node.right, right_type)
 	node.auto_locked, _ = c.fail_if_immutable(mut node.left)
+	c.check_mut_capture_write(node.left, .mutate)
 	left_value_type := c.table.value_type(c.unwrap_generic(left_type))
 	left_value_sym := c.table.sym(c.unwrap_generic(left_value_type))
 	if !left_value_type.has_flag(.option) && right_type.has_flag(.option) {
