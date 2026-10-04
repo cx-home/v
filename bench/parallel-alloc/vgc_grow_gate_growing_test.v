@@ -12,9 +12,10 @@
 // Shape: a live set that grows to 256 MB in 2 KB records, each record built
 // beside one 2 KB transient, the way a formatter keeps its output and drops
 // its scratch. The child runs the build with the gate at its default and with
-// it off (VGC_GROW_GATE_PCT=0) and counts the collections in VGC_GCTRACE. The
-// gate at its default must take no more collections than the gate off, and
-// its total pause time no more than 1.25x the gate off's plus 10 ms.
+// it off (VGC_GROW_GATE_PCT=0), three times each, and counts the collections
+// in VGC_GCTRACE. The gate at its default must take no more collections than
+// the gate off, and its total pause time no more than 1.25x the gate off's
+// plus 10 ms (each the least of its three runs).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_grow_gate_growing_test.v
 module main
@@ -60,6 +61,23 @@ fn run_child(pct string) Trace {
 	return t
 }
 
+// least_of keeps the fewest collections and the least pause time over n
+// runs: a loaded box can add a collection or stretch a pause (a concurrent
+// mark held up by other jobs), never take one away, so the minimum is the
+// workload's own count (measured: 9 and 9 on an idle core, 9 and 10 with 28
+// test jobs beside it).
+fn least_of(n int, pct string) Trace {
+	mut best := run_child(pct)
+	for _ in 1 .. n {
+		t := run_child(pct)
+		best = Trace{
+			cycles:   if t.cycles < best.cycles { t.cycles } else { best.cycles }
+			pause_us: if t.pause_us < best.pause_us { t.pause_us } else { best.pause_us }
+		}
+	}
+	return best
+}
+
 fn line_count_ok(out string) bool {
 	return out.split_into_lines().any(it.starts_with('GROW-DONE='))
 }
@@ -69,8 +87,8 @@ fn test_a_growing_heap_takes_no_extra_collections() {
 		println('GROW-DONE=${grow()}')
 		return
 	}
-	off := run_child('0')
-	on := run_child('')
+	off := least_of(3, '0')
+	on := least_of(3, '')
 	println('vgc_grow_gate_growing: gate off ${off.cycles} collections ${off.pause_us} us; default ${on.cycles} collections ${on.pause_us} us')
 	assert off.cycles > 0
 	assert on.cycles <= off.cycles, 'the gate added collections on a growing heap: ${on.cycles} against ${off.cycles} with the gate off'
