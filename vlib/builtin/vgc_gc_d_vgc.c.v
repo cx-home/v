@@ -549,6 +549,7 @@ fn vgc_gc_start() {
 			vgc_heap.pool_trimmed_bytes / 1024)
 	}
 	vgc_heap.gc_cycle++
+	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 
 	// Mark + sweep done — release every allocator lock held across the cycle before
 	// resuming, so resumed mutators don't block on them. (Reverse acquisition order.)
@@ -764,6 +765,7 @@ fn vgc_gc_start_concurrent() {
 
 	vgc_update_trigger()
 	vgc_heap.gc_cycle++
+	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 }
 
@@ -2131,7 +2133,20 @@ fn vgc_heap_usage() (usize, usize, usize, usize, usize) {
 		}
 	}
 	free_bytes := if in_use_bytes > usize(live) { in_use_bytes - usize(live) } else { usize(0) }
-	return in_use_bytes, free_bytes, usize(live), usize(total_alloc), usize(vgc_heap.gc_cycle)
+	// cx-private#1796: GCHeapUsage's Boehm meanings — unmapped_bytes is what the
+	// pool trim returned to the OS (the cold, decommitted spans), never the
+	// lifetime allocation count; bytes_since_gc is what the program allocated
+	// since the last completed collection, never the collection count.
+	// The per-thread un-flushed deltas (vgc_acct_alloc flushes every ~1 MB)
+	// are counted too, so a reader sees what was allocated, not what was
+	// flushed — a racy read of each slot, exact once the threads are quiet.
+	mut pending := u64(0)
+	for ci in 0 .. vgc_heap.ncaches {
+		pending += unsafe { vgc_heap.caches[ci].alloc_delta }
+	}
+	all := total_alloc + pending
+	since := if all > vgc_heap.total_alloc_at_gc { all - vgc_heap.total_alloc_at_gc } else { u64(0) }
+	return in_use_bytes, free_bytes, usize(live), usize(vgc_heap.pool_trimmed_bytes), usize(since)
 }
 
 fn vgc_memory_use() usize {

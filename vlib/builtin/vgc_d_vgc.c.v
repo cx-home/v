@@ -395,6 +395,9 @@ mut:
 	heap_marked u64 // bytes marked in last cycle
 	next_gc     u64 // trigger next GC at this heap size
 	total_alloc u64 // atomic: total bytes allocated
+	// total_alloc as the last completed collection left it — gc_heap_usage's
+	// bytes_since_gc is total_alloc minus this (cx-private#1796).
+	total_alloc_at_gc u64
 	gc_cycle    u64 // number of completed GC cycles
 	// GC work queues
 	work_full  &VGC_WorkBuf = unsafe { nil }

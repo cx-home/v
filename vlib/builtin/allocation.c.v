@@ -673,6 +673,18 @@ pub fn gc_heap_usage() GCHeapUsage {
 	}
 }
 
+// gc_cycles answers the number of collections the collector has completed —
+// what a meter counting collections reads (cx-private#1796: it read
+// gc_heap_usage().bytes_since_gc, which under vgc held the cycle count). 0 with
+// no collector that counts them.
+pub fn gc_cycles() u64 {
+	$if vgc ? {
+		return vgc_heap.gc_cycle
+	} $else {
+		return 0
+	}
+}
+
 // gc_total_allocated returns the MONOTONE count of bytes the program has
 // allocated since start — it never decreases at a collection (unlike
 // gc_memory_use, which reports live/used bytes). Cost: one atomic load under
