@@ -13,6 +13,15 @@ module builtin
 #flag -DVGC_SUSPEND_SIGNAL_D=$d('vgc_suspend_signal', 0)
 #include "vgc_platform.h"
 
+// vgc starts its own threads and reads each thread's stack bounds
+// (pthread_create, pthread_attr_getstack). On the BSDs those live in libthr,
+// not libc, so the link names it — without it every vgc program, the
+// bootstrap's own probes included, fails to link on FreeBSD (cx-private#1008's
+// CI run found it). linux glibc >= 2.34 and macOS carry them in libc.
+$if freebsd || openbsd || netbsd || dragonfly {
+	#flag -lpthread
+}
+
 // C interop declarations for platform header
 fn C.vgc_get_cache_idx() int
 fn C.vgc_set_cache_idx(idx int)
