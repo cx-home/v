@@ -136,16 +136,13 @@ fn test_usecache_links_exactly_one_definition_of_every_symbol() {
 	assert cold_run.exit_code == 0, cold_run.output
 	assert cold_run.output.trim_space() == usecache_probe_expected, cold_run.output
 
-	// the link line itself must not ask the linker to tolerate duplicates
-	$if !freebsd {
-		// FreeBSD still passes `-Wl,--allow-multiple-definition` for every
-		// build, not only cached ones; removing that needs its own measurement
-		// on that platform, so do not assert about it here.
-		flags := run_v_in(dir, 'probe_flags', '-dump-c-flags -')
-		assert flags.exit_code == 0, flags.output
-		assert !flags.output.contains('muldefs'), 'a -usecache link must not accept duplicate definitions:\n${flags.output}'
-		assert !flags.output.contains('--allow-multiple-definition'), 'a -usecache link must not accept duplicate definitions:\n${flags.output}'
-	}
+	// the link line itself must not ask the linker to tolerate duplicates —
+	// on FreeBSD too (cx-private#1008: measured by ci/freebsd_ci.vsh's
+	// one_definition task)
+	flags := run_v_in(dir, 'probe_flags', '-dump-c-flags -')
+	assert flags.exit_code == 0, flags.output
+	assert !flags.output.contains('muldefs'), 'a -usecache link must not accept duplicate definitions:\n${flags.output}'
+	assert !flags.output.contains('--allow-multiple-definition'), 'a -usecache link must not accept duplicate definitions:\n${flags.output}'
 
 	// warm cache: the module objects are served from the cache and linked
 	// against a freshly generated program TU — the arrangement that turns a

@@ -108,6 +108,21 @@ fn check_compress() {
 	}
 }
 
+// check_one_definition runs the -usecache one-definition test, which
+// test-self's essential list does not carry: a cold and a warm cached build
+// link with no duplicate symbol and no flag that tolerates one
+// (cx-private#1008).
+fn check_one_definition() {
+	if common.is_github_job {
+		println('::group::One definition under -usecache')
+		exec('v test vlib/v/builder/usecache_one_definition_test.v')
+		println('::endgroup::')
+	} else {
+		println('### One definition under -usecache')
+		exec('v test vlib/v/builder/usecache_one_definition_test.v')
+	}
+}
+
 fn run_essential_tests() {
 	if common.is_github_job {
 		println('::group::Run essential tests')
@@ -132,6 +147,7 @@ fn build_examples() {
 
 const all_tasks = {
 	'v_doctor':              Task{v_doctor, 'Run v doctor'}
+	'check_one_definition':  Task{check_one_definition, 'Check one definition under -usecache'}
 	'build_v_with_prealloc': Task{build_v_with_prealloc, 'Build V with prealloc'}
 	'verify_v_test_works':   Task{verify_v_test_works, 'Verify that v test works'}
 	'build_fast_script':     Task{build_fast_script, 'Check that building fast.v works'}

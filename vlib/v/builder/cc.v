@@ -976,15 +976,14 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 			}
 		}
 	}
-	if v.pref.os == .freebsd {
-		// Needed for -usecache on FreeBSD 13, otherwise we get `ld: error: duplicate symbol: _const_math__bits__de_bruijn32` errors there
-		if ccoptions.cc != .tcc {
-			ccoptions.linker_flags << '-Wl,--allow-multiple-definition'
-		} else {
-			// tcc needs this, otherwise it fails to compile the runetype.h system header with:
-			// /usr/include/runetype.h:94: error: ';' expected (got "const")
-			ccoptions.args << '-D__RUNETYPE_INTERNAL'
-		}
+	if v.pref.os == .freebsd && ccoptions.cc == .tcc {
+		// tcc needs this, otherwise it fails to compile the runetype.h system header with:
+		// /usr/include/runetype.h:94: error: ';' expected (got "const")
+		// (cx-private#1008: FreeBSD no longer links every build with
+		// -Wl,--allow-multiple-definition — the duplicate it masked under
+		// -usecache, a module const defined in every object, is defined once
+		// at source since cf25c48308, as #971 found for linux's muldefs.)
+		ccoptions.args << '-D__RUNETYPE_INTERNAL'
 	}
 
 	// Fix 'braces around scalar initializer' errors
