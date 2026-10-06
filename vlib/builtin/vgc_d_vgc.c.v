@@ -1923,10 +1923,12 @@ fn vgc_pool_trim_decommit(mut span VGC_Span) {
 // 3. Mark work buffers one hardware page each (vgc_workbuf_carve): 1175
 //    buffers, 18.4 MB resident for 2.4 MB of queue. Now carved 64 to a chunk.
 //
-// After: 2.40× (JSON) and 2.37× (XML) on the same reads; the trace's
-// `trimmed=` counts what (2) returned. (1) is the STW collector's alone: under
-// -d vgc_concurrent, which does not run vgc_protect_cached_spans, the
-// acquisition stamp stays that collector's only in-flight protection.
+// After: 2.40× (JSON) and 2.37× (XML) on the same reads at fefd75a56; 2.49×
+// and 2.49992× at 80051ebad, once the refutation read's fixes took back the
+// per-thread large slot; 2.32× and 2.26× at 6a44b7173, with the grow gate
+// (VGCG-1). The trace's `trimmed=` counts what (2) returned. (1) is the STW
+// collector's alone: -d vgc_concurrent keeps the acquisition stamp beside the
+// cache-resident stamp its mark-termination window now takes as well.
 
 // The compensation walk's cursor: the arena and page the next carve of cycle
 // vgc_compensate_cursor_cycle resumes from. Pooled runs are formed by the
@@ -2794,8 +2796,9 @@ fn vgc_central_get_span(span_class int) &VGC_Span {
 // stamp. A large-object span (vgc_alloc_large) has no slot and keeps its stamp:
 // the one sweep after its acquisition skips it, as before RTMEM-1. `gc_cycle - 1` can never equal the cycle the next sweep runs at
 // (gc_cycle only grows), so the span is swept normally from then on. Not used
-// under -d vgc_concurrent: that collector does not run vgc_protect_cached_spans
-// and keeps the acquisition stamp as its only in-flight protection.
+// under -d vgc_concurrent: that collector keeps the acquisition stamp beside the
+// stamp vgc_protect_cached_spans gives cache-resident spans in its
+// mark-termination window.
 @[inline]
 fn vgc_span_release_acquisition(span &VGC_Span) {
 	unsafe {
