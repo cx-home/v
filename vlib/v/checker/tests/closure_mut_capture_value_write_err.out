@@ -96,3 +96,17 @@ vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:44:3: error: `p` is 
       |         ^
    45 |             n: p.n + v
    46 |         }
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:99:16: error: `fixed` is captured by value: `[mut fixed]` gives the closure its own copy, so this write never reaches the `fixed` outside it; capture a reference instead (`mut r := &fixed` before the closure, then `[mut r]`)
+   97 |     mut pg := &Grid{}
+   98 |     f := fn [mut fixed, mut g, mut pg] () {
+   99 |         for mut e in fixed {
+      |                      ~~~~~
+  100 |             e = 0
+  101 |         }
+vlib/v/checker/tests/closure_mut_capture_value_write_err.vv:102:18: error: `g` is captured by value: `[mut g]` gives the closure its own copy, so this write never reaches the `g` outside it; capture a reference instead (`mut r := &g` before the closure, then `[mut r]`)
+  100 |             e = 0
+  101 |         }
+  102 |         for mut e in g.cells {
+      |                        ~~~~~
+  103 |             e = 5
+  104 |         }

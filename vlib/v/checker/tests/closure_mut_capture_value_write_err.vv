@@ -82,8 +82,40 @@ fn kept_writes(mut param Acc) {
 	println('${list} ${p.n} ${h()}')
 }
 
+// `for mut` over a fixed array writes the value in place (cx-private #1852):
+// a fixed array captured, or one inside a captured struct, is reported; a
+// dynamic array's elements and anything reached through a pointer are not.
+struct Grid {
+mut:
+	cells [3]int
+	rows  []int
+}
+
+fn for_mut_writes() {
+	mut fixed := [3, 1, 2]!
+	mut g := Grid{}
+	mut pg := &Grid{}
+	f := fn [mut fixed, mut g, mut pg] () {
+		for mut e in fixed {
+			e = 0
+		}
+		for mut e in g.cells {
+			e = 5
+		}
+		for mut e in g.rows {
+			e = 1
+		}
+		for mut e in pg.cells {
+			e = 2
+		}
+	}
+	f()
+	println('${fixed} ${g.cells} ${pg.cells}')
+}
+
 fn main() {
 	lost_writes()
+	for_mut_writes()
 	mut a := Acc{}
 	kept_writes(mut a)
 }
