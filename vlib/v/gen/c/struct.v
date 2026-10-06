@@ -581,7 +581,7 @@ fn (mut g Gen) can_use_direct_heap_struct_init(node ast.StructInit, sym ast.Type
 
 fn (mut g Gen) direct_heap_struct_init(node ast.StructInit, styp string, info ast.Struct, language ast.Language) {
 	stmt_pos_idx := g.stmt_path_pos.len - (1 + g.inside_ternary)
-	stmt_str := g.out.cut_to(g.stmt_path_pos[stmt_pos_idx]).trim_space()
+	stmt_str := g.cut_stmt_to(g.stmt_path_pos[stmt_pos_idx]).trim_space()
 	g.empty_line = true
 	tmp_var := g.new_tmp_var()
 	if info.is_empty_struct() {

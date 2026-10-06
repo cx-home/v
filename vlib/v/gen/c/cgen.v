@@ -205,6 +205,8 @@ mut:
 	ternary_level_names                  map[string][]string
 	arraymap_set_pos                     int              // map or array set value position
 	stmt_path_pos                        []int            // positions of each statement start, for inserting C statements before the current statement
+	expr_str_starts                      []int            // start offsets of the expr_string() calls in progress, innermost last
+	expr_str_cuts                        []ExprStrCut     // statement cuts made while an expr_string() was in progress
 	skip_stmt_pos                        bool             // for handling if expressions + autofree (since both prepend C statements)
 	left_is_opt                          bool             // left hand side on assignment is an option
 	right_is_opt                         bool             // right hand side on assignment is an option
@@ -1725,10 +1727,11 @@ fn (mut g Gen) generic_fn_name(types []ast.Type, before string) string {
 
 fn (mut g Gen) expr_string(expr ast.Expr) string {
 	pos := g.out.len
+	first_cut := g.begin_expr_string(pos)
 	// pos2 := 	g.out_parallel[g.out_idx].len
 	g.expr(expr)
 	// g.out_parallel[g.out_idx].cut_to(pos2)
-	return g.out.cut_to(pos).trim_space()
+	return g.out.cut_to(g.end_expr_string(pos, first_cut)).trim_space()
 }
 
 fn (mut g Gen) expr_string_opt(typ ast.Type, expr ast.Expr) string {
@@ -1741,10 +1744,11 @@ fn (mut g Gen) expr_string_opt(typ ast.Type, expr ast.Expr) string {
 
 fn (mut g Gen) expr_string_with_cast(expr ast.Expr, typ ast.Type, exp ast.Type) string {
 	pos := g.out.len
+	first_cut := g.begin_expr_string(pos)
 	// pos2 := 	g.out_parallel[g.out_idx].len
 	g.expr_with_cast(expr, typ, exp)
 	// g.out_parallel[g.out_idx].cut_to(pos2)
-	return g.out.cut_to(pos).trim_space()
+	return g.out.cut_to(g.end_expr_string(pos, first_cut)).trim_space()
 }
 
 // Surround a potentially multi-statement expression safely with `prepend` and `append`.
