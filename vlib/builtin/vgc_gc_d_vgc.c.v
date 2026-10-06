@@ -531,23 +531,7 @@ fn vgc_gc_start() {
 	// spans acquired during THIS cycle. Doing the bump here closes the window: every
 	// post-resume acquisition stamps exactly the cycle the next sweep checks against.
 	vgc_update_trigger()
-	if vgc_gctrace != 0 {
-		// VGC_GCTRACE=1 per-cycle pacing trace (GODEBUG=gctrace analog). Emitted
-		// under STW right after the trigger recompute, so every field is a
-		// consistent snapshot: cycle, marked (true live set), the recomputed base
-		// goal (pre thread-multiplier), arena/span pressure, live mutators.
-		// Env-gated (one integer test per cycle when off).
-		mut pause_us := u64(0)
-		if vgc_gc_last_end > vgc_gc_t0 {
-			pause_us = (vgc_gc_last_end - vgc_gc_t0) / 1000
-		}
-		C.vgc_gctrace_line(u64(vgc_heap.gc_cycle),
-			C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
-			C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas),
-			u64(vgc_heap.nspans), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
-			vgc_headroom / 1024, pause_us, vgc_heap.pool_bytes / 1024,
-			vgc_heap.pool_trimmed_bytes / 1024)
-	}
+	vgc_gctrace_emit()
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 
@@ -771,12 +755,40 @@ fn vgc_gc_start_concurrent() {
 	vgc_protect_cached_spans()
 	vgc_do_sweep()
 	vgc_fixup_caches()
-	vgc_cm_stw_exit(self_idx)
-
+	// Advance the cycle and recompute the trigger while the world is STILL
+	// stopped, as the STW collector does (see the note there): a mutator resumed
+	// before the bump stamps a span it acquires with the old cycle, and the next
+	// sweep's in-flight guard (`sweep_gen != gc_cycle`) then recycles that span
+	// under it. The trace line is emitted here too, so VGC_GCTRACE=1 prints one
+	// line per concurrent collection (cx-private #1795: it printed none); its
+	// pause= is the whole cycle, the concurrent middle included.
 	vgc_update_trigger()
+	vgc_gctrace_emit()
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
+	vgc_cm_stw_exit(self_idx)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
+}
+
+// vgc_gctrace_emit writes the VGC_GCTRACE=1 per-cycle pacing line (GODEBUG=gctrace
+// analog) for the cycle about to be counted. Both collectors call it under STW right
+// after the trigger recompute and before gc_cycle advances, so every field is a
+// consistent snapshot: cycle, marked (true live set), the recomputed base goal (pre
+// thread-multiplier), arena/span pressure, live mutators. Env-gated (one integer
+// test per cycle when off).
+@[markused]
+fn vgc_gctrace_emit() {
+	if vgc_gctrace == 0 {
+		return
+	}
+	mut pause_us := u64(0)
+	if vgc_gc_last_end > vgc_gc_t0 {
+		pause_us = (vgc_gc_last_end - vgc_gc_t0) / 1000
+	}
+	C.vgc_gctrace_line(u64(vgc_heap.gc_cycle), C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
+		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
+		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
+		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024)
 }
 
 // Scan the roots of every suspended mutator: refresh its stack range from its
