@@ -759,6 +759,16 @@ fn vgc_gc_start_concurrent() {
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 0)
 	vgc_heap.sweep_idx = 0
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_sweep)
+	// Protect mcache-RESIDENT spans from this sweep, exactly as the STW
+	// collector does (under STW, after mark, before sweep, gc_cycle still this
+	// cycle's). Without it a span a thread still allocates from was swept like
+	// an orphan: a partially-free one was relinked onto central.partial while
+	// its owner kept carving from it, so a second thread popped it once the
+	// owner had filled it — a full span from central, a nil slot, and
+	// `memory allocation failure` from malloc(0x30) under 8 allocating threads
+	// with forced collections — and a slot the owner was mid-claim in was
+	// reclaimable under the claim (the #58 window the stamp closes).
+	vgc_protect_cached_spans()
 	vgc_do_sweep()
 	vgc_fixup_caches()
 	vgc_cm_stw_exit(self_idx)
