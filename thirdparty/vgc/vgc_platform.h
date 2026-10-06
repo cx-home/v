@@ -537,6 +537,19 @@ static void vgc_init_size_tables(void) {
     }
 }
 
+// cx-private cx-core-code#63: the size-class tables are pure data, built
+// before main by a load-time constructor — vgc_init() runs only AFTER _vinit()
+// (it must: _vinit zero-inits vgc_heap), so every allocation the program's
+// module initialisers made saw empty tables, vgc_size_class answered 0, and
+// each small object took the large path: a whole 8 KB page apiece (a cx
+// process carved ~1,000 such pages, ~8 MB, for ~160 KB of start-up objects).
+// vgc_init() still calls vgc_init_size_tables(); building them twice is idempotent.
+#if defined(__GNUC__) || defined(__clang__) || defined(__TINYC__)
+__attribute__((constructor)) static void vgc_size_tables_ctor(void) {
+    vgc_init_size_tables();
+}
+#endif
+
 // Get size class for a given allocation size
 static inline uint8_t vgc_size_class(uint32_t size) {
     if (size == 0) return 0;
