@@ -232,7 +232,7 @@ _libssh2_ecdsa_curve_type_from_name(const char *name,
 
 #endif /* LIBSSH2_ECDSA */
 
-#if LIBSSH2_ED25519
+#if LIBSSH2_ED25519 || LIBSSH2_ED25519_HOSTKEY
 
 int
 _libssh2_curve25519_new(LIBSSH2_SESSION *session, uint8_t **out_public_key,

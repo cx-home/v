@@ -110,6 +110,12 @@
 # define LIBSSH2_ECDSA          0
 #endif
 #define LIBSSH2_ED25519         0
+/* ssh-ed25519 HOST-KEY verification only (cx-private#1746, owner ruling
+   (a): in the current stack, no stack change). mbedTLS carries no Ed25519,
+   so the signature check is V's crypto.ed25519 through the net.ssh2
+   module's exported cx_ssh2_ed25519_verify; ed25519 key exchange
+   (curve25519-sha256), ed25519 user keys and signing stay off. */
+#define LIBSSH2_ED25519_HOSTKEY 1
 
 #include "crypto_config.h"
 
@@ -310,6 +316,14 @@ typedef enum {
 #if LIBSSH2_ECDSA
 
 #define libssh2_ecdsa_ctx mbedtls_ecdsa_context
+
+#if LIBSSH2_ED25519_HOSTKEY && !LIBSSH2_ED25519
+typedef struct {
+    unsigned char pub[32];
+} libssh2_ed25519_ctx;
+void _libssh2_mbedtls_ed25519_free(libssh2_ed25519_ctx *ctx);
+#define _libssh2_ed25519_free(ctx) _libssh2_mbedtls_ed25519_free(ctx)
+#endif
 
 #define _libssh2_ecdsa_create_key(session, privkey, pubkey_octal, \
                                   pubkey_octal_len, curve) \

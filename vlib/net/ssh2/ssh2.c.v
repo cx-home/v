@@ -16,6 +16,7 @@ module ssh2
 import net.mbedtls
 import crypto.rand
 import encoding.base64
+import crypto.ed25519
 
 #flag -I @VEXEROOT/thirdparty/libssh2/include
 #flag -I @VEXEROOT/thirdparty/libssh2/src
@@ -592,4 +593,21 @@ pub fn (mut s Session) make_dir(path string, mode int) ! {
 	if rc != 0 {
 		return s.error_of(rc)
 	}
+}
+
+// cx_ssh2_ed25519_verify — the ssh-ed25519 host-key signature check libssh2's
+// mbedTLS backend calls (thirdparty/libssh2/src/mbedtls.c; cx-private #1746,
+// owner ruling (a)): mbedTLS carries no Ed25519, so the check is crypto.ed25519,
+// the same RFC 8032 verify the rest of the build uses — one stack, no second.
+// 1 when `sig` is a valid signature of msg[..msg_len] under `pub`, else 0.
+@[export: 'cx_ssh2_ed25519_verify']
+fn cx_ssh2_ed25519_verify(pubkey &u8, sig &u8, msg &u8, msg_len usize) int {
+	if isnil(pubkey) || isnil(sig) || (isnil(msg) && msg_len > 0) {
+		return 0
+	}
+	pk := unsafe { pubkey.vbytes(32) }.clone()
+	sg := unsafe { sig.vbytes(64) }.clone()
+	m := if msg_len == 0 { []u8{} } else { unsafe { msg.vbytes(int(msg_len)) }.clone() }
+	ok := ed25519.verify(ed25519.PublicKey(pk), m, sg) or { return 0 }
+	return if ok { 1 } else { 0 }
 }

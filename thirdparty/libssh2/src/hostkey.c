@@ -1120,7 +1120,7 @@ static const LIBSSH2_HOSTKEY_METHOD hostkey_method_ecdsa_ssh_nistp521_cert = {
 
 #endif /* LIBSSH2_ECDSA */
 
-#if LIBSSH2_ED25519
+#if LIBSSH2_ED25519 || LIBSSH2_ED25519_HOSTKEY
 
 /* ***********
  * ed25519 *
@@ -1355,6 +1355,8 @@ static const LIBSSH2_HOSTKEY_METHOD *hostkey_methods[] = {
 #if LIBSSH2_ED25519
     &hostkey_method_ssh_ed25519,
     &hostkey_method_ssh_ed25519_cert,
+#elif LIBSSH2_ED25519_HOSTKEY
+    &hostkey_method_ssh_ed25519,
 #endif
 #if LIBSSH2_RSA
 #if LIBSSH2_RSA_SHA2

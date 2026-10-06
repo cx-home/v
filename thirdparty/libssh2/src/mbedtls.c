@@ -1530,4 +1530,83 @@ _libssh2_supported_key_sign_algorithms(LIBSSH2_SESSION *session,
     return NULL;
 }
 
+#if LIBSSH2_ED25519_HOSTKEY && !LIBSSH2_ED25519
+/* ssh-ed25519 host-key verification over V's crypto.ed25519 (cx-private
+   #1746). The verify is exported by vlib/net/ssh2 (the module that links
+   this object); everything a CLIENT would need beyond checking the
+   server's signature refuses, by name. */
+extern int cx_ssh2_ed25519_verify(const unsigned char *pub,
+                                  const unsigned char *sig,
+                                  const unsigned char *msg, size_t msg_len);
+
+void
+_libssh2_mbedtls_ed25519_free(libssh2_ed25519_ctx *ctx)
+{
+    free(ctx);
+}
+
+int
+_libssh2_ed25519_new_public(libssh2_ed25519_ctx **ed_ctx,
+                            LIBSSH2_SESSION *session,
+                            const unsigned char *raw_pub_key,
+                            const size_t key_len)
+{
+    libssh2_ed25519_ctx *ctx;
+    (void)session;
+    if(!ed_ctx || !raw_pub_key || key_len != LIBSSH2_ED25519_KEY_LEN)
+        return -1;
+    ctx = (libssh2_ed25519_ctx *)malloc(sizeof(libssh2_ed25519_ctx));
+    if(!ctx)
+        return -1;
+    memcpy(ctx->pub, raw_pub_key, LIBSSH2_ED25519_KEY_LEN);
+    *ed_ctx = ctx;
+    return 0;
+}
+
+int
+_libssh2_ed25519_verify(libssh2_ed25519_ctx *ctx, const uint8_t *s,
+                        size_t s_len, const uint8_t *m, size_t m_len)
+{
+    if(!ctx || !s || s_len != LIBSSH2_ED25519_SIG_LEN)
+        return -1;
+    return cx_ssh2_ed25519_verify(ctx->pub, s, m, m_len) == 1 ? 0 : -1;
+}
+
+int
+_libssh2_ed25519_new_private(libssh2_ed25519_ctx **ed_ctx,
+                             LIBSSH2_SESSION *session,
+                             const char *filename, const uint8_t *passphrase)
+{
+    (void)ed_ctx; (void)filename; (void)passphrase;
+    return _libssh2_error(session, LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
+                          "ed25519 private keys are not supported by this "
+                          "build (host-key verification only)");
+}
+
+int
+_libssh2_ed25519_new_private_frommemory(libssh2_ed25519_ctx **ed_ctx,
+                                        LIBSSH2_SESSION *session,
+                                        const char *filedata,
+                                        size_t filedata_len,
+                                        unsigned const char *passphrase)
+{
+    (void)ed_ctx; (void)filedata; (void)filedata_len; (void)passphrase;
+    return _libssh2_error(session, LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
+                          "ed25519 private keys are not supported by this "
+                          "build (host-key verification only)");
+}
+
+int
+_libssh2_ed25519_sign(libssh2_ed25519_ctx *ctx, LIBSSH2_SESSION *session,
+                      uint8_t **out_sig, size_t *out_sig_len,
+                      const uint8_t *message, size_t message_len)
+{
+    (void)ctx; (void)out_sig; (void)out_sig_len; (void)message;
+    (void)message_len;
+    return _libssh2_error(session, LIBSSH2_ERROR_METHOD_NOT_SUPPORTED,
+                          "ed25519 signing is not supported by this build "
+                          "(host-key verification only)");
+}
+#endif /* LIBSSH2_ED25519_HOSTKEY && !LIBSSH2_ED25519 */
+
 #endif /* LIBSSH2_CRYPTO_C */
