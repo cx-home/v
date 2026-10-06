@@ -202,3 +202,23 @@ fn test_orm_transaction_interface() {
 	})!
 	tx.commit()!
 }
+
+// cx-platform-db#2: exec reports a failing step (a UNIQUE violation here) as
+// the error it is, with the result code, instead of returning the rows it had
+// collected — the contract exec_param_many keeps.
+fn test_exec_raises_a_failing_step() {
+	$if !linux && !macos && !windows && !freebsd {
+		return
+	}
+	mut db := sqlite.connect(':memory:') or { panic(err) }
+	db.exec('create table u (id integer primary key, name text unique);')!
+	db.exec("insert into u (name) values ('a');")!
+	if _ := db.exec("insert into u (name) values ('a');") {
+		assert false, 'a UNIQUE violation through exec returned as a success'
+	} else {
+		assert err.code() == 19 || err.msg().to_lower().contains('unique'), 'unexpected error: ${err.code()} ${err.msg()}'
+	}
+	rows := db.exec('select name from u;')!
+	assert rows.len == 1
+	db.close()!
+}

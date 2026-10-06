@@ -351,6 +351,13 @@ pub fn (db &DB) exec(query string) ![]Row {
 	for {
 		res = C.sqlite3_step(stmt)
 		if res != sqlite_row {
+			// cx-platform-db#2: a step that ends in anything but SQLITE_DONE
+			// (SQLITE_CONSTRAINT, SQLITE_ERROR, SQLITE_BUSY, ...) is the error
+			// it reports — the contract exec_param_many keeps — never the rows
+			// collected so far returned as if the statement had succeeded.
+			if res != sqlite_done {
+				return db.error_message(res, query)
+			}
 			break
 		}
 		mut row := Row{
