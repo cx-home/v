@@ -1277,7 +1277,7 @@ fn (mut g Gen) infix_expr_is_op(node ast.InfixExpr) {
 				right_type
 			}
 			ast.None {
-				ast.idx_to_type(g.table.type_idxs['None__'])
+				ast.idx_to_type(g.table.find_type_idx('None__'))
 			}
 			else {
 				ast.no_type

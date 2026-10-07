@@ -494,7 +494,11 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) GenO
 		util.timing_start('cgen parallel processing')
 		mut pp := pool.new_pool_processor(callback: cgen_process_one_file_cb)
 		pp.set_shared_context(global_g) // TODO: make global_g shared
+		// the workers register new instantiations into the one table while the
+		// others look types up by name (cx-private #1864)
+		table.begin_parallel_registration()
 		pp.work_on_items(files)
+		table.end_parallel_registration()
 		util.timing_measure('cgen parallel processing')
 
 		util.timing_start('cgen unification')

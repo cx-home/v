@@ -7,6 +7,7 @@ module ast
 import v.cflag
 import v.util
 import v.token
+import sync
 
 @[heap; minify]
 pub struct UsedFeatures {
@@ -110,6 +111,12 @@ pub mut:
 	new_int_fmt_fix     bool              // vfmt will fix `int` to `i32`
 	export_names        map[string]string // @[export] names
 	filelist            []string          // all files list
+	// parallel cgen (cx-private #1864): while parallel_registration is set,
+	// register_sym holds type_mu for writing and every lookup of type_idxs by
+	// name holds it for reading, so a worker's insert never runs under another
+	// worker's lookup; type_symbols grows by copy (the old buffer stays valid).
+	parallel_registration bool
+	type_mu               &sync.RwMutex = unsafe { nil }
 }
 
 pub struct ComptTimeCondResult {
@@ -960,30 +967,61 @@ pub fn (t &Table) find_single_field_variant(sym &TypeSymbol, field_name string) 
 	return found_variant, found_field, found_embed_types
 }
 
+// idx_by_name answers type_idxs[name], read under type_mu while workers may
+// register (cx-private #1864); 0 when the name is not registered.
+@[inline]
+pub fn (t &Table) idx_by_name(name string) int {
+	if t.parallel_registration {
+		mut mu := t.type_mu
+		mu.rlock()
+		idx := t.type_idxs[name]
+		mu.runlock()
+		return idx
+	}
+	return t.type_idxs[name]
+}
+
+// begin_parallel_registration is called once, on the main thread, before the
+// parallel cgen workers start: it makes register_sym and the lookups by name
+// safe to call from several threads until end_parallel_registration.
+pub fn (mut t Table) begin_parallel_registration() {
+	if t.type_mu == unsafe { nil } {
+		t.type_mu = sync.new_rwmutex()
+	}
+	t.type_symbols.ensure_cap(t.type_symbols.len * 2 + 4096)
+	t.parallel_registration = true
+}
+
+// end_parallel_registration is called on the main thread after the workers
+// are joined.
+pub fn (mut t Table) end_parallel_registration() {
+	t.parallel_registration = false
+}
+
 @[inline]
 pub fn (t &Table) find_type(name string) Type {
-	return idx_to_type(t.type_idxs[name])
+	return idx_to_type(t.idx_by_name(name))
 }
 
 @[inline]
 pub fn (t &Table) find_type_idx(name string) int {
-	return t.type_idxs[name]
+	return t.idx_by_name(name)
 }
 
 @[inline]
 pub fn (t &Table) find_type_idx_fn_scoped(name string, scope &Scope) int {
 	if scope != unsafe { nil } {
-		idx := t.type_idxs['_${name}_${scope.start_pos}']
+		idx := t.idx_by_name('_${name}_${scope.start_pos}')
 		if idx != 0 {
 			return idx
 		}
 	}
-	return t.type_idxs[name]
+	return t.idx_by_name(name)
 }
 
 @[inline]
 pub fn (t &Table) find_sym(name string) ?&TypeSymbol {
-	idx := t.type_idxs[name]
+	idx := t.idx_by_name(name)
 	if idx > 0 {
 		return t.type_symbols[idx]
 	}
@@ -992,7 +1030,7 @@ pub fn (t &Table) find_sym(name string) ?&TypeSymbol {
 
 @[inline]
 pub fn (t &Table) find_sym_and_type_idx(name string) (&TypeSymbol, int) {
-	idx := t.type_idxs[name]
+	idx := t.idx_by_name(name)
 	if idx > 0 {
 		return t.type_symbols[idx], idx
 	}
@@ -1322,8 +1360,30 @@ fn (mut t Table) rewrite_already_registered_symbol(typ TypeSymbol, existing_idx 
 	return invalid_type_idx
 }
 
-@[inline]
+// register_sym registers `sym` and answers its index; under parallel cgen
+// (begin_parallel_registration) one worker registers at a time, and the
+// lookups by name wait for it (cx-private #1864).
 pub fn (mut t Table) register_sym(sym TypeSymbol) int {
+	if t.parallel_registration {
+		mut mu := t.type_mu
+		mu.lock()
+		defer {
+			mu.unlock()
+		}
+		if t.type_symbols.len == t.type_symbols.cap {
+			// grow by copy: a reader that loaded the old buffer keeps reading
+			// valid memory (V's in-place growth would realloc and free it)
+			mut grown := []&TypeSymbol{cap: t.type_symbols.cap * 2 + 1024}
+			grown << t.type_symbols
+			t.type_symbols = grown
+		}
+		return t.register_sym_unlocked(sym)
+	}
+	return t.register_sym_unlocked(sym)
+}
+
+@[inline]
+fn (mut t Table) register_sym_unlocked(sym TypeSymbol) int {
 	mut idx := -2
 	$if trace_register_sym ? {
 		defer(fn) {
@@ -1379,7 +1439,7 @@ pub fn (mut t Table) register_anon_union(name string, sym_idx int) {
 }
 
 pub fn (t &Table) known_type(name string) bool {
-	return t.type_idxs[name] != 0 || t.parsing_type == name || name in ['i32', 'byte']
+	return t.idx_by_name(name) != 0 || t.parsing_type == name || name in ['i32', 'byte']
 }
 
 @[inline]
@@ -1698,7 +1758,7 @@ pub fn (mut t Table) find_or_register_chan(elem_type Type, is_mut bool) int {
 	name := t.chan_name(elem_type, is_mut)
 	cname := t.chan_cname(elem_type, is_mut)
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
@@ -1720,7 +1780,7 @@ pub fn (mut t Table) find_or_register_map(key_type Type, value_type Type) int {
 	name := t.map_name(key_type, value_type)
 	cname := t.map_cname(key_type, value_type)
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
@@ -1742,7 +1802,7 @@ pub fn (mut t Table) find_or_register_thread(return_type Type) int {
 	name := t.thread_name(return_type)
 	cname := t.thread_cname(return_type)
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
@@ -1764,19 +1824,19 @@ pub fn (mut t Table) find_or_register_promise(return_type Type) int {
 
 	cname := t.promise_cname(return_type)
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
 
 	promise_type := TypeSymbol{
-		parent_idx: t.type_idxs['Promise']
+		parent_idx: t.idx_by_name('Promise')
 		kind:       .struct
 		name:       name
 		cname:      cname
 		ngname:     strip_generic_params(name)
 		info:       Struct{
-			concrete_types: [return_type, t.type_idxs['JS.Any']]
+			concrete_types: [return_type, t.idx_by_name('JS.Any')]
 		}
 	}
 
@@ -1787,7 +1847,7 @@ pub fn (mut t Table) find_or_register_promise(return_type Type) int {
 pub fn (mut t Table) find_or_register_array(elem_type Type) int {
 	name := t.array_name(elem_type)
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
@@ -1819,7 +1879,7 @@ pub fn (mut t Table) find_or_register_array_fixed(elem_type Type, size int, size
 	prefix := if is_fn_ret { '_v_' } else { '' }
 	name := prefix + t.array_fixed_name(elem_type, size, size_expr)
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
@@ -1858,7 +1918,7 @@ pub fn (mut t Table) find_or_register_multi_return(mr_typs []Type) int {
 	}
 	name += ')'
 	// existing
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		return existing_idx
 	}
@@ -1882,7 +1942,7 @@ pub fn (mut t Table) find_or_register_fn_type(f Fn, is_anon bool, has_decl bool)
 		util.no_dots(f.name.clone()).replace_each(fn_type_escape_seq)
 	}
 	anon := f.name == '' || is_anon
-	existing_idx := t.type_idxs[name]
+	existing_idx := t.idx_by_name(name)
 	if existing_idx > 0 {
 		mut existing_sym := t.type_symbols[existing_idx]
 		if existing_sym.kind != .placeholder {
@@ -1940,7 +2000,7 @@ pub fn (mut t Table) find_or_register_generic_inst(parent_typ Type, concrete_typ
 		}
 	}
 	inst_name += ']'
-	existing_idx := t.type_idxs[inst_name]
+	existing_idx := t.idx_by_name(inst_name)
 	if existing_idx > 0 {
 		if t.type_symbols[existing_idx].kind == .placeholder {
 			t.type_symbols[existing_idx].kind = .generic_inst
@@ -2928,9 +2988,9 @@ pub fn (mut t Table) convert_generic_type(generic_type Type, generic_names []str
 				}
 				nrt += ']'
 				rnrt += ']'
-				mut idx := t.type_idxs[nrt]
+				mut idx := t.idx_by_name(nrt)
 				if idx == 0 {
-					idx = t.type_idxs[rnrt]
+					idx = t.idx_by_name(rnrt)
 					if idx == 0 {
 						idx = t.add_placeholder_type(nrt, cnrt, .v)
 					}
@@ -2974,7 +3034,7 @@ pub fn (mut t Table) convert_generic_type(generic_type Type, generic_names []str
 				}
 				if changed {
 					new_name := base_name + '[' + converted_args.join(', ') + ']'
-					mut new_idx := t.type_idxs[new_name]
+					mut new_idx := t.idx_by_name(new_name)
 					if new_idx == 0 {
 						new_idx = t.add_placeholder_type(new_name, util.no_dots(new_name).replace_each([
 							'[',
@@ -3808,7 +3868,7 @@ fn (mut t Table) unwrap_generic_type_ex_with_depth(typ Type, generic_names []str
 				}
 			}
 			nrt += ']'
-			mut idx := t.type_idxs[nrt]
+			mut idx := t.idx_by_name(nrt)
 			if idx != 0 && t.type_symbols[idx].kind != .placeholder {
 				if recheck_concrete_types {
 					// Rechecking an already-registered concrete generic can revisit the same
@@ -3968,7 +4028,7 @@ fn (mut t Table) unwrap_generic_type_ex_with_depth(typ Type, generic_names []str
 				t.unwrap_method_types(ts, generic_names, concrete_types)
 			}
 			if new_idx <= 0 {
-				existing := t.type_idxs[nrt]
+				existing := t.idx_by_name(nrt)
 				if existing > 0 {
 					return new_type(existing).derive(typ).clear_flag(.generic)
 				}
@@ -4014,7 +4074,7 @@ fn (mut t Table) unwrap_generic_type_ex_with_depth(typ Type, generic_names []str
 				t.unwrap_method_types(ts, generic_names, concrete_types)
 			}
 			if new_idx <= 0 {
-				existing := t.type_idxs[nrt]
+				existing := t.idx_by_name(nrt)
 				if existing > 0 {
 					return new_type(existing).derive(typ).clear_flag(.generic)
 				}
@@ -4085,7 +4145,7 @@ fn (mut t Table) unwrap_generic_type_ex_with_depth(typ Type, generic_names []str
 				// which converts the placeholder we created earlier into a generic_inst.
 				// In that case, look up the existing entry and use it — the
 				// generic_insts_to_concrete pass will resolve it later.
-				existing := t.type_idxs[nrt]
+				existing := t.idx_by_name(nrt)
 				if existing > 0 {
 					return new_type(existing).derive(typ).clear_flag(.generic)
 				}
