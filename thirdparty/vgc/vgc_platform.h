@@ -1456,6 +1456,16 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   }
 #endif // VGC_SIGNAL_SUSPEND
 #elif defined(__linux__)
+  #if defined(__TINYC__) && (defined(__x86_64__) || defined(__i386__)) && !defined(__ATOMIC_ACQUIRE)
+    // tcc has no __atomic builtins ("'__ATOMIC_ACQUIRE' undeclared", tcc-linux,
+    // cx-private#1889). This branch needs only acquire loads and release stores:
+    // on x86 (TSO) those are plain accesses, and tcc does not reorder volatile
+    // accesses, so a volatile access of the operand's own type is the builtin.
+    #define __ATOMIC_ACQUIRE 2
+    #define __ATOMIC_RELEASE 3
+    #define __atomic_load_n(p, order) (*(volatile __typeof__(*(p))*)(p))
+    #define __atomic_store_n(p, v, order) ((void)(*(volatile __typeof__(*(p))*)(p) = (v)))
+  #endif
   // ----------------------------------------------------------------------------
   // Linux OS-level stop-the-world via signal-based suspension.
   //
