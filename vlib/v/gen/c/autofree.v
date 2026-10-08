@@ -246,6 +246,16 @@ fn (mut g Gen) autofree_variable(v ast.Var) {
 		// here — which is exactly what the blanket `-experimental` flag cannot
 		// establish. So we free it whether or not `-experimental` is set; without a
 		// proof (no Perceus, no -experimental) we still leave it to leak.
+		if g.perceus_dropping && !g.pref.experimental && v.typ.share() == .shared_t {
+			// A `shared` reference is not Perceus's to drop: other threads may hold
+			// it (uniqueness does not cover a lock-guarded object), and the call
+			// below would reach the object as `&x->val`, an interior pointer of
+			// its `__shared__` wrapper, through a `<Foo>_free` that was generated
+			// for the wrapper type ("call to undeclared function
+			// 'main__Foo_T_int_free'", vlib/v/tests/concurrency/shared_generic_test.v,
+			// cx-private#1894). The tracing collector reclaims it.
+			return
+		}
 		if g.pref.experimental || g.perceus_dropping {
 			if g.pref.gc_mode == .vgc && g.perceus_dropping && v.name in g.perceus_deep_drop {
 				// DEEP free under E: the deep-drop analysis proved this `&Foo`
