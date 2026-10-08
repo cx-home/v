@@ -10,6 +10,10 @@
 #include <stdlib.h> // abort (span-registry-full hard fail in vgc_span_alloc)
 
 static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnostics section)
+// vgc_ull: a u64 as unsigned long long, the type a %llu conversion reads — u64
+// (uint64_t) is unsigned long on LP64 Linux and the BSDs, which -Wformat refuses
+// under -cstrict (the out-of-memory report in vgc_d_vgc.c.v).
+static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long long)v; }
 
 // ============================================================
 // Global / BSS data-segment roots
@@ -530,6 +534,9 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   }
 #elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__) || defined(__OpenBSD__)
   #include <pthread.h>
+  #if !defined(__NetBSD__)
+    #include <pthread_np.h> // pthread_attr_get_np (an implicit declaration under -cstrict)
+  #endif
   static inline int vgc_get_stack_bounds(uintptr_t* lo, uintptr_t* hi) {
       pthread_attr_t attr;
       if (pthread_attr_init(&attr) != 0) return 0;

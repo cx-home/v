@@ -76,6 +76,7 @@ fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default c
 fn C.vgc_trace(ev int, slot int, a u64, b u64)
 fn C.vgc_trace_init()
 fn C.vgc_say(tag u64, v u64) // loud one-line stderr note (used by the span-registry abort)
+fn C.vgc_ull(v u64) u64 // u64 as unsigned long long, the type %llu reads (u64 is unsigned long on LP64 Linux/BSD)
 fn C.vgc_ra0() voidptr // #58 freering: __builtin_return_address(0) of the calling V fn
 fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site)
 fn C.vgc_ra2() voidptr // #58 freering: two frames up
@@ -3027,11 +3028,11 @@ fn vgc_oom_report(n usize) {
 	}
 	C.fprintf(C.stderr,
 		c'vgc: out of memory: %llu bytes requested; arenas %d/%d, spans %d, heap_live %llu MB, marked %llu MB, next_gc %llu MB, soft limit %llu MB\n',
-		u64(n), vgc_heap.narenas, max_arenas, vgc_heap.nspans,
-		C.vgc_atomic_load_u64(&vgc_heap.heap_live) / (1024 * 1024),
-		C.vgc_atomic_load_u64(&vgc_heap.heap_marked) / (1024 * 1024),
-		C.vgc_atomic_load_u64(&vgc_heap.next_gc) / (1024 * 1024),
-		vgc_heap_soft_limit / (1024 * 1024))
+		C.vgc_ull(u64(n)), vgc_heap.narenas, max_arenas, vgc_heap.nspans,
+		C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.heap_live) / (1024 * 1024)),
+		C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.heap_marked) / (1024 * 1024)),
+		C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.next_gc) / (1024 * 1024)),
+		C.vgc_ull(vgc_heap_soft_limit / (1024 * 1024)))
 }
 
 // Span-allocation failed (arenas physically exhausted while the heap_live-driven
