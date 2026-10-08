@@ -197,7 +197,7 @@ mut:
 	// with; superseded generations park in `retained` until shutdown because
 	// live connections still reference them. rot_mu guards the swap and the
 	// accept-side read.
-	rot_mu   &sync.Mutex = unsafe { nil }
+	rot_mu   &sync.Mutex     = unsafe { nil }
 	active   &SSLIdentityGen = unsafe { nil }
 	retained []&SSLIdentityGen
 	// handle		int
@@ -420,13 +420,11 @@ pub fn (mut l SSLListener) rotate_certs(config SSLConnectConfig) ! {
 		C.mbedtls_ssl_conf_rng(&gen.conf, tls_listener_rng, l)
 	}
 	gen.certs = if config.in_memory_verification {
-		new_sslcerts_in_memory_with_rng(config.verify, config.cert, config.cert_key,
-			&l.ctr_drbg) or {
+		new_sslcerts_in_memory_with_rng(config.verify, config.cert, config.cert_key, &l.ctr_drbg) or {
 			return error('net.mbedtls SSLListener.rotate_certs, cert failure (in-memory), err: ${err}')
 		}
 	} else {
-		new_sslcerts_from_file_with_rng(config.verify, config.cert, config.cert_key,
-			&l.ctr_drbg) or {
+		new_sslcerts_from_file_with_rng(config.verify, config.cert, config.cert_key, &l.ctr_drbg) or {
 			return error('net.mbedtls SSLListener.rotate_certs, cert failure (file), err: ${err}')
 		}
 	}

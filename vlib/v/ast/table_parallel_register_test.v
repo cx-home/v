@@ -47,11 +47,11 @@ fn writer_loop(mut t Table, w int) []int {
 	mut idxs := []int{cap: per_writer}
 	for i in 0 .. per_writer {
 		idxs << t.register_sym(TypeSymbol{
-			kind: .struct
-			name: 'main.W${w}_${i}'
+			kind:  .struct
+			name:  'main.W${w}_${i}'
 			cname: 'main__W${w}_${i}'
-			mod:  'main'
-			info: Struct{}
+			mod:   'main'
+			info:  Struct{}
 		})
 		// the shape cgen's workers take: a new []T for a fresh element type
 		t.find_or_register_array(idx_to_type(idxs.last()))

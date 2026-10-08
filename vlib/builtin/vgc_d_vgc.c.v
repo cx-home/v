@@ -77,6 +77,7 @@ fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default c
 fn C.vgc_trace(ev int, slot int, a u64, b u64)
 fn C.vgc_trace_init()
 fn C.vgc_say(tag u64, v u64) // loud one-line stderr note (used by the span-registry abort)
+fn C.vgc_ull(v u64) u64 // u64 as unsigned long long, the type %llu reads (u64 is unsigned long on LP64 Linux/BSD)
 fn C.vgc_ra0() voidptr // #58 freering: __builtin_return_address(0) of the calling V fn
 fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site)
 fn C.vgc_ra2() voidptr // #58 freering: two frames up
@@ -240,8 +241,8 @@ mut:
 	// platform cannot report bounds (validation disabled, prior behavior).
 	stack_limit_lo usize
 	stack_limit_hi usize
-	thread_id  u64
-	stopped    u32 // 1 if stopped for GC
+	thread_id      u64
+	stopped        u32 // 1 if stopped for GC
 	// Which stop-cycle this park belongs to (== gc_stop_seq at park time). A
 	// stale `stopped==1` from the PREVIOUS cycle is a soundness trap: a parker
 	// waking from GC-1 (its spin exited when the flag briefly dropped) still
@@ -250,8 +251,8 @@ mut:
 	// collector must trust stopped only when park_seq matches the current
 	// gc_stop_seq; anything else is a straggler and gets signal-suspended.
 	// (#57/#58/#63/#145: the mid-GC mutator the forensics kept catching.)
-	park_seq   u32
-	mach_port  u32 // OS thread handle for OS-level suspend-the-world (darwin)
+	park_seq  u32
+	mach_port u32 // OS thread handle for OS-level suspend-the-world (darwin)
 	// GC-safe blocking region (cx #316): 1 while this thread is parked/blocked
 	// inside gc_safe_region_enter/exit. The cooperative collector treats a safe
 	// thread as already stopped — no park wait, no mach suspend/resume — and
@@ -366,7 +367,7 @@ mut:
 	// pool serves varied page counts instead of ratcheting the arena bump on
 	// every previously-unseen npages (cx #360; the #277 field deaths were the
 	// large-object flavor of that ratchet).
-	free_spans      [8193]&VGC_Span
+	free_spans [8193]&VGC_Span
 	// Tail of each free_spans chain. Push/pop work at the HEAD (LIFO — reuse
 	// stays cache-warm), so a chain's age grows monotonically toward the tail;
 	// vgc_pool_trim walks tails via .prev and stops at the first young span,
@@ -387,11 +388,11 @@ mut:
 	// vgc_max_pooled_pages). First-fit with split on reuse; no coalescing (an
 	// oversized arena hosts exactly its one span, so it has no in-arena neighbors).
 	// Short by construction, so trim/reuse walk it whole.
-	free_oversized  &VGC_Span = unsafe { nil }
+	free_oversized &VGC_Span = unsafe { nil }
 	// Per-thread caches
 	caches       [64]VGC_Cache
-	ncaches      int // high-water mark of slots ever used
-	live_threads u32 // atomic-ish (guarded by cache_lock): currently-registered mutators
+	ncaches      int     // high-water mark of slots ever used
+	live_threads u32     // atomic-ish (guarded by cache_lock): currently-registered mutators
 	free_slots   [64]int // reclaimed cache indices, reused before growing ncaches
 	nfree_slots  int
 	cache_lock   u32
@@ -408,7 +409,7 @@ mut:
 	// total_alloc as the last completed collection left it — gc_heap_usage's
 	// bytes_since_gc is total_alloc minus this (cx-private#1796).
 	total_alloc_at_gc u64
-	gc_cycle    u64 // number of completed GC cycles
+	gc_cycle          u64 // number of completed GC cycles
 	// GC work queues
 	work_full  &VGC_WorkBuf = unsafe { nil }
 	work_empty &VGC_WorkBuf = unsafe { nil }
@@ -493,6 +494,7 @@ __global vgc_max_arenas_eff = int(0)
 // releases it after the call. While registered, the collector shades it (and,
 // being a scan object, its referents) every STW cycle.
 const vgc_max_spawn_roots = 1024
+
 __global vgc_spawn_roots = [1024]voidptr{}
 __global vgc_nspawn_roots = int(0)
 __global vgc_spawn_root_lock = u32(0)
@@ -521,6 +523,7 @@ __global vgc_spawn_root_lock = u32(0)
 // mid-unpin leaves every still-pinned address present in >=1 slot (at worst shaded
 // twice for one cycle — harmless). Same discipline as vgc_spawn_roots.
 const vgc_pin_cap = 65536 // max concurrent pins; the array (512 KB) is scanned each GC
+
 __global vgc_pins = [vgc_pin_cap]voidptr{}
 __global vgc_npins = int(0)
 __global vgc_pin_lock = u32(0)
@@ -678,7 +681,8 @@ __global vgc_headroom_pinned = false
 __global vgc_grow_gate_pct = u64(30)
 __global vgc_grow_gate_cycle = u64(0)
 __global vgc_grow_gate_fired = false
-__global vgc_grow_gate_hold = u32(0) // atomic: reclaim-and-retry loops in flight
+__global vgc_grow_gate_hold = u32(0)
+// atomic: reclaim-and-retry loops in flight
 // The gate pays only where a collection finds garbage the growth can reuse —
 // a live set that has stopped growing. While the live set still grows (the
 // last collection marked more than vgc_grow_gate_growth_pct % over the one
@@ -689,7 +693,8 @@ __global vgc_grow_gate_hold = u32(0) // atomic: reclaim-and-retry loops in fligh
 // gate stands down until a collection shows the growth has flattened.
 // VGC_GROW_GATE_GROWTH_PCT overrides (decimal 0..100).
 __global vgc_grow_gate_growth_pct = u64(10)
-__global vgc_grow_gate_prev_marked = u64(0) // the marked set one collection back
+__global vgc_grow_gate_prev_marked = u64(0)
+// the marked set one collection back
 // ── FRAG GATE + POOL DEFRAG (cx-private #1892) ─────────────────────────────
 // The pool coalesces a freed span only with pooled neighbours of at least
 // vgc_pool_merge_min pages and of the same decommit state (vgc_put_free_span),
@@ -860,7 +865,8 @@ pub fn vgc_envcheck_dedupe(p usize) bool {
 // allocations). Lookup miss => born before the table wrapped (old object).
 __global vgc_birth_ptr = [262144]usize{}
 __global vgc_birth_cyc = [262144]u64{}
-__global vgc_birth_span = [262144]usize{} // descriptor identity at claim time
+__global vgc_birth_span = [262144]usize{}
+// descriptor identity at claim time
 
 @[inline]
 fn vgc_birth_record(addr usize, span_ptr usize) {
@@ -910,7 +916,8 @@ pub fn vgc_birth_delta(p voidptr) i64 {
 //   0xc1ea1 = vgc_free (explicit)      0xc1ea2 = sweep garbage-clear
 //   0xc1ea3 = span reset/recycle       (value = the watched object address)
 // Direct attribution — no inference. Racy one-slot-per-thread by design.
-__global vgc_bw_byte = [64]usize{} // address of the alloc_bits byte
+__global vgc_bw_byte = [64]usize{}
+// address of the alloc_bits byte
 __global vgc_bw_mask = [64]u8{}
 __global vgc_bw_addr = [64]usize{}
 
@@ -991,7 +998,8 @@ pub fn vgc_envcheck_sample() bool {
 // for words pointing into those objects. See vgc_do_sweep for the verdict tags.
 const vgc_ks_cap = 262144 // 2^18 direct-mapped slots (~2 MB BSS; ~120k candidates/GC observed)
 
-__global vgc_ks_tab = [262144]usize{} // freed-object BASE address (0 = empty slot)
+__global vgc_ks_tab = [262144]usize{}
+// freed-object BASE address (0 = empty slot)
 __global vgc_ks_count = u32(0)
 __global vgc_ks_overflow = u32(0)
 
@@ -1285,7 +1293,6 @@ fn vgc_register_thread() {
 			vgc_heap.caches[idx].safe_regs[w] = 0
 		}
 	}
-
 	C.vgc_set_cache_idx(idx)
 	// Arrange for vgc_thread_exit_cb(idx) to fire when this thread exits.
 	C.vgc_install_thread_exit(idx)
@@ -1605,7 +1612,7 @@ fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 	}
 	unsafe {
 		if span.next == nil {
-			return // alone on its list: head is tail
+			return
 		}
 		// find, from the tail, the first span YOUNGER than this one
 		mut t := vgc_heap.free_spans_tail[span.npages]
@@ -1613,7 +1620,7 @@ fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 			t = t.prev
 		}
 		if t == nil || t == span {
-			return // every other span is at least as old: the head is right
+			return
 		}
 		// unlink from the head …
 		vgc_heap.free_spans[span.npages] = span.next
@@ -2041,8 +2048,7 @@ fn vgc_pool_compensate_arena(arena_idx int, start usize, want u64) (u64, usize, 
 		}
 		head := s != unsafe { nil } && s.npages > 0 && s.base >= a.base
 			&& (s.base - a.base) / vgc_page_size == p
-		if head && s.pooled && !s.in_use && !s.decommitted
-			&& s.npages <= u32(vgc_max_pooled_pages) {
+		if head && s.pooled && !s.in_use && !s.decommitted && s.npages <= u32(vgc_max_pooled_pages) {
 			if run == 0 {
 				run_start = p
 			}
@@ -2191,8 +2197,8 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			if sidx < map_pages {
 				mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[sidx]))))) }
 				if s != unsafe { nil } && s.pooled && !s.in_use && s.decommitted == cur.decommitted
-					&& s.npages >= u32(vgc_pool_merge_min)
-					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end {
+					&& s.npages >= u32(vgc_pool_merge_min) && s.npages <= u32(vgc_max_pooled_pages)
+					&& s.base == end {
 					if s.pool_gen < gen {
 						gen = s.pool_gen
 					}
@@ -2672,7 +2678,7 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	span.free_index = 0
 	span.alloc_count = 0
 	span.is_tiny = false // reset on (re)use; set true only when the tiny allocator carves a packed block
-	span.dirty = 0       // concurrent mark: a recycled span starts clean
+	span.dirty = 0 // concurrent mark: a recycled span starts clean
 
 	// Bitmaps are inline in the span (alloc_buf/mark_buf); point the working pointers
 	// at them and zero the bytes in use. nobjs <= 1024 -> bitmap_size <= 128 <= 136,
@@ -2682,8 +2688,7 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 		// span (re)init wipes the whole bitmap — if any thread's watched bit lives
 		// in these bytes, this recycle is the clearer (0xc1ea3).
 		for wb in 0 .. int(bitmap_size) {
-			vgc_bw_check(usize(voidptr(unsafe { &span.alloc_buf[0] })) + usize(wb), 0xff,
-				0xc1ea3)
+			vgc_bw_check(usize(voidptr(unsafe { &span.alloc_buf[0] })) + usize(wb), 0xff, 0xc1ea3)
 		}
 	}
 	unsafe {
@@ -2726,7 +2731,7 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 	// otherwise. Independent of, and complementary to, the atomic sweep write-back
 	// and the suspend-retry fix.
 	$if vgc_allocblack_off ? {
-		return // A/B isolation switch: disable the alloc-black soundness floor
+		return
 	}
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
 		if span.mark_bits != unsafe { nil } {
@@ -2739,8 +2744,8 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 			// frees live objects — worse than no hook at all.
 			mask := u8(1) << (obj_idx & 7)
 			unsafe {
-				_ = C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) +
-					usize(obj_idx >> 3))), mask)
+				_ =
+					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
 			}
 		}
 	}
@@ -2787,8 +2792,8 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 					// lock-free mcache fast path does not hold. With both sides atomic
 					// (OR here, AND in vgc_free) neither loses the other's update.
 					old := unsafe {
-						C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.alloc_bits) + usize(byte_idx))),
-							mask)
+						C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.alloc_bits) +
+							usize(byte_idx))), mask)
 					}
 					if (old & mask) != 0 {
 						// Lost the slot to a racer (defensive; normally only the owning
@@ -2809,11 +2814,9 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 						if C.vgc_bitmap_get(span.alloc_bits, i) == 0 {
 							C.vgc_say(0xa110, u64(addr))
 						}
-						if !span.noscan && span.elem_size >= u32(128)
-							&& span.elem_size <= u32(192) {
+						if !span.noscan && span.elem_size >= u32(128) && span.elem_size <= u32(192) {
 							vgc_birth_record(addr, usize(voidptr(span)))
-							vgc_bw_arm(usize(span.alloc_bits) + usize(byte_idx), mask,
-								addr)
+							vgc_bw_arm(usize(span.alloc_bits) + usize(byte_idx), mask, addr)
 							// Descriptor-identity check at birth: the span we just
 							// carved from must be the one the address map resolves.
 							if vgc_find_span_addr(voidptr(addr)) != usize(voidptr(span)) {
@@ -3137,12 +3140,13 @@ fn vgc_oom_report(n usize) {
 	if max_arenas <= 0 {
 		max_arenas = int(vgc_max_arenas) // pre-vgc_init window (see vgc_span_alloc)
 	}
-	C.fprintf(C.stderr, c'vgc: out of memory: %llu bytes requested; arenas %d/%d, spans %d, heap_live %llu MB, marked %llu MB, next_gc %llu MB, soft limit %llu MB\n',
-		u64(n), vgc_heap.narenas, max_arenas, vgc_heap.nspans,
-		C.vgc_atomic_load_u64(&vgc_heap.heap_live) / (1024 * 1024),
-		C.vgc_atomic_load_u64(&vgc_heap.heap_marked) / (1024 * 1024),
-		C.vgc_atomic_load_u64(&vgc_heap.next_gc) / (1024 * 1024),
-		vgc_heap_soft_limit / (1024 * 1024))
+	C.fprintf(C.stderr,
+		c'vgc: out of memory: %llu bytes requested; arenas %d/%d, spans %d, heap_live %llu MB, marked %llu MB, next_gc %llu MB, soft limit %llu MB\n',
+		C.vgc_ull(u64(n)), vgc_heap.narenas, max_arenas, vgc_heap.nspans,
+		C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.heap_live) / (1024 * 1024)),
+		C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.heap_marked) / (1024 * 1024)),
+		C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.next_gc) / (1024 * 1024)),
+		C.vgc_ull(vgc_heap_soft_limit / (1024 * 1024)))
 }
 
 // Span-allocation failed (arenas physically exhausted while the heap_live-driven
@@ -3482,7 +3486,7 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		span.class_idx = 0
 		span.noscan = noscan
 		span.is_tiny = false // large spans are never tiny-packed (reset in case of a recycled span)
-		span.dirty = 0       // concurrent mark: recycled large span starts clean
+		span.dirty = 0 // concurrent mark: recycled large span starts clean
 		span.elem_size = u32(n)
 		span.nelems = 1
 		span.alloc_count = 1
@@ -3813,12 +3817,17 @@ fn vgc_freering_lookup(strptr usize) {
 // it, swept it, or decommitted its span. A test sets the watch per wave (e.g.
 // vgc_set_watch(c)) and reads vgc_watch_report() at a stall. Gated by
 // vgc_watch_addr != 0 so it is a no-op (one compare) when unused.
-__global vgc_watch_addr     = usize(0)
-__global vgc_watch_in_root  = u32(0) // UNUSED (the per-shade hook perturbed timing; removed)
-__global vgc_watch_marked   = u32(0) // vgc_shade() set the mark bit for the watched object
-__global vgc_watch_swept    = u32(0) // vgc_sweep_span() cleared the watched object's alloc bit
-__global vgc_watch_decommit = u32(0) // vgc_put_free_span() returned the watched object's span
-__global vgc_watch_cycles   = u32(0) // GC cycles observed since the watch was set
+__global vgc_watch_addr = usize(0)
+__global vgc_watch_in_root = u32(0)
+// UNUSED (the per-shade hook perturbed timing; removed)
+__global vgc_watch_marked = u32(0)
+// vgc_shade() set the mark bit for the watched object
+__global vgc_watch_swept = u32(0)
+// vgc_sweep_span() cleared the watched object's alloc bit
+__global vgc_watch_decommit = u32(0)
+// vgc_put_free_span() returned the watched object's span
+__global vgc_watch_cycles = u32(0)
+// GC cycles observed since the watch was set
 
 // ROOT-SCAN-MISS localizers (set ONLY in the bounded root-scan paths
 // vgc_mark_roots / vgc_scan_suspended_roots / the spawn-root shade loop — NEVER
@@ -3826,10 +3835,14 @@ __global vgc_watch_cycles   = u32(0) // GC cycles observed since the watch was s
 // sensitive residual). Each records WHICH scanned root (if any) held a pointer to
 // the watched object this cycle; combined with vgc_watch_marked they pin whether
 // the miss is "no root held it" vs "a root held it but the mark/sweep dropped it".
-__global vgc_watch_in_stack = u32(0) // (thread idx+1) whose [stack_lo,stack_hi] held a word == watch_addr
-__global vgc_watch_in_reg   = u32(0) // (thread idx+1) whose captured registers held watch_addr
-__global vgc_watch_in_spawn = u32(0) // bit0=a spawn-root ptr == watch_addr; bit1=a spawn-root OBJECT held a word == watch_addr
-__global vgc_watch_rng_cov  = u32(0) // (thread idx+1) whose [stack_lo,stack_hi] numerically COVERS watch_addr
+__global vgc_watch_in_stack = u32(0)
+// (thread idx+1) whose [stack_lo,stack_hi] held a word == watch_addr
+__global vgc_watch_in_reg = u32(0)
+// (thread idx+1) whose captured registers held watch_addr
+__global vgc_watch_in_spawn = u32(0)
+// bit0=a spawn-root ptr == watch_addr; bit1=a spawn-root OBJECT held a word == watch_addr
+__global vgc_watch_rng_cov = u32(0)
+// (thread idx+1) whose [stack_lo,stack_hi] numerically COVERS watch_addr
 
 // vgc_set_watch arms the diagnostic GC watch on the object at `ptr`, resetting the
 // per-watch counters (root/marked/swept/decommit/cycles/stack hits) so a single
@@ -3945,7 +3958,7 @@ fn vgc_watch_roots_report() u64 {
 // bit2=alloc_bit set, bit3=mark_bit set. vgc_watch_stage_span carries span.base
 // (identity) so we can see if mark and sweep operate on DIFFERENT spans. 6 calls
 // per cycle — off the per-word hot path.
-__global vgc_watch_stage      = [8]u64{}
+__global vgc_watch_stage = [8]u64{}
 __global vgc_watch_stage_span = [8]u64{}
 
 fn vgc_watch_snapshot(stage int) {
@@ -3965,10 +3978,12 @@ fn vgc_watch_snapshot(stage int) {
 		if span.elem_size != 0 {
 			obj_idx := u32((w - span.base) / usize(span.elem_size))
 			if obj_idx < span.nelems {
-				if span.alloc_bits != unsafe { nil } && C.vgc_bitmap_get(span.alloc_bits, obj_idx) != 0 {
+				if span.alloc_bits != unsafe { nil }
+					&& C.vgc_bitmap_get(span.alloc_bits, obj_idx) != 0 {
 					v |= 4
 				}
-				if span.mark_bits != unsafe { nil } && C.vgc_bitmap_get(span.mark_bits, obj_idx) != 0 {
+				if span.mark_bits != unsafe { nil }
+					&& C.vgc_bitmap_get(span.mark_bits, obj_idx) != 0 {
 					v |= 8
 				}
 			}
@@ -4088,8 +4103,7 @@ fn vgc_find_span(ptr voidptr) &VGC_Span {
 	// + page maps it gates. A plain read here raced the locked writer (TSan).
 	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 	mut arena_idx := C.vgc_addr_to_arena(addr)
-	if arena_idx < 0 || arena_idx >= nar
-		|| addr < vgc_heap.arenas[arena_idx].base
+	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		arena_idx = -1
 		for i in 0 .. nar {
@@ -4155,10 +4169,10 @@ fn vgc_safepoint() {
 		return
 	}
 	unsafe {
-		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq,
-			&vgc_heap.gc_stopped_count, &vgc_heap.caches[cache_idx].stopped,
-			&vgc_heap.caches[cache_idx].park_seq, &vgc_heap.caches[cache_idx].stack_lo,
-			&vgc_heap.caches[cache_idx].stack_hi, vgc_heap.caches[cache_idx].stack_base)
+		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq, &vgc_heap.gc_stopped_count,
+			&vgc_heap.caches[cache_idx].stopped, &vgc_heap.caches[cache_idx].park_seq,
+			&vgc_heap.caches[cache_idx].stack_lo, &vgc_heap.caches[cache_idx].stack_hi,
+			vgc_heap.caches[cache_idx].stack_base)
 	}
 }
 
@@ -4225,13 +4239,19 @@ fn vgc_safe_region_exit() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const vgc_slog_n = 65536
-__global vgc_slog_addr = [65536]usize{} // freed small-buffer addrs (ring)
-__global vgc_slog_gen = [65536]u32{} // gc gen when freed
-__global vgc_slog_sc = [65536]u32{} // size class
+
+__global vgc_slog_addr = [65536]usize{}
+// freed small-buffer addrs (ring)
+__global vgc_slog_gen = [65536]u32{}
+// gc gen when freed
+__global vgc_slog_sc = [65536]u32{}
+// size class
 __global vgc_slog_head = u32(0)
-__global vgc_slog_total = u64(0) // total small frees recorded (stat)
+__global vgc_slog_total = u64(0)
+// total small frees recorded (stat)
 __global vgc_uaf_count = u32(0)
-__global vgc_gold_total = u64(0) // total GOLD correlations (swept -> read-after-free)
+__global vgc_gold_total = u64(0)
+// total GOLD correlations (swept -> read-after-free)
 
 // vgc_slog_record: called from the sweep free-path (STW) for each freed small
 // noscan buffer. Lock-free ring push (collector is the only writer during STW).

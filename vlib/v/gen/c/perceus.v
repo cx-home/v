@@ -362,6 +362,7 @@ fn pcs_collect(e ast.Expr, mut out []string) {
 			for s in e.or_block.stmts {
 				pcs_collect_stmt(s, mut out)
 			}
+			pcs_collect_tmpl(e, mut out)
 		}
 		ast.ComptimeSelector {
 			pcs_collect(e.left, mut out)
@@ -486,6 +487,25 @@ fn pcs_collect(e ast.Expr, mut out []string) {
 // pcs_collect it is EXHAUSTIVE BY CONSTRUCTION (every `ast.Stmt` variant, no
 // `else`). Used for nested stmts in if/match/lock/or arms and for the
 // conservative pin sweep over statement kinds the CFG does not model precisely.
+// pcs_collect_tmpl collects the identifiers a `$tmpl(...)` / `$veb.html()` body
+// reads. The template is parsed into its own file (`veb_tmpl`, a `veb_tmpl_N` fn
+// whose statements cgen inlines at the call site) and reads the CALLER's locals
+// by name — invisible to a walk of the call's left/args, so a local read only by
+// the template was taken as dead right after its definition and dropped before
+// the template read it (cx-private#1888: slow_tests/inout/tmpl_expand_v_source_code
+// printed `//objects: ` for `objects := name + 's'`).
+fn pcs_collect_tmpl(e ast.ComptimeCall, mut out []string) {
+	for st in e.veb_tmpl.stmts {
+		if st is ast.FnDecl {
+			for s in st.stmts {
+				pcs_collect_stmt(s, mut out)
+			}
+		} else {
+			pcs_collect_stmt(st, mut out)
+		}
+	}
+}
+
 fn pcs_collect_stmt(st ast.Stmt, mut out []string) {
 	match st {
 		ast.ExprStmt {
@@ -718,6 +738,11 @@ fn (mut c PcsCfg) pcs_scan_share(e ast.Expr) {
 			}
 			for s in e.or_block.stmts {
 				c.pcs_scan_share_stmt(s)
+			}
+			mut tmpl_ids := []string{}
+			pcs_collect_tmpl(e, mut tmpl_ids)
+			for id in tmpl_ids {
+				c.pcs_mark_shared(id)
 			}
 		}
 		ast.SpawnExpr {

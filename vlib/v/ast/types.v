@@ -1755,10 +1755,17 @@ pub fn (t &Table) type_to_str_using_aliases(typ Type, import_aliases map[string]
 				res = 'map'
 				return res
 			}
-			info := sym.info as Map
-			key_str := t.type_to_str_using_aliases(info.key_type, import_aliases)
-			val_str := t.type_to_str_using_aliases(info.value_type, import_aliases)
-			res = 'map[${key_str}]${val_str}'
+			// `&map(p)` in module builtin names the `map` struct itself through a
+			// pointer: int(typ) carries the pointer bits, and a parse-only table
+			// (vfmt) holds no Map info for it — answer 'map' as the array arm does
+			// for `array` (cx-private#1889: vfmt panicked on vgc_d_vgc.c.v).
+			if sym.info is Map {
+				key_str := t.type_to_str_using_aliases(sym.info.key_type, import_aliases)
+				val_str := t.type_to_str_using_aliases(sym.info.value_type, import_aliases)
+				res = 'map[${key_str}]${val_str}'
+			} else {
+				res = 'map'
+			}
 		}
 		.multi_return {
 			res = '('

@@ -1309,8 +1309,8 @@ fn (mut v Builder) setup_output_name() {
 		}
 	}
 	if v.pref.build_mode == .build_module {
-		v.build_module_final_o = v.pref.cache_manager.mod_postfix_with_key2cpath(v.pref.path,
-			'.o', v.pref.path)
+		v.build_module_final_o = v.pref.cache_manager.mod_postfix_with_key2cpath(v.pref.path, '.o',
+			v.pref.path)
 		v.pref.out_name = v.build_module_final_o
 		if !v.pref.parallel_cc && v.ccoptions.cc != .msvc {
 			// Compile to a temporary name; publish_built_module_object renames

@@ -101,9 +101,9 @@ mut:
 // dial() to connect the UDP socket and run the handshake.
 pub fn new_dtls_client(config SSLConnectConfig) !&DTLSConn {
 	mut c := &DTLSConn{
-		config:       config
-		owns_conf:     true
-		owns_socket:   true
+		config:      config
+		owns_conf:   true
+		owns_socket: true
 	}
 	C.mbedtls_net_init(&c.server_fd)
 	C.mbedtls_ssl_init(&c.ssl)
@@ -150,7 +150,8 @@ pub fn new_dtls_client(config SSLConnectConfig) !&DTLSConn {
 	if ret != 0 {
 		return error_with_code('net.mbedtls DTLSConn, ssl_setup ret: ${ret}', ret)
 	}
-	C.mbedtls_ssl_set_timer_cb(&c.ssl, &c.timer, C.mbedtls_timing_set_delay, C.mbedtls_timing_get_delay)
+	C.mbedtls_ssl_set_timer_cb(&c.ssl, &c.timer, C.mbedtls_timing_set_delay,
+		C.mbedtls_timing_get_delay)
 	return c
 }
 
@@ -304,17 +305,17 @@ fn (mut l DTLSListener) init() ! {
 		bind_ip = voidptr(lhost.str)
 	}
 	bind_port := lport.str()
-	mut ret := C.mbedtls_net_bind(&l.server_fd, bind_ip, voidptr(bind_port.str), C.MBEDTLS_NET_PROTO_UDP)
+	mut ret := C.mbedtls_net_bind(&l.server_fd, bind_ip, voidptr(bind_port.str),
+		C.MBEDTLS_NET_PROTO_UDP)
 	if ret != 0 {
 		return error_with_code("net.mbedtls DTLSListener.init, net_bind can't bind ${l.saddr} ret: ${ret}",
 			ret)
 	}
 
-	ret = C.mbedtls_ssl_config_defaults(&l.conf, C.MBEDTLS_SSL_IS_SERVER, C.MBEDTLS_SSL_TRANSPORT_DATAGRAM,
-		C.MBEDTLS_SSL_PRESET_DEFAULT)
+	ret = C.mbedtls_ssl_config_defaults(&l.conf, C.MBEDTLS_SSL_IS_SERVER,
+		C.MBEDTLS_SSL_TRANSPORT_DATAGRAM, C.MBEDTLS_SSL_PRESET_DEFAULT)
 	if ret != 0 {
-		return error_with_code('net.mbedtls DTLSListener.init, config_defaults ret: ${ret}',
-			ret)
+		return error_with_code('net.mbedtls DTLSListener.init, config_defaults ret: ${ret}', ret)
 	}
 
 	dtls_apply_handshake_timeout(&l.conf, l.config)
@@ -322,19 +323,17 @@ fn (mut l DTLSListener) init() ! {
 	C.mbedtls_ssl_conf_ca_chain(&l.conf, &l.certs.cacert, unsafe { nil })
 	ret = C.mbedtls_ssl_conf_own_cert(&l.conf, &l.certs.client_cert, &l.certs.client_key)
 	if ret != 0 {
-		return error_with_code('net.mbedtls DTLSListener.init, conf_own_cert ret: ${ret}',
-			ret)
+		return error_with_code('net.mbedtls DTLSListener.init, conf_own_cert ret: ${ret}', ret)
 	}
 
 	// mandatory stateless cookie (anti-amplification, §3.6a/H3): generate keys +
 	// wire the HelloVerifyRequest write/check callbacks against the cookie ctx.
 	ret = C.mbedtls_ssl_cookie_setup(&l.cookie_ctx, C.mbedtls_ctr_drbg_random, &l.ctr_drbg)
 	if ret != 0 {
-		return error_with_code('net.mbedtls DTLSListener.init, cookie_setup ret: ${ret}',
-			ret)
+		return error_with_code('net.mbedtls DTLSListener.init, cookie_setup ret: ${ret}', ret)
 	}
-	C.mbedtls_ssl_conf_dtls_cookies(&l.conf, C.mbedtls_ssl_cookie_write, C.mbedtls_ssl_cookie_check,
-		&l.cookie_ctx)
+	C.mbedtls_ssl_conf_dtls_cookies(&l.conf, C.mbedtls_ssl_cookie_write,
+		C.mbedtls_ssl_cookie_check, &l.cookie_ctx)
 
 	// mTLS: require a client cert only when a CA was supplied.
 	if l.config.validate {
@@ -359,7 +358,8 @@ pub fn (mut l DTLSListener) accept() !&DTLSConn {
 	if ret != 0 {
 		return error_with_code('net.mbedtls DTLSListener.accept, ssl_setup ret: ${ret}', ret)
 	}
-	C.mbedtls_ssl_set_timer_cb(&conn.ssl, &conn.timer, C.mbedtls_timing_set_delay, C.mbedtls_timing_get_delay)
+	C.mbedtls_ssl_set_timer_cb(&conn.ssl, &conn.timer, C.mbedtls_timing_set_delay,
+		C.mbedtls_timing_get_delay)
 
 	for {
 		C.mbedtls_net_free(&conn.server_fd)
@@ -369,8 +369,7 @@ pub fn (mut l DTLSListener) accept() !&DTLSConn {
 		cliip_len := usize(0)
 		ret = C.mbedtls_net_accept(&l.server_fd, &conn.server_fd, &client_ip[0], 16, &cliip_len)
 		if ret != 0 {
-			return error_with_code('net.mbedtls DTLSListener.accept, net_accept ret: ${ret}',
-				ret)
+			return error_with_code('net.mbedtls DTLSListener.accept, net_accept ret: ${ret}', ret)
 		}
 
 		// bind the cookie to this client's transport address (HelloVerifyRequest)
@@ -393,8 +392,7 @@ pub fn (mut l DTLSListener) accept() !&DTLSConn {
 			continue
 		}
 		if hret != 0 {
-			return error_with_code('net.mbedtls DTLSListener.accept, handshake ret: ${hret}',
-				hret)
+			return error_with_code('net.mbedtls DTLSListener.accept, handshake ret: ${hret}', hret)
 		}
 		break
 	}

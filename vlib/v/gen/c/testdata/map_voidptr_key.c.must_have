@@ -1,0 +1,2 @@
+(sizeof(voidptr) == 8 ? &builtin__map_hash_int_8 : &builtin__map_hash_int_4)
+(sizeof(voidptr) == 8 ? &builtin__map_clone_int_8 : &builtin__map_clone_int_4)

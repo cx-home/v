@@ -1,4 +1,4 @@
-// vtest vflags: -os linux
+// vtest vflags: -os linux -gc boehm
 module main
 
 fn main() {}

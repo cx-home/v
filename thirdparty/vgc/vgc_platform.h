@@ -10,6 +10,10 @@
 #include <stdlib.h> // abort (span-registry-full hard fail in vgc_span_alloc)
 
 static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnostics section)
+// vgc_ull: a u64 as unsigned long long, the type a %llu conversion reads — u64
+// (uint64_t) is unsigned long on LP64 Linux and the BSDs, which -Wformat refuses
+// under -cstrict (the out-of-memory report in vgc_d_vgc.c.v).
+static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long long)v; }
 
 // ============================================================
 // Global / BSS data-segment roots
@@ -84,7 +88,31 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
   // one) is collected too. dl_iterate_phdr takes the loader lock, but the
   // collector calls this with the world stopped during a RARE backstop cycle,
   // not from a signal handler, so it is safe here.
-  #include <link.h>
+  #if defined(__TINYC__) && defined(__linux__)
+    // glibc's <bits/link.h> declares an x86-64 register struct with __int128_t,
+    // which tcc does not parse ("';' expected (got __int128_t)"), so under tcc
+    // no vgc program built on Linux (cx-private#1889). Take the ELF types from
+    // <elf.h> and declare the leading fields of dl_phdr_info — the only ones
+    // read below; glibc and musl lay them out alike and the struct is reached
+    // through the callback's pointer only — and dl_iterate_phdr itself.
+    #include <elf.h>
+    #if !defined(ElfW)
+      #if UINTPTR_MAX > 0xffffffffu
+        #define ElfW(type) Elf64_##type
+      #else
+        #define ElfW(type) Elf32_##type
+      #endif
+    #endif
+    struct dl_phdr_info {
+        ElfW(Addr) dlpi_addr;
+        const char* dlpi_name;
+        const ElfW(Phdr)* dlpi_phdr;
+        ElfW(Half) dlpi_phnum;
+    };
+    extern int dl_iterate_phdr(int (*callback)(struct dl_phdr_info*, size_t, void*), void* data);
+  #else
+    #include <link.h>
+  #endif
   #if !defined(ElfW)
     #define ElfW(type) Elf_##type // the BSDs' <link.h> names the native-width ELF types Elf_*
   #endif
@@ -134,18 +162,42 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
 // ============================================================
 // Thread-local storage
 // ============================================================
-#ifdef _WIN32
-  #define VGC_TLS __declspec(thread)
-#elif defined(__TINYC__)
-  #define VGC_TLS __thread
+#if (defined(__TINYC__) || defined(VGC_FORCE_TLS_BY_KEY)) && !defined(_WIN32)
+  // tcc has no working __thread off Windows: on Linux it does not parse it
+  // ("';' expected (got int)", cx-private#1889), and where it compiles it the
+  // variable is not per-thread, so every thread read and wrote ONE cache index
+  // — threads took each other's mcache and stack range, and the root scan of a
+  // threaded tcc program faulted in vgc_mark_roots (FreeBSD's tcc lane: vtest's
+  // runners, check_math; cx-private#1887). Under tcc the two per-thread words
+  // live in pthread keys instead (NULL = the -1 / 0 initial values).
+  // -DVGC_FORCE_TLS_BY_KEY takes this path under any compiler (to test it).
+  #include <pthread.h>
+  #define VGC_TLS_BY_KEY 1
+  static pthread_key_t _vgc_key_cache_idx;
+  static pthread_key_t _vgc_key_alloc_held;
+  static pthread_once_t _vgc_tls_once = PTHREAD_ONCE_INIT;
+  static void _vgc_tls_init(void) {
+      pthread_key_create(&_vgc_key_cache_idx, 0);
+      pthread_key_create(&_vgc_key_alloc_held, 0);
+  }
+  static inline int vgc_get_cache_idx(void) {
+      pthread_once(&_vgc_tls_once, _vgc_tls_init);
+      return (int)(intptr_t)pthread_getspecific(_vgc_key_cache_idx) - 1;
+  }
+  static inline void vgc_set_cache_idx(int idx) {
+      pthread_once(&_vgc_tls_once, _vgc_tls_init);
+      pthread_setspecific(_vgc_key_cache_idx, (void*)(intptr_t)(idx + 1));
+  }
 #else
-  #define VGC_TLS __thread
+  #ifdef _WIN32
+    #define VGC_TLS __declspec(thread)
+  #else
+    #define VGC_TLS __thread
+  #endif
+  static VGC_TLS int _vgc_cache_idx = -1;
+  static inline int vgc_get_cache_idx(void) { return _vgc_cache_idx; }
+  static inline void vgc_set_cache_idx(int idx) { _vgc_cache_idx = idx; }
 #endif
-
-static VGC_TLS int _vgc_cache_idx = -1;
-
-static inline int vgc_get_cache_idx(void) { return _vgc_cache_idx; }
-static inline void vgc_set_cache_idx(int idx) { _vgc_cache_idx = idx; }
 
 // DEBUG/BASELINE (-d vgc_coarse_alloc): a per-thread re-entrancy guard so the
 // coarse allocator lock is taken only at the OUTERMOST malloc/free/realloc entry
@@ -153,9 +205,19 @@ static inline void vgc_set_cache_idx(int idx) { _vgc_cache_idx = idx; }
 // not already inside the locked region (caller must then lock); vgc_alloc_exit
 // clears it. Lets us serialize ALL mutator allocation to confirm a residual
 // crash is an allocator data race + provide a known-correct baseline.
-static __thread int _vgc_alloc_held = 0;
+#ifdef VGC_TLS_BY_KEY
+static inline int vgc_alloc_try_enter(void) {
+    pthread_once(&_vgc_tls_once, _vgc_tls_init);
+    if (pthread_getspecific(_vgc_key_alloc_held)) return 0;
+    pthread_setspecific(_vgc_key_alloc_held, (void*)1);
+    return 1;
+}
+static inline void vgc_alloc_exit(void) { pthread_setspecific(_vgc_key_alloc_held, 0); }
+#else
+static VGC_TLS int _vgc_alloc_held = 0;
 static inline int vgc_alloc_try_enter(void) { if (_vgc_alloc_held) return 0; _vgc_alloc_held = 1; return 1; }
 static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
+#endif
 
 // ============================================================
 // Atomic operations
@@ -472,6 +534,9 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   }
 #elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__) || defined(__OpenBSD__)
   #include <pthread.h>
+  #if !defined(__NetBSD__)
+    #include <pthread_np.h> // pthread_attr_get_np (an implicit declaration under -cstrict)
+  #endif
   static inline int vgc_get_stack_bounds(uintptr_t* lo, uintptr_t* hi) {
       pthread_attr_t attr;
       if (pthread_attr_init(&attr) != 0) return 0;
@@ -930,7 +995,10 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
     else { *range_lo = stack_base; *range_hi = sp; }
-    int n = (int)(sizeof(buf) / sizeof(uintptr_t));
+    // jmp_buf is int[] on macOS: count WORDS of its byte size (a bare
+    // sizeof(buf)/sizeof(uintptr_t) trips clang's -Wsizeof-array-div under -cstrict).
+    size_t buf_bytes = sizeof(buf);
+    int n = (int)(buf_bytes / sizeof(uintptr_t));
     if (n > reg_max) { n = reg_max; }
     const uintptr_t* w = (const uintptr_t*)&buf;
     for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }
@@ -1449,6 +1517,16 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   }
 #endif // VGC_SIGNAL_SUSPEND
 #elif defined(__linux__)
+  #if defined(__TINYC__) && (defined(__x86_64__) || defined(__i386__)) && !defined(__ATOMIC_ACQUIRE)
+    // tcc has no __atomic builtins ("'__ATOMIC_ACQUIRE' undeclared", tcc-linux,
+    // cx-private#1889). This branch needs only acquire loads and release stores:
+    // on x86 (TSO) those are plain accesses, and tcc does not reorder volatile
+    // accesses, so a volatile access of the operand's own type is the builtin.
+    #define __ATOMIC_ACQUIRE 2
+    #define __ATOMIC_RELEASE 3
+    #define __atomic_load_n(p, order) (*(volatile __typeof__(*(p))*)(p))
+    #define __atomic_store_n(p, v, order) ((void)(*(volatile __typeof__(*(p))*)(p) = (v)))
+  #endif
   // ----------------------------------------------------------------------------
   // Linux OS-level stop-the-world via signal-based suspension.
   //

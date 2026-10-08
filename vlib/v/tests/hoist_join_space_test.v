@@ -264,7 +264,8 @@ fn probe_39(cs []string) []Node {
 fn probe_40(cs []string) []Node {
 	mut iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii := []Node{}
 	iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii << mk('k', [], [
-		wrap(cs.join(' '))])
+		wrap(cs.join(' ')),
+	])
 	return iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
 }
 
