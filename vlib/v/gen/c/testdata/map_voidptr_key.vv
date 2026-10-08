@@ -1,0 +1,23 @@
+// cx-home/v#9: a map[voidptr]T key is as wide as the TARGET's pointer.
+// The hash/eq/clone functions are chosen by the C compiler (sizeof(voidptr)),
+// not by the host's pref.m64 — a wasm32 build on a 64-bit host has 4-byte keys.
+// 64 keys fill past the initial capacity, so the dense array grows and its
+// last slot is written by the clone function.
+fn key(i int) voidptr {
+	return voidptr(usize(i) * 16 + 16)
+}
+
+fn main() {
+	mut m := map[voidptr]int{}
+	for i in 0 .. 64 {
+		m[key(i)] = i
+	}
+	mut ok := 0
+	for i in 0 .. 64 {
+		if m[key(i)] == i {
+			ok++
+		}
+	}
+	c := m.clone()
+	println('${m.len} ${ok} ${c.len} ${c[key(63)]}')
+}
