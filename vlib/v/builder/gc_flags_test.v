@@ -2,6 +2,9 @@ module builder
 
 import os
 
+// The Boehm cases name `-gc boehm`: this fork's default collector for ordinary
+// C-backend programs is vgc (pref/default.v), where upstream's is Boehm.
+
 fn execute_without_vflags(cmd string) os.Result {
 	old_vflags := os.getenv_opt('VFLAGS')
 	os.unsetenv('VFLAGS')
@@ -24,7 +27,7 @@ fn test_macos_tcc_boehm_uses_bundled_libgc() {
 	}
 	exe_path := os.join_path(os.vtmp_dir(), 'builder_gc_flags_test')
 	source_path := os.join_path(@VEXEROOT, 'examples', 'hello_world.v')
-	cmd := '${os.quoted_path(@VEXE)} -showcc -cc tcc -no-retry-compilation -o ${os.quoted_path(exe_path)} ${os.quoted_path(source_path)}'
+	cmd := '${os.quoted_path(@VEXE)} -showcc -cc tcc -gc boehm -no-retry-compilation -o ${os.quoted_path(exe_path)} ${os.quoted_path(source_path)}'
 	res := execute_without_vflags(cmd)
 	defer {
 		os.rm(exe_path) or {}
@@ -40,7 +43,7 @@ fn test_linux_musl_tcc_boehm_uses_system_libgc() {
 		return
 	}
 	source_path := os.join_path(@VEXEROOT, 'examples', 'hello_world.v')
-	cmd := '${os.quoted_path(@VEXE)} -dump-c-flags - -cc tcc -musl ${os.quoted_path(source_path)}'
+	cmd := '${os.quoted_path(@VEXE)} -dump-c-flags - -cc tcc -gc boehm -musl ${os.quoted_path(source_path)}'
 	res := execute_without_vflags(cmd)
 	assert res.exit_code == 0, res.output
 	assert res.output.contains('-lgc')
@@ -49,7 +52,7 @@ fn test_linux_musl_tcc_boehm_uses_system_libgc() {
 
 fn test_no_gc_thread_local_alloc_uses_source_libgc_without_tla_define() {
 	source_path := os.join_path(@VEXEROOT, 'examples', 'hello_world.v')
-	cmd := '${os.quoted_path(@VEXE)} -dump-c-flags - -d no_gc_thread_local_alloc ${os.quoted_path(source_path)}'
+	cmd := '${os.quoted_path(@VEXE)} -dump-c-flags - -gc boehm -d no_gc_thread_local_alloc ${os.quoted_path(source_path)}'
 	res := execute_without_vflags(cmd)
 	assert res.exit_code == 0, res.output
 	normalized := res.output.replace('\\', '/')
