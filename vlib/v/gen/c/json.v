@@ -91,12 +91,23 @@ fn (mut g Gen) gen_jsons() {
 				init_styp += ' = '
 				g.set_current_pos_as_last_stmt_pos()
 				pos := g.out.len
-				g.write(g.type_default(utyp))
-				init_generated := g.out.cut_to(pos).trim_space()
-				if g.type_default_vars.len > 0 {
+				// A field default that needs C statements (`[]Result{len: 0}` of a
+				// struct with defaults hoists its element loop) is hoisted to `pos`,
+				// the statement start set above; whatever type_default() leaves in
+				// the output past `pos` is those statements, never the expression
+				// (cx-private#1894: since the fork's expr_string() follows a hoisted
+				// start, the loop no longer travels inside the default's string and
+				// landed after `res = `).
+				init_generated := g.type_default(utyp).trim_space()
+				hoisted := g.out.cut_to(pos).trim_space()
+				if g.type_default_vars.len > 0 || hoisted.len > 0 {
 					saved_init := init_styp
 					init_styp = g.type_default_vars.bytestr()
 					init_styp += '\n'
+					if hoisted.len > 0 {
+						init_styp += hoisted
+						init_styp += '\n'
+					}
 					init_styp += saved_init
 					g.type_default_vars.clear()
 				}
@@ -860,8 +871,8 @@ fn (mut g Gen) gen_struct_enc_dec(utyp ast.Type, type_info ast.TypeInfo, styp st
 				dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${dec_name}(jsonroot_${tmp});')
 				if field.has_default_expr {
 					dec.writeln('\t} else {')
-					dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${g.expr_string_opt(field.typ,
-						field.default_expr)};')
+					g.json_write_default(mut dec, '${prefix}${op}${c_name(field.name)}', field.typ,
+						field.default_expr)
 				}
 				dec.writeln('\t}')
 			} else if field_sym.kind == .enum {
@@ -895,8 +906,8 @@ fn (mut g Gen) gen_struct_enc_dec(utyp ast.Type, type_info ast.TypeInfo, styp st
 				}
 				if field.has_default_expr {
 					dec.writeln('\t} else {')
-					dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${g.expr_string_opt(field.typ,
-						field.default_expr)};')
+					g.json_write_default(mut dec, '${prefix}${op}${c_name(field.name)}', field.typ,
+						field.default_expr)
 				}
 				dec.writeln('\t}')
 			} else if field_sym.name == 'time.Time' {
@@ -921,8 +932,8 @@ fn (mut g Gen) gen_struct_enc_dec(utyp ast.Type, type_info ast.TypeInfo, styp st
 					dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = *(time__Time*)${tmp_time_res}.data;')
 					if field.has_default_expr {
 						dec.writeln('\t} else {')
-						dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${g.expr_string_opt(field.typ,
-							field.default_expr)};')
+						g.json_write_default(mut dec, '${prefix}${op}${c_name(field.name)}',
+							field.typ, field.default_expr)
 					}
 				}
 				dec.writeln('\t}')
@@ -944,8 +955,8 @@ fn (mut g Gen) gen_struct_enc_dec(utyp ast.Type, type_info ast.TypeInfo, styp st
 					dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${parent_dec_name} (jsonroot_${tmp});')
 					if field.has_default_expr {
 						dec.writeln('\t} else {')
-						dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${g.expr_string_opt(field.typ,
-							field.default_expr)};')
+						g.json_write_default(mut dec, '${prefix}${op}${c_name(field.name)}',
+							field.typ, field.default_expr)
 					}
 					dec.writeln('\t}')
 				} else {
@@ -956,8 +967,8 @@ fn (mut g Gen) gen_struct_enc_dec(utyp ast.Type, type_info ast.TypeInfo, styp st
 					dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = *(${field_type}*) ${tmp}.data;')
 					if field.has_default_expr {
 						dec.writeln('\t} else {')
-						dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${g.expr_string_opt(field.typ,
-							field.default_expr)};')
+						g.json_write_default(mut dec, '${prefix}${op}${c_name(field.name)}',
+							field.typ, field.default_expr)
 					}
 					dec.writeln('\t}')
 				}
@@ -996,13 +1007,8 @@ fn (mut g Gen) gen_struct_enc_dec(utyp ast.Type, type_info ast.TypeInfo, styp st
 				}
 				if field.has_default_expr {
 					dec.writeln('\t} else {')
-					default_str := g.expr_string_opt(field.typ, field.default_expr)
-					if default_str.count(';\n') > 1 {
-						dec.writeln(default_str.all_before_last('\n'))
-						dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${default_str.all_after_last('\n')};')
-					} else {
-						dec.writeln('\t\t${prefix}${op}${c_name(field.name)} = ${default_str};')
-					}
+					g.json_write_default(mut dec, '${prefix}${op}${c_name(field.name)}', field.typ,
+						field.default_expr)
 				}
 				dec.writeln('\t}')
 			}
@@ -1374,4 +1380,28 @@ fn (mut g Gen) encode_map(utyp ast.Type, key_type ast.Type, value_type ast.Type)
 @[noreturn]
 fn verror_suggest_json_no_inline_sumtypes(sumtype_name string, type_name1 string, type_name2 string) {
 	verror('json: can not decode `${sumtype_name}` sumtype, too many numeric types (conflict of `${type_name1}` and `${type_name2}`), you can try to use alias for `${type_name2}` or compile v with `json_no_inline_sumtypes` flag')
+}
+
+// json_write_default writes `<lhs> = <field default>;` into the decoder, with
+// the C statements the default needs (a hoisted temporary: `[]T{len: n}` of a
+// struct with defaults fills an element buffer in a loop) written before it.
+// The hoist lands in g.out at the statement start set here — the fork's
+// expr_string() follows a hoisted start, so the statements are no longer part
+// of the returned string (cx-private#1894: they were left at a stale position
+// of g.out, before _vinit, and the decoder named an undeclared `_t4`); a
+// default string that still carries them (several `;\n`) is split as before.
+fn (mut g Gen) json_write_default(mut dec strings.Builder, lhs string, typ ast.Type, expr ast.Expr) {
+	g.set_current_pos_as_last_stmt_pos()
+	pos := g.out.len
+	mut value := g.expr_string_opt(typ, expr)
+	hoisted := g.out.cut_to(pos).trim_space()
+	g.stmt_path_pos.delete_last()
+	if hoisted.len > 0 {
+		dec.writeln(hoisted)
+	}
+	if value.count(';\n') > 1 {
+		dec.writeln(value.all_before_last('\n'))
+		value = value.all_after_last('\n')
+	}
+	dec.writeln('\t\t${lhs} = ${value};')
 }
