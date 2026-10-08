@@ -1733,6 +1733,13 @@ fn vgc_do_sweep() {
 	// see vgc_pool_trim). After the sweep so this cycle's fresh empties are
 	// pooled (and start aging) before the walk. An explicit gc_collect() cycle
 	// instead returns the WHOLE pool (cx #52; see vgc_force_collect_release_os).
+	// #1892: a frag gate deferred an arena carve to this collection — merge the
+	// pool's adjacent free spans first, so the retried request finds its run
+	// (and the trim below sees the merged spans).
+	if C.vgc_atomic_load_u32(&vgc_defrag_pending) != 0 {
+		C.vgc_atomic_store_u32(&vgc_defrag_pending, 0)
+		vgc_pool_defrag()
+	}
 	if C.vgc_atomic_load_u32(&vgc_eager_trim_pending) != 0 {
 		C.vgc_atomic_store_u32(&vgc_eager_trim_pending, 0)
 		vgc_pool_trim_all()
