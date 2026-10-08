@@ -387,7 +387,41 @@ fn test_c_error_bug_report_url_uses_bugs_domain_by_default() {
 	assert c_error_bug_report_url('') == 'https://bugs.vlang.io/bug-report'
 }
 
+// opt_in_c_error_bug_reports turns reporting on for one test: on this fork a
+// C error report is opt-in (V_C_ERROR_BUG_REPORT=1, see
+// should_submit_c_error_bug_report), where upstream posts by default.
+fn opt_in_c_error_bug_reports() ?string {
+	old := os.getenv_opt('V_C_ERROR_BUG_REPORT')
+	os.setenv('V_C_ERROR_BUG_REPORT', '1', true)
+	return old
+}
+
+fn test_should_submit_c_error_bug_report_is_opt_in_on_the_fork() {
+	old_opt_in := os.getenv_opt('V_C_ERROR_BUG_REPORT')
+	old_github_actions := os.getenv_opt('GITHUB_ACTIONS')
+	old_github_job := os.getenv_opt('GITHUB_JOB')
+	old_disabled := os.getenv_opt(c_error_bug_report_disabled_env)
+	os.unsetenv('V_C_ERROR_BUG_REPORT')
+	os.unsetenv('GITHUB_ACTIONS')
+	os.unsetenv('GITHUB_JOB')
+	os.unsetenv(c_error_bug_report_disabled_env)
+	defer {
+		restore_env_var('V_C_ERROR_BUG_REPORT', old_opt_in)
+		restore_env_var('GITHUB_ACTIONS', old_github_actions)
+		restore_env_var('GITHUB_JOB', old_github_job)
+		restore_c_error_bug_report_disabled_env(old_disabled)
+	}
+	assert !should_submit_c_error_bug_report('')
+	assert !should_submit_c_error_bug_report('http://127.0.0.1:19090/bug-report')
+	os.setenv('V_C_ERROR_BUG_REPORT', '0', true)
+	assert !should_submit_c_error_bug_report('')
+}
+
 fn test_should_submit_c_error_bug_report_allows_default_outside_github_ci() {
+	old_opt_in := opt_in_c_error_bug_reports()
+	defer {
+		restore_env_var('V_C_ERROR_BUG_REPORT', old_opt_in)
+	}
 	old_github_actions := os.getenv_opt('GITHUB_ACTIONS')
 	old_github_job := os.getenv_opt('GITHUB_JOB')
 	old_disabled := os.getenv_opt(c_error_bug_report_disabled_env)
@@ -422,6 +456,10 @@ fn test_should_submit_c_error_bug_report_skips_bugs_domain_in_github_ci() {
 }
 
 fn test_should_submit_c_error_bug_report_uses_custom_url_in_github_ci() {
+	old_opt_in := opt_in_c_error_bug_reports()
+	defer {
+		restore_env_var('V_C_ERROR_BUG_REPORT', old_opt_in)
+	}
 	old_github_actions := os.getenv_opt('GITHUB_ACTIONS')
 	old_github_job := os.getenv_opt('GITHUB_JOB')
 	old_url := os.getenv_opt('V_C_ERROR_BUG_REPORT_URL')
@@ -441,6 +479,10 @@ fn test_should_submit_c_error_bug_report_uses_custom_url_in_github_ci() {
 }
 
 fn test_should_submit_c_error_bug_report_can_be_disabled_by_env() {
+	old_opt_in := opt_in_c_error_bug_reports()
+	defer {
+		restore_env_var('V_C_ERROR_BUG_REPORT', old_opt_in)
+	}
 	old_github_actions := os.getenv_opt('GITHUB_ACTIONS')
 	old_github_job := os.getenv_opt('GITHUB_JOB')
 	old_disabled := os.getenv_opt(c_error_bug_report_disabled_env)
