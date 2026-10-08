@@ -152,8 +152,65 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
 // ============================================================
 // Atomic operations
 // ============================================================
-#if defined(__TINYC__)
-  // TCC: use __sync builtins
+#if defined(__TINYC__) && defined(__x86_64__)
+  // TCC on x86-64: the lock-prefixed instructions themselves, through tcc's
+  // GNU inline assembler — no runtime symbol. tcc has no __sync builtins of
+  // its own (each is an ordinary call), and FreeBSD's tcc links no library
+  // that defines them, so every vgc program failed to link there with
+  // "unresolved reference to '__sync_synchronize'" (and the add/sub/or/and/CAS
+  // twins) and V fell back to cc (cx-private#1856). Semantics are the __sync
+  // ones this branch replaces: full barriers, add/sub answer the NEW value,
+  // fetch_or/fetch_and the OLD byte, CAS a bool, exchange the old word.
+  static inline void vgc__tcc_fence(void) { __asm__ __volatile__("mfence" : : : "memory"); }
+  static inline uint64_t vgc__tcc_xadd_u64(volatile uint64_t* p, uint64_t v) {
+      __asm__ __volatile__("lock; xaddq %0, %1" : "+r"(v), "+m"(*p) : : "memory");
+      return v;
+  }
+  static inline uint32_t vgc__tcc_xadd_u32(volatile uint32_t* p, uint32_t v) {
+      __asm__ __volatile__("lock; xaddl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
+      return v;
+  }
+  static inline int vgc__tcc_cas_u8(volatile uint8_t* p, uint8_t expected, uint8_t desired) {
+      uint8_t prev;
+      __asm__ __volatile__("lock; cmpxchgb %2, %1" : "=a"(prev), "+m"(*p) : "q"(desired), "0"(expected) : "memory");
+      return prev == expected;
+  }
+  static inline int vgc__tcc_cas_u32(volatile uint32_t* p, uint32_t expected, uint32_t desired) {
+      uint32_t prev;
+      __asm__ __volatile__("lock; cmpxchgl %2, %1" : "=a"(prev), "+m"(*p) : "r"(desired), "0"(expected) : "memory");
+      return prev == expected;
+  }
+  static inline uint32_t vgc__tcc_xchg_u32(volatile uint32_t* p, uint32_t v) {
+      __asm__ __volatile__("xchgl %0, %1" : "+r"(v), "+m"(*p) : : "memory");
+      return v;
+  }
+  static inline uint8_t vgc__tcc_fetch_or_u8(volatile uint8_t* p, uint8_t v) {
+      uint8_t old;
+      do { old = *p; } while (!vgc__tcc_cas_u8(p, old, (uint8_t)(old | v)));
+      return old;
+  }
+  static inline uint8_t vgc__tcc_fetch_and_u8(volatile uint8_t* p, uint8_t v) {
+      uint8_t old;
+      do { old = *p; } while (!vgc__tcc_cas_u8(p, old, (uint8_t)(old & v)));
+      return old;
+  }
+  #define vgc_atomic_load_u32(ptr) (*(volatile uint32_t*)(ptr))
+  #define vgc_atomic_store_u32(ptr, val) do { *(volatile uint32_t*)(ptr) = (val); vgc__tcc_fence(); } while(0)
+  #define vgc_atomic_load_u64(ptr) (*(volatile uint64_t*)(ptr))
+  #define vgc_atomic_store_u64(ptr, val) do { *(volatile uint64_t*)(ptr) = (val); vgc__tcc_fence(); } while(0)
+  #define vgc_atomic_add_u64(ptr, val) (vgc__tcc_xadd_u64((volatile uint64_t*)(ptr), (uint64_t)(val)) + (uint64_t)(val))
+  #define vgc_atomic_sub_u64(ptr, val) (vgc__tcc_xadd_u64((volatile uint64_t*)(ptr), (uint64_t)0 - (uint64_t)(val)) - (uint64_t)(val))
+  #define vgc_atomic_add_u32(ptr, val) (vgc__tcc_xadd_u32((volatile uint32_t*)(ptr), (uint32_t)(val)) + (uint32_t)(val))
+  #define vgc_atomic_sub_u32(ptr, val) (vgc__tcc_xadd_u32((volatile uint32_t*)(ptr), (uint32_t)0 - (uint32_t)(val)) - (uint32_t)(val))
+  #define vgc_atomic_fetch_or_u8(ptr, val) vgc__tcc_fetch_or_u8((volatile uint8_t*)(ptr), (uint8_t)(val))
+  #define vgc_atomic_fetch_and_u8(ptr, val) vgc__tcc_fetch_and_u8((volatile uint8_t*)(ptr), (uint8_t)(val))
+  #define vgc_atomic_load_u16(ptr) (*(volatile uint16_t*)(ptr))
+  #define vgc_atomic_store_u16(ptr, val) do { *(volatile uint16_t*)(ptr) = (val); vgc__tcc_fence(); } while(0)
+  #define vgc_atomic_cas_u32(ptr, expected, desired) vgc__tcc_cas_u32((volatile uint32_t*)(ptr), *(expected), (uint32_t)(desired))
+  #define vgc_atomic_exchange_u32(ptr, val) vgc__tcc_xchg_u32((volatile uint32_t*)(ptr), (uint32_t)(val))
+  #define vgc_atomic_fence() vgc__tcc_fence()
+#elif defined(__TINYC__)
+  // TCC elsewhere (arm64): use __sync builtins
   #define vgc_atomic_load_u32(ptr) (*(volatile uint32_t*)(ptr))
   #define vgc_atomic_store_u32(ptr, val) do { *(volatile uint32_t*)(ptr) = (val); __sync_synchronize(); } while(0)
   #define vgc_atomic_load_u64(ptr) (*(volatile uint64_t*)(ptr))
