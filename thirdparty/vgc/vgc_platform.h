@@ -746,7 +746,24 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     *my_park_seq = vgc_atomic_load_u32(stop_seq);
     vgc_atomic_store_u32(my_stopped, 1);
     vgc_atomic_add_u32(stopped_count, 1);
-    while (vgc_atomic_load_u32(stop_flag) != 0) { vgc_cpu_pause(); }
+    // A SLEEPING wait past a short spin (vgc_safe_exit_handshake's shape): a
+    // collection runs for milliseconds, and every parked mutator busy-spun
+    // on a core for the whole of it — a [par] binary-trees spent 2.4x its
+    // serial CPU, the excess here (cx-private#1836). Sleeping hands the
+    // core to the collector; the frame (and `buf`) stays put, and the sleep's
+    // own frames lie below range_lo, unscanned and holding no GC state.
+    int spins = 0;
+    while (vgc_atomic_load_u32(stop_flag) != 0) {
+        if (++spins < 2000) {
+            vgc_cpu_pause();
+        } else {
+#ifdef _WIN32
+            Sleep(0);
+#else
+            usleep(50);
+#endif
+        }
+    }
     vgc_atomic_store_u32(my_stopped, 0);
     __asm__ __volatile__("" : : "r"(&buf) : "memory");
 }
