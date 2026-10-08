@@ -1020,6 +1020,10 @@ fn vgc_mark_roots() {
 		}
 	}
 	for k in 0 .. nseg {
+		$if vgc_dbg1887 ? {
+			C.vgc_say(0x18890, u64(vgc_seg_lo[k]))
+			C.vgc_say(0x18891, u64(vgc_seg_hi[k]))
+		}
 		if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
 			vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k])
 		}
@@ -1032,6 +1036,12 @@ fn vgc_mark_roots() {
 			continue
 		}
 		if cache.stack_lo > 0 && cache.stack_hi > 0 && cache.stack_hi > cache.stack_lo {
+			$if vgc_dbg1887 ? {
+				C.vgc_say(0x18880, u64(i))
+				C.vgc_say(0x18881, u64(cache.stack_lo))
+				C.vgc_say(0x18882, u64(cache.stack_hi))
+				C.vgc_say(0x18883, u64(C.vgc_get_cache_idx()))
+			}
 			vgc_scan_range(cache.stack_lo, cache.stack_hi)
 			// DIAGNOSTIC (root-scan-miss localizer): does THIS thread's stack hold
 			// a pointer to the watched object? Bounded to the stack ranges only.

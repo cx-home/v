@@ -66,6 +66,11 @@ jobs:
           export VTEST_SHOW_LONGEST_BY_TOTALTIME=3
           export VFLAGS='-cc tcc -no-retry-compilation'
           echo "::endgroup::"
+          echo "::group::DBG 1887"
+          ./v -cc tcc -d vgc_dbg1887 -o /tmp/dbg1887 ci/dbg_1887.v && /tmp/dbg1887 > /tmp/dbg1887.log 2>&1 ; echo "dbg exit $?" ; head -40 /tmp/dbg1887.log ; echo ... ; tail -150 /tmp/dbg1887.log
+          ./v -cc tcc -o /tmp/dbg1887b ci/dbg_1887.v && /tmp/dbg1887b ; echo "dbg-b exit $?"
+          ./v -cc cc -d vgc_dbg1887 -o /tmp/dbg1887c ci/dbg_1887.v && /tmp/dbg1887c 2>&1 | head -60 ; echo "dbg-c exit $?"
+          echo "::endgroup::"
           ./v run ci/freebsd_ci.vsh all
 
   clang-freebsd:
