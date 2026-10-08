@@ -310,6 +310,7 @@ fn (mut c Checker) for_in_stmt(mut node ast.ForInStmt) {
 					}
 					else {}
 				}
+
 				// VCAP-1 (cx-private#1852): `for mut e in a` writes the elements of
 				// `a` in place. For a fixed array that is a write to the value
 				// itself, so on a `[mut x]` capture's copy it is lost, as

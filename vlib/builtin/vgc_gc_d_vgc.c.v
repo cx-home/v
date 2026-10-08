@@ -688,7 +688,7 @@ fn vgc_rescan_dirty_spans() {
 fn vgc_gc_start_concurrent() {
 	mut expected := vgc_phase_off
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
-		return // a cycle is already in flight
+		return
 	}
 	vgc_gc_t0 = C.vgc_now_ns() // adaptive-pacer cycle cost (#71); includes the concurrent middle
 	self_idx := C.vgc_get_cache_idx()
@@ -1567,8 +1567,8 @@ fn vgc_verify_mark_closure() {
 							// Marked referrer -> allocated-but-unmarked referent: closure broken.
 							if violations < 40 {
 								C.vgc_verify_report(u64(if span.noscan { 1 } else { 0 }),
-									u64(obj_addr), u64(span.elem_size), u64(addr - obj_addr),
-									u64(tspan.base + usize(tidx) * usize(tspan.elem_size)),
+									u64(obj_addr), u64(span.elem_size), u64(addr - obj_addr), u64(
+									tspan.base + usize(tidx) * usize(tspan.elem_size)),
 									u64(tspan.elem_size))
 							}
 							violations++
@@ -1637,9 +1637,9 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 							}
 						}
 						if vgc_rootfind_count < 80 {
-							C.vgc_rootfind_report(u64(addr), in_stack,
-								u64(span.base + usize(tidx) * usize(span.elem_size)),
-								u64(span.elem_size), u64(kind))
+							C.vgc_rootfind_report(u64(addr), in_stack, u64(span.base +
+								usize(tidx) * usize(span.elem_size)), u64(span.elem_size),
+								u64(kind))
 						}
 						vgc_rootfind_count++
 					}
@@ -1885,8 +1885,8 @@ fn vgc_sweep_span(span &VGC_Span) {
 				}
 			} $else {
 				unsafe {
-					_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) +
-						usize(b))), ~garbage)
+					_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.alloc_bits) + usize(b))),
+						~garbage)
 				}
 			}
 			// Track lowest freed index for free_index hint

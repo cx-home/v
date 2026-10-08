@@ -242,22 +242,22 @@ pub mut:
 	experimental      bool // enable experimental features
 	skip_unused       bool // skip generating C code for functions, that are not used
 
-	use_color           ColorOutput // whether the warnings/errors should use ANSI color escapes.
-	cleanup_files       []string    // list of temporary *.tmp.c and *.tmp.c.rsp files. Cleaned up on successful builds.
-	build_options       []string    // list of options, that should be passed down to `build-module`, if needed for -usecache
+	use_color     ColorOutput // whether the warnings/errors should use ANSI color escapes.
+	cleanup_files []string    // list of temporary *.tmp.c and *.tmp.c.rsp files. Cleaned up on successful builds.
+	build_options []string    // list of options, that should be passed down to `build-module`, if needed for -usecache
 	// cx-private#864: -usecache modules whose cached layer's TYPE TABLE does not
 	// prefix-match this build's table. Their cached .o is NOT linked and cgen
 	// emits their bodies inline — correctness first, the cache win only where
 	// the type universes provably agree. Filled by validate_usecache_type_tables.
 	usecache_invalid_mods []string
-	cache_manager       vcache.CacheManager
-	gc_mode             GarbageCollectionMode = .unknown // .no_gc, .boehm, .boehm_leak, ...
-	gc_set_by_flag      bool              // true when the compiler receives `-gc`
-	assert_failure_mode AssertFailureMode // whether to call abort() or print_backtrace() after an assertion failure
-	message_limit       int = 200 // the maximum amount of warnings/errors/notices that will be accumulated
-	nofloat             bool // for low level code, like kernels: replaces f32 with u32 and f64 with u64
-	use_coroutines      bool // experimental coroutines
-	fast_math           bool // -fast-math will pass either -ffast-math or /fp:fast (for msvc) to the C backend
+	cache_manager         vcache.CacheManager
+	gc_mode               GarbageCollectionMode = .unknown // .no_gc, .boehm, .boehm_leak, ...
+	gc_set_by_flag        bool              // true when the compiler receives `-gc`
+	assert_failure_mode   AssertFailureMode // whether to call abort() or print_backtrace() after an assertion failure
+	message_limit         int = 200 // the maximum amount of warnings/errors/notices that will be accumulated
+	nofloat               bool // for low level code, like kernels: replaces f32 with u32 and f64 with u64
+	use_coroutines        bool // experimental coroutines
+	fast_math             bool // -fast-math will pass either -ffast-math or /fp:fast (for msvc) to the C backend
 	// checker settings:
 	checker_match_exhaustive_cutoff_limit int = 12
 	thread_stack_size                     int = 8388608 // Change with `-thread-stack-size 4194304`. The final default is adjusted in fill_with_defaults() based on the target architecture.

@@ -84,7 +84,31 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
   // one) is collected too. dl_iterate_phdr takes the loader lock, but the
   // collector calls this with the world stopped during a RARE backstop cycle,
   // not from a signal handler, so it is safe here.
-  #include <link.h>
+  #if defined(__TINYC__) && defined(__linux__)
+    // glibc's <bits/link.h> declares an x86-64 register struct with __int128_t,
+    // which tcc does not parse ("';' expected (got __int128_t)"), so under tcc
+    // no vgc program built on Linux (cx-private#1889). Take the ELF types from
+    // <elf.h> and declare the leading fields of dl_phdr_info — the only ones
+    // read below; glibc and musl lay them out alike and the struct is reached
+    // through the callback's pointer only — and dl_iterate_phdr itself.
+    #include <elf.h>
+    #if !defined(ElfW)
+      #if UINTPTR_MAX > 0xffffffffu
+        #define ElfW(type) Elf64_##type
+      #else
+        #define ElfW(type) Elf32_##type
+      #endif
+    #endif
+    struct dl_phdr_info {
+        ElfW(Addr) dlpi_addr;
+        const char* dlpi_name;
+        const ElfW(Phdr)* dlpi_phdr;
+        ElfW(Half) dlpi_phnum;
+    };
+    extern int dl_iterate_phdr(int (*callback)(struct dl_phdr_info*, size_t, void*), void* data);
+  #else
+    #include <link.h>
+  #endif
   #if !defined(ElfW)
     #define ElfW(type) Elf_##type // the BSDs' <link.h> names the native-width ELF types Elf_*
   #endif

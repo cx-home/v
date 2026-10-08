@@ -412,7 +412,8 @@ fn (mut b Builder) cached_module_provenance_fresh(imp_path string, obj_path stri
 				}
 				obj := os.read_bytes(obj_path) or { return false }
 				if obj.len.str() != parts[0] || hash.sum64(obj, 7).hex_full() != parts[1] {
-					vcache.dlog('| Builder.' + @FN, 'object bytes do not match manifest binding: ${obj_path}')
+					vcache.dlog('| Builder.' + @FN,
+						'object bytes do not match manifest binding: ${obj_path}')
 					return false
 				}
 			}
@@ -420,7 +421,8 @@ fn (mut b Builder) cached_module_provenance_fresh(imp_path string, obj_path stri
 				recorded := rest.all_before(' ')
 				fpath := rest.all_after(' ')
 				if b.provenance_file_hash(fpath) != recorded {
-					vcache.dlog('| Builder.' + @FN, 'stale file dependency: ${fpath} (module ${imp_path})')
+					vcache.dlog('| Builder.' + @FN,
+						'stale file dependency: ${fpath} (module ${imp_path})')
 					return false
 				}
 			}
@@ -428,7 +430,8 @@ fn (mut b Builder) cached_module_provenance_fresh(imp_path string, obj_path stri
 				recorded := rest.all_before(' ')
 				name := rest.all_after(' ')
 				if hash.sum64_string(os.getenv(name), 7).hex_full() != recorded {
-					vcache.dlog('| Builder.' + @FN, 'stale \$env value: ${name} (module ${imp_path})')
+					vcache.dlog('| Builder.' + @FN,
+						'stale \$env value: ${name} (module ${imp_path})')
 					return false
 				}
 			}
@@ -597,7 +600,9 @@ pub fn (mut b Builder) validate_usecache_type_tables() {
 				if b.table.type_idxs[name] or { -1 } != idx {
 					ok = false
 					$if trace_usecache_types ? {
-						eprintln('> usecache type-table mismatch in ${mods[i]}: layer ${idx}:${name} vs program ${b.table.type_idxs[name] or { -1 }}')
+						eprintln('> usecache type-table mismatch in ${mods[i]}: layer ${idx}:${name} vs program ${b.table.type_idxs[name] or {
+							-1
+						}}')
 					}
 					break
 				}

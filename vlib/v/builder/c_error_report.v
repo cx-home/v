@@ -500,8 +500,7 @@ fn should_submit_c_error_bug_report(flag_url string) bool {
 }
 
 fn c_error_bug_reports_enabled() bool {
-	return os.getenv('V_C_ERROR_BUG_REPORT').trim_space().to_lower() in ['1', 'true', 'yes',
-		'on']
+	return os.getenv('V_C_ERROR_BUG_REPORT').trim_space().to_lower() in ['1', 'true', 'yes', 'on']
 }
 
 fn c_error_bug_reports_disabled() bool {

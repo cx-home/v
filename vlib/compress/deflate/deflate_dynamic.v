@@ -130,9 +130,9 @@ fn huff_lengths_from_freqs(freqs []int, max_bits int) []int {
 	for i, s in leaves {
 		weight[i] = i64(freqs[s])
 	}
-	mut lq := 0            // next unconsumed leaf (leaves: [0, used.len))
-	mut iq := used.len     // next unconsumed internal node ([used.len, next))
-	mut next := used.len   // next internal node index to create
+	mut lq := 0 // next unconsumed leaf (leaves: [0, used.len))
+	mut iq := used.len // next unconsumed internal node ([used.len, next))
+	mut next := used.len // next internal node index to create
 	for next < total {
 		// pop the two smallest; a leaf wins weight ties (deterministic,
 		// and it keeps depths minimal for equal weights).
@@ -215,8 +215,8 @@ const cl_symbol_order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 
 
 // ClToken is one RLE-encoded code-length symbol (0..18 + extra bits).
 struct ClToken {
-	sym       u8
-	extra     u16
+	sym        u8
+	extra      u16
 	extra_bits u8
 }
 
@@ -235,26 +235,44 @@ fn rle_code_lengths(lens []int) []ClToken {
 			mut left := run
 			for left >= 11 {
 				take := if left > 138 { 138 } else { left }
-				out << ClToken{ sym: 18, extra: u16(take - 11), extra_bits: 7 }
+				out << ClToken{
+					sym:        18
+					extra:      u16(take - 11)
+					extra_bits: 7
+				}
 				left -= take
 			}
 			if left >= 3 {
-				out << ClToken{ sym: 17, extra: u16(left - 3), extra_bits: 3 }
+				out << ClToken{
+					sym:        17
+					extra:      u16(left - 3)
+					extra_bits: 3
+				}
 				left = 0
 			}
 			for _ in 0 .. left {
-				out << ClToken{ sym: 0 }
+				out << ClToken{
+					sym: 0
+				}
 			}
 		} else {
-			out << ClToken{ sym: u8(l) }
+			out << ClToken{
+				sym: u8(l)
+			}
 			mut left := run - 1
 			for left >= 3 {
 				take := if left > 6 { 6 } else { left }
-				out << ClToken{ sym: 16, extra: u16(take - 3), extra_bits: 2 }
+				out << ClToken{
+					sym:        16
+					extra:      u16(take - 3)
+					extra_bits: 2
+				}
 				left -= take
 			}
 			for _ in 0 .. left {
-				out << ClToken{ sym: u8(l) }
+				out << ClToken{
+					sym: u8(l)
+				}
 			}
 		}
 		i += run

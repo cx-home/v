@@ -11258,6 +11258,7 @@ fn (mut g Gen) gen_hash_stmts(mut sb strings.Builder, node &ast.HashStmtNode, se
 					} else {
 						// cx-private#864: an invalidated-layer module is compiled
 						// into THIS TU, so the TU owns its C definition-includes.
+
 						node.mod in ['main', 'help'] || util.should_bundle_module(node.mod)
 							|| node.mod in g.pref.usecache_invalid_mods
 					}
