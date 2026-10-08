@@ -550,6 +550,8 @@ fn vgc_gc_start() {
 		// only for mach-suspended stragglers) is the authoritative resume set, so clearing
 		// gc_stop_flag here cannot confuse the resume loop below.
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0)
+		// cx-private#1893: parkers past their spin sleep on the flag (vgc_wait_flag_clear).
+		C.vgc_wake_flag_waiters(&vgc_heap.gc_stop_flag)
 	}
 
 	// Resume the world: mark + sweep are complete, every live object survived, and

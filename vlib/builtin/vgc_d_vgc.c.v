@@ -62,6 +62,7 @@ fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping on gc_stop_flag
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32

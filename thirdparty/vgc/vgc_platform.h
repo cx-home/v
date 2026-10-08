@@ -851,6 +851,67 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
     __asm__ __volatile__("" : : "r"(&buf) : "memory");
 }
 
+// ── Waiting out a stop-the-world (cx-private#1893) ─────────────────────────
+// A mutator parked at a safepoint used to spin on gc_stop_flag with the CPU's
+// pause/yield hint for the WHOLE collection (mark + sweep, milliseconds under a
+// server's heap). Every parked mutator then stays runnable, so on a box with
+// more registered threads than cores (an http server: reactors + the executor
+// pool + the load generator) the spinners compete with the collector for
+// cores and the collection — the pause every mutator waits out — stretches
+// (the sampled hot spot: the `yield; ldapr; cbnz` loop, cx-examples#369).
+// vgc_wait_flag_clear spins briefly (a back-to-back cycle or a short sweep is
+// answered with no syscall), then BLOCKS in the kernel on the flag's address
+// (darwin __ulock_wait, linux futex), bounded by a 1 ms timeout so a missed
+// wake costs at most that; vgc_wake_flag_waiters wakes them all when the
+// collector drops the flag. How the flag-drop is awaited is irrelevant to
+// soundness: the parker's spilled registers and recorded [sp, base] range are
+// unchanged while it sleeps, and the kernel wait's frames are below sp.
+#define VGC_PARK_SPINS 2000
+#if defined(__APPLE__)
+  extern int __ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us);
+  extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+  #define VGC_UL_COMPARE_AND_WAIT 1u
+  #define VGC_ULF_WAKE_ALL 0x00000100u
+  #define VGC_ULF_NO_ERRNO 0x01000000u
+  static inline void vgc_flag_block(uint32_t* flag) {
+      (void)__ulock_wait(VGC_UL_COMPARE_AND_WAIT | VGC_ULF_NO_ERRNO, (void*)flag, 1, 1000);
+  }
+  static inline void vgc_wake_flag_waiters(uint32_t* flag) {
+      (void)__ulock_wake(VGC_UL_COMPARE_AND_WAIT | VGC_ULF_WAKE_ALL | VGC_ULF_NO_ERRNO, (void*)flag, 0);
+  }
+#elif defined(__linux__)
+  #include <linux/futex.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+  #include <time.h>
+  #include <limits.h>
+  static inline void vgc_flag_block(uint32_t* flag) {
+      struct timespec ts = { 0, 1000000 };
+      (void)syscall(SYS_futex, (void*)flag, FUTEX_WAIT_PRIVATE, 1, &ts, NULL, 0);
+  }
+  static inline void vgc_wake_flag_waiters(uint32_t* flag) {
+      (void)syscall(SYS_futex, (void*)flag, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+  }
+#elif defined(_WIN32)
+  static inline void vgc_flag_block(uint32_t* flag) { (void)flag; Sleep(0); }
+  static inline void vgc_wake_flag_waiters(uint32_t* flag) { (void)flag; }
+#else
+  #include <unistd.h>
+  static inline void vgc_flag_block(uint32_t* flag) { (void)flag; usleep(50); }
+  static inline void vgc_wake_flag_waiters(uint32_t* flag) { (void)flag; }
+#endif
+static inline void vgc_wait_flag_clear(uint32_t* flag) {
+    int spins = 0;
+    while (vgc_atomic_load_u32(flag) != 0) {
+        if (spins < VGC_PARK_SPINS) {
+            spins++;
+            vgc_cpu_pause();
+        } else {
+            vgc_flag_block(flag);
+        }
+    }
+}
+
 // Park at a safepoint with callee-saved registers spilled onto THIS frame, so
 // the GC's conservative stack scan sees roots that live only in registers (a
 // hot loop variable like `last` is often kept in a callee-saved register and
@@ -876,7 +937,7 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     *my_park_seq = vgc_atomic_load_u32(stop_seq);
     vgc_atomic_store_u32(my_stopped, 1);
     vgc_atomic_add_u32(stopped_count, 1);
-    while (vgc_atomic_load_u32(stop_flag) != 0) { vgc_cpu_pause(); }
+    vgc_wait_flag_clear(stop_flag);
     vgc_atomic_store_u32(my_stopped, 0);
     __asm__ __volatile__("" : : "r"(&buf) : "memory");
 }
