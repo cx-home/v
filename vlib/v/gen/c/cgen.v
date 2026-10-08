@@ -6617,12 +6617,14 @@ fn (mut g Gen) map_fn_ptrs(key_sym ast.TypeSymbol) (string, string, string, stri
 			clone_fn = '&builtin__map_clone_int_4'
 		}
 		.voidptr {
-			ts := if g.pref.m64 {
-				unsafe { g.table.sym_by_idx(ast.u64_type_idx) }
-			} else {
-				unsafe { g.table.sym_by_idx(ast.u32_type_idx) }
-			}
-			return g.map_fn_ptrs(ts)
+			// The key is as wide as the TARGET's pointer, which the C compiler
+			// knows and the host's pref.m64 does not: a wasm32 build (emcc, no
+			// -m32) has 4-byte pointers on a 64-bit host, and the _8 functions
+			// read and write 8 bytes per 4-byte key slot (a heap overflow in
+			// map_clone_int_8 at the dense array's last slot).
+			hash_fn = '(sizeof(voidptr) == 8 ? &builtin__map_hash_int_8 : &builtin__map_hash_int_4)'
+			key_eq_fn = '(sizeof(voidptr) == 8 ? &builtin__map_eq_int_8 : &builtin__map_eq_int_4)'
+			clone_fn = '(sizeof(voidptr) == 8 ? &builtin__map_clone_int_8 : &builtin__map_clone_int_4)'
 		}
 		.u64, .i64, .f64 {
 			hash_fn = '&builtin__map_hash_int_8'
