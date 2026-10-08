@@ -158,18 +158,42 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
 // ============================================================
 // Thread-local storage
 // ============================================================
-#ifdef _WIN32
-  #define VGC_TLS __declspec(thread)
-#elif defined(__TINYC__)
-  #define VGC_TLS __thread
+#if (defined(__TINYC__) || defined(VGC_FORCE_TLS_BY_KEY)) && !defined(_WIN32)
+  // tcc has no working __thread off Windows: on Linux it does not parse it
+  // ("';' expected (got int)", cx-private#1889), and where it compiles it the
+  // variable is not per-thread, so every thread read and wrote ONE cache index
+  // — threads took each other's mcache and stack range, and the root scan of a
+  // threaded tcc program faulted in vgc_mark_roots (FreeBSD's tcc lane: vtest's
+  // runners, check_math; cx-private#1887). Under tcc the two per-thread words
+  // live in pthread keys instead (NULL = the -1 / 0 initial values).
+  // -DVGC_FORCE_TLS_BY_KEY takes this path under any compiler (to test it).
+  #include <pthread.h>
+  #define VGC_TLS_BY_KEY 1
+  static pthread_key_t _vgc_key_cache_idx;
+  static pthread_key_t _vgc_key_alloc_held;
+  static pthread_once_t _vgc_tls_once = PTHREAD_ONCE_INIT;
+  static void _vgc_tls_init(void) {
+      pthread_key_create(&_vgc_key_cache_idx, 0);
+      pthread_key_create(&_vgc_key_alloc_held, 0);
+  }
+  static inline int vgc_get_cache_idx(void) {
+      pthread_once(&_vgc_tls_once, _vgc_tls_init);
+      return (int)(intptr_t)pthread_getspecific(_vgc_key_cache_idx) - 1;
+  }
+  static inline void vgc_set_cache_idx(int idx) {
+      pthread_once(&_vgc_tls_once, _vgc_tls_init);
+      pthread_setspecific(_vgc_key_cache_idx, (void*)(intptr_t)(idx + 1));
+  }
 #else
-  #define VGC_TLS __thread
+  #ifdef _WIN32
+    #define VGC_TLS __declspec(thread)
+  #else
+    #define VGC_TLS __thread
+  #endif
+  static VGC_TLS int _vgc_cache_idx = -1;
+  static inline int vgc_get_cache_idx(void) { return _vgc_cache_idx; }
+  static inline void vgc_set_cache_idx(int idx) { _vgc_cache_idx = idx; }
 #endif
-
-static VGC_TLS int _vgc_cache_idx = -1;
-
-static inline int vgc_get_cache_idx(void) { return _vgc_cache_idx; }
-static inline void vgc_set_cache_idx(int idx) { _vgc_cache_idx = idx; }
 
 // DEBUG/BASELINE (-d vgc_coarse_alloc): a per-thread re-entrancy guard so the
 // coarse allocator lock is taken only at the OUTERMOST malloc/free/realloc entry
@@ -177,9 +201,19 @@ static inline void vgc_set_cache_idx(int idx) { _vgc_cache_idx = idx; }
 // not already inside the locked region (caller must then lock); vgc_alloc_exit
 // clears it. Lets us serialize ALL mutator allocation to confirm a residual
 // crash is an allocator data race + provide a known-correct baseline.
-static __thread int _vgc_alloc_held = 0;
+#ifdef VGC_TLS_BY_KEY
+static inline int vgc_alloc_try_enter(void) {
+    pthread_once(&_vgc_tls_once, _vgc_tls_init);
+    if (pthread_getspecific(_vgc_key_alloc_held)) return 0;
+    pthread_setspecific(_vgc_key_alloc_held, (void*)1);
+    return 1;
+}
+static inline void vgc_alloc_exit(void) { pthread_setspecific(_vgc_key_alloc_held, 0); }
+#else
+static VGC_TLS int _vgc_alloc_held = 0;
 static inline int vgc_alloc_try_enter(void) { if (_vgc_alloc_held) return 0; _vgc_alloc_held = 1; return 1; }
 static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
+#endif
 
 // ============================================================
 // Atomic operations
