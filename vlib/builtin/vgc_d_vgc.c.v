@@ -1296,6 +1296,13 @@ fn vgc_register_thread() {
 		vgc_heap.caches[idx].mach_port = C.vgc_thread_self_port() // for OS-level STW
 	}
 	vgc_refresh_stack_range_for_sp(idx, sp)
+	$if vgc_dbg1887 ? {
+		C.vgc_say(0x18870, u64(idx))
+		C.vgc_say(0x18871, u64(sp))
+		C.vgc_say(0x18872, u64(stack_lo))
+		C.vgc_say(0x18873, u64(stack_hi))
+		C.vgc_say(0x18874, u64(stack_base))
+	}
 	C.vgc_trace(1, idx, u64(stack_base), u64(vgc_heap.caches[idx].mach_port)) // REG
 	C.vgc_trace(2, idx, u64(C.vgc_atomic_load_u32(&vgc_heap.gc_phase)), 0) // BAR_IN
 
