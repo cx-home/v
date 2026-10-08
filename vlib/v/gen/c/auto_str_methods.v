@@ -1347,7 +1347,10 @@ fn (mut g Gen) gen_str_for_struct(info ast.Struct, lang ast.Language, styp strin
 			if field.typ in ast.charptr_types {
 				fn_body.write_string('builtin__tos4((byteptr)${func})')
 			} else {
-				is_ptr_field := field.typ.is_ptr() && sym.kind in [.struct, .interface]
+				// a `&&T` field (or deeper) is printed as its address: func is already
+				// `(voidptr) it.field`, never a string, so it takes the plain path below
+				is_ptr_field := field.typ.is_ptr() && ftyp_nr_muls == 1
+					&& sym.kind in [.struct, .interface]
 				is_opt_ptr_field := field.typ.has_flag(.option) && field.typ.is_ptr()
 					&& sym.kind in [.struct, .interface]
 				if is_ptr_field && !field.typ.has_flag(.option) {
