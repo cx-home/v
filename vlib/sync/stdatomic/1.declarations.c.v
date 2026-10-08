@@ -21,6 +21,14 @@ $if windows {
 	}
 }
 
+// cx-private#1856: tcc on FreeBSD (amd64) has no __atomic_thread_fence in its
+// runtime and no libatomic beside it — every program importing sync failed to
+// link ("unresolved reference to '__atomic_thread_fence'"); atomic.S defines it
+// (lock orq), as it does for musl.
+$if freebsd && tinyc && amd64 {
+	#flag @VEXEROOT/thirdparty/stdatomic/nix/atomic.S
+}
+
 $if linux {
 	$if tinyc {
 		$if amd64 {
