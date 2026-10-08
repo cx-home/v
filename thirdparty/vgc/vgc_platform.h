@@ -69,8 +69,13 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
       }
       return n;
   }
-#elif defined(__linux__)
-  // Linux: dl_iterate_phdr (the ELF analog of mach-o getsegmentdata). p_memsz —
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+  // Linux and the ELF BSDs: dl_iterate_phdr (the ELF analog of mach-o
+  // getsegmentdata). The BSDs answered NO data segment before (the #else
+  // below), so a heap object reachable only from a global or a const — a
+  // const map, a cached table — was never marked and was freed under its
+  // owner (cx-private#1856's FreeBSD reds: "map.hash_fn is nil" in the fmt
+  // tests, "math.big: Invalid character" in check_math). p_memsz —
   // NOT p_filesz — is used so the range spans .bss (zero-initialized globals
   // live there, and a heap pointer parked in an uninitialized-at-link global
   // must still be scanned). dl_iterate_phdr's FIRST callback is always the main
@@ -80,6 +85,9 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
   // collector calls this with the world stopped during a RARE backstop cycle,
   // not from a signal handler, so it is safe here.
   #include <link.h>
+  #if !defined(ElfW)
+    #define ElfW(type) Elf_##type // the BSDs' <link.h> names the native-width ELF types Elf_*
+  #endif
   static char vgc__image_marker; // dl_iterate_phdr anchor: the image carrying THIS vgc
   typedef struct { uintptr_t* los; uintptr_t* his; int max; int n; int idx; uintptr_t marker; } vgc_seg_ctx;
   static int vgc__phdr_cb(struct dl_phdr_info* info, size_t size, void* data) {
@@ -116,7 +124,7 @@ static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnost
       return ctx.n;
   }
 #else
-  // Other platforms (Windows/BSD): not yet implemented.
+  // Other platforms (Windows): not yet implemented.
   static inline int vgc_data_segments(uintptr_t* los, uintptr_t* his, int max_ranges) {
       (void)los; (void)his; (void)max_ranges;
       return 0;
