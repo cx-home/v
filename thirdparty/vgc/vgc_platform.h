@@ -869,7 +869,10 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
     else { *range_lo = stack_base; *range_hi = sp; }
-    int n = (int)(sizeof(buf) / sizeof(uintptr_t));
+    // jmp_buf is int[] on macOS: count WORDS of its byte size (a bare
+    // sizeof(buf)/sizeof(uintptr_t) trips clang's -Wsizeof-array-div under -cstrict).
+    size_t buf_bytes = sizeof(buf);
+    int n = (int)(buf_bytes / sizeof(uintptr_t));
     if (n > reg_max) { n = reg_max; }
     const uintptr_t* w = (const uintptr_t*)&buf;
     for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }

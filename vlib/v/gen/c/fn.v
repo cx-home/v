@@ -967,8 +967,15 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 
 	// handle `@[ignore_overflow] fn abc() {}` and -check-overflow :
 	prev_do_int_overflow_checks := g.do_int_overflow_checks
+	// The vgc collector (builtin's `*_d_vgc.c.v` files) counts in modular
+	// arithmetic on purpose — `u32(gc_cycle) - 1` before the first cycle is the
+	// "never swept" stamp — so `-check-overflow` leaves it unchecked like
+	// builtin.overflow itself; checked, every allocation of a `-check-overflow`
+	// program panicked inside the collector (cx-private#1888: coutput_test's
+	// ignore_overflow_tag_check.vv).
+	is_vgc_runtime := g.is_builtin_mod && node.file.ends_with('d_vgc.c.v')
 	g.do_int_overflow_checks = g.pref.is_check_overflow && !g.is_builtin_overflow_mod
-		&& !node.is_ignore_overflow
+		&& !node.is_ignore_overflow && !is_vgc_runtime
 	defer {
 		g.do_int_overflow_checks = prev_do_int_overflow_checks
 	}
