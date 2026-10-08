@@ -360,10 +360,17 @@ fn test_musl_still_defaults_to_boehm_gc() {
 	// Regression test for https://github.com/vlang/v/issues/27090 .
 	// Alpine/musl programs must keep the boehm GC by default; otherwise
 	// long-running allocations grow without bound (see the issue's repro).
+	// On this fork the default collector is vgc, musl included (pref/default.v):
+	// still a tracing collector, never -gc none, so the issue's growth stays
+	// fixed; an explicit `-gc boehm` keeps upstream's Boehm.
 	target := os.join_path(vroot, 'examples', 'hello_world.v')
 	prefs, _ := pref.parse_args_and_show_errors([], ['', '-musl', target], false)
 	assert prefs.is_musl
-	assert prefs.gc_mode == .boehm_full_opt
+	assert prefs.gc_mode == .vgc
+	boehm_prefs, _ := pref.parse_args_and_show_errors([], ['', '-musl', '-gc', 'boehm', target],
+		false)
+	assert boehm_prefs.is_musl
+	assert boehm_prefs.gc_mode == .boehm_full_opt
 }
 
 fn test_prealloc_defaults_to_no_gc() {
@@ -385,8 +392,9 @@ fn test_prealloc_overrides_explicit_gc_selection() {
 
 fn test_no_gc_thread_local_alloc_prefers_source_bundled_boehm() {
 	target := os.join_path(vroot, 'examples', 'hello_world.v')
-	prefs, _ := pref.parse_args_and_show_errors([], ['', '-d', 'no_gc_thread_local_alloc', target],
-		false)
+	// `-gc boehm`: the fork's default collector is vgc, and these defines are Boehm's
+	prefs, _ := pref.parse_args_and_show_errors([], ['', '-gc', 'boehm', '-d',
+		'no_gc_thread_local_alloc', target], false)
 	assert prefs.gc_mode == .boehm_full_opt
 	assert 'no_gc_thread_local_alloc' in prefs.compile_defines_all
 	assert 'use_bundled_libgc' in prefs.compile_defines_all
@@ -405,8 +413,8 @@ fn test_no_gc_thread_local_alloc_does_not_force_boehm_with_gc_none() {
 
 fn test_no_gc_thread_local_alloc_keeps_explicit_dynamic_boehm() {
 	target := os.join_path(vroot, 'examples', 'hello_world.v')
-	prefs, _ := pref.parse_args_and_show_errors([], ['', '-d', 'dynamic_boehm', '-d',
-		'no_gc_thread_local_alloc', target], false)
+	prefs, _ := pref.parse_args_and_show_errors([], ['', '-gc', 'boehm', '-d', 'dynamic_boehm',
+		'-d', 'no_gc_thread_local_alloc', target], false)
 	assert prefs.gc_mode == .boehm_full_opt
 	assert 'dynamic_boehm' in prefs.compile_defines_all
 	assert 'use_bundled_libgc' !in prefs.compile_defines_all
