@@ -104,6 +104,9 @@ fn (mut g Gen) gen_free_method(typ ast.Type) string {
 		ast.SumType {
 			g.gen_free_for_sumtype(objtyp, sym.info, styp, fn_name)
 		}
+		ast.Alias {
+			g.gen_free_for_alias(sym.info, styp, fn_name, sym.is_builtin())
+		}
 		else {
 			println(g.table.type_str(typ))
 			// print_backtrace()
@@ -113,6 +116,29 @@ fn (mut g Gen) gen_free_method(typ ast.Type) string {
 	}
 
 	return fn_name
+}
+
+// gen_free_for_alias frees a plain alias (`type Foo = Bar`, `type Foo = C.foo`)
+// as its parent: the alias is a typedef of the parent's C type, so the call
+// forwards with a cast. A parent V does not own (a C struct, a number, a
+// pointer) frees nothing. Before this, the alias fell to the `could not generate
+// free method` branch and a Perceus deep drop of `&sub.Foo{}` called an
+// undeclared `sub__Foo_free` (cx-private#1894, vlib/v/tests/modules/sub).
+fn (mut g Gen) gen_free_for_alias(info ast.Alias, styp string, ofn_name string, sym_is_builtin bool) {
+	fn_name := if sym_is_builtin { 'builtin__${ofn_name}' } else { ofn_name }
+	g.definitions.writeln('${g.static_non_parallel}void ${fn_name}(${styp}* it);')
+	parent_typ := g.unwrap_generic(info.parent_type)
+	parent_sym := g.table.sym(parent_typ)
+	mut call := ''
+	if !parent_typ.is_ptr() && parent_sym.language == .v
+		&& parent_sym.kind in [.string, .array, .map, .struct, .sum_type, .interface, .alias] {
+		mut parent_fn := g.gen_free_method(parent_typ)
+		if parent_sym.is_builtin() && !parent_fn.starts_with('builtin__') {
+			parent_fn = 'builtin__${parent_fn}'
+		}
+		call = '\t${parent_fn}((${g.styp(parent_typ)}*)it);\n'
+	}
+	g.auto_fn_definitions << '${g.static_non_parallel}void ${fn_name}(${styp}* it) {\n${call}}\n'
 }
 
 fn (mut g Gen) gen_free_for_interface(sym ast.TypeSymbol, info ast.Interface, styp string, fn_name string) {
