@@ -190,11 +190,13 @@ pub fn read_file(path string) !string {
 
 // truncate changes the size of the file located in `path` to `len`.
 // Note that changing symbolic links on Windows only works as admin.
+// The bytes below `len` are kept, and a longer `len` pads with zeros.
 pub fn truncate(path string, len u64) ! {
+	// no O_TRUNC: it empties the file before the resize (cx-home/v#8)
 	fp := $if windows {
-		C._wopen(path.to_wide(), o_wronly | o_trunc, 0)
+		C._wopen(path.to_wide(), o_wronly, 0)
 	} $else {
-		C.open(&char(path.str), o_wronly | o_trunc, 0)
+		C.open(&char(path.str), o_wronly, 0)
 	}
 	if fp < 0 {
 		return error_posix()

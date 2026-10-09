@@ -979,6 +979,23 @@ fn test_truncate() {
 	os.rm(filename) or { panic(err) }
 }
 
+fn test_truncate_keeps_the_prefix() {
+	// truncate changes the size: a shorter length keeps the file's first bytes,
+	// a longer one keeps them all and pads with zeros (cx-home/v#8: the file was
+	// opened with O_TRUNC, so every byte read back as zero)
+	filename := './test_trunc_prefix.txt'
+	os.write_file(filename, 'hello world!')!
+	defer {
+		os.rm(filename) or {}
+	}
+	os.truncate(filename, 5)!
+	assert os.read_file(filename)! == 'hello'
+	os.truncate(filename, 8)!
+	assert os.read_bytes(filename)! == [u8(`h`), `e`, `l`, `l`, `o`, 0, 0, 0]
+	os.truncate(filename, 0)!
+	assert os.file_size(filename) == 0
+}
+
 fn test_hostname() {
 	hostname := os.hostname() or { '' }
 	assert hostname.len > 2
