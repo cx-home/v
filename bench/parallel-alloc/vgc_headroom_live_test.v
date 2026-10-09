@@ -1,18 +1,21 @@
 // vgc_headroom_live_test.v — the adaptive headroom is bounded by the live set
 // (cx-home/v#12, the cx side of cx-private#1892).
 //
-// Shape: a 24 MB live set of 48-byte linked nodes (a pointer-rich tree, as a
-// parsed document is) is built and held, then sixteen times its size streams
+// Shape: a 40 MB live set of 48-byte linked nodes (a pointer-rich tree, as a
+// parsed document is) is built and held, then twelve times its size streams
 // past in 4 KB transients; the child reports the carved high-water
-// (gc_memory_use()) over the live bytes. Marking half a million nodes costs
+// (gc_memory_use()) over the live bytes. Marking most of a million nodes costs
 // more than a tenth of the interval between cycles, so the pacer's time band
 // doubles the headroom to the flat 64 MB cap and the goal sits at marked +
-// 64 MB — over 3.5× a live set that never grows (json-codec 1 MB on dev2:
-// 153 MB peak for 20 MB marked, Python 42 MB). With the live-set bound
+// 64 MB — 2.6× a live set that never grows (json-codec 1 MB on dev2: 153 MB
+// peak for 20 MB marked, Python 42 MB). With the live-set bound
 // (VGC_HEADROOM_LIVE_PCT, 100 by default) the headroom is at most the marked
 // set, so the goal is 2× the live set, Go's GOGC=100 goal. The default must
-// carve less than the bound off (VGC_HEADROOM_LIVE_PCT=0) and stay under 2.5×
-// (cx-private 1226-a).
+// carve less than the bound off (VGC_HEADROOM_LIVE_PCT=0) and stay under 2.3×
+// (cx-private 1226-a). The live set is above the bound's 32 MB floor
+// (vgc_headroom_live_floor) so the bound itself is what the ratio measures; the
+// second case holds an 8 MB set under the same churn and shows the floor: the
+// default carve is the floor's (32 MB over 8 live), a 16 MB floor carves less.
 //
 // Run: ./v test bench/parallel-alloc/vgc_headroom_live_test.v
 module main
@@ -26,11 +29,12 @@ mut:
 }
 
 const chunk = 4096
-const live_bytes = 24 * 1024 * 1024
+const live_bytes = 40 * 1024 * 1024
+const small_live_bytes = 8 * 1024 * 1024
 const node_bytes = 48
-const churn_rounds = 16
+const churn_rounds = 12
 
-fn child() {
+fn child(live_bytes int) {
 	mut head := &Node(unsafe { nil })
 	for i in 0 .. live_bytes / node_bytes {
 		mut n := &Node{
@@ -59,9 +63,8 @@ fn child() {
 	println('RATIO=${f64(high) / f64(live_bytes):.3f} sink=${sink} kept=${kept}')
 }
 
-fn ratio(pct string) f64 {
-	env := if pct == '' { '' } else { 'VGC_HEADROOM_LIVE_PCT=${pct} ' }
-	r := os.execute('VGC_LIVE_CHILD=1 ${env}${os.quoted_path(os.executable())}')
+fn ratio(env string, live string) f64 {
+	r := os.execute('VGC_LIVE_CHILD=${live} ${env}${os.quoted_path(os.executable())}')
 	assert r.exit_code == 0, r.output
 	for l in r.output.split_into_lines() {
 		if l.starts_with('RATIO=') {
@@ -72,13 +75,31 @@ fn ratio(pct string) f64 {
 }
 
 fn test_the_headroom_is_bounded_by_the_live_set() {
-	if os.getenv('VGC_LIVE_CHILD') != '' {
-		child()
+	which := os.getenv('VGC_LIVE_CHILD')
+	if which == 'big' {
+		child(live_bytes)
 		return
 	}
-	on := ratio('')
-	off := ratio('0')
-	println('vgc_headroom_live: bound default ${on:.3f}x, bound off ${off:.3f}x (carved high / live)')
+	if which == 'small' {
+		child(small_live_bytes)
+		return
+	}
+	on := ratio('', 'big')
+	off := ratio('VGC_HEADROOM_LIVE_PCT=0 ', 'big')
+	println('vgc_headroom_live: bound default ${on:.3f}x, bound off ${off:.3f}x (carved high / live, 40 MB live)')
 	assert on < off, 'the live-set bound does not lower the carve: ${on:.3f}x against bound off ${off:.3f}x'
-	assert on <= 2.5, 'the bounded pacer carved ${on:.3f}x the live set (bar 2.5x)'
+	assert on <= 2.3, 'the bounded pacer carved ${on:.3f}x the live set (bar 2.3x)'
+}
+
+fn test_the_bound_has_a_floor() {
+	if os.getenv('VGC_LIVE_CHILD') != '' {
+		return
+	}
+	floor32 := ratio('', 'small')
+	floor16 := ratio('VGC_HEADROOM_LIVE_FLOOR_MB=16 ', 'small')
+	println('vgc_headroom_live: 8 MB live — default floor ${floor32:.3f}x, 16 MB floor ${floor16:.3f}x')
+	// 8 MB live under the 32 MB floor: the carve is live + floor (+ slack), 5x,
+	// not the 2x the bare bound would force; a 16 MB floor carves measurably less.
+	assert floor32 >= 4.0, 'the default floor did not hold: ${floor32:.3f}x (expected live + 32 MB, ~5x)'
+	assert floor16 < floor32, 'a 16 MB floor carved ${floor16:.3f}x, not less than the default ${floor32:.3f}x'
 }

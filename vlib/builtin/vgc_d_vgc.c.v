@@ -630,6 +630,20 @@ __global vgc_headroom_cap = u64(64 * 1024 * 1024)
 // (dev2, the same build): json-codec 1 MB peak 153 → 73 MB, 1 KB 88 → 47 MB.
 // VGC_HEADROOM_LIVE_PCT overrides (decimal; 0 removes the bound).
 __global vgc_headroom_live_pct = u64(100)
+// The bound's FLOOR: a live set smaller than this still gets this much
+// headroom, so a small-live-set program is not driven to a cycle every 8 MB.
+// The 8 MB vgc_headroom_min floor measured too low on dev2 (bound at 100 %,
+// interleaved A/B against the flat cap, same build): http-json-echo c=128
+// 92k → 71k req/s (−22 %) for 120 → 60 MB; json-codec 1 KB ×100k +14 % time
+// for 89 → 36 MB; fasta 2.5M +18 % for 101 → 42 MB — every one a tiny live set
+// whose per-cycle cost is the stop protocol and the root scan, not the mark,
+// so halving the interval buys nothing but pauses. At 32 MB: http c=128 86-87k
+// (−6 %) at 85 MB, json 1 KB at parity at 67 MB, fasta 67 MB at +10 %; the 1 MB
+// json-codec loop (15-20 MB marked) is the case the bound exists for and
+// lands at ~82 MB (Python 42; the flat cap 153) with parse/emit time within
+// 5 % of Python on the same box. VGC_HEADROOM_LIVE_FLOOR_MB overrides (decimal;
+// a value below vgc_headroom_min is raised to it).
+__global vgc_headroom_live_floor = u64(32) * 1024 * 1024
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
 // Go's GOMEMLIMIT analog for the backstop collector. The default is a PINNED
@@ -1232,6 +1246,16 @@ pub fn vgc_init() {
 		if lp >= 0 {
 			vgc_headroom_live_pct = u64(lp)
 		}
+	}
+	floor_env := C.getenv(c'VGC_HEADROOM_LIVE_FLOOR_MB')
+	if floor_env != unsafe { nil } {
+		fmb := C.atoll(floor_env)
+		if fmb > 0 {
+			vgc_headroom_live_floor = u64(fmb) * 1024 * 1024
+		}
+	}
+	if vgc_headroom_live_floor < vgc_headroom_min {
+		vgc_headroom_live_floor = vgc_headroom_min
 	}
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
 	// see vgc_heap_soft_limit / cx #282), env-overridable.
