@@ -55,8 +55,13 @@ fn test_sqlite() {
 	username := db.exec_param('select name from users where id = ?', '1')!
 	assert username[0].vals[0] == 'Sam'
 
-	// this insert will be rejected due to duplicated id
-	db.exec("insert into users (id,name) values (1,'Silly')")!
+	// this insert is rejected due to the duplicated id; on this fork exec raises
+	// the failed step (SQLITE_CONSTRAINT, 19) instead of answering the rows so far
+	if _ := db.exec("insert into users (id,name) values (1,'Silly')") {
+		assert false, 'a duplicated primary key must be rejected'
+	} else {
+		assert err.code() == 19
+	}
 	assert db.get_affected_rows_count() == 0
 
 	mut users := db.exec('select * from users')!
