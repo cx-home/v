@@ -470,6 +470,9 @@ fn pcs_collect(e ast.Expr, mut out []string) {
 			}
 		}
 		ast.SqlExpr {
+			if e.inserted_var != '' {
+				pcs_uniq_push(mut out, e.inserted_var)
+			}
 			pcs_collect(e.db_expr, mut out)
 			pcs_collect(e.where_expr, mut out)
 			pcs_collect(e.order_expr, mut out)
@@ -503,6 +506,29 @@ fn pcs_collect_tmpl(e ast.ComptimeCall, mut out []string) {
 		} else {
 			pcs_collect_stmt(st, mut out)
 		}
+	}
+}
+
+// pcs_collect_sql_line collects the variables one ORM statement line reads:
+// the inserted or updated object and the update array are NAMED on the line,
+// not expressions (`insert batch into T` holds 'batch' in object_var), so a
+// walk of the line's expressions alone missed them and Perceus dropped the
+// array right after its declaration — the insert then saw len 0 and wrote no
+// row (vlib/orm/orm_scope_test.v's three batch-insert cases, cx-private#1894).
+fn pcs_collect_sql_line(line ast.SqlStmtLine, mut out []string) {
+	if line.object_var != '' {
+		pcs_uniq_push(mut out, line.object_var)
+	}
+	if line.array_update_var != '' {
+		pcs_uniq_push(mut out, line.array_update_var)
+	}
+	pcs_collect(line.where_expr, mut out)
+	for e in line.update_exprs {
+		pcs_collect(e, mut out)
+	}
+	pcs_collect(line.update_data_expr, mut out)
+	for _, sub in line.sub_structs {
+		pcs_collect_sql_line(sub, mut out)
 	}
 }
 
@@ -585,6 +611,9 @@ fn pcs_collect_stmt(st ast.Stmt, mut out []string) {
 		}
 		ast.SqlStmt {
 			pcs_collect(st.db_expr, mut out)
+			for line in st.lines {
+				pcs_collect_sql_line(line, mut out)
+			}
 		}
 		// Pure leaves / declaration statements with no local-variable uses.
 		ast.BranchStmt, ast.ConstDecl, ast.DebuggerStmt, ast.EmptyStmt, ast.EnumDecl,
@@ -936,6 +965,9 @@ fn (mut c PcsCfg) pcs_scan_share(e ast.Expr) {
 			}
 		}
 		ast.SqlExpr {
+			if e.inserted_var != '' {
+				c.pcs_mark_shared(e.inserted_var)
+			}
 			c.pcs_scan_share(e.db_expr)
 			c.pcs_scan_share(e.where_expr)
 			c.pcs_scan_share(e.order_expr)
@@ -1143,6 +1175,15 @@ fn (mut c PcsCfg) pcs_scan_share_stmt(st ast.Stmt) {
 		}
 		ast.SqlStmt {
 			c.pcs_scan_share(st.db_expr)
+			// the ORM reads the named object's fields into its query data, which may
+			// keep their buffers: never a deterministic drop
+			mut names := []string{}
+			for line in st.lines {
+				pcs_collect_sql_line(line, mut names)
+			}
+			for name in names {
+				c.pcs_mark_shared(name)
+			}
 		}
 		// Declaration / leaf statements with no local-variable uses.
 		ast.BranchStmt, ast.ConstDecl, ast.DebuggerStmt, ast.EmptyStmt, ast.EnumDecl,
