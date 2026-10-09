@@ -1703,10 +1703,13 @@ fn (mut g Gen) infix_expr_left_shift_op(node ast.InfixExpr) {
 			// Allow concatenation for array-returning calls; avoids nesting for common builder APIs.
 			prevent_push_many = false
 		}
+		// a variadic parameter (`...string`, its `.clone()` too) is the array type
+		// with the .variadic flag: compared with the flag, `[][]string << prefixes`
+		// read the pushed []string as the elements to append (cx-home/v#10)
 		if (right.unaliased_sym.kind == .array
 			|| (right.unaliased_sym.kind == .struct && right.unaliased_sym.name == 'array'))
-			&& resolved_left.sym.nr_dims() == right.sym.nr_dims() && elem_type != right.typ
-			&& !elem_is_option && !prevent_push_many {
+			&& resolved_left.sym.nr_dims() == right.sym.nr_dims()
+			&& elem_type != right.typ.clear_flag(.variadic) && !elem_is_option && !prevent_push_many {
 			// push an array => PUSH_MANY, but not if pushing an array to 2d array (`[][]int << []int`)
 			g.write('_PUSH_MANY${noscan}(')
 			// The push macro needs the plain array type (not option/result),
