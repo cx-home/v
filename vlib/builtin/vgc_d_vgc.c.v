@@ -2830,16 +2830,17 @@ __global vgc_gc_owner = int(-1)
 // should first let the collection in flight finish (cx-home/v#17). That
 // collection's sweep is about to return its garbage to the pool; an arena
 // carved while it stops the world, or while it resumes it, is memory the heap
-// keeps. Only a registered mutator that is not the collector waits, and only
-// outside the reclaim-and-retry loop (vgc_grow_gate_hold), which waits for the
-// phase itself. The concurrent collector is excluded: its mark runs beside the
+// keeps. Only a registered mutator that is not the collector waits. The
+// reclaim-and-retry loop is not excluded: vgc_grow_gate_hold is a count over
+// all threads, so excluding it let every thread carve while any one retried
+// (the first cut of this fix measured 27 of 34 FreeBSD carves still inside a
+// collection). The concurrent collector is excluded: its mark runs beside the
 // mutators by design, for as long as it takes.
 fn vgc_carve_waits() bool {
 	$if vgc_concurrent ? {
 		return false
 	}
-	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) == vgc_phase_off
-		|| C.vgc_atomic_load_u32(&vgc_grow_gate_hold) != 0 {
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) == vgc_phase_off {
 		return false
 	}
 	ci := C.vgc_get_cache_idx()
@@ -2861,14 +2862,17 @@ fn vgc_wait_gc_done() {
 }
 
 fn vgc_span_alloc(npages u32) &VGC_Span {
-	span, waited := vgc_span_alloc_once(npages, true)
-	if waited {
-		// the collection this thread waited out has swept into the pool: carve
-		// only if the pool still misses
-		again, _ := vgc_span_alloc_once(npages, false)
-		return again
+	// Each wait lets one collection's sweep refill the pool; collections can run
+	// back to back (an explicit gc_collect loop on a 2-vCPU box), so a few waits
+	// are allowed before the carve goes ahead regardless.
+	for _ in 0 .. 4 {
+		span, waited := vgc_span_alloc_once(npages, true)
+		if !waited {
+			return span
+		}
 	}
-	return span
+	last, _ := vgc_span_alloc_once(npages, false)
+	return last
 }
 
 // vgc_span_alloc_once answers the span, and whether it returned nil because it
