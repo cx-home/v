@@ -7,6 +7,11 @@ module builtin
 // builds — but the checker still walks those comptime branches, and `v -os cross`
 // emits every branch into the generated v.c. Both paths therefore need the symbol
 // to resolve in non-vgc builds (boehm/none/...), where this no-op stands in.
-@[export: 'vgc_wb_store']
+// Only V code calls it here (the C barrier of assign.v is emitted under vgc
+// alone), so it is kept by @[markused] under its V name: an @[export] made a
+// public `vgc_wb_store` in every -is_o object, and two of them linked together
+// were a duplicate symbol (vlib/v/gen/c/link_generated_c_files_test.v,
+// cx-private#1894).
+@[markused]
 fn vgc_wb_store(obj voidptr) {
 }

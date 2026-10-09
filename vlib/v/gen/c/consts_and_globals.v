@@ -600,7 +600,10 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 		program_owned_argv_global := g.pref.build_mode != .build_module && is_argv_global
 		field_visibility_kw := if field.is_extern {
 			''
-		} else if program_owned_argv_global {
+		} else if program_owned_argv_global && !g.pref.is_o {
+			// (an -is_o object keeps upstream's visibility: several are linked
+			// into one host program, and a public definition in each of them was
+			// a duplicate symbol — link_generated_c_files_test, cx-private#1894)
 			''
 		} else if g.pref.build_mode == .build_module && is_argv_global {
 			// builtin declares these, but the program TU owns them (its `main()`
