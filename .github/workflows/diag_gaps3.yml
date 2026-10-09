@@ -1,0 +1,39 @@
+name: diag gaps3 v17
+
+on:
+  push:
+    branches:
+      - 'diag/gaps3-**'
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start FreeBSD VM
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          version: '15.1'
+          memory: 4G
+          shell: sh
+          sync_files: runner-to-vm
+      - name: diag on FreeBSD
+        shell: cpa.sh {0}
+        run: |
+          sudo pkg install -y git gmake
+          git config --global --add safe.directory .
+          gmake
+          echo "=== tcc used_memory"
+          ./v -cc tcc -no-retry-compilation test vlib/runtime/used_memory_test.v 2>&1 | grep -v '^\s*$' | head -40 || true
+          ./v -gc e -cc cc -d vgc_concurrent -o /tmp/mtc bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
+          ./v -gc e -cc cc -o /tmp/mtd bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
+          for b in mtd mtc; do for t in 8 16; do
+            echo "=== $b T=$t $(date -u +%H:%M:%S)"
+            ( ulimit -v 1500000; VGC_GCTRACE=1 T=$t STEPS=20000 /usr/bin/time -l timeout 240 /tmp/$b > /tmp/m.out 2>&1 ); echo "rc=$?"
+            grep -E 'mt_sound|maximum resident|real' /tmp/m.out | tr -s ' '
+            echo "acd=$(grep -c 'tag=0x0000000000000acd' /tmp/m.out) gclines=$(grep -c '^\[gc' /tmp/m.out)"
+            grep '^\[gc' /tmp/m.out | head -2; grep '^\[gc' /tmp/m.out | tail -3
+            grep -v '^\[gc' /tmp/m.out | grep -v 'acd' | tail -5
+          done; done
