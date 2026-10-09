@@ -135,7 +135,7 @@ const vgc_max_arenas = 1024
 // Floor for the RAM-derived default ceiling: never below the historical
 // 64-arena (4 GB) capacity, however small the machine reports.
 const vgc_default_min_arenas = 64
-const vgc_max_threads = 64
+const vgc_max_threads = 1024
 // cx #316: words captured per safe-region register snapshot. Sized to hold a
 // full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
 // x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
@@ -395,10 +395,10 @@ mut:
 	// Short by construction, so trim/reuse walk it whole.
 	free_oversized &VGC_Span = unsafe { nil }
 	// Per-thread caches
-	caches       [64]VGC_Cache
+	caches       [vgc_max_threads]VGC_Cache
 	ncaches      int     // high-water mark of slots ever used
 	live_threads u32     // atomic-ish (guarded by cache_lock): currently-registered mutators
-	free_slots   [64]int // reclaimed cache indices, reused before growing ncaches
+	free_slots   [vgc_max_threads]int // reclaimed cache indices, reused before growing ncaches
 	nfree_slots  int
 	cache_lock   u32
 	// GC state
@@ -762,10 +762,10 @@ __global vgc_gc_last_end = u64(0)
 // frame depth against its own last-scanned window — a holder frame below the
 // scanned lo is the root-miss, localized. Written only under STW; read only on
 // the rare catch path — cannot mask.
-__global vgc_spchk_lo = [64]usize{}
-__global vgc_spchk_hi = [64]usize{}
-__global vgc_spchk_cyc = [64]u64{}
-__global vgc_spchk_parked = [64]u64{}
+__global vgc_spchk_lo = [vgc_max_threads]usize{}
+__global vgc_spchk_hi = [vgc_max_threads]usize{}
+__global vgc_spchk_cyc = [vgc_max_threads]u64{}
+__global vgc_spchk_parked = [vgc_max_threads]u64{}
 
 // vgc_map_backing_status: #58 cx_envcheck probe support. Reports whether a live
 // map's key/value backing arrays are still ALLOCATED in the vgc heap. An
@@ -1273,19 +1273,35 @@ fn vgc_register_thread() {
 	// Reuse a reclaimed slot before growing the high-water mark, so that
 	// churn (many short-lived threads) cannot exhaust the fixed cache array.
 	mut idx := -1
-	if vgc_heap.nfree_slots > 0 {
-		vgc_heap.nfree_slots--
-		idx = vgc_heap.free_slots[vgc_heap.nfree_slots]
-	} else if vgc_heap.ncaches < vgc_max_threads {
-		idx = vgc_heap.ncaches
-		vgc_heap.ncaches = idx + 1
-	}
-	if idx < 0 {
-		// Genuinely out of slots (>64 concurrent live threads). Leave this
-		// thread unregistered rather than scribbling on caches[-1]; its
-		// allocations fall through to vgc_ensure_registered retries.
+	mut waited_us := u64(0)
+	for {
+		if vgc_heap.nfree_slots > 0 {
+			vgc_heap.nfree_slots--
+			idx = vgc_heap.free_slots[vgc_heap.nfree_slots]
+		} else if vgc_heap.ncaches < vgc_max_threads {
+			idx = vgc_heap.ncaches
+			vgc_heap.ncaches = idx + 1
+		}
+		if idx >= 0 {
+			break
+		}
+		// The table is full: vgc_max_threads live mutators. An UNREGISTERED
+		// mutator is unsound, not merely slow — the collector never suspends it
+		// and never scans its stack or registers, so every object only it holds
+		// is freed under it while it runs through the mark (cx-core-code#113: 64
+		// [?async] futures + the main thread overflowed the old 64-slot table and
+		// the overflow threads died of reused memory — SIGSEGV, SIGBUS,
+		// `map.hash_fn is nil`). This thread holds no heap object yet (its spawn
+		// argument sits in the spawn-root registry), so it WAITS for an exiting
+		// thread's slot instead; loud once a second (0x0ac7 = seconds waited) so
+		// a program past the cap is visible, never silently corrupt.
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
-		return
+		C.usleep(100)
+		waited_us += 100
+		if waited_us % 1000000 == 0 {
+			C.vgc_say(0x0ac7, waited_us / 1000000)
+		}
+		C.vgc_mutex_lock(&vgc_heap.cache_lock)
 	}
 	// Atomic bump (cache_lock serializes writers, but vgc_maybe_gc reads live_threads
 	// LOCK-FREE for per-thread GC pacing — a plain RMW here races that atomic read).
@@ -3045,9 +3061,9 @@ fn vgc_span_release_acquisition(span &VGC_Span) {
 
 fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	if cache_idx < 0 {
-		// Unregistered thread: the fixed [vgc_max_threads] cache table is exhausted
-		// (e.g. >64 concurrent `go` threads — vgc_register_thread leaves idx = -1
-		// rather than scribble on caches[-1]). It has no per-thread mcache slot, so
+		// Unregistered thread: only a thread that allocates before it has
+		// registered (vgc_register_thread now WAITS for a slot rather than leave a
+		// mutator unregistered, cx-core-code#113). It has no per-thread mcache slot, so
 		// allocate straight from central (vgc_central_get_span is internally locked).
 		// No caching: each call gets its own span; partial spans are reclaimed by the
 		// collector. Slower for these overflow threads, but SAFE — previously this

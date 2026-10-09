@@ -1118,7 +1118,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   // with a still-running mutator (a stale scanned window is a use-after-free
   // class) — the settle wait is unbounded with a loud periodic diagnostic
   // (0x0ace), and only a genuinely-gone thread (dead port) is skipped.
-  #define VGC_MAC_MAXTH 128   // >= caches[64]
+  #define VGC_MAC_MAXTH 1024  // >= caches[vgc_max_threads]
   #define VGC_MAC_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95
   typedef struct {
       volatile uint32_t port;    // mach-port key (0 = free); == caches[].mach_port
@@ -1281,7 +1281,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #ifndef VGC_SUSPEND_SIGNAL
     #define VGC_SUSPEND_SIGNAL SIGXCPU
   #endif
-  #define VGC_MAC_MAXTH 128   // >= caches[64]
+  #define VGC_MAC_MAXTH 1024  // >= caches[vgc_max_threads]
   #define VGC_MAC_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95
   typedef struct {
       volatile uint32_t port;    // mach-port key (0 = free); == caches[].mach_port
@@ -1570,7 +1570,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
     #define VGC_SUSPEND_SIGNAL (SIGRTMIN + 6)
   #endif
 
-  #define VGC_LINUX_MAXTH 128 // >= caches[64]; one slot per simultaneously-parked thread
+  #define VGC_LINUX_MAXTH 1024 // >= caches[vgc_max_threads]; one slot per simultaneously-parked thread
   typedef struct {
       volatile uint32_t tid;     // target kernel tid (0 = free slot)
       volatile uint32_t acked;   // handler has captured regs and is parked
