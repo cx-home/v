@@ -705,6 +705,9 @@ __global vgc_mark_pool_next = u32(0)
 __global vgc_mark_last_ns = u64(0)
 // the previous cycle's mark phase
 __global vgc_mark_nworkers_cur = int(1)
+// the previous mark's single-marker-equivalent work (ns): its wall time x its
+// marker count — what the next cycle plans its marker count from
+__global vgc_mark_last_work_ns = u64(0)
 __global vgc_mark_rate1 = u64(0)
 // ns per marked KB with one marker (a running mean)
 __global vgc_mark_n_target = int(0)
@@ -1291,6 +1294,7 @@ fn vgc_atfork_child() {
 	vgc_mark_done = 0
 	vgc_mark_nworkers_cur = 1
 	vgc_mark_n_target = 0
+	vgc_mark_last_work_ns = 0
 	vgc_mark_backoff = 0
 	for i in 0 .. vgc_max_markers {
 		vgc_mark_local[i] = 0

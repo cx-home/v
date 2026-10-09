@@ -466,6 +466,19 @@ fn vgc_gc_start() {
 	vgc_drain_mark_work(0)
 	vgc_ph[5] = C.vgc_now_ns()
 	vgc_mark_last_ns = vgc_ph[5] - vgc_ph[4] // the next cycle's parallel-mark decision (cx-home/v#16)
+	// The single-marker-equivalent work of that mark: n markers took last_ns,
+	// so one would have taken about n x last_ns. The next cycle plans its
+	// marker count from the WORK, not the wall time a parallel cycle left —
+	// planned from the wall time, eight markers that cut a 3 ms mark to 0.6 ms
+	// dropped the next cycle back to one marker, which took 3 ms again: the
+	// count flapped 1/8 every other cycle and the pool's CPU was spent on
+	// marks that one or two markers cover (json-codec 1 MB: user +15 % for
+	// wall -5 %).
+	vgc_mark_last_work_ns = vgc_mark_last_ns * u64(if vgc_mark_nworkers_cur > 1 {
+		vgc_mark_nworkers_cur
+	} else {
+		1
+	})
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 
 	// Disable write barrier
@@ -1255,10 +1268,18 @@ fn vgc_shade_spawn_root(addr usize) {
 // The markers of this cycle (cx-home/v#16): one, or the pool plus the
 // collector. Decided and the pool created BEFORE the world stops.
 fn vgc_mark_plan() int {
-	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_ns < vgc_mark_par_min_ns {
+	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_work_ns < vgc_mark_par_min_ns {
 		return 1
 	}
 	mut total := vgc_mark_workers_cfg
+	// One marker per vgc_mark_par_min_ns of the previous mark's work: a 3 ms
+	// mark gets three markers, a 10 ms one the configured count. The whole
+	// pool on a small mark is CPU for nothing — each marker's time is the
+	// mark's wall time, mostly idle-spinning on an emptied grey set.
+	by_work := int(vgc_mark_last_work_ns / vgc_mark_par_min_ns)
+	if by_work < total {
+		total = by_work
+	}
 	if vgc_mark_n_target > 0 && vgc_mark_n_target < total {
 		total = vgc_mark_n_target
 	}
