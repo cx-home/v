@@ -700,6 +700,28 @@ __global vgc_grow_gate_hold = u32(0)
 __global vgc_grow_gate_growth_pct = u64(10)
 __global vgc_grow_gate_prev_marked = u64(0)
 // the marked set one collection back
+// ── FRAG GATE + POOL DEFRAG (cx-private #1892) ─────────────────────────────
+// The pool coalesces a freed span only with pooled neighbours of at least
+// vgc_pool_merge_min pages and of the same decommit state (vgc_put_free_span),
+// which keeps the exact-fit size-class pools churn-free but lets the pool
+// fragment: a parse/emit loop over a 1 MB document read 6,000-9,000 pooled
+// pages (50-70 MB) whose largest span was 16-178 pages when a 33-257 page
+// request (the emitter's growing buffer) found no run and carved a fresh
+// 64 MB arena — so the process's peak stepped by an arena's touched pages
+// depending on where in the run that request landed (json-codec peak-1mb
+// 160-194 MB across N and across builds that change no runtime code). The
+// gate: when vgc_span_alloc must carve a new arena while the pool already
+// holds at least twice the request and an eighth of an arena, the carve is
+// deferred to ONE collection (once per cycle, never inside a reclaim-and-retry
+// loop — vgc_grow_gate_hold — the same contract as the grow gate above), and
+// that collection's sweep runs vgc_pool_defrag: every run of adjacent pooled
+// spans in an arena becomes one span, whatever its size or decommit state (a
+// mixed run is recommitted — a no-op on POSIX, where trimmed pages fault back
+// zero-filled). The retry then finds the run; when it cannot (the free pages
+// are not adjacent), it carves as before, one collection later.
+__global vgc_frag_gate_cycle = u64(0)
+__global vgc_frag_gate_fired = false
+__global vgc_defrag_pending = u32(0) // atomic: a gate deferred a carve; the next sweep defragments
 // Cycle timestamps for the overhead measurement (collector-only writes: t0 is
 // stamped by the thread that won the gc_phase CAS; last_end in the STW
 // trigger recompute — never touched on the allocation path).
@@ -2438,6 +2460,97 @@ fn vgc_grow_gate_defers() bool {
 	return true
 }
 
+// vgc_frag_gate_defers answers whether vgc_span_alloc defers a new-arena
+// carve of `nbytes` to a defragmenting collection (the #1892 frag gate above).
+// Called with vgc_heap.lock held.
+fn vgc_frag_gate_defers(nbytes usize) bool {
+	if vgc_heap.narenas == 0 || C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0
+		|| C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		return false
+	}
+	if C.vgc_atomic_load_u32(&vgc_grow_gate_hold) != 0 {
+		return false // a reclaim-and-retry loop is running: it carves if it must
+	}
+	cycle := vgc_heap.gc_cycle
+	if vgc_frag_gate_fired && cycle == vgc_frag_gate_cycle {
+		return false
+	}
+	pooled := C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) +
+		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes)
+	if pooled < u64(nbytes) * 2 || pooled < u64(vgc_arena_size / 8) {
+		return false
+	}
+	vgc_frag_gate_fired = true
+	vgc_frag_gate_cycle = cycle
+	C.vgc_atomic_store_u32(&vgc_defrag_pending, 1)
+	return true
+}
+
+// vgc_pool_defrag merges every run of adjacent pooled spans in each regular
+// arena into one span (the #1892 defrag; see the frag gate). Collector-only,
+// under STW with free_spans_lock and vgc_heap.lock held across the cycle — the
+// context vgc_put_free_span's coalescing runs in. A span joins a run only
+// while the merged span stays a pooled size (<= vgc_max_pooled_pages). A mixed
+// run is recommitted and pooled hot; an all-cold run stays cold. The run's
+// trim clock is its oldest part's (the coalescing rule of #1295).
+fn vgc_pool_defrag() {
+	for i in 0 .. vgc_heap.narenas {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if a.size > vgc_arena_size || a.page_span == unsafe { nil } {
+			continue
+		}
+		npg := a.used / vgc_page_size
+		mut p := usize(0)
+		for p < npg {
+			mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[p]))))) }
+			if s == unsafe { nil } || s.npages == 0 || s.base != a.base + p * vgc_page_size {
+				p++
+				continue
+			}
+			if !s.pooled || s.in_use {
+				p += usize(s.npages)
+				continue
+			}
+			mut merged := false
+			mut gen := s.pool_gen
+			mut q_idx := p + usize(s.npages)
+			for q_idx < npg {
+				mut q := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[q_idx]))))) }
+				if q == unsafe { nil } || !q.pooled || q.in_use || q.npages == 0
+					|| q.base != a.base + q_idx * vgc_page_size
+					|| s.npages + q.npages > u32(vgc_max_pooled_pages) {
+					break
+				}
+				if !merged {
+					vgc_pool_unlink(mut s)
+					merged = true
+				}
+				vgc_pool_unlink(mut q)
+				if s.decommitted != q.decommitted {
+					if s.decommitted {
+						C.vgc_os_recommit(voidptr(s.base), usize(s.npages) * vgc_page_size)
+						s.decommitted = false
+					} else {
+						C.vgc_os_recommit(voidptr(q.base), usize(q.npages) * vgc_page_size)
+					}
+				}
+				if q.pool_gen < gen {
+					gen = q.pool_gen
+				}
+				q_np := q.npages
+				vgc_span_repoint_pages(i, q.base, q_np, s)
+				s.npages += q_np
+				vgc_retire_span_desc(mut q)
+				q_idx += usize(q_np)
+			}
+			if merged {
+				vgc_pool_push_aged(mut s, gen)
+			}
+			p += usize(s.npages)
+		}
+	}
+}
+
 fn vgc_span_alloc(npages u32) &VGC_Span {
 	// First try to reuse a free span
 	recycled := vgc_get_free_span(npages)
@@ -2471,7 +2584,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 	// Allocate new arena if needed
 	if base == 0 {
-		if vgc_grow_gate_defers() {
+		if vgc_grow_gate_defers() || vgc_frag_gate_defers(nbytes) {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }
 		}
