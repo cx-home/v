@@ -742,7 +742,8 @@ __global vgc_grow_gate_probe_goal = u64(0)
 // are not adjacent), it carves as before, one collection later.
 __global vgc_frag_gate_cycle = u64(0)
 __global vgc_frag_gate_fired = false
-__global vgc_defrag_pending = u32(0) // atomic: a gate deferred a carve; the next sweep defragments
+__global vgc_defrag_pending = u32(0)
+// atomic: a gate deferred a carve; the next sweep defragments
 // Cycle timestamps for the overhead measurement (collector-only writes: t0 is
 // stamped by the thread that won the gc_phase CAS; last_end in the STW
 // trigger recompute — never touched on the allocation path).
