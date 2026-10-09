@@ -1278,7 +1278,11 @@ fn vgc_mark_plan() int {
 	// mark's wall time, mostly idle-spinning on an emptied grey set.
 	// VGC_MARK_PAR_MIN_US=0 forces the configured count (and is no divisor:
 	// x86 traps on it, arm64 reads 0 and would never engage the pool).
-	by_work := if vgc_mark_par_min_ns == 0 { total } else { int(vgc_mark_last_work_ns / vgc_mark_par_min_ns) }
+	by_work := if vgc_mark_par_min_ns == 0 {
+		total
+	} else {
+		int(vgc_mark_last_work_ns / vgc_mark_par_min_ns)
+	}
 	if by_work < total {
 		total = by_work
 	}

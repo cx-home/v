@@ -412,8 +412,8 @@ mut:
 	free_oversized &VGC_Span = unsafe { nil }
 	// Per-thread caches
 	caches       [vgc_max_threads]VGC_Cache
-	ncaches      int     // high-water mark of slots ever used
-	live_threads u32     // atomic-ish (guarded by cache_lock): currently-registered mutators
+	ncaches      int                  // high-water mark of slots ever used
+	live_threads u32                  // atomic-ish (guarded by cache_lock): currently-registered mutators
 	free_slots   [vgc_max_threads]int // reclaimed cache indices, reused before growing ncaches
 	nfree_slots  int
 	cache_lock   u32
