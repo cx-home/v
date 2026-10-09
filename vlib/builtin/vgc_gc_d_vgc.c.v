@@ -1268,7 +1268,7 @@ fn vgc_shade_spawn_root(addr usize) {
 // The markers of this cycle (cx-home/v#16): one, or the pool plus the
 // collector. Decided and the pool created BEFORE the world stops.
 fn vgc_mark_plan() int {
-	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_work_ns < vgc_mark_par_min_ns {
+	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_work_ns < vgc_mark_par_min_ns || vgc_mark_forked {
 		return 1
 	}
 	mut total := vgc_mark_workers_cfg
@@ -1276,7 +1276,9 @@ fn vgc_mark_plan() int {
 	// mark gets three markers, a 10 ms one the configured count. The whole
 	// pool on a small mark is CPU for nothing — each marker's time is the
 	// mark's wall time, mostly idle-spinning on an emptied grey set.
-	by_work := int(vgc_mark_last_work_ns / vgc_mark_par_min_ns)
+	// VGC_MARK_PAR_MIN_US=0 forces the configured count (and is no divisor:
+	// x86 traps on it, arm64 reads 0 and would never engage the pool).
+	by_work := if vgc_mark_par_min_ns == 0 { total } else { int(vgc_mark_last_work_ns / vgc_mark_par_min_ns) }
 	if by_work < total {
 		total = by_work
 	}
@@ -1287,6 +1289,9 @@ fn vgc_mark_plan() int {
 		return 1
 	}
 	want := total - 1
+	// a thread created now has seen every generation up to the current one;
+	// this cycle's advance (vgc_parallel_mark) is the first it drains
+	C.vgc_atomic_store_u32(&vgc_mark_spawn_gen, C.vgc_atomic_load_u32(&vgc_mark_go))
 	for vgc_mark_pool_n < want {
 		if C.vgc_start_thread_rc(vgc_mark_worker_main) != 0 {
 			break
@@ -1362,7 +1367,11 @@ fn vgc_parallel_mark() {
 // (every pool thread is a marker of every parallel cycle), reports done.
 fn vgc_mark_worker_main() {
 	slot := int(C.vgc_atomic_add_u32(&vgc_mark_pool_next, 1)) // 1-based; the collector is 0
-	mut seen := u32(0)
+	// the generation at creation, not 0: a pool that grows after cycle G starts
+	// its new threads at G, so they wait for G+1 (vgc_mark_spawn_gen above). The
+	// collector cannot move it on before this read: the next plan runs only after
+	// this cycle's collector has counted this thread done.
+	mut seen := C.vgc_atomic_load_u32(&vgc_mark_spawn_gen)
 	for {
 		C.vgc_mark_wait(&vgc_mark_go, seen)
 		g := C.vgc_atomic_load_u32(&vgc_mark_go)

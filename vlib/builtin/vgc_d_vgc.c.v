@@ -702,6 +702,16 @@ __global vgc_mark_pool_n = int(0)
 // pool threads alive (the collector excluded)
 __global vgc_mark_pool_next = u32(0)
 // slot handed to a starting pool thread
+__global vgc_mark_spawn_gen = u32(0)
+// the generation a starting pool thread has already seen: vgc_mark_go as it
+// stood when the collector created it, before this cycle's advance. A thread
+// that started from 0 instead took an earlier cycle's generation for a new one
+// and drained a cycle that was not running (cx-home/v#16: the fork child's
+// livelock — vgc_mark_idle never reached n — and, in the parent, a pool that
+// grows after its first parallel cycle).
+__global vgc_mark_forked = false
+// set in a fork child: one marker until exec (POSIX: a multithreaded parent's
+// fork child may call only async-signal-safe functions, pthread_create is not)
 __global vgc_mark_last_ns = u64(0)
 // the previous cycle's mark phase
 __global vgc_mark_nworkers_cur = int(1)
@@ -1286,8 +1296,13 @@ fn vgc_atfork_child() {
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	C.vgc_mutex_unlock(&vgc_heap.lock)
-	// The mark pool's threads did not survive the fork (cx-home/v#16): the next
-	// parallel cycle in the child recreates them; its counters start clean.
+	// The mark pool's threads did not survive the fork (cx-home/v#16), and the
+	// child never recreates them: it marks on one thread until it execs (the V/cx
+	// spawn path execs at once; a child that keeps running keeps one marker).
+	// Every pool counter, the generation included, starts clean.
+	vgc_mark_forked = true
+	vgc_mark_go = 0
+	vgc_mark_spawn_gen = 0
 	vgc_mark_pool_n = 0
 	vgc_mark_pool_next = 0
 	vgc_mark_idle = 0
