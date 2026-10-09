@@ -52,6 +52,7 @@ fn C.vgc_bitmap_set(bits &u8, idx u32)
 fn C.vgc_bitmap_clear(bits &u8, idx u32)
 fn C.vgc_bitmap_test_and_set(bits &u8, idx u32) int
 fn C.vgc_popcount8(x u8) int
+fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
 fn C.vgc_size_class(size u32) u8
 fn C.vgc_get_class_size(cls int) u32
 fn C.vgc_get_class_npages(cls int) u32
@@ -86,6 +87,7 @@ fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -197,6 +199,7 @@ mut:
 	// chain is hijacked into free_spans -> a later vgc_central_get_span traverses a
 	// garbage node -> returns a wild span -> SIGSEGV in the allocation memset.
 	on_central u8
+	slot       u32 // this descriptor's index in vgc_heap.allspans (cx-home/v#15)
 	// cx #360 free-span pool state. `pooled` is true exactly while the span sits on
 	// a free_spans[npages] list (or the oversized list) — it is what the coalescer
 	// trusts when a page_span neighbor lookup lands on this descriptor, so it is
@@ -349,7 +352,13 @@ mut:
 	// large marked set via the GOGC term) can push the goal far past the adaptive
 	// default, so an alloc-heavy [par] workload needs far more than the old fixed
 	// 262144. vgc_span_alloc fails loudly (never silently) past cap.
-	allspans     &&VGC_Span = unsafe { nil }
+	allspans &&VGC_Span = unsafe { nil }
+	// cx-home/v#15: one bit per allspans slot, set while that span is in use, so
+	// the collector's per-cycle walks (clear, sweep, count) visit the in-use
+	// descriptors only — pooled spans stay registered (their slots are kept for
+	// life, cx #360) but a pi-digits heap with 10,000 registered and 1,000 in-use
+	// spans no longer pays three 10,000-descriptor cache-missing walks per cycle.
+	inuse_bits   &u8 = unsafe { nil }
 	allspans_cap int
 	nspans       int
 	// Free spans (completely empty, reusable by page count)
@@ -527,9 +536,15 @@ __global vgc_spawn_root_lock = u32(0)
 // writes the moved value to its new slot BEFORE shrinking the count, so a frozen
 // mid-unpin leaves every still-pinned address present in >=1 slot (at worst shaded
 // twice for one cycle — harmless). Same discipline as vgc_spawn_roots.
-const vgc_pin_cap = 65536 // max concurrent pins; the array (512 KB) is scanned each GC
+const vgc_pin_cap = 65536 // max concurrent pins; the table (512 KB) is shaded [0, npins) each GC
 
-__global vgc_pins = [vgc_pin_cap]voidptr{}
+// The pin table lives OUTSIDE the data segment (vgc_os_alloc'd on the first pin,
+// its pages untouched until used): the collector shades exactly [0, vgc_npins)
+// in vgc_mark_roots, so the conservative data-segment scan never needs to walk
+// it — as a 512 KB __global it was walked every cycle (cx-home/v#15: the fixed
+// per-cycle cost of a small live set was the data-segment scan, 7 MB of which
+// were the collector's own tables).
+__global vgc_pins = &voidptr(unsafe { nil })
 __global vgc_npins = int(0)
 __global vgc_pin_lock = u32(0)
 
@@ -540,6 +555,9 @@ fn vgc_pin(p voidptr) {
 		return
 	}
 	C.vgc_mutex_lock(&vgc_pin_lock)
+	if vgc_pins == unsafe { nil } {
+		vgc_pins = &voidptr(C.vgc_os_alloc(usize(sizeof(voidptr)) * usize(vgc_pin_cap)))
+	}
 	if vgc_npins < vgc_pin_cap {
 		unsafe {
 			vgc_pins[vgc_npins] = p
@@ -894,17 +912,31 @@ pub fn vgc_envcheck_dedupe(p usize) bool {
 // Direct-mapped: ptr -> gc_cycle at allocation, for victim-class objects.
 // Collisions overwrite (younger birth wins — fine: we only ask about recent
 // allocations). Lookup miss => born before the table wrapped (old object).
-__global vgc_birth_ptr = [262144]usize{}
-__global vgc_birth_cyc = [262144]u64{}
-__global vgc_birth_span = [262144]usize{}
+// The three tables (6 MB) are vgc_os_alloc'd on the first record — only a
+// -d vgc_birthcheck build ever records — so a default build carries no 6 MB
+// of BSS, and the conservative data-segment root scan does not walk 6 MB of
+// diagnostic words every cycle (cx-home/v#15: that walk was ~0.8 ms per
+// collection at a 1 MB live set, and it kept the pages resident).
+const vgc_birth_cap = 262144
+
+__global vgc_birth_ptr = &usize(unsafe { nil })
+__global vgc_birth_cyc = &u64(unsafe { nil })
+__global vgc_birth_span = &usize(unsafe { nil })
 // descriptor identity at claim time
 
 @[inline]
 fn vgc_birth_record(addr usize, span_ptr usize) {
+	if vgc_birth_ptr == unsafe { nil } {
+		vgc_birth_ptr = &usize(C.vgc_os_alloc(usize(sizeof(usize)) * usize(vgc_birth_cap)))
+		vgc_birth_cyc = &u64(C.vgc_os_alloc(usize(sizeof(u64)) * usize(vgc_birth_cap)))
+		vgc_birth_span = &usize(C.vgc_os_alloc(usize(sizeof(usize)) * usize(vgc_birth_cap)))
+	}
 	i := int((u64(addr) * u64(0x9E3779B97F4A7C15)) >> 46)
-	vgc_birth_ptr[i] = addr
-	vgc_birth_cyc[i] = u64(vgc_heap.gc_cycle)
-	vgc_birth_span[i] = span_ptr
+	unsafe {
+		vgc_birth_ptr[i] = addr
+		vgc_birth_cyc[i] = u64(vgc_heap.gc_cycle)
+		vgc_birth_span[i] = span_ptr
+	}
 }
 
 // vgc_birth_span_of: the span DESCRIPTOR that carved `p` at its recorded birth,
@@ -913,11 +945,14 @@ fn vgc_birth_record(addr usize, span_ptr usize) {
 // memory served twice; every "wild bit clear" symptom follows.
 @[markused]
 pub fn vgc_birth_span_of(p voidptr) usize {
-	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
-	if vgc_birth_ptr[i] != usize(p) {
+	if vgc_birth_ptr == unsafe { nil } {
 		return 0
 	}
-	return vgc_birth_span[i]
+	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
+	if unsafe { vgc_birth_ptr[i] } != usize(p) {
+		return 0
+	}
+	return unsafe { vgc_birth_span[i] }
 }
 
 // vgc_find_span_addr: the current descriptor address for `p` (0 = none).
@@ -933,11 +968,14 @@ pub fn vgc_find_span_addr(p voidptr) usize {
 // vgc_birth_delta: cycles between `p`'s recorded birth and now; -1 = unknown.
 @[markused]
 pub fn vgc_birth_delta(p voidptr) i64 {
-	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
-	if vgc_birth_ptr[i] != usize(p) {
+	if vgc_birth_ptr == unsafe { nil } {
 		return -1
 	}
-	return i64(u64(vgc_heap.gc_cycle) - vgc_birth_cyc[i])
+	i := int((u64(usize(p)) * u64(0x9E3779B97F4A7C15)) >> 46)
+	if unsafe { vgc_birth_ptr[i] } != usize(p) {
+		return -1
+	}
+	return i64(u64(vgc_heap.gc_cycle) - unsafe { vgc_birth_cyc[i] })
 }
 
 // ── #58 BIT-WATCH (-d vgc_birthcheck) ───────────────────────────────────────
@@ -1198,8 +1236,9 @@ pub fn vgc_init() {
 		}
 	}
 	trace_env := C.getenv(c'VGC_GCTRACE')
-	if trace_env != unsafe { nil } && C.atoll(trace_env) != 0 {
-		vgc_gctrace = 1
+	if trace_env != unsafe { nil } && C.atoll(trace_env) > 0 {
+		// 1: the pacing line per cycle; 2: the phase line too (cx-home/v#15)
+		vgc_gctrace = u32(C.atoll(trace_env))
 	}
 	// decimal digits only, 0..100; anything else keeps the default (atoll read
 	// `abc`, `0x1e` and an empty value as 0 — the gate silently off)
@@ -1796,7 +1835,9 @@ fn vgc_span_split(mut span VGC_Span, want u32) bool {
 		return true // descriptor exhaustion: hand out the whole span rather than fail
 	}
 	unsafe {
+		rslot := rspan.slot // the allspans slot survives the reset (cx-home/v#15)
 		C.memset(rspan, 0, sizeof(VGC_Span))
+		rspan.slot = rslot
 		rspan.base = rem_base
 		rspan.npages = rem
 		rspan.decommitted = span.decommitted
@@ -2211,6 +2252,8 @@ fn vgc_put_free_span(mut span VGC_Span) {
 	// by the STW pool trim (vgc_pool_trim, cx #360) — once per pool residence, so
 	// the syscall churn cannot return.
 	span.in_use = false
+	C.vgc_atomic_fetch_and_u8(unsafe { &vgc_heap.inuse_bits[span.slot >> 3] },
+		~u8(1 << (span.slot & 7)))
 	span.class_idx = 0
 	span.elem_size = 0
 	span.nelems = 0
@@ -2306,7 +2349,9 @@ fn vgc_put_free_span(mut span VGC_Span) {
 // vgc_new_span_desc hands it back out already-registered.
 fn vgc_retire_span_desc(mut span VGC_Span) {
 	unsafe {
+		slot := span.slot // the allspans slot survives the reset (cx-home/v#15)
 		C.memset(&span, 0, sizeof(VGC_Span))
+		span.slot = slot
 		span.next = vgc_heap.span_meta_pending
 		vgc_heap.span_meta_pending = &span
 	}
@@ -2360,6 +2405,7 @@ fn vgc_new_span_desc() &VGC_Span {
 			}
 		}
 		vgc_heap.allspans = &&VGC_Span(C.vgc_os_alloc(usize(sizeof(voidptr)) * usize(cap)))
+		vgc_heap.inuse_bits = &u8(C.vgc_os_alloc(usize(cap / 8 + 8)))
 		vgc_heap.allspans_cap = cap
 	}
 	// Track in allspans. Exceeding the (mmap-reserved) capacity is NOT silently
@@ -2372,6 +2418,7 @@ fn vgc_new_span_desc() &VGC_Span {
 	}
 	unsafe {
 		vgc_heap.allspans[vgc_heap.nspans] = span
+		span.slot = u32(vgc_heap.nspans)
 	}
 	vgc_heap.nspans++
 	return span
@@ -2706,7 +2753,9 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		return unsafe { nil }
 	}
 	unsafe {
+		slot := span.slot // the allspans slot survives the reset (cx-home/v#15)
 		C.memset(span, 0, sizeof(VGC_Span))
+		span.slot = slot
 		span.base = base
 		span.npages = npages
 		// in_use stays FALSE until the span is fully initialized (vgc_span_init /
@@ -2813,6 +2862,10 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	// clear-mark / count-marked / sweep all skip !in_use, so until this store a span
 	// already in allspans (and a mutator possibly suspended right here) is invisible
 	// to collection -> no half-built span is ever swept or cleared.
+	// the in-use bit goes up BEFORE in_use: a collector that stops the world
+	// between the two sees the bit, and the walk's own in_use test skips the span
+	C.vgc_atomic_fetch_or_u8(unsafe { &vgc_heap.inuse_bits[span.slot >> 3] },
+		u8(1 << (span.slot & 7)))
 	span.in_use = true
 }
 
@@ -3610,6 +3663,7 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		vgc_alloc_black_hook(span, 0) // concurrent mark: alloc-black this large object
 		// Fully initialized -> publish as live (see the in_use invariant in
 		// vgc_span_init; span_alloc/get_free_span leave in_use false until here).
+		C.vgc_atomic_fetch_or_u8(&vgc_heap.inuse_bits[span.slot >> 3], u8(1 << (span.slot & 7)))
 		span.in_use = true
 	}
 	// (No large-allocation list: the old vgc_heap.large_alloc chain was write-only
