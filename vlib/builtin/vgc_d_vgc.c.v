@@ -287,6 +287,7 @@ mut:
 	// the collector reads/resets all slots under STW.
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
+	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
 }
 
 // VGC_Central is a central free list for one span class.
@@ -711,15 +712,17 @@ __global vgc_mark_n_target = int(0)
 __global vgc_mark_backoff = int(0)
 // parallel cycles left at the reduced count
 
-// The live-set bound's release (cx-home/v#16): the bound holds the headroom
-// to max(floor, live) for memory's sake, but under heavy parallel allocation
-// (eight threads filling 32 MB in a few ms of mutator time) it pins the
-// collector at a quarter or more of the wall clock. Past
-// 1/vgc_overhead_release_div of the interval the bound yields to the flat cap
-// so the time band can buy the throughput back; a single-threaded parse/emit
-// loop (json-codec: ~12 %) stays under it. VGC_OVERHEAD_RELEASE_DIV overrides
-// (0 = never release).
-__global vgc_overhead_release_div = u64(4)
+// The live-set bound's floor scales with the allocating threads (cx-home/v#16):
+// the bound holds the headroom to max(floor, live) for memory's sake, which is
+// right for one thread (json-codec: RSS tracks the live set), but T threads
+// fill the same headroom T times faster while a cycle's pause is set by the
+// live set, so the collector's share of the wall clock grows with T (eight
+// threads: a quarter or more stopped). With the floor at floor x T (under the
+// flat cap, as ever) the cycle rate per thread stays what one thread pays; the
+// reference for a parallel workload, Python's multiprocessing, spends T heaps.
+// A thread counts when it allocated since the previous cycle.
+// VGC_HEADROOM_PER_THREAD=0 switches the scaling off.
+__global vgc_headroom_per_thread = true
 // markers this cycle, the collector included
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
@@ -1383,12 +1386,9 @@ pub fn vgc_init() {
 		mw = vgc_max_markers
 	}
 	vgc_mark_workers_cfg = mw
-	rel_env := C.getenv(c'VGC_OVERHEAD_RELEASE_DIV')
-	if rel_env != unsafe { nil } {
-		rv := C.atoll(rel_env)
-		if rv >= 0 {
-			vgc_overhead_release_div = u64(rv)
-		}
+	pt_env := C.getenv(c'VGC_HEADROOM_PER_THREAD')
+	if pt_env != unsafe { nil } {
+		vgc_headroom_per_thread = C.atoll(pt_env) != 0
 	}
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
@@ -3512,6 +3512,7 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_heap.caches[cache_idx].live_delta += i64(live_sz)
 		vgc_heap.caches[cache_idx].alloc_delta += total_n
+		vgc_heap.caches[cache_idx].alloc_gen = u32(vgc_heap.gc_cycle)
 		if vgc_heap.caches[cache_idx].alloc_delta >= vgc_acct_flush {
 			ld := vgc_heap.caches[cache_idx].live_delta
 			if ld >= 0 {

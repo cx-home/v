@@ -2262,6 +2262,19 @@ const vgc_overhead_shrink_div = u64(50)
 // check-time per-thread additive: it decides how much DEAD transient growth a
 // small-live-set program accumulates between backstop cycles, sized by what
 // collections actually cost here and now rather than by a static guess.
+// The registered threads that allocated since the previous cycle (their
+// alloc_gen stamp is this cycle's number; the world is stopped here).
+fn vgc_alloc_threads() int {
+	mut n := 0
+	for i in 0 .. vgc_heap.ncaches {
+		c := unsafe { &vgc_heap.caches[i] }
+		if c.registered && c.alloc_gen == u32(vgc_heap.gc_cycle) {
+			n++
+		}
+	}
+	return n
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -2304,13 +2317,18 @@ fn vgc_update_trigger() {
 		// is pauses for nothing (see the floor's doc for the measurements).
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
-			if live_cap < vgc_headroom_live_floor {
-				live_cap = vgc_headroom_live_floor
+			mut floor := vgc_headroom_live_floor
+			if vgc_headroom_per_thread {
+				// cx-home/v#16: floor x the threads that allocated this cycle.
+				nt := vgc_alloc_threads()
+				if nt > 1 {
+					floor *= u64(nt)
+				}
 			}
-			// cx-home/v#16: the bound yields while the collector takes more than
-			// 1/vgc_overhead_release_div of the wall clock (see the global).
-			released := vgc_overhead_release_div > 0 && pause * vgc_overhead_release_div > interval
-			if hr_max > live_cap && !released {
+			if live_cap < floor {
+				live_cap = floor
+			}
+			if hr_max > live_cap {
 				hr_max = live_cap
 			}
 		}
