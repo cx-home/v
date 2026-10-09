@@ -1595,7 +1595,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       return n;
   }
 #endif // VGC_SIGNAL_SUSPEND
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
   #if defined(__TINYC__) && (defined(__x86_64__) || defined(__i386__)) && !defined(__ATOMIC_ACQUIRE)
     // tcc has no __atomic builtins ("'__ATOMIC_ACQUIRE' undeclared", tcc-linux,
     // cx-private#1889). This branch needs only acquire loads and release stores:
@@ -1624,13 +1624,54 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   //
   // The `mach_port u32` cache field carries the kernel TID (gettid) on Linux; it
   // is the signal target (via tgkill) and the per-thread slot key.
+  //
+  // FreeBSD takes the same path (cx-home/v#17): the thread id is thr_self's
+  // lwpid, the signal goes through thr_kill (which reaches only this process's
+  // threads, as tgkill(getpid(), ...) does), and the park blocks on _umtx_op's
+  // private wait/wake (FreeBSD's futex). It took the #else below before: every
+  // thread's port was 0, so the STW neither waited for nor suspended any peer —
+  // the cooperative collector marked and swept while the other mutators ran,
+  // and the concurrent collector's STW windows stopped nobody (mt_sound under
+  // -d vgc_concurrent read bad=7..818 records on FreeBSD CI).
   // ----------------------------------------------------------------------------
   #include <signal.h>
   #include <pthread.h>
   #include <ucontext.h>
   #include <unistd.h>
-  #include <sys/syscall.h>
   #include <errno.h> // ESRCH: genuinely-gone vs transient tgkill failure
+  #if defined(__FreeBSD__)
+    #include <sys/types.h>
+    #include <sys/thr.h>
+    #include <sys/umtx.h>
+    // Each answers -1 with errno set on failure (ESRCH: no such thread here),
+    // as syscall(SYS_tgkill) does. All are plain syscalls: async-signal-safe.
+    static inline uint32_t vgc_lin_gettid(void) {
+        long id = 0;
+        (void)thr_self(&id);
+        return (uint32_t)id;
+    }
+    static inline int vgc_lin_tkill(uint32_t t, int sig) { return thr_kill((long)t, sig); }
+    static inline void vgc_lin_park_wait(volatile uint32_t* w) {
+        (void)_umtx_op((void*)w, UMTX_OP_WAIT_UINT_PRIVATE, 0, (void*)0, (void*)0);
+    }
+    static inline void vgc_lin_park_wake(volatile uint32_t* w) {
+        (void)_umtx_op((void*)w, UMTX_OP_WAKE_PRIVATE, 1, (void*)0, (void*)0);
+    }
+  #else
+    #include <sys/syscall.h>
+    static inline uint32_t vgc_lin_gettid(void) {
+        return (uint32_t)syscall(SYS_gettid); // async-signal-safe
+    }
+    static inline int vgc_lin_tkill(uint32_t t, int sig) {
+        return (int)syscall(SYS_tgkill, getpid(), (int)t, sig);
+    }
+    static inline void vgc_lin_park_wait(volatile uint32_t* w) {
+        syscall(SYS_futex, (uint32_t*)w, 0 /*FUTEX_WAIT*/, 0, (void*)0, (void*)0, 0);
+    }
+    static inline void vgc_lin_park_wake(volatile uint32_t* w) {
+        syscall(SYS_futex, (uint32_t*)w, 1 /*FUTEX_WAKE*/, 1, (void*)0, (void*)0, 0);
+    }
+  #endif
 
   // Private suspend signal. SIGRTMIN+6 mirrors Boehm's default GC_SIG_SUSPEND so
   // it does not clobber an application's SIGUSR1/SIGUSR2 handlers. (SIGRTMIN is a
@@ -1672,10 +1713,6 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       return 0;
   }
 
-  static inline uint32_t vgc_lin_gettid(void) {
-      return (uint32_t)syscall(SYS_gettid); // async-signal-safe
-  }
-
   // Async-signal-safe: only syscall(gettid), volatile loads/stores, register copy,
   // and sched_yield while parking. No malloc / no locks / no stdio.
   static void vgc_suspend_handler(int sig, siginfo_t* si, void* uctx) {
@@ -1688,7 +1725,22 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       if (s == 0) return; // spurious / not a target of this cycle
       ucontext_t* uc = (ucontext_t*)uctx;
       int c = 0;
-    #if defined(__aarch64__)
+    #if defined(__FreeBSD__) && defined(__aarch64__)
+      for (int i = 0; i < 30 && c < 32; i++) s->regs[c++] = (uintptr_t)uc->uc_mcontext.mc_gpregs.gp_x[i];
+      if (c < 32) s->regs[c++] = (uintptr_t)uc->uc_mcontext.mc_gpregs.gp_lr;
+      s->sp = (uintptr_t)uc->uc_mcontext.mc_gpregs.gp_sp;
+    #elif defined(__FreeBSD__) && defined(__x86_64__)
+      {
+          const mcontext_t* m = &uc->uc_mcontext;
+          uintptr_t r[15] = { (uintptr_t)m->mc_rax, (uintptr_t)m->mc_rbx, (uintptr_t)m->mc_rcx,
+                              (uintptr_t)m->mc_rdx, (uintptr_t)m->mc_rsi, (uintptr_t)m->mc_rdi,
+                              (uintptr_t)m->mc_rbp, (uintptr_t)m->mc_r8, (uintptr_t)m->mc_r9,
+                              (uintptr_t)m->mc_r10, (uintptr_t)m->mc_r11, (uintptr_t)m->mc_r12,
+                              (uintptr_t)m->mc_r13, (uintptr_t)m->mc_r14, (uintptr_t)m->mc_r15 };
+          for (int i = 0; i < 15 && c < 32; i++) s->regs[c++] = r[i];
+          s->sp = (uintptr_t)m->mc_rsp;
+      }
+    #elif defined(__aarch64__)
       for (int i = 0; i < 31 && c < 32; i++) s->regs[c++] = (uintptr_t)uc->uc_mcontext.regs[i];
       s->sp = (uintptr_t)uc->uc_mcontext.sp;
     #elif defined(__x86_64__)
@@ -1711,7 +1763,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #else
       for (int i = 0; i < 256 && __atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0; i++) { }
       while (__atomic_load_n(&s->release, __ATOMIC_ACQUIRE) == 0) {
-          syscall(SYS_futex, (uint32_t*)&s->release, 0 /*FUTEX_WAIT*/, 0, (void*)0, (void*)0, 0);
+          vgc_lin_park_wait(&s->release);
       }
   #endif
       __atomic_store_n(&s->acked, 0, __ATOMIC_RELEASE); // confirm departure before slot reuse
@@ -1773,21 +1825,21 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       // Only ESRCH = genuinely gone; retry any transient failure for a live thread
       // (see the darwin twin — dropping a live peer = the #58 sweep-while-live UAF).
       {
-          int kr = syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL);
+          int kr = vgc_lin_tkill(t, VGC_SUSPEND_SIGNAL);
           if (kr != 0 && errno == ESRCH) {
               vgc_say(0xdea52, (uint64_t)t);
               __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
               return 0;
           }
           for (uint64_t kspin = 1; kr != 0; kspin++) {
-              if (syscall(SYS_tgkill, getpid(), (int)t, 0) != 0 && errno == ESRCH) {
+              if (vgc_lin_tkill(t, 0) != 0 && errno == ESRCH) {
                   vgc_say(0xdea52, (uint64_t)t);
                   __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
                   return 0;
               }
               if ((kspin & 0xfffff) == 0) vgc_say(0xdead2, (uint64_t)t);
               sched_yield();
-              kr = syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL);
+              kr = vgc_lin_tkill(t, VGC_SUSPEND_SIGNAL);
           }
       }
       for (int i = 0; i < 200000; i++) {
@@ -1800,12 +1852,12 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   #else
       for (uint64_t spins = 1;; spins++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1;
-          if (syscall(SYS_tgkill, getpid(), (int)t, 0) != 0) { // target exited
+          if (vgc_lin_tkill(t, 0) != 0) { // target exited
               __atomic_store_n(&s->tid, 0, __ATOMIC_RELEASE);
               return 0;
           }
           if ((spins & 0xffff) == 0) {
-              (void)syscall(SYS_tgkill, getpid(), (int)t, VGC_SUSPEND_SIGNAL); // re-signal
+              (void)vgc_lin_tkill(t, VGC_SUSPEND_SIGNAL); // re-signal
           }
           if ((spins & 0xfffff) == 0) {
               vgc_say(0x0acd, (uint64_t)t); // abnormal: still waiting for ack
@@ -1820,7 +1872,7 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       if (s == 0) return;
       __atomic_store_n(&s->release, 1, __ATOMIC_RELEASE);
   #ifndef VGC_PARK_SPIN
-      syscall(SYS_futex, (uint32_t*)&s->release, 1 /*FUTEX_WAKE*/, 1, (void*)0, (void*)0, 0);
+      vgc_lin_park_wake(&s->release);
   #endif
       for (int i = 0; i < 200000; i++) { // wait for the handler to leave before freeing
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) == 0) break;
