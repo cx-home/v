@@ -2824,7 +2824,7 @@ fn vgc_pool_defrag() {
 // vgc_gc_owner is the cache index of the thread running the stop-the-world
 // collection, -1 when none (cx-home/v#17: a carve waits for another thread's
 // collection, never for its own).
-__global vgc_gc_owner = -1
+__global vgc_gc_owner = int(-1)
 
 // vgc_carve_waits reports whether this thread, about to carve a new arena,
 // should first let the collection in flight finish (cx-home/v#17). That
