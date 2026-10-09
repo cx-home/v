@@ -1910,7 +1910,17 @@ fn (mut g Gen) gen_anon_fn(mut node ast.AnonFn) {
 	// alone; under vgc that chain loses races at high mutator counts (captured
 	// envs swept while the closure is callable — the N=24 churn UAF). The paired
 	// release (closure_release_no_lock → free_uncollectable) unpins on reclaim.
-	g.write('builtin__closure__closure_create_with_data(${fn_name}, (${ctx_struct}*) builtin__memdup_uncollectable(&(${ctx_struct}){')
+	// Every other collector keeps upstream's collectable memdup, retained by
+	// g_closure.live: under Boehm an uncollectable ctx is a root, so each env a
+	// reclaimed lifetime's closures captured stayed reachable (79 MB over 20k
+	// frames, closure_lifetime_api_test's boehm run; cx-private#1894), and the
+	// release's free_uncollectable is a plain free there.
+	ctx_dup := if g.pref.gc_mode == .vgc {
+		'builtin__memdup_uncollectable'
+	} else {
+		'builtin__memdup'
+	}
+	g.write('builtin__closure__closure_create_with_data(${fn_name}, (${ctx_struct}*) ${ctx_dup}(&(${ctx_struct}){')
 	g.indent++
 	for var in node.inherited_vars {
 		mut has_inherited := false
