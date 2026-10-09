@@ -2151,11 +2151,14 @@ fn vgc_update_trigger() {
 		// Live-set bound (cx-home/v#12, see vgc_headroom_live_pct): the dead
 		// growth a cycle allows is at most live_pct % of what the cycle marked,
 		// so the goal stays within 2× the live set at the default and a small
-		// live set no longer rides the flat cap into another arena.
+		// live set no longer rides the flat cap into another arena. The bound
+		// never goes below vgc_headroom_live_floor (32 MB): a tiny live set's
+		// cycle is all stop protocol and root scan, so a shorter interval there
+		// is pauses for nothing (see the floor's doc for the measurements).
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
-			if live_cap < vgc_headroom_min {
-				live_cap = vgc_headroom_min
+			if live_cap < vgc_headroom_live_floor {
+				live_cap = vgc_headroom_live_floor
 			}
 			if hr_max > live_cap {
 				hr_max = live_cap
