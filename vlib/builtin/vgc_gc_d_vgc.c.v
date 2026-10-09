@@ -84,6 +84,8 @@ fn vgc_gc_start() {
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return
 	}
+	// cx-home/v#17: the collector's own carves never wait for its collection
+	vgc_gc_owner = C.vgc_get_cache_idx()
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
@@ -608,6 +610,7 @@ fn vgc_gc_start() {
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock) // release the registration gate
 
 	C.vgc_trace(12, self_idx, u64(vgc_heap.gc_cycle), 0) // GC_END
+	vgc_gc_owner = -1
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 }
 

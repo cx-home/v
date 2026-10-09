@@ -2821,7 +2821,59 @@ fn vgc_pool_defrag() {
 	}
 }
 
+// vgc_gc_owner is the cache index of the thread running the stop-the-world
+// collection, -1 when none (cx-home/v#17: a carve waits for another thread's
+// collection, never for its own).
+__global vgc_gc_owner = -1
+
+// vgc_carve_waits reports whether this thread, about to carve a new arena,
+// should first let the collection in flight finish (cx-home/v#17). That
+// collection's sweep is about to return its garbage to the pool; an arena
+// carved while it stops the world, or while it resumes it, is memory the heap
+// keeps. Only a registered mutator that is not the collector waits, and only
+// outside the reclaim-and-retry loop (vgc_grow_gate_hold), which waits for the
+// phase itself. The concurrent collector is excluded: its mark runs beside the
+// mutators by design, for as long as it takes.
+fn vgc_carve_waits() bool {
+	$if vgc_concurrent ? {
+		return false
+	}
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) == vgc_phase_off
+		|| C.vgc_atomic_load_u32(&vgc_grow_gate_hold) != 0 {
+		return false
+	}
+	ci := C.vgc_get_cache_idx()
+	return ci >= 0 && ci != vgc_gc_owner
+}
+
+// vgc_wait_gc_done parks at the safepoint while the world is being stopped and
+// yields until the collection's phase is off. The caller holds no allocator
+// lock: a straggler the collector signal-suspends here is frozen holding
+// nothing, as at any other poll.
+fn vgc_wait_gc_done() {
+	for C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		if C.vgc_atomic_load_u32(&vgc_heap.gc_stop_flag) != 0 {
+			vgc_safepoint()
+		} else {
+			C.vgc_yield()
+		}
+	}
+}
+
 fn vgc_span_alloc(npages u32) &VGC_Span {
+	span, waited := vgc_span_alloc_once(npages, true)
+	if waited {
+		// the collection this thread waited out has swept into the pool: carve
+		// only if the pool still misses
+		again, _ := vgc_span_alloc_once(npages, false)
+		return again
+	}
+	return span
+}
+
+// vgc_span_alloc_once answers the span, and whether it returned nil because it
+// waited for a collection in flight instead of carving (may_wait only).
+fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 	// First try to reuse a free span
 	recycled := vgc_get_free_span(npages)
 	if recycled != unsafe { nil } {
@@ -2831,7 +2883,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		unsafe {
 			recycled.sweep_gen = u32(vgc_heap.gc_cycle)
 		}
-		return recycled
+		return recycled, false
 	}
 
 	nbytes := usize(npages) * vgc_page_size
@@ -2854,6 +2906,11 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 	// Allocate new arena if needed
 	if base == 0 {
+		if may_wait && vgc_carve_waits() {
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			vgc_wait_gc_done()
+			return unsafe { nil }, true
+		}
 		if vgc_grow_gate_defers() {
 			// The grow gate's collection is the retry's one chance to find a run:
 			// the reclaim-and-retry loop that follows holds vgc_grow_gate_hold, so
@@ -2863,17 +2920,17 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 				C.vgc_atomic_store_u32(&vgc_defrag_pending, 1)
 			}
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		if vgc_frag_gate_defers(nbytes) {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		asize := if nbytes > vgc_arena_size { nbytes } else { vgc_arena_size }
 		mem := C.vgc_os_alloc(asize)
 		if mem == unsafe { nil } {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		arena_idx = vgc_heap.narenas
 		// <=0 means vgc_init has not run yet (the _vinit allocation window) —
@@ -2886,7 +2943,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		if arena_idx >= max_arenas {
 			C.vgc_os_free(mem, asize)
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		// Out-of-line page->span map (cx #282, see VGC_Arena.page_span): one slot
 		// per page of the ACTUAL arena size (an oversized single-object arena gets
@@ -2896,7 +2953,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		if psmem == unsafe { nil } {
 			C.vgc_os_free(mem, asize)
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		unsafe {
 			vgc_heap.arenas[arena_idx].base = usize(mem)
@@ -2931,7 +2988,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	span := vgc_new_span_desc()
 	if span == unsafe { nil } {
 		C.vgc_mutex_unlock(&vgc_heap.lock)
-		return unsafe { nil }
+		return unsafe { nil }, false
 	}
 	unsafe {
 		slot := span.slot // the allspans slot survives the reset (cx-home/v#15)
@@ -3002,7 +3059,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		// here; the in_use=false span is invisible to the sweep meanwhile.
 		vgc_pool_compensate(u64(nbytes))
 	}
-	return span
+	return span, false
 }
 
 // Initialize a span for a specific size class
