@@ -22,5 +22,7 @@ run() { # name env...
   grep '^\[gc' /tmp/m.out | head -40
 }
 echo "=== box $(uname -sm) ncpu=$(getconf _NPROCESSORS_ONLN) pagesize=$(getconf PAGESIZE)"
-run mt_port T=16
+echo "ulimit -s: $(ulimit -s)"
+run mt_port T=16 VGC_GCTRACE=2
+(ulimit -s 8192; echo "ulimit -s now: $(ulimit -s)"; run mt_port T=16 VGC_GCTRACE=2)
 exit 0
