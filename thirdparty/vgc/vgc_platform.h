@@ -357,6 +357,8 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void vgc_os_decommit(void* ptr, size_t size) {
       VirtualFree(ptr, size, MEM_DECOMMIT);
   }
+  // MEM_DECOMMIT works on 4 KB pages: an 8 KB span always returns whole.
+  static inline size_t vgc_os_page(void) { return 4096; }
   // Undo vgc_os_decommit before a pooled span's pages are handed out again
   // (cx #360). On Windows MEM_DECOMMIT actually unmaps the commit, so touching
   // the pages without this call would fault.

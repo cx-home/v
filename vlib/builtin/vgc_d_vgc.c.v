@@ -44,6 +44,7 @@ fn C.vgc_cpu_pause()
 fn C.vgc_os_alloc(size usize) voidptr
 fn C.vgc_os_free(ptr voidptr, size usize)
 fn C.vgc_os_decommit(ptr voidptr, size usize)
+fn C.vgc_os_page() usize
 fn C.vgc_os_recommit(ptr voidptr, size usize) // undo decommit before reuse (cx #360)
 fn C.vgc_get_sp() voidptr
 fn C.vgc_get_stack_bounds(lo &usize, hi &usize) int
@@ -2161,6 +2162,13 @@ fn vgc_pool_trim() {
 			examined++
 			if cyc - s.pool_gen >= vgc_pool_trim_age {
 				prv := s.prev
+				if vgc_span_below_hw_page(s) {
+					// a decommit of it alone returns nothing (its pages share a
+					// hardware page with a neighbour): the run pass below takes
+					// it together with its pooled neighbours
+					s = unsafe { prv }
+					continue
+				}
 				vgc_pool_trim_decommit(mut s)
 				decommits++
 				s = unsafe { prv }
@@ -2172,6 +2180,109 @@ fn vgc_pool_trim() {
 			// blocker itself ages past vgc_pool_trim_age (<= 2 cycles), so the
 			// walk converges without paying for the young majority.
 			break
+		}
+	}
+	if decommits < vgc_pool_trim_max_decommits {
+		vgc_pool_trim_runs(cyc, vgc_pool_trim_max_decommits - decommits)
+	}
+}
+
+// cx-home/v#14: the aged trim returned nothing for a span smaller than one
+// hardware page. vgc_page_size is 8 KB; Apple Silicon's MMU page is 16 KB, and
+// vgc_os_decommit returns only the hardware-aligned inner range of a span, so a
+// one-page span's decommit was an empty range — yet the span went cold and its
+// bytes counted as trimmed. pi-digits 3000 kept ~3000 such pooled one-page
+// spans (spans_in_use ~430 of 3620 descriptors) resident: 56.6 MB peak at an
+// 8 MB floor where the trace read 48 MB trimmed. The run pass decommits
+// address-adjacent runs of aged hot pooled spans with one call
+// (vgc_pool_decommit_run), so the shared hardware pages go back with their
+// neighbours. COST: the page maps walked from a cursor that persists across
+// cycles, at most vgc_pool_trim_run_scan pages per cycle; at most `budget`
+// runs decommitted.
+const vgc_pool_trim_run_scan = usize(65536)
+
+__global vgc_trim_run_arena = int(0)
+__global vgc_trim_run_page = usize(0)
+
+@[inline]
+fn vgc_span_below_hw_page(s &VGC_Span) bool {
+	hw := C.vgc_os_page()
+	if hw <= vgc_page_size {
+		return false
+	}
+	lo := (s.base + hw - 1) & ~(hw - 1)
+	hi := (s.base + usize(s.npages) * vgc_page_size) & ~(hw - 1)
+	return hi <= lo
+}
+
+fn vgc_pool_trim_runs(cyc u32, budget int) {
+	if C.vgc_os_page() <= vgc_page_size || vgc_heap.narenas == 0 {
+		return
+	}
+	mut scanned := usize(0)
+	mut runs := 0
+	mut wrapped := false
+	for scanned < vgc_pool_trim_run_scan && runs < budget {
+		if vgc_trim_run_arena >= vgc_heap.narenas {
+			if wrapped {
+				break
+			}
+			wrapped = true
+			vgc_trim_run_arena = 0
+			vgc_trim_run_page = 0
+		}
+		a := unsafe { &vgc_heap.arenas[vgc_trim_run_arena] }
+		if a.size > vgc_arena_size || a.page_span == unsafe { nil } {
+			vgc_trim_run_arena++
+			vgc_trim_run_page = 0
+			continue
+		}
+		used_pages := a.used / vgc_page_size
+		mut p := vgc_trim_run_page
+		mut run_start := usize(0)
+		mut run := u64(0)
+		mut sub := false // the run holds a span a lone decommit could not return
+		for p <= used_pages && scanned < vgc_pool_trim_run_scan && runs < budget {
+			scanned++
+			mut s := unsafe { &VGC_Span(nil) }
+			if p < used_pages {
+				s = unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[p]))))) }
+			}
+			head := s != unsafe { nil } && s.npages > 0 && s.base >= a.base
+				&& (s.base - a.base) / vgc_page_size == p
+			if head && s.pooled && !s.in_use && !s.decommitted
+				&& s.npages <= u32(vgc_max_pooled_pages) && cyc - s.pool_gen >= vgc_pool_trim_age {
+				if run == 0 {
+					run_start = p
+					sub = false
+				}
+				if vgc_span_below_hw_page(s) {
+					sub = true
+				}
+				run += u64(s.npages)
+				p += usize(s.npages)
+				continue
+			}
+			if run >= vgc_compensate_min_run && sub {
+				vgc_pool_decommit_run(vgc_trim_run_arena, run_start, run)
+				runs++
+			}
+			run = 0
+			if head {
+				p += usize(s.npages)
+			} else {
+				p++
+			}
+		}
+		if run >= vgc_compensate_min_run && sub && runs < budget {
+			vgc_pool_decommit_run(vgc_trim_run_arena, run_start, run)
+			runs++
+		}
+		if p > used_pages {
+			vgc_trim_run_arena++
+			vgc_trim_run_page = 0
+		} else {
+			vgc_trim_run_page = p
 		}
 	}
 }
