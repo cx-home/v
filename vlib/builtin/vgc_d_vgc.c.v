@@ -718,9 +718,10 @@ __global vgc_mark_backoff = int(0)
 // fill the same headroom T times faster while a cycle's pause is set by the
 // live set, so the collector's share of the wall clock grows with T (eight
 // threads: a quarter or more stopped). With the floor at floor x T (under the
-// flat cap, as ever) the cycle rate per thread stays what one thread pays; the
-// reference for a parallel workload, Python's multiprocessing, spends T heaps.
-// A thread counts when it allocated since the previous cycle.
+// flat cap) the cycle rate per thread stays what one thread pays, and past four
+// threads the flat cap grows too (x ceil(T/4), at most x4: 128 MB at eight);
+// the reference for a parallel workload, Python's multiprocessing, spends T
+// heaps. A thread counts when it allocated since the previous cycle.
 // VGC_HEADROOM_PER_THREAD=0 switches the scaling off.
 __global vgc_headroom_per_thread = true
 // markers this cycle, the collector included

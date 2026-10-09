@@ -2305,25 +2305,29 @@ fn vgc_update_trigger() {
 		// the pause is span-walk-dominated up there, so more headroom does not
 		// reduce the overhead ratio). Floor = vgc_headroom_min (8 MB default).
 		mut hr_max := vgc_headroom_cap
+		mut nt := 1
+		if vgc_headroom_per_thread {
+			// cx-home/v#16: the threads that allocated this cycle scale the flat
+			// cap too — x ceil(nt / 4), at most x4 (eight threads: 128 MB; the
+			// reference, Python's multiprocessing, spends eight heaps).
+			nt = vgc_alloc_threads()
+			if nt > 4 {
+				mut mult := u64((nt + 3) / 4)
+				if mult > 4 {
+					mult = 4
+				}
+				hr_max *= mult
+			}
+		}
 		if hr_max > vgc_heap_soft_limit {
 			hr_max = vgc_heap_soft_limit
 		}
-		// Live-set bound (cx-home/v#12, see vgc_headroom_live_pct): the dead
-		// growth a cycle allows is at most live_pct % of what the cycle marked,
-		// so the goal stays within 2× the live set at the default and a small
-		// live set no longer rides the flat cap into another arena. The bound
-		// never goes below vgc_headroom_live_floor (32 MB): a tiny live set's
-		// cycle is all stop protocol and root scan, so a shorter interval there
-		// is pauses for nothing (see the floor's doc for the measurements).
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
 			mut floor := vgc_headroom_live_floor
-			if vgc_headroom_per_thread {
+			if vgc_headroom_per_thread && nt > 1 {
 				// cx-home/v#16: floor x the threads that allocated this cycle.
-				nt := vgc_alloc_threads()
-				if nt > 1 {
-					floor *= u64(nt)
-				}
+				floor *= u64(nt)
 			}
 			if live_cap < floor {
 				live_cap = floor
