@@ -714,6 +714,10 @@ __global vgc_grow_gate_prev_marked = u64(0)
 // mixed run is recommitted — a no-op on POSIX, where trimmed pages fault back
 // zero-filled). The retry then finds the run; when it cannot (the free pages
 // are not adjacent), it carves as before, one collection later.
+// The grow gate (above) is tried first and its retry runs under
+// vgc_grow_gate_hold, where this gate stands down, so a grow-gate deferral
+// whose request the pool could hold (vgc_frag_pool_covers) requests the same
+// defragmenting sweep (cx-home/v#12).
 __global vgc_frag_gate_cycle = u64(0)
 __global vgc_frag_gate_fired = false
 __global vgc_defrag_pending = u32(0) // atomic: a gate deferred a carve; the next sweep defragments
@@ -2402,6 +2406,15 @@ fn vgc_grow_gate_defers() bool {
 	return true
 }
 
+// vgc_frag_pool_covers answers whether the pool (hot + trimmed) holds at least
+// twice `nbytes` and an eighth of an arena: enough free pages that a
+// defragmenting collection may serve the request from the arenas carved.
+fn vgc_frag_pool_covers(nbytes usize) bool {
+	pooled := C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) +
+		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes)
+	return pooled >= u64(nbytes) * 2 && pooled >= u64(vgc_arena_size / 8)
+}
+
 // vgc_frag_gate_defers answers whether vgc_span_alloc defers a new-arena
 // carve of `nbytes` to a defragmenting collection (the #1892 frag gate above).
 // Called with vgc_heap.lock held.
@@ -2417,9 +2430,7 @@ fn vgc_frag_gate_defers(nbytes usize) bool {
 	if vgc_frag_gate_fired && cycle == vgc_frag_gate_cycle {
 		return false
 	}
-	pooled := C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) +
-		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes)
-	if pooled < u64(nbytes) * 2 || pooled < u64(vgc_arena_size / 8) {
+	if !vgc_frag_pool_covers(nbytes) {
 		return false
 	}
 	vgc_frag_gate_fired = true
@@ -2526,7 +2537,18 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 	// Allocate new arena if needed
 	if base == 0 {
-		if vgc_grow_gate_defers() || vgc_frag_gate_defers(nbytes) {
+		if vgc_grow_gate_defers() {
+			// The grow gate's collection is the retry's one chance to find a run:
+			// the reclaim-and-retry loop that follows holds vgc_grow_gate_hold, so
+			// the frag gate stands down there and the retry carves. When the pool
+			// could hold the request, that collection defragments too (cx-home/v#12).
+			if vgc_frag_pool_covers(nbytes) {
+				C.vgc_atomic_store_u32(&vgc_defrag_pending, 1)
+			}
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			return unsafe { nil }
+		}
+		if vgc_frag_gate_defers(nbytes) {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }
 		}
