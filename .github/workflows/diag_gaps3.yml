@@ -1,0 +1,49 @@
+name: diag gaps3 v17
+
+on:
+  push:
+    branches:
+      - 'diag/gaps3-**'
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build V
+        run: make -j4 && ./v symlink
+      - name: diag
+        run: |
+          for cc in gcc clang; do
+            echo "=== cc=$cc"
+            VGC_GCTRACE=2 ./v -cc $cc -stats test bench/parallel-alloc/vgc_large_drop_test.v 2>&1 | grep -v '^\s*$' | tail -25 || true
+            VGC_GCTRACE=2 ./v -cc $cc -stats test bench/parallel-alloc/vgc_pool_defrag_test.v 2>&1 | grep -v '^\s*$' | tail -25 || true
+          done
+          ./v run diag/mapfixed.v || true
+
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start FreeBSD VM
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          version: '15.1'
+          memory: 4G
+          shell: sh
+          sync_files: runner-to-vm
+      - name: diag on FreeBSD
+        shell: cpa.sh {0}
+        run: |
+          sudo pkg install -y git gmake
+          git config --global --add safe.directory .
+          gmake
+          sysctl vm.pmap.pg_ps_enabled hw.ncpu || true
+          ./v run diag/mapfixed.v || true
+          VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_large_drop_test.v 2>&1 | tail -30 || true
+          VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_pool_defrag_test.v 2>&1 | tail -30 || true
+          VGC_GCTRACE=1 ./v -stats test bench/parallel-alloc/vgc_os_suspend_port_test.v 2>&1 | tail -10 || true
+          T=8 STEPS=20000 ./v -d vgc_concurrent run bench/parallel-alloc/concurrent_mt_sound/mt_sound.v || true
