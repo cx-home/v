@@ -1,0 +1,38 @@
+name: diag gaps3 v17
+
+on:
+  push:
+    branches:
+      - 'diag/gaps3-**'
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start FreeBSD VM
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          version: '15.1'
+          memory: 4G
+          shell: sh
+          sync_files: runner-to-vm
+      - name: diag on FreeBSD
+        shell: cpa.sh {0}
+        run: |
+          sudo pkg install -y git gmake
+          git config --global --add safe.directory .
+          gmake
+          ./v run diag/mapfixed.v || true
+          ./v test vlib/runtime/used_memory_test.v || true
+          for f in bench/parallel-alloc/*_test.v; do
+            echo "=== $f $(date -u +%H:%M:%S)"
+            /usr/bin/time -l timeout 600 ./v test $f > /tmp/t.out 2>/tmp/t.time; rc=$?
+            tail -4 /tmp/t.out | grep -v '^-*$'
+            grep -E 'maximum resident|real' /tmp/t.time | tr -s ' ' | tr '\n' ' '
+            echo " rc=$rc"
+            grep -c 'tag=0x0000000000000acd' /tmp/t.out | sed 's/^/acd_lines=/'
+          done
+          swapinfo || true
