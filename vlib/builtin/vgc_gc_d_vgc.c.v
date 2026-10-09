@@ -18,7 +18,7 @@ module builtin
 // suspend loop exempted, even if a thread flips safe mid-cycle (it then spins
 // in its exit handshake; its recorded roots stay valid — see
 // vgc_safe_exit_handshake in vgc_platform.h).
-__global vgc_safe_cov = [64]bool{}
+__global vgc_safe_cov = [vgc_max_threads]bool{}
 
 // cx #316 observability: mach suspensions actually ACKed across all STW cycles
 // (collector-exclusive increments). The safe-region selftest asserts this does
