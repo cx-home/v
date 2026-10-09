@@ -1,0 +1,45 @@
+name: diag gaps3 windows
+
+# cx-private#1011 / #517 (gaps3): measurements on a GitHub-hosted Windows runner
+# (diagnostic branch, not for the pin).
+on:
+  push:
+    branches:
+      - 'diag/gaps3-win**'
+
+jobs:
+  win:
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, msvc, tcc]
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build V (${{ matrix.cc }})
+        shell: pwsh
+        run: |
+          if ('${{ matrix.cc }}' -eq 'msvc') { .\makev.bat -msvc } elseif ('${{ matrix.cc }}' -eq 'tcc') { .\makev.bat -tcc } else { .\makev.bat -gcc }
+          .\v.exe version
+      - name: cx-private#1011 per-stream stdio redirection probes
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          .\v.exe -cc ${{ matrix.cc }} -stats test vlib/os/process_test.v
+          .\v.exe -cc ${{ matrix.cc }} -gc boehm -stats test vlib/os/process_test.v
+      - name: '#517 Q3: vgc on Windows — default gc, OS-suspend handle, soundness under threads'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          .\v.exe -cc ${{ matrix.cc }} -stats test bench/parallel-alloc/vgc_os_suspend_port_test.v
+          .\v.exe -cc ${{ matrix.cc }} -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
+          $env:T = '8'; $env:STEPS = '20000'; $env:VGC_GCTRACE = '1'
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          .\mts.exe 2>&1 | Select-Object -Last 4
+          "exit=$LASTEXITCODE secs=$($sw.Elapsed.TotalSeconds)"
+      - name: '#517 Q3: bench/parallel-alloc on Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          .\v.exe -cc ${{ matrix.cc }} test bench/parallel-alloc
