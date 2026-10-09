@@ -49,9 +49,12 @@ fn test_prealloc_spawn_args_use_c_malloc() {
 	assert res.output.contains('free(ret_ptr);'), res.output
 }
 
+// find_generated_c_line also matches the line with a `static ` prefix: this
+// fork's cgen declares its generated helpers with internal linkage outside a
+// parallel build (g.static_non_parallel).
 fn find_generated_c_line(lines []string, needle string, start int) int {
 	for idx := start; idx < lines.len; idx++ {
-		if lines[idx] == needle {
+		if lines[idx] == needle || lines[idx] == 'static ${needle}' {
 			return idx
 		}
 	}
