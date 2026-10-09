@@ -1816,8 +1816,19 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
   static inline int vgc_suspend_thread(uint32_t t) {
       if (t == 0) return 0;
       vgc_lin_susp* s = 0;
+      // A free slot (tid 0) is claimable only once its last occupant has LEFT
+      // the handler (acked back to 0). vgc_resume_thread frees the slot after a
+      // bounded wait for that departure; a woken parker that the scheduler has
+      // not run yet (a 2-vCPU FreeBSD VM under eight allocating threads) is
+      // still inside the handler reading this slot's `release`. Re-claiming
+      // the slot reset `release` to 0 under it, so it parked again on a slot
+      // that now belonged to another target, the wake of that target's resume
+      // (one waiter) could go to the wrong thread, and its own next suspend
+      // signal stayed masked behind the handler (cx-home/v#17: FreeBSD CI's
+      // first run of this path logged 0x0acd ack waits).
       for (int i = 0; i < VGC_LINUX_MAXTH; i++) {
-          if (__atomic_load_n(&vgc_lin_slots[i].tid, __ATOMIC_ACQUIRE) == 0) { s = &vgc_lin_slots[i]; break; }
+          if (__atomic_load_n(&vgc_lin_slots[i].tid, __ATOMIC_ACQUIRE) == 0
+              && __atomic_load_n(&vgc_lin_slots[i].acked, __ATOMIC_ACQUIRE) == 0) { s = &vgc_lin_slots[i]; break; }
       }
       if (s == 0) return 0; // table full (should not happen: MAXTH >= caches)
       s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0;
