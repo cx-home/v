@@ -29,8 +29,9 @@ fn test_used_memory() {
 fn test_used_memory_falls_when_pages_are_returned() {
 	$if linux || macos || freebsd {
 		n := usize(64 * 1024 * 1024)
-		p :=
-			C.mmap(unsafe { nil }, n, C.PROT_READ | C.PROT_WRITE, C.MAP_PRIVATE | C.MAP_ANON, -1, 0)
+		p := unsafe {
+			C.mmap(nil, n, C.PROT_READ | C.PROT_WRITE, C.MAP_PRIVATE | C.MAP_ANON, -1, 0)
+		}
 		assert p != voidptr(-1)
 		for i := usize(0); i < n; i += 4096 {
 			unsafe {
@@ -38,7 +39,7 @@ fn test_used_memory_falls_when_pages_are_returned() {
 			}
 		}
 		touched := runtime.used_memory()!
-		assert C.munmap(p, n) == 0
+		assert unsafe { C.munmap(p, n) } == 0
 		after := runtime.used_memory()!
 		println('used memory touched 64 MB: ${touched}, after munmap: ${after}')
 		assert after + n / 2 < touched
