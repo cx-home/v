@@ -830,6 +830,7 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024)
+	C.vgc_diag_line(vgc_diag_carves, vgc_diag_carve_bytes >> 20, vgc_diag_big)
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
 		// bytes the root scan walked and the spans the clear/sweep walks visited.

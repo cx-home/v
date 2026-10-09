@@ -414,11 +414,12 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       if (pg == 0) { long v = sysconf(_SC_PAGESIZE); pg = (v > 0) ? (size_t)v : 16384; }
       return pg;
   }
+  static uint64_t vgc_diag_decommit_n, vgc_diag_decommit_bytes, vgc_diag_decommit_fail, vgc_diag_small_skip;
   static inline void vgc_os_decommit(void* ptr, size_t size) {
       size_t pg = vgc_os_page();
       uintptr_t lo = ((uintptr_t)ptr + pg - 1) & ~(uintptr_t)(pg - 1);
       uintptr_t hi = ((uintptr_t)ptr + size) & ~(uintptr_t)(pg - 1);
-      if (hi <= lo) return;
+      if (hi <= lo) { vgc_diag_small_skip++; return; }
   #ifdef VGC_TRIM_PROTECT
       // DEBUG (-cflags -DVGC_TRIM_PROTECT): make trimmed pages INACCESSIBLE
       // instead of replacing them — any reader of trimmed pool memory faults
@@ -433,8 +434,11 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       // back zero-filled on the next touch.
       void* q = mmap((void*)lo, hi - lo, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-      if (q == MAP_FAILED)
+      vgc_diag_decommit_n++; vgc_diag_decommit_bytes += (hi - lo);
+      if (q == MAP_FAILED) {
+          vgc_diag_decommit_fail++;
           madvise((void*)lo, hi - lo, MADV_DONTNEED);
+      }
   #endif
   }
   static inline void vgc_os_recommit(void* ptr, size_t size) {
@@ -1952,6 +1956,16 @@ static void vgc__wdec(uint64_t v) {
     if (v == 0) { b[--i] = '0'; }
     while (v > 0 && i > 0) { b[--i] = (char)('0' + (v % 10)); v /= 10; }
     (void)!write(2, b + i, 24 - i);
+}
+static void vgc_diag_line(uint64_t carves, uint64_t carve_mb, uint64_t misses_big) {
+    vgc__ws("[diag] decommits="); vgc__wdec(vgc_diag_decommit_n);
+    vgc__ws(" decommit_mb="); vgc__wdec(vgc_diag_decommit_bytes >> 20);
+    vgc__ws(" decommit_fail="); vgc__wdec(vgc_diag_decommit_fail);
+    vgc__ws(" small_skip="); vgc__wdec(vgc_diag_small_skip);
+    vgc__ws(" carves="); vgc__wdec(carves);
+    vgc__ws(" carve_mb="); vgc__wdec(carve_mb);
+    vgc__ws(" big_carve_reqs="); vgc__wdec(misses_big);
+    vgc__ws("\n");
 }
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
                              uint64_t narenas, uint64_t nspans, uint64_t lthreads,
