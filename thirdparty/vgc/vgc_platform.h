@@ -585,6 +585,17 @@ static inline int vgc_bitmap_test_and_set(uint8_t* bits, uint32_t idx) {
     return 0;
 }
 
+// The same, safe against other markers racing on the same byte (cx-home/v#16,
+// parallel mark): a plain read-modify-write loses a neighbour's bit set between
+// the read and the write, so a live object would go unmarked. Relaxed pre-check,
+// then an atomic OR; returns 1 if the bit was already set.
+static inline int vgc_bitmap_test_and_set_atomic(uint8_t* bits, uint32_t idx) {
+    uint8_t mask = (uint8_t)(1u << (idx & 7));
+    uint8_t* byte_ptr = &bits[idx >> 3];
+    if (*byte_ptr & mask) return 1;
+    return (vgc_atomic_fetch_or_u8(byte_ptr, mask) & mask) != 0;
+}
+
 // Index of the lowest set bit of a NON-ZERO byte (cx-home/v#15: the in-use
 // span bitmap walk). Portable (tcc has no __builtin_ctz).
 static inline int vgc_ctz8(uint8_t x) {
@@ -827,6 +838,38 @@ static inline void vgc_start_thread(vgc_thread_fn fn) {
     pthread_create(&tid, &attr, _vgc_thread_trampoline, (void*)fn);
     pthread_attr_destroy(&attr);
 }
+// As vgc_start_thread, reporting failure: 0 = started (cx-home/v#16: the mark pool
+// counts only threads that exist, or the collector would wait for a phantom).
+static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, _vgc_thread_trampoline, (void*)fn);
+    pthread_attr_destroy(&attr);
+    return rc;
+}
+#endif
+#ifdef _WIN32
+static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
+    return CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)fn, NULL, 0, NULL) == NULL ? 1 : 0;
+}
+#endif
+
+// Give the core up (an idle marker spinning on termination, the collector
+// waiting for the pool): under an oversubscribed box a pure spin steals the
+// time the marker holding work needs.
+#ifdef _WIN32
+  static inline void vgc_yield(void) { SwitchToThread(); }
+#else
+  #include <sched.h>
+  static inline void vgc_yield(void) { sched_yield(); }
+#endif
+#ifdef _WIN32
+  static inline int vgc_ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
+#else
+  #include <unistd.h>
+  static inline int vgc_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : (int)n; }
 #endif
 
 // ============================================================
@@ -907,6 +950,34 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
   #include <unistd.h>
   static inline void vgc_flag_block(uint32_t* flag) { (void)flag; usleep(50); }
   static inline void vgc_wake_flag_waiters(uint32_t* flag) { (void)flag; }
+#endif
+// ============================================================
+// Mark pool (cx-home/v#16): a parked mark worker waits while *flag == val
+// (no timeout: the collector wakes it by advancing the generation), the
+// collector wakes every waiter. macOS ulock / Linux futex; elsewhere a short
+// sleep poll (FreeBSD: a worker's wake latency is then <= 200 us).
+// ============================================================
+#if defined(__APPLE__)
+  static inline void vgc_mark_wait(uint32_t* flag, uint32_t val) {
+      (void)__ulock_wait(VGC_UL_COMPARE_AND_WAIT | VGC_ULF_NO_ERRNO, (void*)flag, (uint64_t)val, 0);
+  }
+  static inline void vgc_mark_wake(uint32_t* flag) {
+      (void)__ulock_wake(VGC_UL_COMPARE_AND_WAIT | VGC_ULF_WAKE_ALL | VGC_ULF_NO_ERRNO, (void*)flag, 0);
+  }
+#elif defined(__linux__)
+  static inline void vgc_mark_wait(uint32_t* flag, uint32_t val) {
+      (void)syscall(SYS_futex, (void*)flag, FUTEX_WAIT_PRIVATE, val, NULL, NULL, 0);
+  }
+  static inline void vgc_mark_wake(uint32_t* flag) {
+      (void)syscall(SYS_futex, (void*)flag, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+  }
+#elif defined(_WIN32)
+  static inline void vgc_mark_wait(uint32_t* flag, uint32_t val) { if (vgc_atomic_load_u32(flag) == val) Sleep(1); }
+  static inline void vgc_mark_wake(uint32_t* flag) { (void)flag; }
+#else
+  #include <unistd.h>
+  static inline void vgc_mark_wait(uint32_t* flag, uint32_t val) { if (vgc_atomic_load_u32(flag) == val) usleep(200); }
+  static inline void vgc_mark_wake(uint32_t* flag) { (void)flag; }
 #endif
 static inline void vgc_wait_flag_clear(uint32_t* flag) {
     int spins = 0;
@@ -1842,7 +1913,8 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
 static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_us,
                                uint64_t susp_us, uint64_t data_us, uint64_t stacks_us,
                                uint64_t mark_us, uint64_t count_us, uint64_t sweep_us,
-                               uint64_t tail_us, uint64_t seg_kb, uint64_t spans_in_use) {
+                               uint64_t tail_us, uint64_t seg_kb, uint64_t spans_in_use,
+                               uint64_t markers) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] phases stw="); vgc__wdec(stw_us);
     vgc__ws(" clear="); vgc__wdec(clear_us);
@@ -1855,6 +1927,7 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
     vgc__ws(" tail="); vgc__wdec(tail_us);
     vgc__ws("us seg="); vgc__wdec(seg_kb);
     vgc__ws("KB spans_in_use="); vgc__wdec(spans_in_use);
+    vgc__ws(" markers="); vgc__wdec(markers);
     vgc__ws("\n");
 }
 

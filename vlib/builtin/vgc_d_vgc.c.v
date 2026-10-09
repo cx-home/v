@@ -51,6 +51,12 @@ fn C.vgc_bitmap_get(bits &u8, idx u32) int
 fn C.vgc_bitmap_set(bits &u8, idx u32)
 fn C.vgc_bitmap_clear(bits &u8, idx u32)
 fn C.vgc_bitmap_test_and_set(bits &u8, idx u32) int
+fn C.vgc_bitmap_test_and_set_atomic(bits &u8, idx u32) int
+fn C.vgc_start_thread_rc(f voidptr) int
+fn C.vgc_mark_wait(flag &u32, val u32)
+fn C.vgc_mark_wake(flag &u32)
+fn C.vgc_ncpu() int
+fn C.vgc_yield()
 fn C.vgc_popcount8(x u8) int
 fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
 fn C.vgc_size_class(size u32) u8
@@ -87,7 +93,7 @@ fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64) // VGC_GCTRACE=1 per-cycle line
-fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15)
+fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -662,6 +668,59 @@ __global vgc_headroom_live_pct = u64(100)
 // 5 % of Python on the same box. VGC_HEADROOM_LIVE_FLOOR_MB overrides (decimal;
 // a value below vgc_headroom_min is raised to it).
 __global vgc_headroom_live_floor = u64(32) * 1024 * 1024
+
+// Parallel mark (cx-home/v#16). The mark phase is the pause: with the
+// collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
+// marked on one thread, and under eight allocating threads a 10 ms mark every
+// few ms of mutator time left 60 % of the wall clock stopped. A pool of
+// vgc_mark_workers_cfg - 1 persistent, never-registered marker threads drains
+// the grey set with the collector; each marker owns a local work buffer and
+// trades full/empty buffers through the locked global lists, mark bits are set
+// atomically while more than one marker runs, and the pool engages only when
+// the previous cycle's mark phase cost at least vgc_mark_par_min_ns (a small
+// live set keeps the one-thread path and never wakes a worker). The pool
+// threads are created before the world stops (pthread_create under STW could
+// wait on a libc lock a stopped mutator holds), hold no mutator roots, allocate
+// nothing from the heap, and never register, so suspension never targets them.
+// VGC_MARK_WORKERS (count; 0 or 1 = one marker; default min(ncpu, 8)) and
+// VGC_MARK_PAR_MIN_US (default 1000) override.
+const vgc_max_markers = 16
+
+__global vgc_mark_workers_cfg = int(-1)
+// -1 = decide at init
+__global vgc_mark_par_min_ns = u64(1000) * 1000
+__global vgc_mark_local = [vgc_max_markers]usize{}
+// each marker's current &VGC_WorkBuf
+__global vgc_mark_go = u32(0)
+// generation the pool waits on
+__global vgc_mark_idle = u32(0)
+// markers out of work this cycle (termination)
+__global vgc_mark_done = u32(0)
+// pool threads finished with this cycle
+__global vgc_mark_pool_n = int(0)
+// pool threads alive (the collector excluded)
+__global vgc_mark_pool_next = u32(0)
+// slot handed to a starting pool thread
+__global vgc_mark_last_ns = u64(0)
+// the previous cycle's mark phase
+__global vgc_mark_nworkers_cur = int(1)
+__global vgc_mark_rate1 = u64(0)
+// ns per marked KB with one marker (a running mean)
+__global vgc_mark_n_target = int(0)
+// a reduced marker count while backing off (0 = the configured count)
+__global vgc_mark_backoff = int(0)
+// parallel cycles left at the reduced count
+
+// The live-set bound's release (cx-home/v#16): the bound holds the headroom
+// to max(floor, live) for memory's sake, but under heavy parallel allocation
+// (eight threads filling 32 MB in a few ms of mutator time) it pins the
+// collector at a quarter or more of the wall clock. Past
+// 1/vgc_overhead_release_div of the interval the bound yields to the flat cap
+// so the time band can buy the throughput back; a single-threaded parse/emit
+// loop (json-codec: ~12 %) stays under it. VGC_OVERHEAD_RELEASE_DIV overrides
+// (0 = never release).
+__global vgc_overhead_release_div = u64(4)
+// markers this cycle, the collector included
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
 // Go's GOMEMLIMIT analog for the backstop collector. The default is a PINNED
@@ -1220,6 +1279,18 @@ fn vgc_atfork_child() {
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	C.vgc_mutex_unlock(&vgc_heap.lock)
+	// The mark pool's threads did not survive the fork (cx-home/v#16): the next
+	// parallel cycle in the child recreates them; its counters start clean.
+	vgc_mark_pool_n = 0
+	vgc_mark_pool_next = 0
+	vgc_mark_idle = 0
+	vgc_mark_done = 0
+	vgc_mark_nworkers_cur = 1
+	vgc_mark_n_target = 0
+	vgc_mark_backoff = 0
+	for i in 0 .. vgc_max_markers {
+		vgc_mark_local[i] = 0
+	}
 	for i in 0 .. 136 {
 		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
 	}
@@ -1295,6 +1366,36 @@ pub fn vgc_init() {
 	}
 	if vgc_headroom_live_floor < vgc_headroom_min {
 		vgc_headroom_live_floor = vgc_headroom_min
+	}
+	// Parallel mark (cx-home/v#16): the marker count and the engage threshold.
+	mut mw := C.vgc_ncpu()
+	if mw > 8 {
+		mw = 8
+	}
+	mw_env := C.getenv(c'VGC_MARK_WORKERS')
+	if mw_env != unsafe { nil } {
+		mv := C.atoll(mw_env)
+		if mv >= 0 {
+			mw = int(mv)
+		}
+	}
+	if mw > vgc_max_markers {
+		mw = vgc_max_markers
+	}
+	vgc_mark_workers_cfg = mw
+	rel_env := C.getenv(c'VGC_OVERHEAD_RELEASE_DIV')
+	if rel_env != unsafe { nil } {
+		rv := C.atoll(rel_env)
+		if rv >= 0 {
+			vgc_overhead_release_div = u64(rv)
+		}
+	}
+	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
+	if pm_env != unsafe { nil } {
+		pv := C.atoll(pm_env)
+		if pv >= 0 {
+			vgc_mark_par_min_ns = u64(pv) * 1000
+		}
 	}
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
 	// see vgc_heap_soft_limit / cx #282), env-overridable.
