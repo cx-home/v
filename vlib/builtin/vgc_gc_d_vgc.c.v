@@ -2103,6 +2103,17 @@ fn vgc_update_trigger() {
 		extra = vgc_headroom
 	}
 	mut goal := marked + extra
+	// A grow-gate probe that found the cycle's allocation mostly live gives the
+	// next cycle the budget it cut (cx-home/v#7, vgc_d_vgc.c.v).
+	if vgc_grow_gate_probe_armed {
+		vgc_grow_gate_probe_armed = false
+		pm := vgc_grow_gate_probe_marked
+		pl := vgc_grow_gate_probe_live
+		pg := vgc_grow_gate_probe_goal
+		if pg > pl && pl > pm && marked > pm && (marked - pm) * 2 >= pl - pm {
+			goal += pg - pl
+		}
+	}
 	// Clamp to the soft heap limit: the backstop must keep firing well before the
 	// physical arena ceiling regardless of how large the marked set gets (#57/#71).
 	if goal > vgc_heap_soft_limit {

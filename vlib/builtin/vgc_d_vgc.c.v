@@ -680,9 +680,9 @@ __global vgc_headroom_pinned = false
 // cx's convert gauges at 30 % (peak RSS / marked, VGC_NEXT_GC_MB default and
 // 36/40/48/56/64): JSON 1.84-2.07x and XML 2.01-2.33x, against 2.24-2.68x and
 // 2.29-2.39x without it; vgc_grow_gate_test.v 2.03x -> 1.39x.
-// The gate stands down while the live set still grows (below), so it
-// serves a set that has stopped growing. VGC_GROW_GATE_PCT overrides
-// (0 disables).
+// While the live set still grows (below) the gate only probes at the cycle's
+// last carve (cx-home/v#7), so it serves a set that has stopped growing.
+// VGC_GROW_GATE_PCT overrides (0 disables).
 __global vgc_grow_gate_pct = u64(30)
 __global vgc_grow_gate_cycle = u64(0)
 __global vgc_grow_gate_fired = false
@@ -700,6 +700,27 @@ __global vgc_grow_gate_hold = u32(0)
 __global vgc_grow_gate_growth_pct = u64(10)
 __global vgc_grow_gate_prev_marked = u64(0)
 // the marked set one collection back
+// cx-home/v#7: the history cannot tell a set that has just stopped growing
+// from one that still grows — a set built and then held over a stream of
+// transients, with no collection or one collection after the build, reads as
+// growing and the gate stood down (carved high-water 2.42x against the gate's
+// 2.00x after two collections). While the set reads as growing, the gate
+// fires for the cycle's LAST carve only (the arena would not fill before the
+// goal) and only past vgc_grow_gate_growing_pct % of the way to the goal; its
+// collection is a probe. A probe that finds the cycle's allocation mostly live
+// (at least half of it survived) does not shorten the next cycle: the budget it
+// cut (the goal minus the heap at the probe) is added to the next goal
+// (vgc_update_trigger), so a growing heap takes the collections it took with
+// the gate off. A probe that finds garbage is the gate's ordinary collection.
+// The credit holds for every gate collection, so a set growing a few percent
+// per cycle (under vgc_grow_gate_growth_pct, read as flat) is not shortened
+// either.
+// VGC_GROW_GATE_GROWING_PCT overrides (0: stand down while growing).
+__global vgc_grow_gate_growing_pct = u64(50)
+__global vgc_grow_gate_probe_armed = false
+__global vgc_grow_gate_probe_marked = u64(0)
+__global vgc_grow_gate_probe_live = u64(0)
+__global vgc_grow_gate_probe_goal = u64(0)
 // ── FRAG GATE + POOL DEFRAG (cx-private #1892) ─────────────────────────────
 // The pool coalesces a freed span only with pooled neighbours of at least
 // vgc_pool_merge_min pages and of the same decommit state (vgc_put_free_span),
@@ -1179,6 +1200,7 @@ pub fn vgc_init() {
 	// `abc`, `0x1e` and an empty value as 0 — the gate silently off)
 	vgc_grow_gate_pct = vgc_env_pct(c'VGC_GROW_GATE_PCT', vgc_grow_gate_pct)
 	vgc_grow_gate_growth_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWTH_PCT', vgc_grow_gate_growth_pct)
+	vgc_grow_gate_growing_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWING_PCT', vgc_grow_gate_growing_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
 		cmb := C.atoll(cap_env)
@@ -2447,9 +2469,13 @@ fn vgc_grow_gate_defers() bool {
 	if goal <= marked || live <= marked || (goal - marked) * 2 < marked {
 		return false
 	}
-	// the live set still grows: a collection now would find little to reuse
+	// the live set still grows (or no collection has measured it yet): a
+	// collection early in the cycle would mark a set that is mostly live, so
+	// the gate probes only at the cycle's last carve (cx-home/v#7 above)
 	prev := vgc_grow_gate_prev_marked
-	if prev == 0 || marked * 100 > prev * (100 + vgc_grow_gate_growth_pct) {
+	growing := prev == 0 || marked * 100 > prev * (100 + vgc_grow_gate_growth_pct)
+	if growing && (vgc_grow_gate_growing_pct == 0 || live + u64(vgc_arena_size) <= goal
+		|| (live - marked) * 100 < (goal - marked) * vgc_grow_gate_growing_pct) {
 		return false
 	}
 	if (live - marked) * 100 < (goal - marked) * vgc_grow_gate_pct {
@@ -2457,6 +2483,10 @@ fn vgc_grow_gate_defers() bool {
 	}
 	vgc_grow_gate_fired = true
 	vgc_grow_gate_cycle = cycle
+	vgc_grow_gate_probe_armed = true
+	vgc_grow_gate_probe_marked = marked
+	vgc_grow_gate_probe_live = live
+	vgc_grow_gate_probe_goal = goal
 	return true
 }
 
