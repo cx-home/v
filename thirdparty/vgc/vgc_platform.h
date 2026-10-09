@@ -1964,7 +1964,7 @@ static void vgc_diag_line(uint64_t carves, uint64_t carve_mb, uint64_t misses_bi
     vgc__ws(" small_skip="); vgc__wdec(vgc_diag_small_skip);
     vgc__ws(" carves="); vgc__wdec(carves);
     vgc__ws(" carve_mb="); vgc__wdec(carve_mb);
-    vgc__ws(" big_carve_reqs="); vgc__wdec(misses_big);
+    vgc__ws(" carves_in_gc="); vgc__wdec(misses_big);
     vgc__ws("\n");
 }
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,

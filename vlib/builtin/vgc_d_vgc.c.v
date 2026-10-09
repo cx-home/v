@@ -2877,7 +2877,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		asize := if nbytes > vgc_arena_size { nbytes } else { vgc_arena_size }
 		vgc_diag_carves++
 		vgc_diag_carve_bytes += u64(asize)
-		if nbytes > vgc_arena_size {
+		if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
 			vgc_diag_big++
 		}
 		mem := C.vgc_os_alloc(asize)

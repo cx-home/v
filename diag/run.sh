@@ -24,4 +24,5 @@ run() { # name env...
 echo "=== box $(uname -sm) ncpu=$(getconf _NPROCESSORS_ONLN) pagesize=$(getconf PAGESIZE)"
 run mt_port T=16
 run mt_port T=8
+run mt_port T=16 VGC_MARK_WORKERS=1
 exit 0
