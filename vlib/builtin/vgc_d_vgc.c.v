@@ -376,6 +376,11 @@ mut:
 	// the trim behind any long hot chain). Descriptor pointers only (non-arena
 	// slab memory) — same rooting posture as free_spans itself.
 	free_spans_tail [8193]&VGC_Span
+	// Per hot chain and young gen (slot npages * vgc_pool_trim_age + gen %
+	// vgc_pool_trim_age), the last span vgc_pool_push_aged filed with that gen —
+	// a hint, never trusted unless it is still pooled, committed, of that size
+	// and of the very gen being filed (cx-home/v#11). Descriptor pointers only.
+	free_spans_aged_mark [16386]&VGC_Span
 	// COLD pool: spans whose data pages the trim decommitted, segregated by size
 	// like free_spans. Segregation is load-bearing: while cold spans sat in the
 	// main chains, the trim's tail walk re-skipped every previously-decommitted
@@ -1578,10 +1583,22 @@ fn vgc_pool_push(mut span VGC_Span) {
 // pooled THIS cycle — so the walk broke at once and `trimmed` stayed 0 KB for
 // the whole run (measured: a 300k-record --from=json --to=json, pool 7 →
 // 117 MB over ten cycles, trimmed 0 on every one, gen fix alone included).
-// Filing the span tailward of every younger span restores the invariant; the
-// scan from the tail passes only spans at least as old as this one, which are
-// the ones the next trim decommits anyway. Oversized and decommitted spans are
-// not age-walked, so they keep the plain push.
+// Filing the span tailward of every younger span restores the invariant.
+// Oversized and decommitted spans are not age-walked, so they keep the plain
+// push.
+//
+// The filing is O(1) on the paths that matter (cx-home/v#11: a tail walk per
+// push, each step a struct compare, was 45 % of pi-digits' CPU):
+//   - a span already old enough to trim (cyc - gen >= vgc_pool_trim_age) goes to
+//     the TAIL: every span the next trim must reach lies tailward of the first
+//     young one, and the order among old-enough spans does not matter (they only
+//     grow older; the trim decommits each it reaches);
+//   - a span no older than its head neighbour stays at the head;
+//   - otherwise (a young gen: at most vgc_pool_trim_age of them) it goes
+//     headward of the last span filed with the same gen on this chain
+//     (free_spans_aged_mark) — the young part is age-ordered, so that is
+//     the boundary — and only a miss walks, from both ends at once, stopping at
+//     the boundary (one walk per chain and gen: the mark then holds).
 fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 	vgc_pool_push(mut span)
 	span.pool_gen = gen
@@ -1589,29 +1606,70 @@ fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 		return
 	}
 	unsafe {
-		if span.next == nil {
+		me := &VGC_Span(voidptr(&span))
+		n := span.npages
+		young := u32(vgc_heap.gc_cycle) - gen < vgc_pool_trim_age
+		slot := int(n) * int(vgc_pool_trim_age) + int(gen % vgc_pool_trim_age)
+		if span.next == nil || span.next.pool_gen <= gen {
+			// sole span, or no older than what follows: already in age order
+			if young {
+				vgc_heap.free_spans_aged_mark[slot] = me
+			}
 			return
 		}
-		// find, from the tail, the first span YOUNGER than this one
-		mut t := vgc_heap.free_spans_tail[span.npages]
-		for t != nil && t != span && t.pool_gen <= gen {
-			t = t.prev
+		// t: the span to file `me` tailward of — the last one younger than gen
+		mut t := &VGC_Span(nil)
+		if !young {
+			t = vgc_heap.free_spans_tail[n]
+		} else {
+			m := vgc_heap.free_spans_aged_mark[slot]
+			if m != nil && voidptr(m) != voidptr(me) && m.pooled && !m.decommitted && m.npages == n
+				&& m.pool_gen == gen && m.prev != nil {
+				t = m.prev
+			} else {
+				// from the head (past spans younger than gen) and from the tail (past
+				// spans at least as old) in step; the first to reach the boundary wins
+				mut h := span.next
+				mut b := vgc_heap.free_spans_tail[n]
+				for {
+					if h == nil {
+						t = vgc_heap.free_spans_tail[n]
+						break
+					}
+					if h.pool_gen <= gen {
+						t = h.prev
+						break
+					}
+					h = h.next
+					if b == nil || voidptr(b) == voidptr(me) {
+						break
+					}
+					if b.pool_gen > gen {
+						t = b
+						break
+					}
+					b = b.prev
+				}
+			}
 		}
-		if t == nil || t == span {
+		if t == nil || voidptr(t) == voidptr(me) {
 			return
+		}
+		if young {
+			vgc_heap.free_spans_aged_mark[slot] = me
 		}
 		// unlink from the head …
-		vgc_heap.free_spans[span.npages] = span.next
+		vgc_heap.free_spans[n] = span.next
 		span.next.prev = nil
 		// … and insert tailward of t
 		span.prev = t
 		span.next = t.next
 		if t.next != nil {
-			t.next.prev = span
+			t.next.prev = me
 		} else {
-			vgc_heap.free_spans_tail[span.npages] = span
+			vgc_heap.free_spans_tail[n] = me
 		}
-		t.next = span
+		t.next = me
 	}
 }
 

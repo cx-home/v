@@ -117,3 +117,90 @@ pub fn vgc_rtmem_compensation_stats() (u64, u64, u64) {
 	}
 	return scanned, vgc_heap.gc_cycle, pages
 }
+
+// vgc_pool_aged_selftest — white-box check of vgc_pool_push_aged for
+// bench/parallel-alloc/vgc_pool_push_aged_test.v (cx-home/v#11). On one
+// otherwise unused hot chain (npages 8191, saved and restored around the run,
+// under free_spans_lock, gc_cycle pinned at 100) it files `n` descriptors in
+// the churn shape of pi-digits: each round a plain push (this cycle's span),
+// an aged push of the previous cycle's gen, and one of an old-enough gen. It
+// answers (rc, ns): rc 0 when the chain then reads, head to tail, as the
+// trim needs it — the young spans (cyc - gen < vgc_pool_trim_age) in
+// non-increasing gen order, then only old-enough spans, prev/next and the
+// tail consistent and every span on it; ns is the filing time alone.
+pub fn vgc_pool_aged_selftest(n int) (u32, u64) {
+	np := u32(8191)
+	descs := unsafe { &VGC_Span(C.calloc(usize(n), sizeof(VGC_Span))) }
+	if descs == unsafe { nil } {
+		return 1, 0
+	}
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	saved_head := vgc_heap.free_spans[np]
+	saved_tail := vgc_heap.free_spans_tail[np]
+	saved_mark0 := vgc_heap.free_spans_aged_mark[int(np) * 2]
+	saved_mark1 := vgc_heap.free_spans_aged_mark[int(np) * 2 + 1]
+	saved_bytes := vgc_heap.pool_bytes
+	saved_cycle := vgc_heap.gc_cycle
+	vgc_heap.free_spans[np] = unsafe { nil }
+	vgc_heap.free_spans_tail[np] = unsafe { nil }
+	vgc_heap.free_spans_aged_mark[int(np) * 2] = unsafe { nil }
+	vgc_heap.free_spans_aged_mark[int(np) * 2 + 1] = unsafe { nil }
+	vgc_heap.gc_cycle = 100
+	cyc := u32(100)
+	t0 := C.vgc_now_ns()
+	for i in 0 .. n {
+		mut d := unsafe { &descs[i] }
+		d.npages = np
+		match i % 4 {
+			0 { vgc_pool_push(mut d) }
+			1 { vgc_pool_push_aged(mut d, cyc - 1) }
+			2 { vgc_pool_push_aged(mut d, cyc) }
+			else { vgc_pool_push_aged(mut d, cyc - 2 - u32(i % 5)) }
+		}
+	}
+	elapsed := C.vgc_now_ns() - t0
+	mut rc := u32(0)
+	mut seen := 0
+	mut prev := unsafe { &VGC_Span(nil) }
+	mut last_young_gen := cyc
+	mut in_old := false
+	mut s := vgc_heap.free_spans[np]
+	for s != unsafe { nil } {
+		if voidptr(s.prev) != voidptr(prev) {
+			rc = 2
+			break
+		}
+		young := cyc - s.pool_gen < vgc_pool_trim_age
+		if young {
+			if in_old {
+				rc = 3 // a young span tailward of an old-enough one: the trim stops short
+				break
+			}
+			if s.pool_gen > last_young_gen {
+				rc = 4 // young spans out of age order
+				break
+			}
+			last_young_gen = s.pool_gen
+		} else {
+			in_old = true
+		}
+		seen++
+		prev = s
+		s = s.next
+	}
+	if rc == 0 && voidptr(vgc_heap.free_spans_tail[np]) != voidptr(prev) {
+		rc = 5
+	}
+	if rc == 0 && seen != n {
+		rc = 6
+	}
+	vgc_heap.free_spans[np] = saved_head
+	vgc_heap.free_spans_tail[np] = saved_tail
+	vgc_heap.free_spans_aged_mark[int(np) * 2] = saved_mark0
+	vgc_heap.free_spans_aged_mark[int(np) * 2 + 1] = saved_mark1
+	vgc_heap.pool_bytes = saved_bytes
+	vgc_heap.gc_cycle = saved_cycle
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	unsafe { C.free(descs) }
+	return rc, elapsed
+}
