@@ -49,6 +49,21 @@ fn vgc_cache_data_segments() {
 	vgc_nseg = C.vgc_data_segments(&vgc_seg_lo[0], &vgc_seg_hi[0], 8)
 }
 
+// cx-home/v#15: the current cycle's phase stamps (ns), written by the collector
+// under STW, read by vgc_gctrace_emit for the VGC_GCTRACE=2 phase line:
+// 0 world stopped, 1 mark bits cleared, 2 suspended roots scanned, 3 data
+// segments scanned, 4 stacks scanned, 5 mark drained, 6 marked counted,
+// 7 swept. The cycle's t0 and end are vgc_gc_t0 / vgc_gc_last_end.
+__global vgc_ph = [8]u64{}
+
+@[inline]
+fn vgc_ph_us(a u64, b u64) u64 {
+	if b > a {
+		return (b - a) / 1000
+	}
+	return 0
+}
+
 // vgc_gc_start triggers a garbage collection cycle.
 // Translated from Go's gcStart() in mgc.go.
 // Flow: sweep termination (STW) -> full STW mark -> sweep -> resume.
@@ -351,13 +366,16 @@ fn vgc_gc_start() {
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
 
 	// Clear mark bits on all spans (prepare for new cycle)
+	vgc_ph[0] = C.vgc_now_ns()
 	vgc_clear_mark_bits()
+	vgc_ph[1] = C.vgc_now_ns()
 	vgc_watch_snapshot(0) // STAGE 0: post-clear (expect found+in_use+alloc, mark=0)
 
 	// Scan each suspended thread's roots: refresh its stack range from the
 	// actual suspended SP and shade its register-resident roots (the exact roots
 	// a stack-only scan misses; validated in bench/parallel-alloc/stw_root_scan.c).
 	vgc_scan_suspended_roots(self_idx)
+	vgc_ph[2] = C.vgc_now_ns()
 	vgc_watch_snapshot(1) // STAGE 1: post suspended-thread reg/stack roots (main's reg holds c)
 	$if vgc_rangedump ? {
 		// #58 diagnostic: dump EVERY registered thread's post-refresh scan range so a
@@ -443,6 +461,7 @@ fn vgc_gc_start() {
 
 	// Final drain of work queue
 	vgc_drain_mark_work()
+	vgc_ph[5] = C.vgc_now_ns()
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 
 	// Disable write barrier
@@ -450,6 +469,7 @@ fn vgc_gc_start() {
 
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
+	vgc_ph[6] = C.vgc_now_ns()
 	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
 	// Reset heap_live to match what we actually found alive. The per-thread
@@ -509,6 +529,7 @@ fn vgc_gc_start() {
 	vgc_protect_cached_spans()
 	C.vgc_trace(9, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP0
 	vgc_do_sweep()
+	vgc_ph[7] = C.vgc_now_ns()
 	C.vgc_trace(10, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP1
 
 	// Drop mcache slots whose cached span sweep just recycled to the pool (and the
@@ -791,6 +812,24 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024)
+	if vgc_gctrace >= 2 {
+		// cx-home/v#15: where the pause went (us per phase), the data-segment
+		// bytes the root scan walked and the spans the clear/sweep walks visited.
+		mut seg := u64(0)
+		for k in 0 .. vgc_nseg {
+			if vgc_seg_hi[k] > vgc_seg_lo[k] {
+				seg += u64(vgc_seg_hi[k] - vgc_seg_lo[k])
+			}
+		}
+		mut in_use := u64(0)
+		for w in 0 .. (vgc_heap.nspans + 7) / 8 {
+			in_use += u64(C.vgc_popcount8(unsafe { vgc_heap.inuse_bits[w] }))
+		}
+		C.vgc_gctrace_phases(u64(vgc_heap.gc_cycle), vgc_ph_us(vgc_gc_t0, vgc_ph[0]), vgc_ph_us(vgc_ph[0],
+			vgc_ph[1]), vgc_ph_us(vgc_ph[1], vgc_ph[2]), vgc_ph_us(vgc_ph[2], vgc_ph[3]), vgc_ph_us(vgc_ph[3],
+			vgc_ph[4]), vgc_ph_us(vgc_ph[4], vgc_ph[5]), vgc_ph_us(vgc_ph[5], vgc_ph[6]), vgc_ph_us(vgc_ph[6],
+			vgc_ph[7]), vgc_ph_us(vgc_ph[7], vgc_gc_last_end), seg / 1024, in_use)
+	}
 }
 
 // Scan the roots of every suspended mutator: refresh its stack range from its
@@ -867,14 +906,20 @@ fn vgc_clear_mark_bits() {
 	// that keeps a retired descriptor's identity stable across any mutator frozen
 	// mid-vgc_free at the previous STW (cx #360, see span_meta_pending).
 	vgc_span_meta_promote_pending()
-	for i in 0 .. vgc_heap.nspans {
-		span := unsafe { vgc_heap.allspans[i] }
-		if span == unsafe { nil } || !span.in_use {
-			continue
-		}
-		if span.mark_bits != unsafe { nil } {
-			bitmap_size := (span.nelems + 7) / 8
-			unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+	nb := (vgc_heap.nspans + 7) / 8
+	for w in 0 .. nb {
+		mut bits := unsafe { vgc_heap.inuse_bits[w] }
+		for bits != 0 {
+			bi := C.vgc_ctz8(bits)
+			bits &= bits - 1
+			span := unsafe { vgc_heap.allspans[w * 8 + bi] }
+			if span == unsafe { nil } || !span.in_use {
+				continue
+			}
+			if span.mark_bits != unsafe { nil } {
+				bitmap_size := (span.nelems + 7) / 8
+				unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+			}
 		}
 	}
 }
@@ -1026,6 +1071,7 @@ fn vgc_mark_roots() {
 			vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k])
 		}
 	}
+	vgc_ph[3] = C.vgc_now_ns()
 
 	// Scan each registered thread's stack
 	for i in 0 .. vgc_heap.ncaches {
@@ -1042,6 +1088,8 @@ fn vgc_mark_roots() {
 			}
 		}
 	}
+
+	vgc_ph[4] = C.vgc_now_ns()
 
 	// Shade pinned objects — cgo-safe explicit roots (see vgc_pin). A live object
 	// reachable only from non-GC (FFI/C) memory is invisible to the precise scan
@@ -1683,12 +1731,18 @@ fn vgc_do_sweep() {
 		vgc_ks_count = 0
 		vgc_ks_overflow = 0
 	}
-	for i in 0 .. vgc_heap.nspans {
-		span := unsafe { vgc_heap.allspans[i] }
-		if span == unsafe { nil } || !span.in_use {
-			continue
+	nb := (vgc_heap.nspans + 7) / 8
+	for w in 0 .. nb {
+		mut bits := unsafe { vgc_heap.inuse_bits[w] }
+		for bits != 0 {
+			bi := C.vgc_ctz8(bits)
+			bits &= bits - 1
+			span := unsafe { vgc_heap.allspans[w * 8 + bi] }
+			if span == unsafe { nil } || !span.in_use {
+				continue
+			}
+			vgc_sweep_span(span)
 		}
-		vgc_sweep_span(span)
 	}
 	$if vgc_keysweep ? {
 		// #58 FORENSIC (world still stopped, sweep just freed): does any REGISTERED
@@ -2013,21 +2067,27 @@ fn vgc_sweep_finish() {
 // Count total marked bytes across all spans using byte-level popcount
 fn vgc_count_marked() u64 {
 	mut total := u64(0)
-	for i in 0 .. vgc_heap.nspans {
-		span := unsafe { vgc_heap.allspans[i] }
-		if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
-			continue
+	nb := (vgc_heap.nspans + 7) / 8
+	for w in 0 .. nb {
+		mut bits := unsafe { vgc_heap.inuse_bits[w] }
+		for bits != 0 {
+			bi := C.vgc_ctz8(bits)
+			bits &= bits - 1
+			span := unsafe { vgc_heap.allspans[w * 8 + bi] }
+			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
+				continue
+			}
+			nbytes := (span.nelems + 7) / 8
+			mut count := u32(0)
+			for b in 0 .. nbytes {
+				count += u32(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
+			}
+			// Clamp to nelems (last byte may have extra bits)
+			if count > span.nelems {
+				count = span.nelems
+			}
+			total += u64(count) * u64(span.elem_size)
 		}
-		nbytes := (span.nelems + 7) / 8
-		mut count := u32(0)
-		for b in 0 .. nbytes {
-			count += u32(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
-		}
-		// Clamp to nelems (last byte may have extra bits)
-		if count > span.nelems {
-			count = span.nelems
-		}
-		total += u64(count) * u64(span.elem_size)
 	}
 	return total
 }

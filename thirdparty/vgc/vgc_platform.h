@@ -585,6 +585,14 @@ static inline int vgc_bitmap_test_and_set(uint8_t* bits, uint32_t idx) {
     return 0;
 }
 
+// Index of the lowest set bit of a NON-ZERO byte (cx-home/v#15: the in-use
+// span bitmap walk). Portable (tcc has no __builtin_ctz).
+static inline int vgc_ctz8(uint8_t x) {
+    int n = 0;
+    while ((x & 1u) == 0) { x >>= 1; n++; }
+    return n;
+}
+
 // Popcount on a byte - count number of set bits
 static inline int vgc_popcount8(uint8_t x) {
     x = x - ((x >> 1) & 0x55);
@@ -1825,6 +1833,28 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
     vgc__ws(" pool="); vgc__wdec(pool_kb);
     vgc__ws("KB trimmed="); vgc__wdec(trimmed_kb);
     vgc__ws("KB threads="); vgc__wdec(lthreads);
+    vgc__ws("\n");
+}
+// VGC_GCTRACE=2 phase line (cx-home/v#15): microseconds per phase of the cycle
+// just paced — stop the world, clear mark bits, suspended-thread roots, data
+// segments, stacks, mark drain, count, sweep, trigger/trace tail — plus the
+// data-segment KB the root scan walked and the in-use spans the walks visited.
+static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_us,
+                               uint64_t susp_us, uint64_t data_us, uint64_t stacks_us,
+                               uint64_t mark_us, uint64_t count_us, uint64_t sweep_us,
+                               uint64_t tail_us, uint64_t seg_kb, uint64_t spans_in_use) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] phases stw="); vgc__wdec(stw_us);
+    vgc__ws(" clear="); vgc__wdec(clear_us);
+    vgc__ws(" susp="); vgc__wdec(susp_us);
+    vgc__ws(" data="); vgc__wdec(data_us);
+    vgc__ws(" stacks="); vgc__wdec(stacks_us);
+    vgc__ws(" mark="); vgc__wdec(mark_us);
+    vgc__ws(" count="); vgc__wdec(count_us);
+    vgc__ws(" sweep="); vgc__wdec(sweep_us);
+    vgc__ws(" tail="); vgc__wdec(tail_us);
+    vgc__ws("us seg="); vgc__wdec(seg_kb);
+    vgc__ws("KB spans_in_use="); vgc__wdec(spans_in_use);
     vgc__ws("\n");
 }
 
