@@ -364,7 +364,18 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
   }
   static inline int vgc_num_cpus(void) {
+  #if defined(ALL_PROCESSOR_GROUPS)
       DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+  #else
+      // mingw-w64 and tcc headers below _WIN32_WINNT 0x0601 declare neither
+      // ALL_PROCESSOR_GROUPS nor GetActiveProcessorCount: every vgc program
+      // failed to compile on windows-2025 under gcc, msvc's fallback and tcc
+      // (cx-private#517). The processor count of the process's group is the
+      // same number on every machine with at most 64 logical CPUs.
+      SYSTEM_INFO si;
+      GetSystemInfo(&si);
+      DWORD count = si.dwNumberOfProcessors;
+  #endif
       return count > 0 ? (int)count : 1;
   }
   // Physical RAM in bytes; 0 = unknown. Used once, at vgc_init, to derive the
