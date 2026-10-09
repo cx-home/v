@@ -2148,6 +2148,24 @@ fn vgc_update_trigger() {
 		if hr_max > vgc_heap_soft_limit {
 			hr_max = vgc_heap_soft_limit
 		}
+		// cx-home/v#15, v#14: a small live set cannot buy a large headroom. With
+		// the fixed per-cycle costs gone (the collector's own tables off the
+		// data segment, the pooled-span walks skipped) a cycle's pause is
+		// proportional to the live set, so the overhead ratio the band reads is
+		// set by the allocation rate, not by the live set's size, and doubling
+		// the headroom under a 2 MB live set bought no throughput — it moved
+		// RSS (pi-digits: 1-2 MB live under a 64 MB headroom, 150 MB RSS; fasta
+		// 99 MB at 2 MB live). The adaptive headroom is capped at
+		// vgc_headroom_live_mult x the live set, never under the floor, so RSS
+		// tracks the live set (the cx #71 goal); a live set past
+		// cap / mult sees the flat cap as before.
+		mut hr_live := marked * vgc_headroom_live_mult
+		if hr_live < vgc_headroom_min {
+			hr_live = vgc_headroom_min
+		}
+		if hr_max > hr_live {
+			hr_max = hr_live
+		}
 		if hr < vgc_headroom_min {
 			hr = vgc_headroom_min
 		}

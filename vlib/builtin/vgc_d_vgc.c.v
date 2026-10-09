@@ -676,6 +676,10 @@ const vgc_default_soft_limit = u64(2) * 1024 * 1024 * 1024
 __global vgc_headroom = u64(8) * 1024 * 1024
 __global vgc_headroom_min = u64(8) * 1024 * 1024
 __global vgc_headroom_pinned = false
+// The adaptive headroom's ceiling relative to the live set (cx-home/v#15):
+// at most this many times the marked set, never under vgc_headroom_min.
+// VGC_HEADROOM_LIVE_X overrides (decimal digits, 0..100; 0 = the floor only).
+__global vgc_headroom_live_mult = u64(2)
 // ── VGCG-1 GROW GATE: collect before carving an arena near the goal ─────────
 // An arena is never released, so the arena the heap carves for the LAST
 // stretch of a cycle's growth stays resident for the life of the process —
@@ -1248,6 +1252,7 @@ pub fn vgc_init() {
 			vgc_headroom_cap = u64(cmb) * 1024 * 1024
 		}
 	}
+	vgc_headroom_live_mult = u64(vgc_env_pct(c'VGC_HEADROOM_LIVE_X', vgc_headroom_live_mult))
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
 	// see vgc_heap_soft_limit / cx #282), env-overridable.
 	vgc_heap_soft_limit = vgc_default_soft_limit
