@@ -1,5 +1,8 @@
 module builder
 
+// The retry cases pass -gc boehm: under this fork's default -gc vgc, macOS
+// resolves a tcc to the system cc before cgen (cx fork #350, cx-home/v#13), so
+// no tcc attempt fails and nothing is retried there.
 import os
 import v.pref
 
@@ -73,7 +76,7 @@ fn test_tcc_retry_warning_is_visible() {
 	os.chmod(fake_tcc, 0o700) or { panic(err) }
 	os.write_file(source_path, 'fn main() {}\n') or { panic(err) }
 	res :=
-		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -cc ${os.quoted_path(fake_tcc)} -d run -o ${os.quoted_path(exe_path)} run ${os.quoted_path(source_path)}')
+		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -gc boehm -cc ${os.quoted_path(fake_tcc)} -d run -o ${os.quoted_path(exe_path)} run ${os.quoted_path(source_path)}')
 	assert res.exit_code == 0, res.output
 	assert res.output.contains('warning: tcc compilation failed, falling back to cc'), res.output
 }
@@ -170,7 +173,7 @@ fn test_tcc_retry_forwards_corrected_dump_c_flags() {
 		panic(err)
 	}
 	res :=
-		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -cc ${os.quoted_path(fake_tcc)} -dump-c-flags - -o ${os.quoted_path(exe_path)} ${os.quoted_path(source_path)}')
+		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -gc boehm -cc ${os.quoted_path(fake_tcc)} -dump-c-flags - -o ${os.quoted_path(exe_path)} ${os.quoted_path(source_path)}')
 	assert res.exit_code == 0, res.output
 	assert res.output.contains('V_RETRY_TINYC_CFLAGS'), res.output
 	assert res.output.contains('V_RETRY_SYSTEM_CFLAGS'), res.output
@@ -196,7 +199,7 @@ fn test_tcc_retry_reports_final_compiler_failure() {
 	os.write_file(header_path, '#error retry_system_compiler_failure\n') or { panic(err) }
 	os.write_file(source_path, '#include "${header_path}"\nfn test_retry() {}\n') or { panic(err) }
 	res :=
-		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -cc ${os.quoted_path(fake_tcc)} -o ${os.quoted_path(exe_path)} ${os.quoted_path(source_path)}')
+		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -gc boehm -cc ${os.quoted_path(fake_tcc)} -o ${os.quoted_path(exe_path)} ${os.quoted_path(source_path)}')
 	assert res.exit_code != 0, res.output
 	assert res.output.contains('warning: tcc compilation failed, falling back to cc'), res.output
 	assert res.output.contains('C compilation error (from cc)'), res.output
@@ -229,7 +232,7 @@ fn test_tcc_retry_preserves_shared_and_enable_globals_flags() {
 		panic(err)
 	}
 	res :=
-		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -cc ${os.quoted_path(fake_tcc)} -shared -enable-globals -o ${os.quoted_path(library_path)} ${os.quoted_path(source_path)}')
+		execute_tcc_retry_test_command('${os.quoted_path(@VEXE)} -gc boehm -cc ${os.quoted_path(fake_tcc)} -shared -enable-globals -o ${os.quoted_path(library_path)} ${os.quoted_path(source_path)}')
 	assert res.exit_code == 0, res.output
 	assert res.output.contains('warning: tcc compilation failed, falling back to cc'), res.output
 	assert os.is_file(library_path)

@@ -323,6 +323,17 @@ pub fn (mut p Preferences) fill_with_defaults() {
 	if !p.thread_stack_size_set_by_flag {
 		p.thread_stack_size = p.default_thread_stack_size()
 	}
+	// cx fork #350: tcc on macOS cannot compile the vgc runtime (no Mach-O
+	// __thread), so a -gc vgc build there takes the system cc. Resolved HERE,
+	// before cgen: the builder's late switch compiled C generated for tcc
+	// (`$if tinyc` arms such as print_backtrace's tcc_backtrace call) with cc
+	// ("call to undeclared function 'tcc_backtrace'", cx-home/v#13). The builder
+	// keeps its switch for a `cc` that is tcc under another name.
+	$if macos {
+		if p.gc_mode == .vgc && p.os == .macos && cc_from_string(p.ccompiler) == .tinyc {
+			p.ccompiler = 'cc'
+		}
+	}
 	p.ccompiler_type = cc_from_string(p.ccompiler)
 	p.normalize_gc_defaults_for_resolved_ccompiler()
 	p.prefer_source_boehm_without_thread_local_alloc()

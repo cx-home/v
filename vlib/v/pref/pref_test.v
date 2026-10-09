@@ -700,10 +700,13 @@ fn test_output_flag_accepts_directory_path() {
 }
 
 fn test_tcc_shared_builds_disable_backtraces() {
+	// a Boehm build: under the fork's default vgc, macOS takes the system cc for
+	// a tcc before any tcc rule applies (cx fork #350, cx-home/v#13)
 	mut shared_prefs := &pref.Preferences{
 		path:      'libfoo.v'
 		is_shared: true
 		ccompiler: 'tinyc'
+		gc_mode:   .boehm_full_opt
 	}
 	shared_prefs.fill_with_defaults()
 	assert 'no_backtrace' in shared_prefs.compile_defines_all
