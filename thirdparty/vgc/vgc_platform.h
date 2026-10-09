@@ -380,7 +380,9 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
 #else
   #include <sys/mman.h>
   #include <unistd.h>
+  static uint64_t vgc_diag_osalloc_bytes, vgc_diag_osalloc_n;
   static inline void* vgc_os_alloc(size_t size) {
+      vgc_diag_osalloc_bytes += size; vgc_diag_osalloc_n++;
       void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       return (p == MAP_FAILED) ? NULL : p;
   }
@@ -1965,6 +1967,7 @@ static void vgc_diag_line(uint64_t carves, uint64_t carve_mb, uint64_t misses_bi
     vgc__ws(" carves="); vgc__wdec(carves);
     vgc__ws(" carve_mb="); vgc__wdec(carve_mb);
     vgc__ws(" carves_in_gc="); vgc__wdec(misses_big);
+    vgc__ws(" osalloc_mb="); vgc__wdec(vgc_diag_osalloc_bytes >> 20); vgc__ws(" osalloc_n="); vgc__wdec(vgc_diag_osalloc_n);
     vgc__ws("\n");
 }
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
