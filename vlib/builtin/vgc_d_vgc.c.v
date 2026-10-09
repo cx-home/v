@@ -635,6 +635,19 @@ __global vgc_eager_trim_pending = u32(0)
 // stayed "expensive" by measurement, so servers rode to 768 MB+ heaps for
 // nothing. Big LIVE sets still get a proportional goal via the GOGC term.
 __global vgc_headroom_cap = u64(64 * 1024 * 1024)
+// The adaptive headroom's LIVE-SET bound (cx-home/v#12, cx-private#1892): the
+// headroom may not exceed vgc_headroom_live_pct % of the marked set, never
+// below vgc_headroom_min. The time band alone let a small live set ride to the
+// flat cap: a parse/emit loop over a 1 MB document marks 15-20 MB and pays a
+// 6-7 ms pause per cycle, more than 10 % of a 64 MB interval, so the headroom
+// doubled to 64 MB and the goal (84 MB) crossed into a second 64 MB arena —
+// peak 153 MB for a 20 MB live set (Python: 42 MB). At 100 % the goal is
+// marked + max(headroom ≤ marked, marked × GOGC/100) = 2× the live set, Go's
+// GOGC=100 goal, and RSS tracks the live set (the cx #71 intent); the band
+// still shrinks the headroom below the bound when cycles are cheap. Measured
+// (dev2, the same build): json-codec 1 MB peak 153 → 73 MB, 1 KB 88 → 47 MB.
+// VGC_HEADROOM_LIVE_PCT overrides (decimal; 0 removes the bound).
+__global vgc_headroom_live_pct = u64(100)
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
 // Go's GOMEMLIMIT analog for the backstop collector. The default is a PINNED
@@ -1250,6 +1263,13 @@ pub fn vgc_init() {
 		cmb := C.atoll(cap_env)
 		if cmb > 0 {
 			vgc_headroom_cap = u64(cmb) * 1024 * 1024
+		}
+	}
+	live_env := C.getenv(c'VGC_HEADROOM_LIVE_PCT')
+	if live_env != unsafe { nil } {
+		lp := C.atoll(live_env)
+		if lp >= 0 {
+			vgc_headroom_live_pct = u64(lp)
 		}
 	}
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
