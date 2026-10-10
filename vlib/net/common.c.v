@@ -107,6 +107,23 @@ pub fn close(handle int) ! {
 
 // Select waits for an io operation (specified by parameter `test`) to be available
 fn select(handle int, test Select, timeout time.Duration) !bool {
+	$if windows {
+		return select_fdset(handle, test, timeout)
+	} $else {
+		what := match test {
+			.read { PollFor.read }
+			.write { PollFor.write }
+			.except { PollFor.except }
+		}
+
+		return poll_ready(handle, what, timeout)
+	}
+}
+
+// select_fdset is select(2) on one descriptor: every wait on Windows, and below
+// FD_SETSIZE elsewhere (poll_ready); at FD_SETSIZE and up select fails (macOS)
+// or overflows the fd_set (glibc), so poll_ready uses poll(2) there.
+fn select_fdset(handle int, test Select, timeout time.Duration) !bool {
 	set := C.fd_set{}
 
 	C.FD_ZERO(&set)

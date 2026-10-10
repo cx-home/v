@@ -195,6 +195,7 @@ fn C.mbedtls_net_accept(&C.mbedtls_net_context, &C.mbedtls_net_context, voidptr,
 fn C.mbedtls_net_recv(voidptr, &u8, usize) i32
 fn C.mbedtls_net_send(voidptr, &u8, usize) i32
 fn C.mbedtls_net_recv_timeout(voidptr, &u8, usize, u32) i32
+fn C.v_mbedtls_net_recv_timeout(voidptr, &u8, usize, u32) i32
 fn C.mbedtls_net_free(&C.mbedtls_net_context)
 
 fn C.mbedtls_ssl_init(&C.mbedtls_ssl_context)
