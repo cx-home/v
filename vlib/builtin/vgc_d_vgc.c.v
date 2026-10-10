@@ -2671,8 +2671,14 @@ fn vgc_frag_gate_defers(nbytes usize) bool {
 // (the idle-run coalesce of cx-home/v#14: 0 for the frag gate's merge of
 // everything; vgc_idle_defrag_age for an in-arena carve's request, where a
 // span this sweep or the last epoch's demand touched must stay out of the
-// run — see the IDLE-RUN COALESCE block). Returns the bytes absorbed into
-// runs (the merged spans' sizes, the run heads excluded).
+// run — see the IDLE-RUN COALESCE block). The idle merge also keeps a run to
+// ONE decommit state: a mixed run is pushed hot, which labels its cold pages
+// committed, and the next large carve's vgc_pool_compensate then spends its
+// budget "returning" pages the OS already has while the resident idle pool
+// stays (json-codec 1 MB x100 at the 32 MB floor: 86.7 -> 99.0 MB peak with
+// mixed idle runs, 86.7 with this rule). The frag gate's merge keeps mixing:
+// its run is popped by the deferred request's retry at once. Returns the
+// bytes absorbed into runs (the merged spans' sizes, the run heads excluded).
 fn vgc_pool_defrag(min_age u32) u64 {
 	cyc := u32(vgc_heap.gc_cycle)
 	mut absorbed := u64(0)
@@ -2700,7 +2706,9 @@ fn vgc_pool_defrag(min_age u32) u64 {
 				mut q := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[q_idx]))))) }
 				if q == unsafe { nil } || !q.pooled || q.in_use || q.npages == 0
 					|| q.base != a.base + q_idx * vgc_page_size
-					|| s.npages + q.npages > u32(vgc_max_pooled_pages) || cyc - q.pool_gen < min_age {
+					|| s.npages + q.npages > u32(vgc_max_pooled_pages)
+					|| cyc - q.pool_gen < min_age
+					|| (min_age > 0 && s.decommitted != q.decommitted) {
 					break
 				}
 				if !merged {
