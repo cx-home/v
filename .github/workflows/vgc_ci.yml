@@ -53,13 +53,14 @@ jobs:
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's
   # drivers spawn children through `ENV=v cmd`, which cmd.exe does not read,
-  # so this job runs the port test and the soundness driver directly. -gc e
-  # is explicit: an msvc build defaults to no GC.
+  # so this job runs the port test and the soundness driver directly.
   vgc-windows:
     strategy:
       fail-fast: false
       matrix:
-        cc: [gcc, msvc]
+        # msvc is not in the matrix: vgc does not compile under msvc (GNU inline
+        # asm, __builtin_frame_address; an msvc build defaults to no GC) — its own item
+        cc: [gcc]
     runs-on: windows-2025
     timeout-minutes: 40
     steps:
@@ -67,7 +68,7 @@ jobs:
       - name: Build V (${{ matrix.cc }})
         shell: pwsh
         run: |
-          if ('${{ matrix.cc }}' -eq 'msvc') { .\makev.bat -msvc } else { .\makev.bat -gcc }
+          .\makev.bat -${{ matrix.cc }}
           .\v.exe version
       - name: vgc_os_suspend_port_test
         shell: pwsh

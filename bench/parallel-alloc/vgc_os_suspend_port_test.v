@@ -23,7 +23,10 @@ fn C.vgc_get_cache_idx() int
 // cache index — a spawned thread never took a slot of its own.
 fn cache_idx_of_a_new_thread() int {
 	t := spawn fn () int {
-		return C.vgc_get_cache_idx()
+		// a thread takes its slot at its first allocation
+		mut b := []u8{len: 64}
+		b[0] = 1
+		return C.vgc_get_cache_idx() + int(b[0]) - 1
 	}()
 	return t.wait()
 }
