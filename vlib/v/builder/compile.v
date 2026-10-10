@@ -59,6 +59,15 @@ fn check_if_output_folder_is_writable(pref_ &pref.Preferences) {
 		|| pref_.backend == .interpret {
 		return
 	}
+	if pref_.build_mode == .build_module {
+		// cx-home/v#18: at this point out_name still names the module's SOURCE
+		// directory; cc() repoints it at the cache (mod_postfix_with_key2cpath),
+		// and mod_save creates that directory and reports its own write error.
+		// Probing the source directory here wrote and removed a mkstemp file in
+		// it — every -usecache miss moved the module directory's mtime, and a
+		// read-only module tree could not be built into the cache at all.
+		return
+	}
 	odir := os.dir(pref_.out_name)
 	// When pref.out_name is just the name of an executable, i.e. `./v -o executable main.v`
 	// without a folder component, just use the current folder instead:
