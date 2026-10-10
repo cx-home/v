@@ -564,6 +564,30 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       *hi = *lo + stack_size;
       return 1;
   }
+#elif defined(_WIN32)
+  // cx-home/v#20: a thread's stack is one VirtualAlloc reservation — its
+  // AllocationBase is the low end (guard and uncommitted pages included), and
+  // the regions that share that base run up to the top. Before, Windows took
+  // the 0 answer below, so a registered thread's stack_base became sp - 8 MB:
+  // the scan covered the dead space BELOW the thread's frames and none above.
+  // VirtualQuery answers on every Windows and under msvc, gcc and tcc alike.
+  static inline int vgc_get_stack_bounds(uintptr_t* lo, uintptr_t* hi) {
+      MEMORY_BASIC_INFORMATION mbi;
+      volatile char probe = 0;
+      if (VirtualQuery((const void*)&probe, &mbi, sizeof(mbi)) == 0) return 0;
+      uintptr_t base = (uintptr_t)mbi.AllocationBase;
+      uintptr_t top = (uintptr_t)mbi.BaseAddress + (uintptr_t)mbi.RegionSize;
+      for (;;) {
+          MEMORY_BASIC_INFORMATION m2;
+          if (VirtualQuery((const void*)top, &m2, sizeof(m2)) == 0) break;
+          if ((uintptr_t)m2.AllocationBase != base) break;
+          top = (uintptr_t)m2.BaseAddress + (uintptr_t)m2.RegionSize;
+      }
+      if (base == 0 || top <= base) return 0;
+      *lo = base;
+      *hi = top;
+      return 1;
+  }
 #else
   static inline int vgc_get_stack_bounds(uintptr_t* lo, uintptr_t* hi) {
       (void)lo;
@@ -1153,7 +1177,44 @@ static inline void vgc_install_thread_exit(int idx) {
     pthread_setspecific(_vgc_exit_key, (void*)(intptr_t)(idx + 1));
 }
 #else
-static inline void vgc_install_thread_exit(int idx) { (void)idx; }
+// cx-home/v#20: Windows has no pthread-key destructor, so an exiting thread
+// never left its slot: live_threads never fell, the cooperative STW waited for
+// a dead thread to park (mt_sound T=8 did not finish in 58 min on windows-2025)
+// and its freed stack range stayed registered. A fiber-local-storage callback
+// fires when the thread exits (FlsAlloc, Vista+), looked up at run time so the
+// mingw/tcc headers below _WIN32_WINNT 0x0600 need not declare it. It is
+// skipped while the process shuts down (RtlDllShutdownInProgress): ExitProcess
+// has already terminated the other threads, and one of them may hold
+// cache_lock.
+extern void vgc_thread_exit_cb(int idx);
+typedef void (WINAPI *vgc_fls_cb_t)(void*);
+typedef DWORD (WINAPI *vgc_fls_alloc_t)(vgc_fls_cb_t);
+typedef BOOL (WINAPI *vgc_fls_set_t)(DWORD, void*);
+typedef BOOLEAN (WINAPI *vgc_shutdown_q_t)(void);
+static volatile LONG _vgc_fls_state = 0; // 0 = not set up, 1 = setting up, 2 = ready
+static DWORD _vgc_fls_idx = 0xFFFFFFFFu;  // FLS_OUT_OF_INDEXES
+static vgc_fls_set_t _vgc_fls_set = 0;
+static vgc_shutdown_q_t _vgc_shutdown_q = 0;
+static void WINAPI _vgc_fls_destructor(void* val) {
+    int idx = (int)(intptr_t)val - 1;
+    if (idx < 0) return;
+    if (_vgc_shutdown_q != 0 && _vgc_shutdown_q()) return;
+    vgc_thread_exit_cb(idx);
+}
+static inline void vgc_install_thread_exit(int idx) {
+    if (InterlockedCompareExchange(&_vgc_fls_state, 1, 0) == 0) {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        vgc_fls_alloc_t fa = k32 ? (vgc_fls_alloc_t)(void*)GetProcAddress(k32, "FlsAlloc") : 0;
+        _vgc_fls_set = k32 ? (vgc_fls_set_t)(void*)GetProcAddress(k32, "FlsSetValue") : 0;
+        _vgc_shutdown_q = nt ? (vgc_shutdown_q_t)(void*)GetProcAddress(nt, "RtlDllShutdownInProgress") : 0;
+        if (fa != 0 && _vgc_fls_set != 0) _vgc_fls_idx = fa(_vgc_fls_destructor);
+        InterlockedExchange(&_vgc_fls_state, 2);
+    }
+    while (InterlockedCompareExchange(&_vgc_fls_state, 2, 2) != 2) Sleep(0);
+    if (_vgc_fls_set != 0 && _vgc_fls_idx != 0xFFFFFFFFu)
+        _vgc_fls_set(_vgc_fls_idx, (void*)(intptr_t)(idx + 1));
+}
 #endif
 
 // ============================================================
@@ -1915,8 +1976,152 @@ static inline void vgc_install_thread_exit(int idx) { (void)idx; }
       for (int i = 0; i < n; i++) regs[i] = s->regs[i];
       return n;
   }
+#elif defined(_WIN32)
+  // ---- Windows OS-level STW (cx-home/v#20): SuspendThread + GetThreadContext,
+  // the Boehm win32_threads shape — signal-free like the darwin mach path.
+  // The "port" is the thread id (GetCurrentThreadId); the collector opens a
+  // handle per suspend. SuspendThread is asynchronous: it can return while the
+  // target still runs, and GetThreadContext on a suspended thread returns only
+  // once the target is actually stopped, so the context it answers is the
+  // frozen register file (the kernel-authoritative settle). A thread whose id
+  // no longer opens, that has exited, or that refuses suspension is GONE
+  // (answer 0): its slot leaves through the FLS exit callback above. Before
+  // this branch Windows took the stub below: port 0 for every thread, so the
+  // STW waited for and suspended no peer (the FreeBSD row of cx-home/v#17).
+  #define VGC_WIN_MAXTH 1024  // >= caches[vgc_max_threads]
+  #define VGC_WIN_MAXREG 96   // x64: 15 GP + 32 XMM lanes; arm64: 29 GP + fp + lr + 64 NEON lanes
+  typedef struct {
+      volatile uint32_t port;    // thread-id key (0 = free); == caches[].mach_port
+      volatile uint32_t acked;   // suspended, settled, registers captured
+      HANDLE h;                  // open while suspended; closed at resume
+      volatile uintptr_t sp;     // captured stack pointer
+      uintptr_t regs[VGC_WIN_MAXREG];
+      volatile int nregs;
+  } vgc_win_susp;
+  static vgc_win_susp vgc_win_slots[VGC_WIN_MAXTH];
+
+  static inline int vgc_captured_regs_contain(uintptr_t val) {
+      for (int i = 0; i < VGC_WIN_MAXTH; i++) {
+          if (vgc_atomic_load_u32(&vgc_win_slots[i].port) == 0) continue;
+          if (!vgc_atomic_load_u32(&vgc_win_slots[i].acked)) continue;
+          int n = vgc_win_slots[i].nregs;
+          for (int r = 0; r < n; r++)
+              if (vgc_win_slots[i].regs[r] == val) return i + 1;
+      }
+      return 0;
+  }
+  static inline int vgc_port_is_acked(uint32_t t) {
+      for (int i = 0; i < VGC_WIN_MAXTH; i++) {
+          if (vgc_atomic_load_u32(&vgc_win_slots[i].port) != t) continue;
+          if (vgc_atomic_load_u32(&vgc_win_slots[i].acked)) return 1;
+      }
+      return 0;
+  }
+  static inline uint32_t vgc_thread_self_port(void) { return (uint32_t)GetCurrentThreadId(); }
+  static inline vgc_win_susp* vgc_win_find(uint32_t t) {
+      for (int i = 0; i < VGC_WIN_MAXTH; i++)
+          if (vgc_atomic_load_u32(&vgc_win_slots[i].port) == t) return &vgc_win_slots[i];
+      return 0;
+  }
+  static inline int vgc_suspend_thread(uint32_t t) {
+      if (t == 0) return 0;
+      vgc_win_susp* s = 0;
+      for (int i = 0; i < VGC_WIN_MAXTH; i++)
+          if (vgc_atomic_load_u32(&vgc_win_slots[i].port) == 0) { s = &vgc_win_slots[i]; break; }
+      if (s == 0) { vgc_say(0xdead3, (uint64_t)t); return 0; } // table full (should not happen: MAXTH >= caches)
+      HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, (DWORD)t);
+      if (h == NULL) { vgc_say(0xdea52, (uint64_t)t); return 0; } // target gone
+      DWORD code = 0;
+      if (GetExitCodeThread(h, &code) && code != STILL_ACTIVE) {
+          CloseHandle(h);
+          vgc_say(0xdea52, (uint64_t)t);
+          return 0;
+      }
+      if (SuspendThread(h) == (DWORD)-1) {
+          CloseHandle(h);
+          vgc_say(0xdea52, (uint64_t)t);
+          return 0;
+      }
+      CONTEXT ctx;
+      memset(&ctx, 0, sizeof(ctx));
+    #if defined(_M_X64) || defined(__x86_64__) || defined(_M_ARM64) || defined(__aarch64__)
+      ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL | CONTEXT_FLOATING_POINT;
+    #else
+      ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+    #endif
+      if (!GetThreadContext(h, &ctx)) { // also the settle: returns once the target is stopped
+          vgc_say(0xdead6, (uint64_t)t); // capture failed: resume, report uncovered-and-gone
+          ResumeThread(h);
+          CloseHandle(h);
+          return 0;
+      }
+      int c = 0;
+      uintptr_t sp = 0;
+    #if defined(_M_X64) || defined(__x86_64__)
+      sp = (uintptr_t)ctx.Rsp;
+      uintptr_t r[15] = { (uintptr_t)ctx.Rax, (uintptr_t)ctx.Rbx, (uintptr_t)ctx.Rcx,
+                          (uintptr_t)ctx.Rdx, (uintptr_t)ctx.Rsi, (uintptr_t)ctx.Rdi,
+                          (uintptr_t)ctx.Rbp, (uintptr_t)ctx.R8, (uintptr_t)ctx.R9,
+                          (uintptr_t)ctx.R10, (uintptr_t)ctx.R11, (uintptr_t)ctx.R12,
+                          (uintptr_t)ctx.R13, (uintptr_t)ctx.R14, (uintptr_t)ctx.R15 };
+      for (int i = 0; i < 15 && c < VGC_WIN_MAXREG; i++) s->regs[c++] = r[i];
+      #if !defined(__TINYC__)
+      // gcc/clang/msvc may keep a pointer only in an XMM register; tcc emits no SSE for pointers
+      for (int i = 0; i < 16 && c + 1 < VGC_WIN_MAXREG; i++) {
+          s->regs[c++] = (uintptr_t)ctx.FltSave.XmmRegisters[i].Low;
+          s->regs[c++] = (uintptr_t)ctx.FltSave.XmmRegisters[i].High;
+      }
+      #endif
+    #elif defined(_M_ARM64) || defined(__aarch64__)
+      sp = (uintptr_t)ctx.Sp;
+      for (int i = 0; i < 29 && c < VGC_WIN_MAXREG; i++) s->regs[c++] = (uintptr_t)ctx.X[i];
+      if (c < VGC_WIN_MAXREG) s->regs[c++] = (uintptr_t)ctx.Fp;
+      if (c < VGC_WIN_MAXREG) s->regs[c++] = (uintptr_t)ctx.Lr;
+      for (int i = 0; i < 32 && c + 1 < VGC_WIN_MAXREG; i++) {
+          s->regs[c++] = (uintptr_t)ctx.V[i].Low;
+          s->regs[c++] = (uintptr_t)ctx.V[i].High;
+      }
+    #elif defined(_M_IX86) || defined(__i386__)
+      sp = (uintptr_t)ctx.Esp;
+      uintptr_t r[7] = { (uintptr_t)ctx.Eax, (uintptr_t)ctx.Ebx, (uintptr_t)ctx.Ecx,
+                         (uintptr_t)ctx.Edx, (uintptr_t)ctx.Esi, (uintptr_t)ctx.Edi,
+                         (uintptr_t)ctx.Ebp };
+      for (int i = 0; i < 7 && c < VGC_WIN_MAXREG; i++) s->regs[c++] = r[i];
+    #else
+      vgc_say(0xdead6, (uint64_t)t);
+      ResumeThread(h);
+      CloseHandle(h);
+      return 0;
+    #endif
+      s->h = h;
+      s->sp = sp;
+      s->nregs = c;
+      vgc_atomic_store_u32(&s->acked, 1);
+      vgc_atomic_store_u32(&s->port, t); // publish key (forensic helpers + regs reader)
+      return 1;
+  }
+  static inline void vgc_resume_thread(uint32_t t) {
+      vgc_win_susp* s = vgc_win_find(t);
+      if (s == 0) return; // never suspended this cycle (gone/skipped): nothing to undo
+      HANDLE h = s->h;
+      s->h = NULL;
+      vgc_atomic_store_u32(&s->acked, 0);
+      vgc_atomic_store_u32(&s->port, 0); // free the slot
+      if (h != NULL) {
+          ResumeThread(h);
+          CloseHandle(h);
+      }
+  }
+  static inline int vgc_thread_regs(uint32_t t, uintptr_t* sp_out, uintptr_t* regs, int max) {
+      vgc_win_susp* s = vgc_win_find(t);
+      if (s == 0 || vgc_atomic_load_u32(&s->acked) == 0) return 0;
+      *sp_out = s->sp;
+      int n = s->nregs < max ? s->nregs : max;
+      for (int i = 0; i < n; i++) regs[i] = s->regs[i];
+      return n;
+  }
 #else
-  // Other platforms (Windows/BSD): signal/mach STW not yet ported. Return 0 so the
+  // Other platforms (the remaining BSDs): signal/mach STW not yet ported. Return 0 so the
   // collector detects "no OS-suspend available" and falls back safely.
   static inline int vgc_captured_regs_contain(uintptr_t val) { (void)val; return 0; }
   static inline int vgc_port_is_acked(uint32_t t) { (void)t; return 0; }

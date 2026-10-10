@@ -1,8 +1,8 @@
-// vgc_os_suspend_port_test.v — every thread vgc registers on darwin, linux and
-// freebsd carries an OS suspend handle (cx-home/v#17).
+// vgc_os_suspend_port_test.v — every thread vgc registers on darwin, linux,
+// freebsd and windows carries an OS suspend handle (cx-home/v#17, #20).
 //
 // The handle (caches[i].mach_port: the mach port on darwin, the kernel thread
-// id on linux and freebsd) is what the stop-the-world waits for and suspends.
+// id on linux and freebsd, the thread id on windows) is what the stop-the-world waits for and suspends.
 // A thread whose handle is 0 is skipped by both: the cooperative collector
 // neither waits for it to park nor suspends it, and the -d vgc_concurrent
 // collector's STW windows stop nothing at all. FreeBSD answered 0 for every
@@ -10,7 +10,8 @@
 // "not yet ported" stub), and concurrent_mt_sound read bad records there
 // (bad=7..818 on CI, every pin). The stub reproduces it on macOS: built with
 // the darwin branch compiled out, mt_sound -d vgc_concurrent read bad=76 at
-// T=8 and bad=445 at T=16; with the darwin branch, bad=0.
+// T=8 and bad=445 at T=16; with the darwin branch, bad=0. Windows took the
+// same stub (cx-home/v#20): mt_sound T=8 did not finish in 58 min there.
 //
 // Run: ./v test bench/parallel-alloc/vgc_os_suspend_port_test.v
 module main
@@ -25,7 +26,7 @@ fn port_of_a_new_thread() u32 {
 }
 
 fn test_every_registered_thread_has_an_os_suspend_handle() {
-	$if macos || linux || freebsd {
+	$if macos || linux || freebsd || windows {
 		main_port := C.vgc_thread_self_port()
 		a := port_of_a_new_thread()
 		b := port_of_a_new_thread()
