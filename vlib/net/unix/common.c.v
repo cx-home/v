@@ -29,41 +29,15 @@ pub fn shutdown(handle int, config net.ShutdownConfig) int {
 }
 
 // Select waits for an io operation (specified by parameter `test`) to be available
+// (net.poll_ready: poll(2), any descriptor number — cx-home/v#30).
 fn select(handle int, test Select, timeout time.Duration) !bool {
-	set := C.fd_set{}
-
-	C.FD_ZERO(&set)
-	C.FD_SET(handle, &set)
-
-	mut tt := C.timeval{}
-	mut timeval_timeout := &tt
-
-	// infinite timeout is signaled by passing null as the timeout to
-	// select.
-	if timeout == infinite_timeout {
-		timeval_timeout = &C.timeval(unsafe { nil })
-	} else {
-		seconds := timeout / time.second
-		microseconds := time.Duration(timeout - (seconds * time.second)).microseconds()
-		tt = C.timeval{
-			tv_sec:  u64(seconds)
-			tv_usec: u64(microseconds)
-		}
+	what := match test {
+		.read { net.PollFor.read }
+		.write { net.PollFor.write }
+		.except { net.PollFor.except }
 	}
 
-	match test {
-		.read {
-			net.socket_error(C.select(handle + 1, &set, C.NULL, C.NULL, timeval_timeout))!
-		}
-		.write {
-			net.socket_error(C.select(handle + 1, C.NULL, &set, C.NULL, timeval_timeout))!
-		}
-		.except {
-			net.socket_error(C.select(handle + 1, C.NULL, C.NULL, &set, timeval_timeout))!
-		}
-	}
-
-	return C.FD_ISSET(handle, &set) != 0
+	return net.poll_ready(handle, what, timeout)
 }
 
 @[inline]

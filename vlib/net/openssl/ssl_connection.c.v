@@ -499,66 +499,42 @@ pub fn (mut s SSLConn) write_string(str string) !int {
 	return s.write_ptr(str.str, str.len)
 }
 
-// Select waits for an io operation (specified by parameter `test`) to be available
+// Select waits for an io operation (specified by parameter `test`) to be available.
+// net.poll_ready (poll(2)) underneath, so a descriptor >= FD_SETSIZE (1024) waits
+// like any other — select(2) refused it on macOS (EINVAL) and overflowed its
+// fd_set on glibc (cx-home/v#30). A signal retries with the time left; the
+// bound elapsing is net.err_timed_out.
 fn select(handle int, test Select, timeout time.Duration) !bool {
 	$if trace_ssl ? {
 		eprintln('${@METHOD} handle: ${handle}, timeout: ${timeout}')
 	}
-	set := C.fd_set{}
-	C.FD_ZERO(&set)
-	C.FD_SET(handle, &set)
+	what := match test {
+		.read { net.PollFor.read }
+		.write { net.PollFor.write }
+		.except { net.PollFor.except }
+	}
 
 	is_infinite := timeout <= 0 || timeout == net.infinite_timeout
 	deadline := ssl_timeout_deadline(timeout)
-	mut remaining_time := if is_infinite { i64(0) } else { timeout.milliseconds() }
-	for is_infinite || remaining_time > 0 {
-		seconds := remaining_time / 1000
-		microseconds := (remaining_time % 1000) * 1000
-
-		tt := C.timeval{
-			tv_sec:  u64(seconds)
-			tv_usec: u64(microseconds)
-		}
-		timeval_timeout := if is_infinite {
-			&C.timeval(unsafe { nil })
-		} else {
-			&tt
-		}
-
-		mut res := -1
-		match test {
-			.read {
-				res = net.socket_error(C.select(handle + 1, &set, C.NULL, C.NULL, timeval_timeout))!
-			}
-			.write {
-				res = net.socket_error(C.select(handle + 1, C.NULL, &set, C.NULL, timeval_timeout))!
-			}
-			.except {
-				res = net.socket_error(C.select(handle + 1, C.NULL, C.NULL, &set, timeval_timeout))!
-			}
-		}
-
-		if res < 0 {
-			if C.errno == C.EINTR {
-				// errno is 4, Spurious wakeup from signal, keep waiting
+	mut remaining := if is_infinite { net.infinite_timeout } else { timeout }
+	for {
+		ready := net.poll_ready(handle, what, remaining) or {
+			if err.code() == C.EINTR {
 				if !is_infinite {
-					remaining_time = ssl_remaining_timeout(deadline).milliseconds()
+					remaining = ssl_remaining_timeout(deadline)
 				}
 				continue
 			}
-			cerr := C.errno
-			return error_with_code('net.openssl select, failed: ${res}', cerr)
-		} else if res == 0 {
+			return error_with_code('net.openssl select, failed: ${err.msg()}', err.code())
+		}
+		if !ready {
 			return net.err_timed_out
 		}
-
-		res = C.FD_ISSET(handle, &set)
 		$if trace_ssl ? {
-			eprintln('${@METHOD} ---> res: ${res}')
+			eprintln('${@METHOD} ---> ready')
 		}
-		return res != 0
+		return true
 	}
-
 	return net.err_timed_out
 }
 

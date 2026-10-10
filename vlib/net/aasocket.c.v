@@ -26,6 +26,13 @@ enum Select {
 	except
 }
 
+// PollFor names the readiness poll_ready waits for on one descriptor.
+pub enum PollFor {
+	read
+	write
+	except
+}
+
 // SocketType are the available sockets
 pub enum SocketType {
 	udp       = C.SOCK_DGRAM

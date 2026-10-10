@@ -172,7 +172,7 @@ pub fn (mut c DTLSConn) dial(hostname string, port int) ! {
 	}
 	c.handle = c.server_fd.fd
 	C.mbedtls_ssl_set_bio(&c.ssl, &c.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-		C.mbedtls_net_recv_timeout)
+		C.v_mbedtls_net_recv_timeout)
 
 	mut hret := C.mbedtls_ssl_handshake(&c.ssl)
 	for hret == C.MBEDTLS_ERR_SSL_WANT_READ || hret == C.MBEDTLS_ERR_SSL_WANT_WRITE {
@@ -380,7 +380,7 @@ pub fn (mut l DTLSListener) accept() !&DTLSConn {
 		}
 
 		C.mbedtls_ssl_set_bio(&conn.ssl, &conn.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-			C.mbedtls_net_recv_timeout)
+			C.v_mbedtls_net_recv_timeout)
 
 		mut hret := C.mbedtls_ssl_handshake(&conn.ssl)
 		for hret == C.MBEDTLS_ERR_SSL_WANT_READ || hret == C.MBEDTLS_ERR_SSL_WANT_WRITE {

@@ -175,6 +175,10 @@ mut:
 	certs &SSLCerts = unsafe { nil }
 }
 
+// ssl_listener_backlog — the listen queue an SSLListener asks for (the
+// kernel clamps it); net.listen_tcp's default backlog is 128.
+const ssl_listener_backlog = 4096
+
 // SSLListener listens on a TCP port and accepts connection secured with TLS
 pub struct SSLListener {
 	saddr  string
@@ -317,6 +321,13 @@ fn (mut l SSLListener) init() ! {
 		return error_with_code("net.mbedtls SSLListener.init, mbedtls_net_bind can't bind to ${l.saddr} error ret: ${ret}",
 			ret)
 	}
+	// mbedtls_net_bind listens with MBEDTLS_NET_LISTEN_BACKLOG, 10: a burst of
+	// clients connecting at once (a server's restart, a load balancer's pool
+	// warming) overflowed the queue and their SYNs were dropped into the
+	// kernel's retransmit back-off. Listen again with net's TCP listener
+	// backlog — the kernel clamps it to its own limit (somaxconn); a second
+	// listen() on a listening socket only resizes the queue (cx-home/v#30).
+	C.listen(l.server_fd.fd, ssl_listener_backlog)
 
 	ret = C.mbedtls_ssl_config_defaults(&l.conf, C.MBEDTLS_SSL_IS_SERVER,
 		C.MBEDTLS_SSL_TRANSPORT_STREAM, C.MBEDTLS_SSL_PRESET_DEFAULT)
@@ -501,7 +512,7 @@ pub fn (mut l SSLListener) accept() !&SSLConn {
 	}
 
 	C.mbedtls_ssl_set_bio(&conn.ssl, &conn.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-		C.mbedtls_net_recv_timeout)
+		C.v_mbedtls_net_recv_timeout)
 	conn.server_handshake(net.infinite_timeout)!
 	return conn
 }
@@ -606,7 +617,7 @@ pub fn (mut conn SSLConn) complete_handshake(timeout time.Duration) ! {
 	conn.do_handshake_loop(deadline)!
 	net.set_blocking(conn.handle, true)!
 	C.mbedtls_ssl_set_bio(&conn.ssl, &conn.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-		C.mbedtls_net_recv_timeout)
+		C.v_mbedtls_net_recv_timeout)
 }
 
 // accept_with_timeouts waits up to `accept_timeout` for a new client, then
@@ -774,7 +785,7 @@ pub fn (mut s SSLConn) accept_conn(mut tcp_conn net.TcpConn) ! {
 	s.set_read_timeout(tcp_conn.read_timeout())
 	s.server_fd.fd = s.handle
 	C.mbedtls_ssl_set_bio(&s.ssl, &s.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-		C.mbedtls_net_recv_timeout)
+		C.v_mbedtls_net_recv_timeout)
 	// WANT_READ/WANT_WRITE are not errors -- mbedtls's own docs require every
 	// caller to retry the handshake call on them. On this blocking BIO each
 	// retry's internal recv already blocks up to read_timeout (via
@@ -1005,7 +1016,7 @@ pub fn (mut s SSLConn) connect(mut tcp_conn net.TcpConn, hostname string) ! {
 	}
 	s.server_fd.fd = s.handle
 	C.mbedtls_ssl_set_bio(&s.ssl, &s.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-		C.mbedtls_net_recv_timeout)
+		C.v_mbedtls_net_recv_timeout)
 	ret = C.mbedtls_ssl_handshake(&s.ssl)
 	// WANT_READ/WANT_WRITE are not errors -- mbedtls's own docs require every
 	// caller to retry the handshake call on them. On this blocking BIO each
@@ -1061,7 +1072,7 @@ pub fn (mut s SSLConn) dial(hostname string, port int) ! {
 		return error_with_code('net.mbedtls SSLConn.dial, failed to connect to host', ret)
 	}
 	C.mbedtls_ssl_set_bio(&s.ssl, &s.server_fd, C.mbedtls_net_send, C.mbedtls_net_recv,
-		C.mbedtls_net_recv_timeout)
+		C.v_mbedtls_net_recv_timeout)
 	s.handle = s.server_fd.fd
 	ret = C.mbedtls_ssl_handshake(&s.ssl)
 	// See the identical retry loop in SSLConn.connect() above for why
@@ -1228,62 +1239,42 @@ pub fn (mut s SSLConn) write_string(str string) !int {
 	return s.write_ptr(str.str, str.len)
 }
 
-// Select waits for an io operation (specified by parameter `test`) to be available
+// Select waits for an io operation (specified by parameter `test`) to be available.
+// net.poll_ready (poll(2)) underneath, so a descriptor >= FD_SETSIZE (1024) waits
+// like any other — select(2) refused it on macOS (EINVAL) and overflowed its
+// fd_set on glibc (cx-home/v#30). A signal retries with the time left; the
+// bound elapsing is net.err_timed_out.
 fn select(handle int, test Select, timeout time.Duration) !bool {
 	$if trace_ssl ? {
 		eprintln('${@METHOD} handle: ${handle}, timeout: ${timeout}')
 	}
-	set := C.fd_set{}
-	C.FD_ZERO(&set)
-	C.FD_SET(handle, &set)
+	what := match test {
+		.read { net.PollFor.read }
+		.write { net.PollFor.write }
+		.except { net.PollFor.except }
+	}
 
 	is_infinite := timeout <= 0 || timeout == net.infinite_timeout
 	deadline := ssl_timeout_deadline(timeout)
-	mut remaining_time := if is_infinite { i64(0) } else { timeout.milliseconds() }
-	for is_infinite || remaining_time > 0 {
-		seconds := remaining_time / 1000
-		microseconds := (remaining_time % 1000) * 1000
-
-		tt := C.timeval{
-			tv_sec:  u64(seconds)
-			tv_usec: u64(microseconds)
-		}
-		timeval_timeout := if is_infinite { &C.timeval(unsafe { nil }) } else { &tt }
-
-		mut res := -1
-		match test {
-			.read {
-				res = net.socket_error(C.select(handle + 1, &set, C.NULL, C.NULL, timeval_timeout))!
-			}
-			.write {
-				res = net.socket_error(C.select(handle + 1, C.NULL, &set, C.NULL, timeval_timeout))!
-			}
-			.except {
-				res = net.socket_error(C.select(handle + 1, C.NULL, C.NULL, &set, timeval_timeout))!
-			}
-		}
-
-		if res < 0 {
-			if C.errno == C.EINTR {
-				// errno is 4, Spurious wakeup from signal, keep waiting
+	mut remaining := if is_infinite { net.infinite_timeout } else { timeout }
+	for {
+		ready := net.poll_ready(handle, what, remaining) or {
+			if err.code() == C.EINTR {
 				if !is_infinite {
-					remaining_time = ssl_remaining_timeout(deadline).milliseconds()
+					remaining = ssl_remaining_timeout(deadline)
 				}
 				continue
 			}
-			cerr := C.errno
-			return error_with_code('net.mbedtls select, failed, res: ${res}', cerr)
-		} else if res == 0 {
+			return error_with_code('net.mbedtls select, failed: ${err.msg()}', err.code())
+		}
+		if !ready {
 			return net.err_timed_out
 		}
-
-		res = C.FD_ISSET(handle, &set)
 		$if trace_ssl ? {
-			eprintln('${@METHOD} ---> res: ${res}')
+			eprintln('${@METHOD} ---> ready')
 		}
-		return res != 0
+		return true
 	}
-
 	return net.err_timed_out
 }
 
