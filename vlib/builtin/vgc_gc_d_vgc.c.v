@@ -87,6 +87,7 @@ fn vgc_gc_start() {
 	// cx-home/v#17: the collector's own carves never wait for its collection
 	vgc_gc_owner = C.vgc_get_cache_idx()
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
+	C.vgc_say(u64(0x77099), 0)
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
 	vgc_mark_nworkers_cur = vgc_mark_plan()
@@ -372,8 +373,10 @@ fn vgc_gc_start() {
 
 	// Clear mark bits on all spans (prepare for new cycle)
 	vgc_ph[0] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 0), 0)
 	vgc_clear_mark_bits()
 	vgc_ph[1] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 1), 0)
 	vgc_watch_snapshot(0) // STAGE 0: post-clear (expect found+in_use+alloc, mark=0)
 
 	// Scan each suspended thread's roots: refresh its stack range from the
@@ -381,6 +384,7 @@ fn vgc_gc_start() {
 	// a stack-only scan misses; validated in bench/parallel-alloc/stw_root_scan.c).
 	vgc_scan_suspended_roots(self_idx)
 	vgc_ph[2] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 2), 0)
 	vgc_watch_snapshot(1) // STAGE 1: post suspended-thread reg/stack roots (main's reg holds c)
 	$if vgc_rangedump ? {
 		// #58 diagnostic: dump EVERY registered thread's post-refresh scan range so a
@@ -467,6 +471,7 @@ fn vgc_gc_start() {
 	// Final drain of work queue
 	vgc_drain_mark_work(0)
 	vgc_ph[5] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 5), 0)
 	vgc_mark_last_ns = vgc_ph[5] - vgc_ph[4] // the next cycle's parallel-mark decision (cx-home/v#16)
 	// The single-marker-equivalent work of that mark: n markers took last_ns,
 	// so one would have taken about n x last_ns. The next cycle plans its
@@ -489,6 +494,7 @@ fn vgc_gc_start() {
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
 	vgc_ph[6] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 6), 0)
 	vgc_mark_adapt(marked) // cx-home/v#16: the next cycle's marker count
 	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
@@ -550,6 +556,7 @@ fn vgc_gc_start() {
 	C.vgc_trace(9, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP0
 	vgc_do_sweep()
 	vgc_ph[7] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 7), 0)
 	C.vgc_trace(10, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP1
 
 	// Drop mcache slots whose cached span sweep just recycled to the pool (and the
@@ -1094,6 +1101,7 @@ fn vgc_mark_roots() {
 		}
 	}
 	vgc_ph[3] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 3), 0)
 
 	// Scan each registered thread's stack
 	for i in 0 .. vgc_heap.ncaches {
@@ -1112,6 +1120,7 @@ fn vgc_mark_roots() {
 	}
 
 	vgc_ph[4] = C.vgc_now_ns()
+	C.vgc_say(u64(0x77000 + 4), 0)
 
 	// Shade pinned objects — cgo-safe explicit roots (see vgc_pin). A live object
 	// reachable only from non-GC (FFI/C) memory is invisible to the precise scan

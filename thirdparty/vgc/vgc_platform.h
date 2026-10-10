@@ -2024,6 +2024,7 @@ static inline void vgc_install_thread_exit(int idx) {
       return 0;
   }
   static inline int vgc_suspend_thread(uint32_t t) {
+      vgc_say(0x88001, (uint64_t)t);
       if (t == 0) return 0;
       vgc_win_susp* s = 0;
       for (int i = 0; i < VGC_WIN_MAXTH; i++)
@@ -2037,6 +2038,7 @@ static inline void vgc_install_thread_exit(int idx) {
           vgc_say(0xdea52, (uint64_t)t);
           return 0;
       }
+      vgc_say(0x88002, (uint64_t)t);
       if (SuspendThread(h) == (DWORD)-1) {
           CloseHandle(h);
           vgc_say(0xdea52, (uint64_t)t);
@@ -2049,6 +2051,7 @@ static inline void vgc_install_thread_exit(int idx) {
     #else
       ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
     #endif
+      vgc_say(0x88003, (uint64_t)t);
       if (!GetThreadContext(h, &ctx)) { // also the settle: returns once the target is stopped
           vgc_say(0xdead6, (uint64_t)t); // capture failed: resume, report uncovered-and-gone
           ResumeThread(h);
@@ -2093,6 +2096,7 @@ static inline void vgc_install_thread_exit(int idx) {
       CloseHandle(h);
       return 0;
     #endif
+      vgc_say(0x88004, (uint64_t)sp);
       s->h = h;
       s->sp = sp;
       s->nregs = c;
@@ -2101,6 +2105,7 @@ static inline void vgc_install_thread_exit(int idx) {
       return 1;
   }
   static inline void vgc_resume_thread(uint32_t t) {
+      vgc_say(0x88005, (uint64_t)t);
       vgc_win_susp* s = vgc_win_find(t);
       if (s == 0) return; // never suspended this cycle (gone/skipped): nothing to undo
       HANDLE h = s->h;
