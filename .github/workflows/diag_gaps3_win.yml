@@ -1,0 +1,36 @@
+name: diag gaps3 windows
+
+# cx-home/v#20 (gaps3): why mt_sound under vgc does not finish on Windows (diagnostic branch, not for the pin).
+on:
+  push:
+    branches:
+      - 'diag/gaps3-win**'
+
+jobs:
+  win:
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build V
+        shell: pwsh
+        run: .\makev.bat -gcc
+      - name: mt_sound watched
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          .\v.exe -cc gcc -gc e -g -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
+          foreach ($t in 1, 2, 4, 8) {
+            "=== T=$t"
+            $env:T = "$t"; $env:STEPS = '2000'; $env:VGC_GCTRACE = '2'
+            $p = Start-Process -FilePath .\mts.exe -NoNewWindow -PassThru -RedirectStandardOutput "o$t.txt" -RedirectStandardError "e$t.txt"
+            $done = $p.WaitForExit(45000)
+            if (-not $done) { "HUNG after 45 s"; Stop-Process -Id $p.Id -Force } else { "exit=$($p.ExitCode)" }
+            "--- stdout tail"; Get-Content "o$t.txt" -Tail 5
+            "--- stderr head"; Get-Content "e$t.txt" -TotalCount 25
+            "--- stderr tail"; Get-Content "e$t.txt" -Tail 25
+          }
