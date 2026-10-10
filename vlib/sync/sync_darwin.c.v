@@ -364,7 +364,9 @@ pub fn (mut sem Semaphore) timed_wait(timeout time.Duration) bool {
 	outer: for {
 		if c == 0 {
 			res = C.pthread_cond_timedwait(&sem.cond, &sem.mtx, &t_spec)
-			if res == C.ETIMEDOUT {
+			// ETIMEDOUT, or any error (EINVAL on a bad deadline): looping on
+			// it would spin with sem.mtx held and block every post for ever
+			if res != 0 {
 				break outer
 			}
 			c = C.atomic_load_u32(&sem.count)

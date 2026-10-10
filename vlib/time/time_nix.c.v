@@ -131,7 +131,9 @@ pub fn (d Duration) timespec() C.timespec {
 	d_nsec := d % second
 	ts.tv_sec += d_sec
 	ts.tv_nsec += d_nsec
-	if ts.tv_nsec > i64(second) {
+	// >=: a deadline whose nanoseconds reach exactly one second is invalid
+	// (EINVAL from pthread_cond_timedwait / sem_timedwait)
+	if ts.tv_nsec >= i64(second) {
 		ts.tv_nsec -= i64(second)
 		ts.tv_sec++
 	}
