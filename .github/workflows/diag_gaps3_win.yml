@@ -15,18 +15,15 @@ jobs:
       - name: Build V
         shell: pwsh
         run: .\makev.bat -msvc
-      - name: msvc vgc
+      - name: msvc vgc T=8 under cdb
         shell: pwsh
         continue-on-error: true
         run: |
-          .\v.exe -cc msvc -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v bench/parallel-alloc/vgc_global_root_test.v 2>&1 | Select-Object -Last 40
-          .\v.exe -cc msvc -gc e -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v 2>&1 | Select-Object -Last 40
-          foreach ($t in 2, 8) {
-            "=== T=$t"
-            $env:T = "$t"; $env:STEPS = '20000'
-            $p = Start-Process -FilePath .\mts.exe -NoNewWindow -PassThru -RedirectStandardOutput "o.txt" -RedirectStandardError "e.txt"
-            $done = $p.WaitForExit(90000)
-            if (-not $done) { "HUNG"; Stop-Process -Id $p.Id -Force } else { "exit=$($p.ExitCode)" }
-            Get-Content o.txt -Tail 3
-            Get-Content e.txt -Tail 12
+          .\v.exe -cc msvc -gc e -g -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v 2>&1 | Select-Object -Last 20
+          $cdb = Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\Debuggers' -Recurse -Filter cdb.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+          "cdb: $($cdb.FullName)"
+          $env:T = '8'; $env:STEPS = '20000'
+          foreach ($i in 1, 2, 3) {
+            "=== run $i"
+            & $cdb.FullName -g -G -o -c ".symfix+ ; .reload /f mts.exe ; g ; .ecxr ; kn 25 ; r ; ~*kn 8 ; q" .\mts.exe 2>&1 | Select-String -Pattern 'Access violation|mts!|^ *[0-9a-f]{2} |rax=|rip=|rsp=|exception|mt_sound' | Select-Object -First 80
           }
