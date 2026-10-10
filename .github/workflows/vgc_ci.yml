@@ -1,0 +1,51 @@
+name: CI vgc
+
+# The cx patches' collector tests (bench/parallel-alloc: the parallel marker,
+# the fork child path, the pacer, the grow gate) on Linux and FreeBSD.
+# Runs on every push to a cx fix branch or a cx-patches branch, before
+# cx-private pins it (cx-home/v#16).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'fix/**'
+      - 'cx-patches-*'
+
+jobs:
+  vgc-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build V
+        run: make -j4 && ./v symlink
+      - name: bench/parallel-alloc (default)
+        run: ./v test bench/parallel-alloc
+      - name: bench/parallel-alloc (markers forced)
+        run: VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc
+
+  vgc-freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start FreeBSD VM
+        id: vm-freebsd
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          version: '15.1'
+          memory: 8G
+          cpu_count: 4
+          shell: sh
+          sync_files: runner-to-vm
+      - name: bench/parallel-alloc on FreeBSD
+        shell: cpa.sh {0}
+        run: |
+          sudo pkg install -y git gmake
+          sudo hostname -s freebsd-ci
+          git config --global --add safe.directory .
+          gmake
+          ./v test bench/parallel-alloc
+          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc
