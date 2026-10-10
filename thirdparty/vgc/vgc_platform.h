@@ -883,12 +883,15 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
   #include <unistd.h>
   static inline int vgc_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : (int)n; }
   // cx-home/v#16: is the box oversubscribed right now? The 1-minute load
-  // average against the online CPUs; a pool phase whose threads get no core
-  // waits on the preempted one at the join, so the walks stay serial then.
+  // average against twice the online CPUs; a pool phase whose threads get no
+  // core waits on the preempted one at the join, so the walks stay serial
+  // then. Measured on 28 cores: at load 30-35 the eight walkers still paid
+  // (T16 clear 1029 -> 220 us), at load 60-110 they lost (T8 clear 627 ->
+  // 2321 us); the line sits between.
   static inline int vgc_box_busy(int ncpu) {
       double la[1];
       if (getloadavg(la, 1) != 1) return 0;
-      return la[0] >= (double)ncpu;
+      return la[0] >= 2.0 * (double)ncpu;
   }
 #endif
 

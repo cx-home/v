@@ -749,8 +749,9 @@ __global vgc_mark_backoff = int(0)
 // per span than nine tenths of the one-walker rate halves the count for 32
 // cycles, then 64, 128 ... 1024 while it keeps not paying. A preempted walker
 // holds one chunk and the join waits for it — a scheduler quantum — so on an
-// oversubscribed box (1-minute load at or past the online CPUs, vgc_box_busy)
-// the walks stay serial; VGC_WALK_LOAD_GATE=0 lifts that for measurement.
+// oversubscribed box (1-minute load at or past twice the online CPUs,
+// vgc_box_busy) the walks stay serial; VGC_WALK_LOAD_GATE=0 lifts that for
+// measurement.
 const vgc_walk_chunk = u32(32)
 const vgc_walk_sum_len = 256
 const vgc_walk_tag_none = u8(0)
@@ -3587,6 +3588,14 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 // Get a span with free objects for the given span class
 fn vgc_central_get_span(span_class int) &VGC_Span {
 	central := unsafe { &vgc_heap.central[span_class] }
+	// cx-home/v#16 (fable-v16): an empty partial list is the common refill — a
+	// fresh carve follows — and the lock bought nothing for it: a list that
+	// reads empty here is refilled only by the sweep (under the stop), so the
+	// peek is exact. At T16 on stw_scaling the yield tier of this lock was 9 %
+	// of every worker's time (sample: vgc_central_get_span -> swtch_pri).
+	if unsafe { voidptr(central.partial) } == unsafe { nil } {
+		return vgc_central_get_fresh(span_class)
+	}
 	C.vgc_mutex_lock(&central.lock)
 
 	// Try partial list first (spans with free objects)
@@ -3614,7 +3623,12 @@ fn vgc_central_get_span(span_class int) &VGC_Span {
 	}
 
 	C.vgc_mutex_unlock(&central.lock)
+	return vgc_central_get_fresh(span_class)
+}
 
+// A fresh span for the class: from the pool or a new carve (vgc_span_alloc),
+// initialised; no central list is involved.
+fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	// No spans available - allocate a new one
 	class_idx := u8(span_class / 2)
 	noscan := (span_class % 2) == 1
@@ -4432,39 +4446,39 @@ fn vgc_free(ptr voidptr) {
 		}
 		return
 	}
-	central := unsafe { &vgc_heap.central[span_class] }
-	C.vgc_mutex_lock(&central.lock)
-	if C.vgc_bitmap_get(span.alloc_bits, obj_idx) != 0 {
-		// Atomic clear (AND ~mask) + atomic count: pairs with the lock-free
-		// atomic OR in vgc_span_alloc_obj so a free racing a concurrent
-		// mcache allocation of a sibling slot in the same byte cannot lose
-		// either update. (central.lock still serializes free-vs-free for
-		// double-free idempotency and guards the central-list reads.)
-		$if vgc_birthcheck ? {
-			vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)
+	// cx-home/v#16 (fable-v16): a span on a central list is freed with the same
+	// atomics as a cache-resident one, without the class lock. The lock
+	// protected nothing these atomics do not: the claim side is a lock-free
+	// atomic OR (vgc_span_alloc_obj, which pairs itself with this AND), the
+	// count is atomic, free_index is a hint, and the list fields a pop or the
+	// sweep's relink touch (next/prev/on_central) are not read here. The
+	// double-free guard is the AND's old value. Every Perceus free of an
+	// object outliving its span's cache residency took this lock; at T16 it
+	// was part of the 9 % yield tier on central[].lock.
+	// Atomic clear (AND ~mask) + atomic count: pairs with the lock-free
+	// atomic OR in vgc_span_alloc_obj so a free racing a concurrent
+	// mcache allocation of a sibling slot in the same byte cannot lose
+	// either update. (central.lock still serializes free-vs-free for
+	// double-free idempotency and guards the central-list reads.)
+	$if vgc_birthcheck ? {
+		vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)
+	}
+	old := C.vgc_atomic_fetch_and_u8(byte_ptr, ~mask)
+	if (old & mask) != 0 {
+		C.vgc_atomic_sub_u32(&u32(voidptr(&span.alloc_count)), 1)
+		unsafe {
+			if obj_idx < span.free_index {
+				span.free_index = obj_idx
+			}
 		}
-		old := C.vgc_atomic_fetch_and_u8(byte_ptr, ~mask)
-		if (old & mask) != 0 {
-			C.vgc_atomic_sub_u32(&u32(voidptr(&span.alloc_count)), 1)
-			unsafe {
-				if obj_idx < span.free_index {
-					span.free_index = obj_idx
-				}
-			}
-			vgc_acct_free(u64(span.elem_size))
-			$if vgc_freering ? {
-				vgc_freering_record(span.base + usize(obj_idx) * usize(span.elem_size),
-					usize(C.vgc_ra0()), usize(C.vgc_ra1()), usize(C.vgc_ra2()))
-			}
+		vgc_acct_free(u64(span.elem_size))
+		$if vgc_freering ? {
+			vgc_freering_record(span.base + usize(obj_idx) * usize(span.elem_size),
+				usize(C.vgc_ra0()), usize(C.vgc_ra1()), usize(C.vgc_ra2()))
 		}
 	}
-	C.vgc_mutex_unlock(&central.lock)
 }
 
-// DIAGNOSTIC: report allocation state of an address. Returns a packed status:
-// 0 = no span (not a vgc heap ptr); else bit0=alloc_bit_set, bit1=span.in_use,
-// and the high bits carry alloc_count (for the residual live-object-sweep probe).
-@[markused]
 fn vgc_is_allocated(ptr voidptr) u64 {
 	if ptr == unsafe { nil } {
 		return 0
