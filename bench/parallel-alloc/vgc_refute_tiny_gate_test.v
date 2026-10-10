@@ -53,6 +53,8 @@ fn test_a_tiny_stream_is_gated() {
 	if os.getenv('VGC_REFUTE_CHILD') != '' {
 		return // the child runs only the stream below
 	}
+	// cx-home/v#29: the gate's presence, not its rate bound (see vgc_grow_gate_test.v)
+	vgc_grow_gate_rate_pct = 100
 	ratio := tiny_stream_ratio()
 	println('vgc_refute_tiny_gate: tiny carved_over_live=${ratio:.3f} bound=${carved_over_live_bound}')
 	assert ratio <= carved_over_live_bound, 'a tiny stream carved ${ratio:.3f}x its live set (bound ${carved_over_live_bound})'
@@ -88,7 +90,9 @@ fn test_a_malformed_gate_setting_keeps_the_default() {
 		return
 	}
 	for bad in ['abc', '0x1e', '', '30x'] {
-		r := os.execute('VGC_REFUTE_CHILD=1 VGC_GROW_GATE_PCT="${bad}" ${os.quoted_path(os.executable())}')
+		// VGC_GROW_GATE_RATE_PCT=100: the malformed gate setting is under test, not
+		// the rate bound, which a contended box trips (cx-home/v#29)
+		r := os.execute('VGC_REFUTE_CHILD=1 VGC_GROW_GATE_RATE_PCT=100 VGC_GROW_GATE_PCT="${bad}" ${os.quoted_path(os.executable())}')
 		line := r.output.split_into_lines().filter(it.starts_with('CHILD-RATIO='))
 		assert line.len == 1, 'the child printed no ratio for VGC_GROW_GATE_PCT="${bad}": ${r.output}'
 		ratio := line[0].all_after('CHILD-RATIO=').all_before(' ').f64()

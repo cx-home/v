@@ -45,6 +45,14 @@ const churn_rounds = 4 // transients streamed: churn_rounds × L
 const carved_over_live_bound = 1.75
 
 fn test_the_heap_collects_before_it_carves_an_arena_near_its_goal() {
+	// cx-home/v#29: this test is about the gate's presence, not its rate bound.
+	// The rate bound (fbe27f1d64, cx-private#1916) spends credit on a gate
+	// collection only while the last pause x vgc_overhead_grow_div fits the
+	// interval. A box with more runnable threads than CPUs inflates the
+	// collector's wall-clock pause (4.5 -> 65-70 ms on the FreeBSD 4-vCPU VM
+	// under 8 CPU hogs), the gate stands down and the stream carves: 1.952x.
+	// Lift the bound for this stream so the ratio does not depend on the box.
+	vgc_grow_gate_rate_pct = 100
 	mut live := [][]u8{cap: live_bytes / chunk}
 	for _ in 0 .. live_bytes / chunk {
 		live << []u8{len: chunk, init: 7}
