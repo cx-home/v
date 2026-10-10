@@ -6,7 +6,8 @@ module strconv
 //
 // This file contains utilities for converting a string to a f64 variable.
 // IEEE 754 standard is used.
-// Know limitation: limited to 18 significant digits
+// atof64 is correctly rounded (atof_correct.c.v); `parser` + `converter` (limited to
+// 18 significant digits, not correctly rounded) are kept for their own tests.
 //
 // The code is inspired by:
 // Grzegorz Kraszewski krashan@teleinfo.pb.edu.pl
@@ -435,40 +436,23 @@ pub:
 	allow_extra_chars bool // allow extra characters after number
 }
 
-// atof64 parses the string `s`, and if possible, converts it into a f64 number
+// atof64 parses the string `s`, and if possible, converts it into a f64 number:
+// the f64 nearest to the decimal, ties to even (IEEE 754), as C's strtod and
+// Python's float() answer (cx-home/v#25: the 96-bit `converter` below was 1 ulp off
+// on 1e23 and on halfway literals, and answered 0 for the smallest normals and the
+// subnormals). The accepted grammar is `parser`'s.
 pub fn atof64(s string, param AtoF64Param) !f64 {
 	if s.len == 0 {
 		return error('expected a number found an empty string')
 	}
-	mut res := Float64u{}
-	res_parsing, mut pn := parser(s)
-	match res_parsing {
-		.ok {
-			res.u = converter(mut pn)
-		}
-		.pzero {
-			res.u = double_plus_zero
-		}
-		.mzero {
-			res.u = double_minus_zero
-		}
-		.pinf {
-			res.u = double_plus_infinity
-		}
-		.minf {
-			res.u = double_minus_infinity
-		}
-		.extra_char {
-			if param.allow_extra_chars {
-				res.u = converter(mut pn)
-			} else {
-				return error('extra char after number')
-			}
-		}
-		.invalid_number {
-			return error('not a number')
-		}
+	sc := scan_float(s)
+	if sc.end == 0 {
+		return error('not a number')
 	}
-
+	if sc.end != s.len && !param.allow_extra_chars {
+		return error('extra char after number')
+	}
+	mut res := Float64u{}
+	res.u = atof64_bits(s, sc)
 	return unsafe { res.f }
 }
