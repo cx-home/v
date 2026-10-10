@@ -58,9 +58,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # msvc is not in the matrix: vgc does not compile under msvc (GNU inline
-        # asm, __builtin_frame_address; an msvc build defaults to no GC) — its own item
-        cc: [gcc]
+        # msvc: cx-home/v#22 (vgc compiles under msvc since ac7bc78201; its
+        # atomics arm answers the GCC arm's values since the v#22 atomics fix)
+        cc: [gcc, msvc]
     runs-on: windows-2025
     timeout-minutes: 40
     steps:
@@ -70,9 +70,9 @@ jobs:
         run: |
           .\makev.bat -${{ matrix.cc }}
           .\v.exe version
-      - name: vgc_os_suspend_port_test, vgc_global_root_test
+      - name: vgc_os_suspend_port_test, vgc_global_root_test, vgc_atomics_semantics_test
         shell: pwsh
-        run: .\v.exe -cc ${{ matrix.cc }} -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v bench/parallel-alloc/vgc_global_root_test.v
+        run: .\v.exe -cc ${{ matrix.cc }} -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v bench/parallel-alloc/vgc_global_root_test.v bench/parallel-alloc/vgc_atomics_semantics_test.v
       - name: concurrent_mt_sound T=8 and T=16 (default collector)
         shell: pwsh
         timeout-minutes: 10

@@ -358,7 +358,15 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_fetch_and_u8(ptr, val) vgc__tcc_fetch_and_u8((volatile uint8_t*)(ptr), (uint8_t)(val))
   #define vgc_atomic_load_u16(ptr) (*(volatile uint16_t*)(ptr))
   #define vgc_atomic_store_u16(ptr, val) do { *(volatile uint16_t*)(ptr) = (val); vgc__tcc_fence(); } while(0)
-  #define vgc_atomic_cas_u32(ptr, expected, desired) vgc__tcc_cas_u32((volatile uint32_t*)(ptr), *(expected), (uint32_t)(desired))
+  // a failed CAS writes the observed word into *expected, as the GCC arm does (cx-home/v#22)
+  static inline int vgc__tcc_cas_u32_wb(volatile uint32_t* p, uint32_t* expected, uint32_t desired) {
+      uint32_t prev;
+      __asm__ __volatile__("lock; cmpxchgl %2, %1" : "=a"(prev), "+m"(*p) : "r"(desired), "0"(*expected) : "memory");
+      if (prev == *expected) return 1;
+      *expected = prev;
+      return 0;
+  }
+  #define vgc_atomic_cas_u32(ptr, expected, desired) vgc__tcc_cas_u32_wb((volatile uint32_t*)(ptr), (uint32_t*)(expected), (uint32_t)(desired))
   #define vgc_atomic_exchange_u32(ptr, val) vgc__tcc_xchg_u32((volatile uint32_t*)(ptr), (uint32_t)(val))
   #define vgc_atomic_fence() vgc__tcc_fence()
 #elif defined(__TINYC__)
@@ -375,33 +383,82 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_fetch_and_u8(ptr, val) __sync_fetch_and_and((volatile uint8_t*)(ptr), (uint8_t)(val))
   #define vgc_atomic_load_u16(ptr) (*(volatile uint16_t*)(ptr))
   #define vgc_atomic_store_u16(ptr, val) do { *(volatile uint16_t*)(ptr) = (val); __sync_synchronize(); } while(0)
-  #define vgc_atomic_cas_u32(ptr, expected, desired) __sync_bool_compare_and_swap((volatile uint32_t*)(ptr), *(expected), (desired))
+  static inline int vgc__sync_cas_u32_wb(volatile uint32_t* p, uint32_t* expected, uint32_t desired) {
+      uint32_t want = *expected;
+      uint32_t prev = __sync_val_compare_and_swap(p, want, desired);
+      if (prev == want) return 1;
+      *expected = prev; // as the GCC arm does (cx-home/v#22)
+      return 0;
+  }
+  #define vgc_atomic_cas_u32(ptr, expected, desired) vgc__sync_cas_u32_wb((volatile uint32_t*)(ptr), (uint32_t*)(expected), (uint32_t)(desired))
   #define vgc_atomic_exchange_u32(ptr, val) __sync_lock_test_and_set((volatile uint32_t*)(ptr), (val))
   #define vgc_atomic_fence() __sync_synchronize()
 #elif defined(_MSC_VER)
+  // cx-home/v#22: the msvc arm answers EXACTLY what the GCC/Clang arm below
+  // answers — add/sub return the NEW value (__atomic_add_fetch), a failed CAS
+  // writes the observed word back into *expected (__atomic_compare_exchange_n),
+  // and the fence is a HARDWARE full barrier (seq_cst), not a compiler barrier.
+  // The arm used to return the OLD value from _InterlockedExchangeAdd: the
+  // parallel-mark pool's `slot := add(&vgc_mark_pool_next, 1)` (1-based, the
+  // collector is 0) then gave the first pool thread slot 0 — two markers on the
+  // collector's mark stack, lost marks, live objects swept (mt_sound T=8 access
+  // violation in string__eq under msvc; T=2 never spawns the pool). And
+  // _ReadWriteBarrier alone kept x64's store->load reordering open across the
+  // stop-the-world handshake, which the GCC arm's mfence closes.
   #include <intrin.h>
-  #pragma intrinsic(_InterlockedCompareExchange, _InterlockedExchange, _InterlockedExchangeAdd64)
-  static inline uint32_t vgc_atomic_load_u32_fn(volatile uint32_t* p) { uint32_t v = *p; _ReadBarrier(); return v; }
-  static inline void vgc_atomic_store_u32_fn(volatile uint32_t* p, uint32_t v) { _WriteBarrier(); *p = v; }
-  static inline uint64_t vgc_atomic_load_u64_fn(volatile uint64_t* p) { uint64_t v = *p; _ReadBarrier(); return v; }
-  static inline void vgc_atomic_store_u64_fn(volatile uint64_t* p, uint64_t v) { _WriteBarrier(); *p = v; }
+  #pragma intrinsic(_InterlockedCompareExchange, _InterlockedExchange, _InterlockedExchangeAdd, _InterlockedExchangeAdd64, _InterlockedOr8, _InterlockedAnd8)
+  #if defined(_M_ARM64) || defined(_M_ARM)
+    // weakly ordered: a plain load/store plus a dmb gives acquire/release
+    #define VGC__MSVC_ACQ() __dmb(_ARM64_BARRIER_ISH)
+    #define VGC__MSVC_REL() __dmb(_ARM64_BARRIER_ISH)
+    #define VGC__MSVC_FULL() __dmb(_ARM64_BARRIER_ISH)
+  #else
+    // x86/x64 (TSO): loads are acquire and stores release in hardware; only the
+    // compiler must not move them. The full fence is mfence (store->load).
+    #define VGC__MSVC_ACQ() _ReadWriteBarrier()
+    #define VGC__MSVC_REL() _ReadWriteBarrier()
+    #define VGC__MSVC_FULL() _mm_mfence()
+  #endif
+  static inline uint32_t vgc_atomic_load_u32_fn(volatile uint32_t* p) { uint32_t v = *p; VGC__MSVC_ACQ(); return v; }
+  static inline void vgc_atomic_store_u32_fn(volatile uint32_t* p, uint32_t v) { VGC__MSVC_REL(); *p = v; }
+  static inline uint64_t vgc_atomic_load_u64_fn(volatile uint64_t* p) { uint64_t v = *p; VGC__MSVC_ACQ(); return v; }
+  static inline void vgc_atomic_store_u64_fn(volatile uint64_t* p, uint64_t v) { VGC__MSVC_REL(); *p = v; }
+  static inline uint16_t vgc_atomic_load_u16_fn(volatile uint16_t* p) { uint16_t v = *p; VGC__MSVC_ACQ(); return v; }
+  static inline void vgc_atomic_store_u16_fn(volatile uint16_t* p, uint16_t v) { VGC__MSVC_REL(); *p = v; }
+  static inline uint64_t vgc_atomic_add_u64_fn(volatile uint64_t* p, uint64_t v) {
+      return (uint64_t)_InterlockedExchangeAdd64((volatile __int64*)p, (__int64)v) + v;
+  }
+  static inline uint64_t vgc_atomic_sub_u64_fn(volatile uint64_t* p, uint64_t v) {
+      return (uint64_t)_InterlockedExchangeAdd64((volatile __int64*)p, -(__int64)v) - v;
+  }
+  static inline uint32_t vgc_atomic_add_u32_fn(volatile uint32_t* p, uint32_t v) {
+      return (uint32_t)_InterlockedExchangeAdd((volatile long*)p, (long)v) + v;
+  }
+  static inline uint32_t vgc_atomic_sub_u32_fn(volatile uint32_t* p, uint32_t v) {
+      return (uint32_t)_InterlockedExchangeAdd((volatile long*)p, -(long)v) - v;
+  }
+  static inline int vgc_atomic_cas_u32_fn(volatile uint32_t* p, uint32_t* expected, uint32_t desired) {
+      long want = (long)*expected;
+      long prev = _InterlockedCompareExchange((volatile long*)p, (long)desired, want);
+      if (prev == want) return 1;
+      *expected = (uint32_t)prev;
+      return 0;
+  }
   #define vgc_atomic_load_u32(ptr) vgc_atomic_load_u32_fn((volatile uint32_t*)(ptr))
-  #define vgc_atomic_store_u32(ptr, val) vgc_atomic_store_u32_fn((volatile uint32_t*)(ptr), (val))
+  #define vgc_atomic_store_u32(ptr, val) vgc_atomic_store_u32_fn((volatile uint32_t*)(ptr), (uint32_t)(val))
   #define vgc_atomic_load_u64(ptr) vgc_atomic_load_u64_fn((volatile uint64_t*)(ptr))
-  #define vgc_atomic_store_u64(ptr, val) vgc_atomic_store_u64_fn((volatile uint64_t*)(ptr), (val))
-  #define vgc_atomic_add_u64(ptr, val) _InterlockedExchangeAdd64((volatile int64_t*)(ptr), (int64_t)(val))
-  #define vgc_atomic_sub_u64(ptr, val) _InterlockedExchangeAdd64((volatile int64_t*)(ptr), -(int64_t)(val))
-  #define vgc_atomic_add_u32(ptr, val) _InterlockedExchangeAdd((volatile long*)(ptr), (long)(val))
-  #define vgc_atomic_sub_u32(ptr, val) _InterlockedExchangeAdd((volatile long*)(ptr), -(long)(val))
+  #define vgc_atomic_store_u64(ptr, val) vgc_atomic_store_u64_fn((volatile uint64_t*)(ptr), (uint64_t)(val))
+  #define vgc_atomic_add_u64(ptr, val) vgc_atomic_add_u64_fn((volatile uint64_t*)(ptr), (uint64_t)(val))
+  #define vgc_atomic_sub_u64(ptr, val) vgc_atomic_sub_u64_fn((volatile uint64_t*)(ptr), (uint64_t)(val))
+  #define vgc_atomic_add_u32(ptr, val) vgc_atomic_add_u32_fn((volatile uint32_t*)(ptr), (uint32_t)(val))
+  #define vgc_atomic_sub_u32(ptr, val) vgc_atomic_sub_u32_fn((volatile uint32_t*)(ptr), (uint32_t)(val))
   #define vgc_atomic_fetch_or_u8(ptr, val) ((uint8_t)_InterlockedOr8((volatile char*)(ptr), (char)(val)))
   #define vgc_atomic_fetch_and_u8(ptr, val) ((uint8_t)_InterlockedAnd8((volatile char*)(ptr), (char)(val)))
-  static inline uint16_t vgc_atomic_load_u16_fn(volatile uint16_t* p) { uint16_t v = *p; _ReadBarrier(); return v; }
-  static inline void vgc_atomic_store_u16_fn(volatile uint16_t* p, uint16_t v) { _WriteBarrier(); *p = v; }
   #define vgc_atomic_load_u16(ptr) vgc_atomic_load_u16_fn((volatile uint16_t*)(ptr))
   #define vgc_atomic_store_u16(ptr, val) vgc_atomic_store_u16_fn((volatile uint16_t*)(ptr), (uint16_t)(val))
-  #define vgc_atomic_cas_u32(ptr, expected, desired) (_InterlockedCompareExchange((volatile long*)(ptr), (long)(desired), (long)*(expected)) == (long)*(expected))
+  #define vgc_atomic_cas_u32(ptr, expected, desired) vgc_atomic_cas_u32_fn((volatile uint32_t*)(ptr), (uint32_t*)(expected), (uint32_t)(desired))
   #define vgc_atomic_exchange_u32(ptr, val) (uint32_t)_InterlockedExchange((volatile long*)(ptr), (long)(val))
-  #define vgc_atomic_fence() _ReadWriteBarrier()
+  #define vgc_atomic_fence() VGC__MSVC_FULL()
 #else
   // GCC/Clang
   #define vgc_atomic_load_u32(ptr) __atomic_load_n((volatile uint32_t*)(ptr), __ATOMIC_ACQUIRE)
