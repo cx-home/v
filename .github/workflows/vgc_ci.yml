@@ -53,7 +53,8 @@ jobs:
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's
   # drivers spawn children through `ENV=v cmd`, which cmd.exe does not read,
-  # so this job runs the port test and the soundness driver directly.
+  # so this job runs the port test and the soundness driver directly. -gc e
+  # is explicit: an msvc build defaults to no GC.
   vgc-windows:
     strategy:
       fail-fast: false
@@ -70,12 +71,12 @@ jobs:
           .\v.exe version
       - name: vgc_os_suspend_port_test
         shell: pwsh
-        run: .\v.exe -cc ${{ matrix.cc }} test bench/parallel-alloc/vgc_os_suspend_port_test.v
+        run: .\v.exe -cc ${{ matrix.cc }} -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v
       - name: concurrent_mt_sound T=8 and T=16 (default collector)
         shell: pwsh
         timeout-minutes: 10
         run: |
-          .\v.exe -cc ${{ matrix.cc }} -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
+          .\v.exe -cc ${{ matrix.cc }} -gc e -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
           foreach ($t in 8, 16) {
             $env:T = "$t"; $env:STEPS = '20000'
             $sw = [Diagnostics.Stopwatch]::StartNew()

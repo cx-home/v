@@ -26,13 +26,16 @@ fn port_of_a_new_thread() u32 {
 }
 
 fn test_every_registered_thread_has_an_os_suspend_handle() {
-	$if macos || linux || freebsd || windows {
-		main_port := C.vgc_thread_self_port()
-		a := port_of_a_new_thread()
-		b := port_of_a_new_thread()
-		println('vgc_os_suspend_port: main=${main_port} threads=${a},${b}')
-		assert main_port != 0, 'the main thread has no OS suspend handle: the STW cannot stop it'
-		assert a != 0 && b != 0, 'a spawned thread has no OS suspend handle: the STW cannot stop it'
-		assert a != main_port && b != main_port
+	// msvc builds default to no GC (vlib/v/pref/default.v): only a vgc build has the handle
+	$if vgc ? {
+		$if macos || linux || freebsd || windows {
+			main_port := C.vgc_thread_self_port()
+			a := port_of_a_new_thread()
+			b := port_of_a_new_thread()
+			println('vgc_os_suspend_port: main=${main_port} threads=${a},${b}')
+			assert main_port != 0, 'the main thread has no OS suspend handle: the STW cannot stop it'
+			assert a != 0 && b != 0, 'a spawned thread has no OS suspend handle: the STW cannot stop it'
+			assert a != main_port && b != main_port
+		}
 	}
 }
