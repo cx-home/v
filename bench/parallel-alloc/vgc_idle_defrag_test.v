@@ -53,14 +53,21 @@ fn batch(size int) int {
 	return keep.len
 }
 
+// fill and each batch run on a thread of their own, joined before the
+// collections: a conservative scan of the test thread could otherwise keep a
+// dropped `keep` array alive through a stale callee-saved register or stack
+// slot. On FreeBSD x86_64 (CI vgc, cx-home/v#24) the 32 MB fill stayed marked
+// across both collections below, so its spans were pooled three cycles late,
+// were not yet idle when the batches came, and every batch carved (8,314,880
+// bytes, the no-rule figure). A joined thread's registers and stack are gone.
 fn test_growing_classes_split_the_idle_pool_instead_of_carving() {
-	n := fill()
+	n := (spawn fill()).wait()
 	gc_collect()
 	gc_collect()
 	carved0 := gc_memory_use()
 	mut total := 0
 	for size in classes {
-		total += batch(size)
+		total += (spawn batch(size)).wait()
 		gc_collect()
 	}
 	carved1 := gc_memory_use()
