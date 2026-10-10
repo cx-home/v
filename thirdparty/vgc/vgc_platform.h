@@ -188,8 +188,41 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
       pthread_once(&_vgc_tls_once, _vgc_tls_init);
       pthread_setspecific(_vgc_key_cache_idx, (void*)(intptr_t)(idx + 1));
   }
+#elif defined(__TINYC__) && defined(_WIN32)
+  // cx-home/v#20: tcc on Windows has no thread-local storage class, so the two
+  // per-thread words live in Win32 TLS slots (NULL = the -1 / 0 initial values).
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+  #define VGC_TLS_BY_WINKEY 1
+  static volatile LONG _vgc_tls_state = 0; // 0 = unset, 1 = allocating, 2 = ready
+  static DWORD _vgc_tls_cache_idx = 0;
+  static DWORD _vgc_tls_alloc_held = 0;
+  static inline void _vgc_tls_ready(void) {
+      if (InterlockedCompareExchange(&_vgc_tls_state, 1, 0) == 0) {
+          _vgc_tls_cache_idx = TlsAlloc();
+          _vgc_tls_alloc_held = TlsAlloc();
+          InterlockedExchange(&_vgc_tls_state, 2);
+      }
+      while (InterlockedCompareExchange(&_vgc_tls_state, 2, 2) != 2) Sleep(0);
+  }
+  static inline int vgc_get_cache_idx(void) {
+      _vgc_tls_ready();
+      return (int)(intptr_t)TlsGetValue(_vgc_tls_cache_idx) - 1;
+  }
+  static inline void vgc_set_cache_idx(int idx) {
+      _vgc_tls_ready();
+      TlsSetValue(_vgc_tls_cache_idx, (void*)(intptr_t)(idx + 1));
+  }
 #else
-  #ifdef _WIN32
+  // cx-home/v#20: only msvc reads __declspec(thread). mingw gcc and clang IGNORE
+  // the attribute (a warning V's -w hides), so _vgc_cache_idx was ONE process
+  // global: a spawned thread read the main thread's index, never registered a
+  // slot of its own and rewrote slot 0's stack range with its own SP — the
+  // root scan then walked from the main stack's top to the new thread's SP and
+  // the first collection off the main thread never finished on windows-2025.
+  #if defined(_WIN32) && defined(_MSC_VER)
     #define VGC_TLS __declspec(thread)
   #else
     #define VGC_TLS __thread
@@ -213,6 +246,14 @@ static inline int vgc_alloc_try_enter(void) {
     return 1;
 }
 static inline void vgc_alloc_exit(void) { pthread_setspecific(_vgc_key_alloc_held, 0); }
+#elif defined(VGC_TLS_BY_WINKEY)
+static inline int vgc_alloc_try_enter(void) {
+    _vgc_tls_ready();
+    if (TlsGetValue(_vgc_tls_alloc_held)) return 0;
+    TlsSetValue(_vgc_tls_alloc_held, (void*)1);
+    return 1;
+}
+static inline void vgc_alloc_exit(void) { TlsSetValue(_vgc_tls_alloc_held, 0); }
 #else
 static VGC_TLS int _vgc_alloc_held = 0;
 static inline int vgc_alloc_try_enter(void) { if (_vgc_alloc_held) return 0; _vgc_alloc_held = 1; return 1; }

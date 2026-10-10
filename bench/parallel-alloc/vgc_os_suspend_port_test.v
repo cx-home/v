@@ -17,6 +17,28 @@
 module main
 
 fn C.vgc_thread_self_port() u32
+fn C.vgc_get_cache_idx() int
+
+// cx-home/v#20: mingw gcc ignores __declspec(thread), so every thread read ONE
+// cache index — a spawned thread never took a slot of its own.
+fn cache_idx_of_a_new_thread() int {
+	t := spawn fn () int {
+		return C.vgc_get_cache_idx()
+	}()
+	return t.wait()
+}
+
+fn test_every_thread_has_its_own_vgc_slot() {
+	$if vgc ? {
+		main_idx := C.vgc_get_cache_idx()
+		a := cache_idx_of_a_new_thread()
+		b := cache_idx_of_a_new_thread()
+		println('vgc_os_suspend_port: slots main=${main_idx} threads=${a},${b}')
+		assert main_idx >= 0
+		assert a >= 0 && b >= 0
+		assert a != main_idx && b != main_idx, "a spawned thread shares the main thread's vgc slot: thread-local storage is not per-thread"
+	}
+}
 
 fn port_of_a_new_thread() u32 {
 	t := spawn fn () u32 {
