@@ -515,9 +515,22 @@ __global vgc_max_arenas_eff = int(0)
 // The spawning thread registers the arg here before pthread_create; the wrapper
 // releases it after the call. While registered, the collector shades it (and,
 // being a scan object, its referents) every STW cycle.
-const vgc_max_spawn_roots = 1024
+//
+// The root is held for the whole call (the wrapper releases it after the spawned
+// fn RETURNS: the child's stack is not scanned until its first allocation, so the
+// arg must stay a root while the call can still read it), so the table holds one
+// entry per LIVE spawned thread. It was a fixed [1024] array, and the 1025th live
+// thread's spawn spun forever in vgc_spawn_root_add waiting for a slot no thread
+// would free (cx-core-code#116: a chain of 2,000 parked cx workers hung with ~9
+// cores busy). It now grows: a full table is copied into one twice its size
+// (vgc_os_alloc, outside the data segment like vgc_pins), the new block is
+// published BEFORE the count moves past the old capacity, and the old block is
+// never freed — a collector that read the old pointer under STW still reads
+// valid memory (the blocks sum to under twice the largest, 8 bytes per thread).
+const vgc_spawn_roots_initial = 1024
 
-__global vgc_spawn_roots = [1024]voidptr{}
+__global vgc_spawn_roots = &voidptr(unsafe { nil })
+__global vgc_spawn_roots_cap = int(0)
 __global vgc_nspawn_roots = int(0)
 __global vgc_spawn_root_lock = u32(0)
 
@@ -1767,21 +1780,36 @@ fn vgc_spawn_root_add(p voidptr) {
 	if p == unsafe { nil } {
 		return
 	}
-	for {
-		C.vgc_mutex_lock(&vgc_spawn_root_lock)
-		if vgc_nspawn_roots < vgc_max_spawn_roots {
-			unsafe {
-				vgc_spawn_roots[vgc_nspawn_roots] = p
-			}
-			vgc_nspawn_roots++
-			C.vgc_mutex_unlock(&vgc_spawn_root_lock)
-			return
+	C.vgc_mutex_lock(&vgc_spawn_root_lock)
+	if vgc_nspawn_roots >= vgc_spawn_roots_cap {
+		ncap := if vgc_spawn_roots_cap == 0 {
+			vgc_spawn_roots_initial
+		} else {
+			vgc_spawn_roots_cap * 2
 		}
-		C.vgc_mutex_unlock(&vgc_spawn_root_lock)
-		// Full: a wrapper will release a slot shortly. Spin (rare; bounded by
-		// in-flight spawns, themselves bounded by live threads).
+		mut grown := &voidptr(C.vgc_os_alloc(usize(sizeof(voidptr)) * usize(ncap)))
+		if grown == unsafe { nil } {
+			C.vgc_mutex_unlock(&vgc_spawn_root_lock)
+			panic('vgc: cannot grow the spawn-root table to ${ncap} entries')
+		}
+		for i in 0 .. vgc_nspawn_roots {
+			unsafe {
+				grown[i] = vgc_spawn_roots[i]
+			}
+		}
+		// the copy is complete before the table is published
 		C.vgc_atomic_fence()
+		vgc_spawn_roots = grown
+		vgc_spawn_roots_cap = ncap
 	}
+	unsafe {
+		vgc_spawn_roots[vgc_nspawn_roots] = p
+	}
+	// the slot is written before the count covers it (the collector reads
+	// [0, nspawn_roots) under STW)
+	C.vgc_atomic_fence()
+	vgc_nspawn_roots++
+	C.vgc_mutex_unlock(&vgc_spawn_root_lock)
 }
 
 // vgc_spawn_root_remove drops a registered thread-argument root. Called by the
@@ -1795,12 +1823,18 @@ fn vgc_spawn_root_remove(p voidptr) {
 	}
 	C.vgc_mutex_lock(&vgc_spawn_root_lock)
 	for i in 0 .. vgc_nspawn_roots {
-		if vgc_spawn_roots[i] == p {
-			// swap-remove with the last entry
-			vgc_nspawn_roots--
+		if unsafe { vgc_spawn_roots[i] } == p {
+			// swap-remove with the last entry: the moved root is written to its
+			// new slot BEFORE the count shrinks, so a collector reading under STW
+			// never misses it (vgc_pins' discipline)
+			last := vgc_nspawn_roots - 1
 			unsafe {
-				vgc_spawn_roots[i] = vgc_spawn_roots[vgc_nspawn_roots]
-				vgc_spawn_roots[vgc_nspawn_roots] = nil
+				vgc_spawn_roots[i] = vgc_spawn_roots[last]
+			}
+			C.vgc_atomic_fence()
+			vgc_nspawn_roots = last
+			unsafe {
+				vgc_spawn_roots[last] = nil
 			}
 			break
 		}
