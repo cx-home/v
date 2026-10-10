@@ -18,7 +18,7 @@ module builtin
 // suspend loop exempted, even if a thread flips safe mid-cycle (it then spins
 // in its exit handshake; its recorded roots stay valid — see
 // vgc_safe_exit_handshake in vgc_platform.h).
-__global vgc_safe_cov = [64]bool{}
+__global vgc_safe_cov = [vgc_max_threads]bool{}
 
 // cx #316 observability: mach suspensions actually ACKed across all STW cycles
 // (collector-exclusive increments). The safe-region selftest asserts this does
@@ -84,7 +84,12 @@ fn vgc_gc_start() {
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return
 	}
+	// cx-home/v#17: the collector's own carves never wait for its collection
+	vgc_gc_owner = C.vgc_get_cache_idx()
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
+	// cx-home/v#16: this cycle's marker count, and the pool threads created
+	// BEFORE the world stops (see vgc_mark_workers_cfg).
+	vgc_mark_nworkers_cur = vgc_mark_plan()
 
 	// Take free_spans_lock for the WHOLE cycle, BEFORE stopping the world, so no
 	// mutator is ever frozen mid-vgc_get_free_span holding it (which, if the lock
@@ -460,8 +465,22 @@ fn vgc_gc_start() {
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_mark_term)
 
 	// Final drain of work queue
-	vgc_drain_mark_work()
+	vgc_drain_mark_work(0)
 	vgc_ph[5] = C.vgc_now_ns()
+	vgc_mark_last_ns = vgc_ph[5] - vgc_ph[4] // the next cycle's parallel-mark decision (cx-home/v#16)
+	// The single-marker-equivalent work of that mark: n markers took last_ns,
+	// so one would have taken about n x last_ns. The next cycle plans its
+	// marker count from the WORK, not the wall time a parallel cycle left —
+	// planned from the wall time, eight markers that cut a 3 ms mark to 0.6 ms
+	// dropped the next cycle back to one marker, which took 3 ms again: the
+	// count flapped 1/8 every other cycle and the pool's CPU was spent on
+	// marks that one or two markers cover (json-codec 1 MB: user +15 % for
+	// wall -5 %).
+	vgc_mark_last_work_ns = vgc_mark_last_ns * u64(if vgc_mark_nworkers_cur > 1 {
+		vgc_mark_nworkers_cur
+	} else {
+		1
+	})
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 
 	// Disable write barrier
@@ -470,6 +489,7 @@ fn vgc_gc_start() {
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
 	vgc_ph[6] = C.vgc_now_ns()
+	vgc_mark_adapt(marked) // cx-home/v#16: the next cycle's marker count
 	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
 	// Reset heap_live to match what we actually found alive. The per-thread
@@ -590,6 +610,7 @@ fn vgc_gc_start() {
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock) // release the registration gate
 
 	C.vgc_trace(12, self_idx, u64(vgc_heap.gc_cycle), 0) // GC_END
+	vgc_gc_owner = -1
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 }
 
@@ -686,7 +707,7 @@ fn vgc_rescan_dirty_spans() {
 					}
 					if (alloc_byte & (u8(1) << u32(bit))) != 0 {
 						obj_addr := span.base + usize(idx) * usize(span.elem_size)
-						vgc_scan_range(obj_addr, obj_addr + usize(span.elem_size))
+						vgc_scan_range(obj_addr, obj_addr + usize(span.elem_size), 0)
 					}
 				}
 			}
@@ -733,7 +754,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_cm_stw_exit(self_idx) // RESUME the world — mark now runs concurrently
 
 	// ===== CONCURRENT MARK (world running) =====
-	vgc_drain_mark_work() // collector-exclusive queue; mutators only dirty spans
+	vgc_drain_mark_work(0) // collector-exclusive queue; mutators only dirty spans
 
 	// ===== STW MARK-TERMINATION =====
 	vgc_cm_stw_enter(self_idx)
@@ -744,7 +765,7 @@ fn vgc_gc_start_concurrent() {
 		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
 	}
 	vgc_rescan_dirty_spans() // re-scan everything the barrier dirtied
-	vgc_drain_mark_work() // final drain of the grey set
+	vgc_drain_mark_work(0) // final drain of the grey set
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
 
 	// Compute live bytes from mark bits; rebase heap_live (same as the STW path).
@@ -828,7 +849,8 @@ fn vgc_gctrace_emit() {
 		C.vgc_gctrace_phases(u64(vgc_heap.gc_cycle), vgc_ph_us(vgc_gc_t0, vgc_ph[0]), vgc_ph_us(vgc_ph[0],
 			vgc_ph[1]), vgc_ph_us(vgc_ph[1], vgc_ph[2]), vgc_ph_us(vgc_ph[2], vgc_ph[3]), vgc_ph_us(vgc_ph[3],
 			vgc_ph[4]), vgc_ph_us(vgc_ph[4], vgc_ph[5]), vgc_ph_us(vgc_ph[5], vgc_ph[6]), vgc_ph_us(vgc_ph[6],
-			vgc_ph[7]), vgc_ph_us(vgc_ph[7], vgc_gc_last_end), seg / 1024, in_use)
+			vgc_ph[7]), vgc_ph_us(vgc_ph[7], vgc_gc_last_end), seg / 1024, in_use,
+			u64(vgc_mark_nworkers_cur))
 	}
 }
 
@@ -863,7 +885,7 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			// addresses; that is exactly why the spill is off-stack).
 			if vgc_safe_cov[i] {
 				for k in 0 .. vgc_safe_spill_words {
-					vgc_shade(unsafe { vgc_heap.caches[i].safe_regs[k] })
+					vgc_shade(unsafe { vgc_heap.caches[i].safe_regs[k] }, 0)
 				}
 				continue
 			}
@@ -877,7 +899,7 @@ fn vgc_scan_suspended_roots(self_idx int) {
 		if n > 0 && sp != 0 {
 			vgc_refresh_stack_range_for_sp(i, sp) // [sp, stack_base]
 			for k in 0 .. n {
-				vgc_shade(regs[k]) // register-resident roots
+				vgc_shade(regs[k], 0) // register-resident roots
 			}
 			// DIAGNOSTIC (root-scan-miss localizer): is the watched object held
 			// only in this suspended thread's registers (e.g. main spin-waiting
@@ -1080,7 +1102,7 @@ fn vgc_mark_roots() {
 			continue
 		}
 		if cache.stack_lo > 0 && cache.stack_hi > 0 && cache.stack_hi > cache.stack_lo {
-			vgc_scan_range(cache.stack_lo, cache.stack_hi)
+			vgc_scan_range(cache.stack_lo, cache.stack_hi, 0)
 			// DIAGNOSTIC (root-scan-miss localizer): does THIS thread's stack hold
 			// a pointer to the watched object? Bounded to the stack ranges only.
 			if vgc_watch_addr != 0 {
@@ -1098,7 +1120,7 @@ fn vgc_mark_roots() {
 	// publish-before-shrink keeps every live pin visible (see vgc_pin/vgc_unpin).
 	np := vgc_npins
 	for k in 0 .. np {
-		vgc_shade(usize(unsafe { vgc_pins[k] }))
+		vgc_shade(usize(unsafe { vgc_pins[k] }), 0)
 	}
 }
 
@@ -1142,7 +1164,7 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 			}
 		}
 		if ex_lo > cur {
-			vgc_scan_range(cur, if ex_lo < hi { ex_lo } else { hi })
+			vgc_scan_range(cur, if ex_lo < hi { ex_lo } else { hi }, 0)
 		}
 		if ex_hi <= cur {
 			break
@@ -1154,14 +1176,16 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 // Scan a memory range conservatively, looking for pointers into the GC heap.
 // Each word-aligned value that looks like a heap pointer is treated as a root.
 // Translated from Go's scanblock() with conservative pointer finding.
-fn vgc_scan_range(lo usize, hi usize) {
+// `w` is the marker's slot (0 = the collector; cx-home/v#16): the work buffer
+// a newly greyed object is pushed to.
+fn vgc_scan_range(lo usize, hi usize, w int) {
 	// Align to word boundaries
 	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 	mut addr := start
 	for addr + sizeof(usize) <= hi {
 		val := unsafe { *(&usize(voidptr(addr))) }
 		if val != 0 {
-			vgc_shade(val)
+			vgc_shade(val, w)
 		}
 		addr += sizeof(usize)
 	}
@@ -1169,7 +1193,7 @@ fn vgc_scan_range(lo usize, hi usize) {
 
 // Shade marks an object grey (discovered but not yet scanned).
 // Translated from Go's shade() in mgcmark.go.
-fn vgc_shade(addr usize) {
+fn vgc_shade(addr usize, w int) {
 	if addr < vgc_arena_lo || addr >= vgc_arena_hi {
 		return
 	}
@@ -1193,13 +1217,19 @@ fn vgc_shade(addr usize) {
 	if span.alloc_bits == unsafe { nil } || C.vgc_bitmap_get(span.alloc_bits, obj_idx) == 0 {
 		return
 	}
-	// Mark it (grey -> will be scanned)
+	// Mark it (grey -> will be scanned). More than one marker this cycle: the
+	// bit is set atomically (cx-home/v#16).
 	if span.mark_bits != unsafe { nil } {
-		if C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx) == 0 {
+		was := if vgc_mark_nworkers_cur > 1 {
+			C.vgc_bitmap_test_and_set_atomic(span.mark_bits, obj_idx)
+		} else {
+			C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
+		}
+		if was == 0 {
 			// Newly marked - add to work queue for scanning (only if it may contain pointers)
 			if !span.noscan {
 				obj_addr := span.base + usize(obj_idx) * usize(span.elem_size)
-				vgc_work_put(obj_addr)
+				vgc_work_put(obj_addr, w)
 			}
 		}
 	}
@@ -1233,73 +1263,202 @@ fn vgc_shade_spawn_root(addr usize) {
 		C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
 	}
 	obj_base := span.base + usize(obj_idx) * usize(span.elem_size)
-	vgc_scan_range(obj_base, obj_base + usize(span.elem_size))
+	vgc_scan_range(obj_base, obj_base + usize(span.elem_size), 0)
 }
 
 // Parallel mark using OS threads.
 // Translated from Go's gcDrain() with multiple workers.
-fn vgc_parallel_mark() {
-	// Single-threaded mark for the minimal STW collector: spawning mark-worker
-	// threads during a collection would have them hit the registration barrier
-	// (gc_phase != off) and deadlock, and the work-queue lock-stealing under STW
-	// assumes a single marker. Collection is rare (Perceus front line front-loads
-	// frees), so single-threaded mark is acceptable; parallel mark is a later
-	// optimization that must reintroduce a GC-worker exemption from the barrier.
-	mut nworkers := 1
-	vgc_heap.gc_nworkers = nworkers
-	C.vgc_atomic_store_u32(&vgc_heap.gc_workers_done, 0)
+// The markers of this cycle (cx-home/v#16): one, or the pool plus the
+// collector. Decided and the pool created BEFORE the world stops.
+fn vgc_mark_plan() int {
+	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_work_ns < vgc_mark_par_min_ns || vgc_mark_forked {
+		return 1
+	}
+	mut total := vgc_mark_workers_cfg
+	// One marker per vgc_mark_par_min_ns of the previous mark's work: a 3 ms
+	// mark gets three markers, a 10 ms one the configured count. The whole
+	// pool on a small mark is CPU for nothing — each marker's time is the
+	// mark's wall time, mostly idle-spinning on an emptied grey set.
+	// VGC_MARK_PAR_MIN_US=0 forces the configured count (and is no divisor:
+	// x86 traps on it, arm64 reads 0 and would never engage the pool).
+	by_work := if vgc_mark_par_min_ns == 0 {
+		total
+	} else {
+		int(vgc_mark_last_work_ns / vgc_mark_par_min_ns)
+	}
+	if by_work < total {
+		total = by_work
+	}
+	if vgc_mark_n_target > 0 && vgc_mark_n_target < total {
+		total = vgc_mark_n_target
+	}
+	if total <= 1 {
+		return 1
+	}
+	want := total - 1
+	// a thread created now has seen every generation up to the current one;
+	// this cycle's advance (vgc_parallel_mark) is the first it drains
+	C.vgc_atomic_store_u32(&vgc_mark_spawn_gen, C.vgc_atomic_load_u32(&vgc_mark_go))
+	for vgc_mark_pool_n < want {
+		if C.vgc_start_thread_rc(vgc_mark_worker_main) != 0 {
+			break
+		}
+		vgc_mark_pool_n++
+	}
+	if vgc_mark_pool_n + 1 < total {
+		return vgc_mark_pool_n + 1
+	}
+	return total
+}
 
-	if nworkers <= 1 {
-		vgc_drain_mark_work()
+// After the count: did this cycle's markers pay off? The cost per marked KB
+// with one marker is remembered (a running mean); a parallel cycle no cheaper
+// than nine tenths of it — a loaded box where the markers get no cores, or one
+// preempted marker holding the cycle's tail — halves the marker count for the
+// next 32 parallel cycles, then the configured count is tried again.
+fn vgc_mark_adapt(marked u64) {
+	kb := marked / 1024 + 1
+	rate := vgc_mark_last_ns / kb
+	if vgc_mark_nworkers_cur <= 1 {
+		vgc_mark_rate1 = if vgc_mark_rate1 == 0 { rate } else { (vgc_mark_rate1 * 7 + rate) / 8 }
 		return
 	}
-
-	// Start helper workers and let the current GC thread participate as well.
-	for _ in 1 .. nworkers {
-		C.vgc_start_thread(vgc_mark_worker)
+	if vgc_mark_backoff > 0 {
+		vgc_mark_backoff--
+		if vgc_mark_backoff == 0 {
+			vgc_mark_n_target = 0
+		}
+		return
 	}
-	vgc_drain_mark_work()
-	C.vgc_atomic_add_u32(&vgc_heap.gc_workers_done, 1)
-
-	// Wait for all workers to finish
-	for C.vgc_atomic_load_u32(&vgc_heap.gc_workers_done) < u32(nworkers) {
-		C.vgc_atomic_fence()
+	if vgc_mark_rate1 > 0 && rate * 10 > vgc_mark_rate1 * 9 {
+		mut n := vgc_mark_nworkers_cur / 2
+		if n < 1 {
+			n = 1
+		}
+		vgc_mark_n_target = n
+		vgc_mark_backoff = 32
 	}
 }
 
-// Mark worker function - runs in a spawned thread.
-// Translated from Go's gcDrain() loop.
-fn vgc_mark_worker() {
-	vgc_ensure_registered()
-	vgc_drain_mark_work()
-	C.vgc_atomic_add_u32(&vgc_heap.gc_workers_done, 1)
+// Drain the grey set with every marker of this cycle. Mutators are stopped; the
+// pool threads run vgc_drain_mark_parallel for the same generation and the
+// collector takes slot 0. The collector returns only when every pool thread
+// has reported the cycle done, so no marker ever touches the queue outside
+// this stop.
+fn vgc_parallel_mark() {
+	n := vgc_mark_nworkers_cur
+	vgc_heap.gc_nworkers = n
+	if n <= 1 {
+		vgc_drain_mark_work(0)
+		return
+	}
+	vgc_work_flush_local(0) // the roots go to the shared list, so the pool starts with work
+	C.vgc_atomic_store_u32(&vgc_mark_idle, 0)
+	C.vgc_atomic_store_u32(&vgc_mark_done, 0)
+	_ = C.vgc_atomic_add_u32(&vgc_mark_go, 1)
+	C.vgc_mark_wake(&vgc_mark_go)
+	vgc_drain_mark_parallel(0, n)
+	mut spins := 0
+	for C.vgc_atomic_load_u32(&vgc_mark_done) < u32(vgc_mark_pool_n) {
+		spins++
+		if spins > 256 {
+			C.vgc_yield()
+		} else {
+			C.vgc_cpu_pause()
+		}
+	}
 }
 
-// Drain the mark work queue - scan grey objects and mark their referents.
-// Uses precise pointer maps when available (from vgc_malloc_typed),
-// falls back to conservative scanning otherwise.
-fn vgc_drain_mark_work() {
+// A pool thread: never registered, holds no mutator roots, allocates nothing
+// from the heap. It waits on the generation, drains the cycle it was woken for
+// (every pool thread is a marker of every parallel cycle), reports done.
+fn vgc_mark_worker_main() {
+	slot := int(C.vgc_atomic_add_u32(&vgc_mark_pool_next, 1)) // 1-based; the collector is 0
+	// the generation at creation, not 0: a pool that grows after cycle G starts
+	// its new threads at G, so they wait for G+1 (vgc_mark_spawn_gen above). The
+	// collector cannot move it on before this read: the next plan runs only after
+	// this cycle's collector has counted this thread done.
+	mut seen := C.vgc_atomic_load_u32(&vgc_mark_spawn_gen)
 	for {
-		obj_addr := vgc_work_get()
+		C.vgc_mark_wait(&vgc_mark_go, seen)
+		g := C.vgc_atomic_load_u32(&vgc_mark_go)
+		if g == seen {
+			continue
+		}
+		seen = g
+		n := vgc_mark_nworkers_cur
+		if slot < n {
+			vgc_drain_mark_parallel(slot, n)
+		}
+		_ = C.vgc_atomic_add_u32(&vgc_mark_done, 1)
+	}
+}
+
+// Scan one grey object: every word conservatively. NOTE: precise per-span ptrmap
+// scanning is UNSOUND here and was removed — a span serves one size CLASS, but
+// real workloads pack many different TYPES (and conservative ptrmap==0
+// allocations) into the same size class. The span records only the FIRST typed
+// alloc's ptrmap (vgc_malloc_typed_opts "first typed allocation wins") and
+// applies it to every object, so any object whose real pointer layout differs
+// has live child pointers skipped -> reclaimed-while-reachable (observed as
+// corrupted results under a deep alloc-heavy serial fold). Conservative
+// scanning finds every pointer (may over-retain, never under-retains).
+@[inline]
+fn vgc_mark_scan_obj(obj_addr usize, w int) {
+	span := vgc_find_span(voidptr(obj_addr))
+	if span == unsafe { nil } || span.noscan {
+		return
+	}
+	obj_size := usize(span.elem_size)
+	vgc_scan_range(obj_addr, obj_addr + obj_size, w)
+}
+
+// Drain the mark work queue on one marker (translated from Go's gcDrain()).
+fn vgc_drain_mark_work(w int) {
+	for {
+		obj_addr := vgc_work_get(w)
 		if obj_addr == 0 {
 			break
 		}
-		span := vgc_find_span(voidptr(obj_addr))
-		if span == unsafe { nil } || span.noscan {
-			continue // noscan objects contain no pointers (codegen-reliable: only primitive/pointer-free types)
+		vgc_mark_scan_obj(obj_addr, w)
+	}
+}
+
+// Drain as one of n markers. A marker whose local buffer and the shared list
+// are both empty counts itself idle and spins (yielding the core after a
+// while); the cycle's grey set is empty when every marker is idle (new work
+// comes only from a marker that is not), and a marker seeing the shared list
+// refilled leaves the idle count to take it. A marker holding a half-full
+// buffer while others idle and the shared list is empty publishes half of it
+// (Go's gcWork.balance), so the tail of a cycle is not one marker's walk.
+fn vgc_drain_mark_parallel(w int, n int) {
+	for {
+		obj_addr := vgc_work_get(w)
+		if obj_addr != 0 {
+			vgc_mark_scan_obj(obj_addr, w)
+			if C.vgc_atomic_load_u32(&vgc_mark_idle) > 0
+				&& unsafe { voidptr(vgc_heap.work_full) } == unsafe { nil } {
+				vgc_work_balance(w)
+			}
+			continue
 		}
-		// Scan every word conservatively. NOTE: precise per-span ptrmap scanning is
-		// UNSOUND here and was removed — a span serves one size CLASS, but real
-		// workloads pack many different TYPES (and conservative ptrmap==0 allocations)
-		// into the same size class. The span records only the FIRST typed alloc's
-		// ptrmap (vgc_malloc_typed_opts "first typed allocation wins") and applies it
-		// to every object, so any object whose real pointer layout differs has live
-		// child pointers skipped -> reclaimed-while-reachable (observed as corrupted
-		// results under a deep alloc-heavy serial fold). Conservative scanning finds
-		// every pointer (may over-retain, never under-retains); the backstop runs
-		// rarely behind the Perceus front line, so the cost is negligible.
-		obj_size := usize(span.elem_size)
-		vgc_scan_range(obj_addr, obj_addr + obj_size)
+		_ = C.vgc_atomic_add_u32(&vgc_mark_idle, 1)
+		mut spins := 0
+		for {
+			if C.vgc_atomic_load_u32(&vgc_mark_idle) >= u32(n) {
+				return
+			}
+			if unsafe { voidptr(vgc_heap.work_full) } != unsafe { nil } {
+				_ = C.vgc_atomic_sub_u32(&vgc_mark_idle, 1)
+				break
+			}
+			spins++
+			if spins > 256 {
+				C.vgc_yield()
+			} else {
+				C.vgc_cpu_pause()
+			}
+		}
 	}
 }
 
@@ -1340,7 +1499,7 @@ fn vgc_scan_precise(obj_addr usize, ptrmap u64, ptr_words u8) {
 		ptr_addr := obj_addr + usize(bit) * word_size
 		val := unsafe { *(&usize(voidptr(ptr_addr))) }
 		if val != 0 {
-			vgc_shade(val)
+			vgc_shade(val, 0)
 		}
 		// Clear this bit and continue
 		mask &= mask - 1
@@ -1351,115 +1510,140 @@ fn vgc_scan_precise(obj_addr usize, ptrmap u64, ptr_words u8) {
 // Work queue (translated from Go's mgcwork.go)
 // ============================================================
 
+// The grey set (cx-home/v#16): each marker pushes to and pops from its own
+// current buffer (vgc_mark_local[w], 256 slots); a full one is published to the
+// shared work_full list and an empty one taken from work_empty (or carved),
+// both under work_lock, so the lock is taken once per 256 objects, not per
+// pointer. One marker pays the same.
 @[inline]
-fn vgc_can_use_work_fastpath() bool {
-	return vgc_heap.ncaches <= 1 && vgc_heap.gc_nworkers <= 1
-}
-
-// Add a pointer to the mark work queue
-fn vgc_work_put(addr usize) {
-	if vgc_can_use_work_fastpath() {
-		mut buf := vgc_heap.work_full
-		if buf == unsafe { nil } || buf.nobj >= 256 {
-			mut new_buf := vgc_heap.work_empty
-			if new_buf != unsafe { nil } {
-				unsafe {
-					vgc_heap.work_empty = new_buf.next
-				}
-			} else {
-				new_buf = vgc_workbuf_carve()
-				if new_buf == unsafe { nil } {
-					return
-				}
-			}
-			unsafe {
-				new_buf.nobj = 0
-				new_buf.next = vgc_heap.work_full
-				vgc_heap.work_full = new_buf
-			}
-			buf = new_buf
-		}
-		unsafe {
-			buf.obj[buf.nobj] = addr
-			buf.nobj++
-		}
-		return
-	}
-
-	C.vgc_mutex_lock(&vgc_heap.work_lock)
-
-	// Get or create a work buffer
-	mut buf := vgc_heap.work_full
+fn vgc_work_put(addr usize, w int) {
+	mut buf := unsafe { &VGC_WorkBuf(voidptr(vgc_mark_local[w])) }
 	if buf == unsafe { nil } || buf.nobj >= 256 {
-		// Need a new buffer
-		mut new_buf := vgc_heap.work_empty
-		if new_buf != unsafe { nil } {
+		C.vgc_mutex_lock(&vgc_heap.work_lock)
+		if buf != unsafe { nil } {
 			unsafe {
-				vgc_heap.work_empty = new_buf.next
+				buf.next = vgc_heap.work_full
+				vgc_heap.work_full = buf
+			}
+		}
+		mut nb := vgc_heap.work_empty
+		if nb != unsafe { nil } {
+			unsafe {
+				vgc_heap.work_empty = nb.next
 			}
 		} else {
-			new_buf = vgc_workbuf_carve()
-			if new_buf == unsafe { nil } {
-				C.vgc_mutex_unlock(&vgc_heap.work_lock)
-				return
-			}
+			nb = vgc_workbuf_carve()
+		}
+		C.vgc_mutex_unlock(&vgc_heap.work_lock)
+		if nb == unsafe { nil } {
+			vgc_mark_local[w] = 0
+			return
 		}
 		unsafe {
-			new_buf.nobj = 0
-			new_buf.next = vgc_heap.work_full
-			vgc_heap.work_full = new_buf
+			nb.nobj = 0
+			nb.next = nil
 		}
-		buf = new_buf
+		vgc_mark_local[w] = usize(voidptr(nb))
+		buf = nb
 	}
-
 	unsafe {
 		buf.obj[buf.nobj] = addr
 		buf.nobj++
 	}
-	C.vgc_mutex_unlock(&vgc_heap.work_lock)
 }
 
-// Get a pointer from the mark work queue
-fn vgc_work_get() usize {
-	if vgc_can_use_work_fastpath() {
-		mut buf := vgc_heap.work_full
-		if buf == unsafe { nil } || buf.nobj == 0 {
-			return 0
-		}
+// Pop from the marker's buffer; when it is empty, trade it for a full one from
+// the shared list. 0 = nothing local and nothing shared (the marker's empty
+// buffer stays its current one).
+fn vgc_work_get(w int) usize {
+	mut buf := unsafe { &VGC_WorkBuf(voidptr(vgc_mark_local[w])) }
+	if buf != unsafe { nil } && buf.nobj > 0 {
 		unsafe {
 			buf.nobj--
-			addr := buf.obj[buf.nobj]
-			if buf.nobj == 0 {
-				vgc_heap.work_full = buf.next
+			return buf.obj[buf.nobj]
+		}
+	}
+	C.vgc_mutex_lock(&vgc_heap.work_lock)
+	mut fb := vgc_heap.work_full
+	if fb != unsafe { nil } {
+		unsafe {
+			vgc_heap.work_full = fb.next
+		}
+		if buf != unsafe { nil } {
+			unsafe {
 				buf.next = vgc_heap.work_empty
 				vgc_heap.work_empty = buf
 			}
-			return addr
 		}
 	}
-
-	C.vgc_mutex_lock(&vgc_heap.work_lock)
-
-	mut buf := vgc_heap.work_full
-	if buf == unsafe { nil } || buf.nobj == 0 {
-		C.vgc_mutex_unlock(&vgc_heap.work_lock)
+	C.vgc_mutex_unlock(&vgc_heap.work_lock)
+	if fb == unsafe { nil } {
 		return 0
 	}
-
 	unsafe {
-		buf.nobj--
-		addr := buf.obj[buf.nobj]
+		fb.next = nil
+	}
+	vgc_mark_local[w] = usize(voidptr(fb))
+	unsafe {
+		fb.nobj--
+		return fb.obj[fb.nobj]
+	}
+}
 
-		// If buffer is empty, move to empty list
-		if buf.nobj == 0 {
-			vgc_heap.work_full = buf.next
+// Move half of the marker's local buffer (when it holds at least 64 entries)
+// into a buffer published on the shared list, for the idle markers.
+fn vgc_work_balance(w int) {
+	mut buf := unsafe { &VGC_WorkBuf(voidptr(vgc_mark_local[w])) }
+	if buf == unsafe { nil } || buf.nobj < 64 {
+		return
+	}
+	C.vgc_mutex_lock(&vgc_heap.work_lock)
+	mut nb := vgc_heap.work_empty
+	if nb != unsafe { nil } {
+		unsafe {
+			vgc_heap.work_empty = nb.next
+		}
+	} else {
+		nb = vgc_workbuf_carve()
+	}
+	if nb == unsafe { nil } {
+		C.vgc_mutex_unlock(&vgc_heap.work_lock)
+		return
+	}
+	half := buf.nobj / 2
+	unsafe {
+		for i in 0 .. half {
+			nb.obj[i] = buf.obj[buf.nobj - half + i]
+		}
+		nb.nobj = half
+		buf.nobj -= half
+		nb.next = vgc_heap.work_full
+		vgc_heap.work_full = nb
+	}
+	C.vgc_mutex_unlock(&vgc_heap.work_lock)
+}
+
+// Publish the marker's current buffer to the shared list (the collector's root
+// buffer before the pool starts), so the first pool thread to look finds work.
+fn vgc_work_flush_local(w int) {
+	mut buf := unsafe { &VGC_WorkBuf(voidptr(vgc_mark_local[w])) }
+	if buf == unsafe { nil } {
+		return
+	}
+	C.vgc_mutex_lock(&vgc_heap.work_lock)
+	if buf.nobj > 0 {
+		unsafe {
+			buf.next = vgc_heap.work_full
+			vgc_heap.work_full = buf
+		}
+	} else {
+		unsafe {
 			buf.next = vgc_heap.work_empty
 			vgc_heap.work_empty = buf
 		}
-
-		C.vgc_mutex_unlock(&vgc_heap.work_lock)
-		return addr
 	}
+	C.vgc_mutex_unlock(&vgc_heap.work_lock)
+	vgc_mark_local[w] = 0
 }
 
 // ============================================================
@@ -1476,7 +1660,7 @@ fn vgc_write_barrier(new_val voidptr) {
 		return
 	}
 	// Shade the new pointer (mark it grey)
-	vgc_shade(usize(new_val))
+	vgc_shade(usize(new_val), 0)
 }
 
 // vgc_wb_store is the concurrent-mark write barrier emitted by codegen (and
@@ -1534,7 +1718,7 @@ fn vgc_wb_store(obj voidptr) {
 fn vgc_drain_mark_work_n(budget int) int {
 	mut done := 0
 	for done < budget {
-		obj_addr := vgc_work_get()
+		obj_addr := vgc_work_get(0)
 		if obj_addr == 0 {
 			break
 		}
@@ -1543,7 +1727,7 @@ fn vgc_drain_mark_work_n(budget int) int {
 			continue
 		}
 		obj_size := usize(span.elem_size)
-		vgc_scan_range(obj_addr, obj_addr + obj_size)
+		vgc_scan_range(obj_addr, obj_addr + obj_size, 0)
 		done++
 	}
 	return done
@@ -2123,6 +2307,19 @@ const vgc_overhead_shrink_div = u64(50)
 // check-time per-thread additive: it decides how much DEAD transient growth a
 // small-live-set program accumulates between backstop cycles, sized by what
 // collections actually cost here and now rather than by a static guess.
+// The registered threads that allocated since the previous cycle (their
+// alloc_gen stamp is this cycle's number; the world is stopped here).
+fn vgc_alloc_threads() int {
+	mut n := 0
+	for i in 0 .. vgc_heap.ncaches {
+		c := unsafe { &vgc_heap.caches[i] }
+		if c.registered && c.alloc_gen == u32(vgc_heap.gc_cycle) {
+			n++
+		}
+	}
+	return n
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -2155,20 +2352,32 @@ fn vgc_update_trigger() {
 		// the pause is span-walk-dominated up there, so more headroom does not
 		// reduce the overhead ratio). Floor = vgc_headroom_min (8 MB default).
 		mut hr_max := vgc_headroom_cap
+		mut nt := 1
+		if vgc_headroom_per_thread {
+			// cx-home/v#16: the threads that allocated this cycle scale the flat
+			// cap too — x ceil(nt / 4), at most x4 (eight threads: 128 MB; the
+			// reference, Python's multiprocessing, spends eight heaps).
+			nt = vgc_alloc_threads()
+			if nt > 4 {
+				mut mult := u64((nt + 3) / 4)
+				if mult > 4 {
+					mult = 4
+				}
+				hr_max *= mult
+			}
+		}
 		if hr_max > vgc_heap_soft_limit {
 			hr_max = vgc_heap_soft_limit
 		}
-		// Live-set bound (cx-home/v#12, see vgc_headroom_live_pct): the dead
-		// growth a cycle allows is at most live_pct % of what the cycle marked,
-		// so the goal stays within 2× the live set at the default and a small
-		// live set no longer rides the flat cap into another arena. The bound
-		// never goes below vgc_headroom_live_floor (32 MB): a tiny live set's
-		// cycle is all stop protocol and root scan, so a shorter interval there
-		// is pauses for nothing (see the floor's doc for the measurements).
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
-			if live_cap < vgc_headroom_live_floor {
-				live_cap = vgc_headroom_live_floor
+			mut floor := vgc_headroom_live_floor
+			if vgc_headroom_per_thread && nt > 1 {
+				// cx-home/v#16: floor x the threads that allocated this cycle.
+				floor *= u64(nt)
+			}
+			if live_cap < floor {
+				live_cap = floor
 			}
 			if hr_max > live_cap {
 				hr_max = live_cap

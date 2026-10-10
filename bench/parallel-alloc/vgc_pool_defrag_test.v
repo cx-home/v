@@ -34,7 +34,14 @@ fn fill() int {
 }
 
 fn test_a_large_request_takes_adjacent_free_spans_before_a_new_arena() {
-	n := fill()
+	// The fill runs on its own thread, joined before the collections: once it
+	// has exited no scanned stack holds a slot from its frames. Called on this
+	// thread, a dead frame's copy of `keep` survived below the collections'
+	// frames and the conservative stack scan kept all 48 MB live (marked=55MB
+	// after both collections: Linux gcc under `v -stats test`, FreeBSD under
+	// tcc on every pin — cx-home/v#17), so there was nothing to merge and the
+	// requests carved 25 MB whatever the defrag did.
+	n := (spawn fill()).wait()
 	gc_collect()
 	gc_collect()
 	carved0 := gc_memory_use()

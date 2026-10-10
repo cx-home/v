@@ -51,6 +51,12 @@ fn C.vgc_bitmap_get(bits &u8, idx u32) int
 fn C.vgc_bitmap_set(bits &u8, idx u32)
 fn C.vgc_bitmap_clear(bits &u8, idx u32)
 fn C.vgc_bitmap_test_and_set(bits &u8, idx u32) int
+fn C.vgc_bitmap_test_and_set_atomic(bits &u8, idx u32) int
+fn C.vgc_start_thread_rc(f voidptr) int
+fn C.vgc_mark_wait(flag &u32, val u32)
+fn C.vgc_mark_wake(flag &u32)
+fn C.vgc_ncpu() int
+fn C.vgc_yield()
 fn C.vgc_popcount8(x u8) int
 fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
 fn C.vgc_size_class(size u32) u8
@@ -88,7 +94,7 @@ fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs searc
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
-fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15)
+fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -138,7 +144,7 @@ const vgc_max_arenas = 1024
 // Floor for the RAM-derived default ceiling: never below the historical
 // 64-arena (4 GB) capacity, however small the machine reports.
 const vgc_default_min_arenas = 64
-const vgc_max_threads = 64
+const vgc_max_threads = 1024
 // cx #316: words captured per safe-region register snapshot. Sized to hold a
 // full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
 // x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
@@ -282,6 +288,7 @@ mut:
 	// the collector reads/resets all slots under STW.
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
+	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
 }
 
 // VGC_Central is a central free list for one span class.
@@ -405,10 +412,10 @@ mut:
 	// Short by construction, so trim/reuse walk it whole.
 	free_oversized &VGC_Span = unsafe { nil }
 	// Per-thread caches
-	caches       [64]VGC_Cache
-	ncaches      int     // high-water mark of slots ever used
-	live_threads u32     // atomic-ish (guarded by cache_lock): currently-registered mutators
-	free_slots   [64]int // reclaimed cache indices, reused before growing ncaches
+	caches       [vgc_max_threads]VGC_Cache
+	ncaches      int                  // high-water mark of slots ever used
+	live_threads u32                  // atomic-ish (guarded by cache_lock): currently-registered mutators
+	free_slots   [vgc_max_threads]int // reclaimed cache indices, reused before growing ncaches
 	nfree_slots  int
 	cache_lock   u32
 	// GC state
@@ -665,6 +672,75 @@ __global vgc_headroom_live_pct = u64(100)
 // 5 % of Python on the same box. VGC_HEADROOM_LIVE_FLOOR_MB overrides (decimal;
 // a value below vgc_headroom_min is raised to it).
 __global vgc_headroom_live_floor = u64(32) * 1024 * 1024
+
+// Parallel mark (cx-home/v#16). The mark phase is the pause: with the
+// collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
+// marked on one thread, and under eight allocating threads a 10 ms mark every
+// few ms of mutator time left 60 % of the wall clock stopped. A pool of
+// vgc_mark_workers_cfg - 1 persistent, never-registered marker threads drains
+// the grey set with the collector; each marker owns a local work buffer and
+// trades full/empty buffers through the locked global lists, mark bits are set
+// atomically while more than one marker runs, and the pool engages only when
+// the previous cycle's mark phase cost at least vgc_mark_par_min_ns (a small
+// live set keeps the one-thread path and never wakes a worker). The pool
+// threads are created before the world stops (pthread_create under STW could
+// wait on a libc lock a stopped mutator holds), hold no mutator roots, allocate
+// nothing from the heap, and never register, so suspension never targets them.
+// VGC_MARK_WORKERS (count; 0 or 1 = one marker; default min(ncpu, 8)) and
+// VGC_MARK_PAR_MIN_US (default 1000) override.
+const vgc_max_markers = 16
+
+__global vgc_mark_workers_cfg = int(-1)
+// -1 = decide at init
+__global vgc_mark_par_min_ns = u64(1000) * 1000
+__global vgc_mark_local = [vgc_max_markers]usize{}
+// each marker's current &VGC_WorkBuf
+__global vgc_mark_go = u32(0)
+// generation the pool waits on
+__global vgc_mark_idle = u32(0)
+// markers out of work this cycle (termination)
+__global vgc_mark_done = u32(0)
+// pool threads finished with this cycle
+__global vgc_mark_pool_n = int(0)
+// pool threads alive (the collector excluded)
+__global vgc_mark_pool_next = u32(0)
+// slot handed to a starting pool thread
+__global vgc_mark_spawn_gen = u32(0)
+// the generation a starting pool thread has already seen: vgc_mark_go as it
+// stood when the collector created it, before this cycle's advance. A thread
+// that started from 0 instead took an earlier cycle's generation for a new one
+// and drained a cycle that was not running (cx-home/v#16: the fork child's
+// livelock — vgc_mark_idle never reached n — and, in the parent, a pool that
+// grows after its first parallel cycle).
+__global vgc_mark_forked = false
+// set in a fork child: one marker until exec (POSIX: a multithreaded parent's
+// fork child may call only async-signal-safe functions, pthread_create is not)
+__global vgc_mark_last_ns = u64(0)
+// the previous cycle's mark phase
+__global vgc_mark_nworkers_cur = int(1)
+// the previous mark's single-marker-equivalent work (ns): its wall time x its
+// marker count — what the next cycle plans its marker count from
+__global vgc_mark_last_work_ns = u64(0)
+__global vgc_mark_rate1 = u64(0)
+// ns per marked KB with one marker (a running mean)
+__global vgc_mark_n_target = int(0)
+// a reduced marker count while backing off (0 = the configured count)
+__global vgc_mark_backoff = int(0)
+// parallel cycles left at the reduced count
+
+// The live-set bound's floor scales with the allocating threads (cx-home/v#16):
+// the bound holds the headroom to max(floor, live) for memory's sake, which is
+// right for one thread (json-codec: RSS tracks the live set), but T threads
+// fill the same headroom T times faster while a cycle's pause is set by the
+// live set, so the collector's share of the wall clock grows with T (eight
+// threads: a quarter or more stopped). With the floor at floor x T (under the
+// flat cap) the cycle rate per thread stays what one thread pays, and past four
+// threads the flat cap grows too (x ceil(T/4), at most x4: 128 MB at eight);
+// the reference for a parallel workload, Python's multiprocessing, spends T
+// heaps. A thread counts when it allocated since the previous cycle.
+// VGC_HEADROOM_PER_THREAD=0 switches the scaling off.
+__global vgc_headroom_per_thread = true
+// markers this cycle, the collector included
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
 // Go's GOMEMLIMIT analog for the backstop collector. The default is a PINNED
@@ -879,10 +955,10 @@ __global vgc_gc_last_end = u64(0)
 // frame depth against its own last-scanned window — a holder frame below the
 // scanned lo is the root-miss, localized. Written only under STW; read only on
 // the rare catch path — cannot mask.
-__global vgc_spchk_lo = [64]usize{}
-__global vgc_spchk_hi = [64]usize{}
-__global vgc_spchk_cyc = [64]u64{}
-__global vgc_spchk_parked = [64]u64{}
+__global vgc_spchk_lo = [vgc_max_threads]usize{}
+__global vgc_spchk_hi = [vgc_max_threads]usize{}
+__global vgc_spchk_cyc = [vgc_max_threads]u64{}
+__global vgc_spchk_parked = [vgc_max_threads]u64{}
 
 // vgc_map_backing_status: #58 cx_envcheck probe support. Reports whether a live
 // map's key/value backing arrays are still ALLOCATED in the vgc heap. An
@@ -1292,6 +1368,24 @@ fn vgc_atfork_child() {
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	C.vgc_mutex_unlock(&vgc_heap.lock)
+	// The mark pool's threads did not survive the fork (cx-home/v#16), and the
+	// child never recreates them: it marks on one thread until it execs (the V/cx
+	// spawn path execs at once; a child that keeps running keeps one marker).
+	// Every pool counter, the generation included, starts clean.
+	vgc_mark_forked = true
+	vgc_mark_go = 0
+	vgc_mark_spawn_gen = 0
+	vgc_mark_pool_n = 0
+	vgc_mark_pool_next = 0
+	vgc_mark_idle = 0
+	vgc_mark_done = 0
+	vgc_mark_nworkers_cur = 1
+	vgc_mark_n_target = 0
+	vgc_mark_last_work_ns = 0
+	vgc_mark_backoff = 0
+	for i in 0 .. vgc_max_markers {
+		vgc_mark_local[i] = 0
+	}
 	for i in 0 .. 136 {
 		C.vgc_mutex_unlock(&vgc_heap.central[i].lock)
 	}
@@ -1371,6 +1465,33 @@ pub fn vgc_init() {
 	if vgc_headroom_live_floor < vgc_headroom_min {
 		vgc_headroom_live_floor = vgc_headroom_min
 	}
+	// Parallel mark (cx-home/v#16): the marker count and the engage threshold.
+	mut mw := C.vgc_ncpu()
+	if mw > 8 {
+		mw = 8
+	}
+	mw_env := C.getenv(c'VGC_MARK_WORKERS')
+	if mw_env != unsafe { nil } {
+		mv := C.atoll(mw_env)
+		if mv >= 0 {
+			mw = int(mv)
+		}
+	}
+	if mw > vgc_max_markers {
+		mw = vgc_max_markers
+	}
+	vgc_mark_workers_cfg = mw
+	pt_env := C.getenv(c'VGC_HEADROOM_PER_THREAD')
+	if pt_env != unsafe { nil } {
+		vgc_headroom_per_thread = C.atoll(pt_env) != 0
+	}
+	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
+	if pm_env != unsafe { nil } {
+		pv := C.atoll(pm_env)
+		if pv >= 0 {
+			vgc_mark_par_min_ns = u64(pv) * 1000
+		}
+	}
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
 	// see vgc_heap_soft_limit / cx #282), env-overridable.
 	vgc_heap_soft_limit = vgc_default_soft_limit
@@ -1431,19 +1552,35 @@ fn vgc_register_thread() {
 	// Reuse a reclaimed slot before growing the high-water mark, so that
 	// churn (many short-lived threads) cannot exhaust the fixed cache array.
 	mut idx := -1
-	if vgc_heap.nfree_slots > 0 {
-		vgc_heap.nfree_slots--
-		idx = vgc_heap.free_slots[vgc_heap.nfree_slots]
-	} else if vgc_heap.ncaches < vgc_max_threads {
-		idx = vgc_heap.ncaches
-		vgc_heap.ncaches = idx + 1
-	}
-	if idx < 0 {
-		// Genuinely out of slots (>64 concurrent live threads). Leave this
-		// thread unregistered rather than scribbling on caches[-1]; its
-		// allocations fall through to vgc_ensure_registered retries.
+	mut waited_us := u64(0)
+	for {
+		if vgc_heap.nfree_slots > 0 {
+			vgc_heap.nfree_slots--
+			idx = vgc_heap.free_slots[vgc_heap.nfree_slots]
+		} else if vgc_heap.ncaches < vgc_max_threads {
+			idx = vgc_heap.ncaches
+			vgc_heap.ncaches = idx + 1
+		}
+		if idx >= 0 {
+			break
+		}
+		// The table is full: vgc_max_threads live mutators. An UNREGISTERED
+		// mutator is unsound, not merely slow — the collector never suspends it
+		// and never scans its stack or registers, so every object only it holds
+		// is freed under it while it runs through the mark (cx-core-code#113: 64
+		// [?async] futures + the main thread overflowed the old 64-slot table and
+		// the overflow threads died of reused memory — SIGSEGV, SIGBUS,
+		// `map.hash_fn is nil`). This thread holds no heap object yet (its spawn
+		// argument sits in the spawn-root registry), so it WAITS for an exiting
+		// thread's slot instead; loud once a second (0x0ac7 = seconds waited) so
+		// a program past the cap is visible, never silently corrupt.
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
-		return
+		C.usleep(100)
+		waited_us += 100
+		if waited_us % 1000000 == 0 {
+			C.vgc_say(0x0ac7, waited_us / 1000000)
+		}
+		C.vgc_mutex_lock(&vgc_heap.cache_lock)
 	}
 	// Atomic bump (cache_lock serializes writers, but vgc_maybe_gc reads live_threads
 	// LOCK-FREE for per-thread GC pacing — a plain RMW here races that atomic read).
@@ -2881,7 +3018,71 @@ fn vgc_idle_defrag_request(nbytes usize) {
 	C.vgc_atomic_store_u32(&vgc_idle_defrag_pending, 1)
 }
 
+// vgc_gc_owner is the cache index of the thread running the stop-the-world
+// collection, -1 when none (cx-home/v#17: a carve waits for another thread's
+// collection, never for its own).
+__global vgc_gc_owner = int(-1)
+
+// vgc_carve_waits reports whether this thread, about to carve a new arena,
+// should first let the collection in flight finish (cx-home/v#17). That
+// collection's sweep is about to return its garbage to the pool; an arena
+// carved while it stops the world, or while it resumes it, is memory the heap
+// keeps. Only a registered mutator that is not the collector waits. The
+// reclaim-and-retry loop is not excluded: vgc_grow_gate_hold is a count over
+// all threads, so excluding it let every thread carve while any one retried
+// (the first cut of this fix measured 27 of 34 FreeBSD carves still inside a
+// collection). Under -d vgc_concurrent the wait covers the concurrent mark
+// too, once the carved heap is twice the goal: the mark has no assist, so on a
+// 2-vCPU box it fell behind sixteen allocating threads and the heap grew past
+// 3 GB. Below that ceiling, and for any allocation the pool or an arena tail
+// serves, mutators keep running beside the mark.
+fn vgc_carve_waits() bool {
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) == vgc_phase_off {
+		return false
+	}
+	$if vgc_concurrent ? {
+		// only once the carved heap reaches twice the goal: below that the
+		// concurrent cycle's own overshoot is the design's (no assist)
+		carved := u64(vgc_heap.narenas) * u64(vgc_arena_size)
+		if carved < 2 * C.vgc_atomic_load_u64(&vgc_heap.next_gc) {
+			return false
+		}
+	}
+	ci := C.vgc_get_cache_idx()
+	return ci >= 0 && ci != vgc_gc_owner
+}
+
+// vgc_wait_gc_done parks at the safepoint while the world is being stopped and
+// yields until the collection's phase is off. The caller holds no allocator
+// lock: a straggler the collector signal-suspends here is frozen holding
+// nothing, as at any other poll.
+fn vgc_wait_gc_done() {
+	for C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+		if C.vgc_atomic_load_u32(&vgc_heap.gc_stop_flag) != 0 {
+			vgc_safepoint()
+		} else {
+			C.vgc_yield()
+		}
+	}
+}
+
 fn vgc_span_alloc(npages u32) &VGC_Span {
+	// Each wait lets one collection's sweep refill the pool; collections can run
+	// back to back (an explicit gc_collect loop on a 2-vCPU box), so a few waits
+	// are allowed before the carve goes ahead regardless.
+	for _ in 0 .. 4 {
+		span, waited := vgc_span_alloc_once(npages, true)
+		if !waited {
+			return span
+		}
+	}
+	last, _ := vgc_span_alloc_once(npages, false)
+	return last
+}
+
+// vgc_span_alloc_once answers the span, and whether it returned nil because it
+// waited for a collection in flight instead of carving (may_wait only).
+fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 	// First try to reuse a free span
 	recycled, cold := vgc_get_free_span(npages)
 	nbytes := usize(npages) * vgc_page_size
@@ -2902,7 +3103,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 			// decommitted an equal amount).
 			vgc_pool_compensate(u64(nbytes))
 		}
-		return recycled
+		return recycled, false
 	}
 
 	C.vgc_mutex_lock(&vgc_heap.lock)
@@ -2929,6 +3130,11 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 	// Allocate new arena if needed
 	if base == 0 {
+		if may_wait && vgc_carve_waits() {
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			vgc_wait_gc_done()
+			return unsafe { nil }, true
+		}
 		if vgc_grow_gate_defers(nbytes) {
 			// The grow gate's collection is the retry's one chance to find a run:
 			// the reclaim-and-retry loop that follows holds vgc_grow_gate_hold, so
@@ -2938,17 +3144,17 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 				C.vgc_atomic_store_u32(&vgc_defrag_pending, 1)
 			}
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		if vgc_frag_gate_defers(nbytes) {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		asize := if nbytes > vgc_arena_size { nbytes } else { vgc_arena_size }
 		mem := C.vgc_os_alloc(asize)
 		if mem == unsafe { nil } {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		arena_idx = vgc_heap.narenas
 		// <=0 means vgc_init has not run yet (the _vinit allocation window) —
@@ -2961,7 +3167,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		if arena_idx >= max_arenas {
 			C.vgc_os_free(mem, asize)
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		// Out-of-line page->span map (cx #282, see VGC_Arena.page_span): one slot
 		// per page of the ACTUAL arena size (an oversized single-object arena gets
@@ -2971,7 +3177,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		if psmem == unsafe { nil } {
 			C.vgc_os_free(mem, asize)
 			C.vgc_mutex_unlock(&vgc_heap.lock)
-			return unsafe { nil }
+			return unsafe { nil }, false
 		}
 		unsafe {
 			vgc_heap.arenas[arena_idx].base = usize(mem)
@@ -3006,7 +3212,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	span := vgc_new_span_desc()
 	if span == unsafe { nil } {
 		C.vgc_mutex_unlock(&vgc_heap.lock)
-		return unsafe { nil }
+		return unsafe { nil }, false
 	}
 	unsafe {
 		slot := span.slot // the allspans slot survives the reset (cx-home/v#15)
@@ -3077,7 +3283,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		// here; the in_use=false span is invisible to the sweep meanwhile.
 		vgc_pool_compensate(u64(nbytes))
 	}
-	return span
+	return span, false
 }
 
 // Initialize a span for a specific size class
@@ -3354,9 +3560,9 @@ fn vgc_span_release_acquisition(span &VGC_Span) {
 
 fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	if cache_idx < 0 {
-		// Unregistered thread: the fixed [vgc_max_threads] cache table is exhausted
-		// (e.g. >64 concurrent `go` threads — vgc_register_thread leaves idx = -1
-		// rather than scribble on caches[-1]). It has no per-thread mcache slot, so
+		// Unregistered thread: only a thread that allocates before it has
+		// registered (vgc_register_thread now WAITS for a slot rather than leave a
+		// mutator unregistered, cx-core-code#113). It has no per-thread mcache slot, so
 		// allocate straight from central (vgc_central_get_span is internally locked).
 		// No caching: each call gets its own span; partial spans are reclaimed by the
 		// collector. Slower for these overflow threads, but SAFE — previously this
@@ -3623,6 +3829,7 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_heap.caches[cache_idx].live_delta += i64(live_sz)
 		vgc_heap.caches[cache_idx].alloc_delta += total_n
+		vgc_heap.caches[cache_idx].alloc_gen = u32(vgc_heap.gc_cycle)
 		if vgc_heap.caches[cache_idx].alloc_delta >= vgc_acct_flush {
 			ld := vgc_heap.caches[cache_idx].live_delta
 			if ld >= 0 {

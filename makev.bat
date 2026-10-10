@@ -33,6 +33,9 @@ if "%~1" == "-tcc32" set tcc_branch="thirdparty-windows-i386"
 
 REM VC settings
 set vc_url=https://github.com/vlang/vc
+REM The vc commit the Makefile pins (VC_COMMIT there); override with VC_COMMIT=...
+set vc_commit=7eb8c54a3843e5107d5af06d7a8c3e928f322475
+if /I not ["%VC_COMMIT%"] == [""] set vc_commit=%VC_COMMIT%
 set vc_dir=%~dp0vc
 
 REM Let a particular environment specify their own TCC and VC repos (to help mirrors)
@@ -135,7 +138,7 @@ if !flag_local! NEQ 1 (
 		if !ERRORLEVEL! NEQ 0 goto :error
 		echo Updating vc...
 		echo  ^> Sync with remote !vc_url!
-		git pull --rebase --quiet
+		git fetch --quiet origin
 		if !ERRORLEVEL! NEQ 0 (
 			popd
 			goto :error
@@ -145,6 +148,13 @@ if !flag_local! NEQ 1 (
 		call :cloning_vc
 		if !ERRORLEVEL! NEQ 0 goto :error
 	)
+	REM Check out the vc commit this tree pins, as the Makefile does (cx #491,
+	REM cx-private#517): vc master moves with upstream vlang/v, and its v_win.c
+	REM stopped linking with this tree's bootstrap flags (an unresolved
+	REM BCryptGenRandom on every compiler, the fork's Windows CI 10-09).
+	echo  ^> Checking out vc !vc_commit!
+	git -C "%vc_dir%" checkout --quiet !vc_commit!
+	if !ERRORLEVEL! NEQ 0 goto :error
 	echo.
 )
 
