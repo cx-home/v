@@ -1269,7 +1269,16 @@ fn vgc_mark_roots() {
 fn vgc_scan_data_range(lo usize, hi usize) {
 	heap_lo := usize(voidptr(&vgc_heap))
 	caches_lo := usize(voidptr(&vgc_heap.caches[0]))
-	caches_hi := caches_lo + usize(sizeof(vgc_heap.caches))
+	// cx-home/v#15: only the slots a thread has ever used (ncaches is the
+	// high-water mark; reclaimed slots below it stay scanned). The never-used
+	// tail of the vgc_max_threads table holds no pointer, and scanning it was
+	// ~1.3 MB of conservative words every cycle: 40 % of a small program's
+	// data-segment phase (pi-digits: data 240-370 us of a ~600 us cycle).
+	mut nc := vgc_heap.ncaches
+	if nc < 0 || nc > vgc_max_threads {
+		nc = vgc_max_threads
+	}
+	caches_hi := caches_lo + usize(nc) * usize(sizeof(VGC_Cache))
 	heap_hi := heap_lo + usize(sizeof(VGC_Heap))
 	w := usize(sizeof(usize))
 	ex_los := [heap_lo, caches_hi, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
