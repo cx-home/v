@@ -87,7 +87,16 @@ fn test_the_headroom_is_bounded_by_the_live_set() {
 	on := ratio('', 'big')
 	off := ratio('VGC_HEADROOM_LIVE_PCT=0 ', 'big')
 	println('vgc_headroom_live: bound default ${on:.3f}x, bound off ${off:.3f}x (carved high / live, 40 MB live)')
-	assert on < off, 'the live-set bound does not lower the carve: ${on:.3f}x against bound off ${off:.3f}x'
+	// The bound binds only when the unbounded pacer carves past it: the time
+	// band doubles the headroom when marking costs more than a tenth of the
+	// interval, which a fast runner's mark may not (GitHub's ubuntu-24.04 runner:
+	// 1.6x bound off, 1.6x on — the headroom never left its floor). So the bound
+	// must never carve MORE, and must carve less wherever bound-off went past
+	// 2x + the floor's margin; the 2.3x bar holds on every box.
+	assert on <= off + 0.05, 'the live-set bound raised the carve: ${on:.3f}x against bound off ${off:.3f}x'
+	if off > 2.3 {
+		assert on < off, 'the live-set bound does not lower the carve: ${on:.3f}x against bound off ${off:.3f}x'
+	}
 	assert on <= 2.3, 'the bounded pacer carved ${on:.3f}x the live set (bar 2.3x)'
 }
 
