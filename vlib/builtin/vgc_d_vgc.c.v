@@ -1589,6 +1589,10 @@ pub fn vgc_init() {
 	if pt_env != unsafe { nil } {
 		vgc_headroom_per_thread = C.atoll(pt_env) != 0
 	}
+	pgc_env := C.getenv(c'VGC_POOL_GOAL_COMP')
+	if pgc_env != unsafe { nil } {
+		vgc_pool_goal_comp = C.atoll(pgc_env) != 0
+	}
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
 		pv := C.atoll(pm_env)
@@ -2560,6 +2564,37 @@ __global vgc_compensate_scanned = u64(0)
 // largest the supported hosts use; a shorter run returns nothing there.
 const vgc_compensate_min_run = u64(2)
 
+// cx-home/v#14 follow-up (the pool above the goal). A carve or a cold-run pop
+// of FEWER than vgc_pool_merge_min pages was never compensated, so a program
+// whose requests outgrow the pooled span sizes (pi-digits' growing big
+// integers: each cycle asks for spans a little larger than the ones it freed)
+// carved and recommitted beside a hot pool it could not use, up to twice its
+// goal: carved 65 MB, hot pool 35-51 MB, goal 35 MB, peak RSS 76 MB at a 2 MB
+// live set. Once the committed span pages (carved arena bytes less the cold,
+// decommitted pool) exceed the pacer goal, the mutator cannot reach the
+// surplus before the next collection, so every carve and cold pop of any
+// size is compensated from the hot pool as a large one is. Below the goal
+// (a heap growing toward it, the parallel rows' per-thread headroom) nothing
+// changes and no syscall is paid. Racy reads: a pacing hint, not an invariant.
+// VGC_POOL_GOAL_COMP=0 switches it off.
+__global vgc_pool_goal_comp = true
+
+fn vgc_committed_above_goal() bool {
+	if !vgc_pool_goal_comp {
+		return false
+	}
+	n := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	mut carved := u64(0)
+	for i in 0 .. n {
+		carved += u64(vgc_heap.arenas[i].used)
+	}
+	cold := vgc_heap.pool_trimmed_bytes
+	if carved <= cold {
+		return false
+	}
+	return carved - cold > C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+}
+
 // vgc_pool_compensate decommits up to `nbytes` of committed pooled memory,
 // whole spans of address-adjacent hot pooled runs (see the RTMEM-1 block
 // above), walking the page maps from the cycle's cursor. Mutator context,
@@ -3288,7 +3323,7 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 		unsafe {
 			recycled.sweep_gen = u32(vgc_heap.gc_cycle)
 		}
-		if cold && npages >= u32(vgc_pool_merge_min) {
+		if cold && (npages >= u32(vgc_pool_merge_min) || vgc_committed_above_goal()) {
 			// A large request served from a COLD run commits as many pages as a
 			// carve of it would, beside the same idle hot pool: compensate it
 			// the same way (cx-home/v#14 — once the idle merge forms cold runs
@@ -3471,7 +3506,7 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 	}
 
 	C.vgc_mutex_unlock(&vgc_heap.lock)
-	if npages >= u32(vgc_pool_merge_min) {
+	if npages >= u32(vgc_pool_merge_min) || vgc_committed_above_goal() {
 		// A large carve: vgc_get_free_span found no pooled span covering the
 		// request, so these fresh pages would sit beside whatever the pool holds
 		// idle — offset them (RTMEM-1 (2), vgc_pool_compensate). No lock is held
