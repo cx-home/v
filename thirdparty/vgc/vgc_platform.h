@@ -1243,6 +1243,10 @@ static void WINAPI _vgc_fls_destructor(void* val) {
     vgc_thread_exit_cb(idx);
 }
 static inline void vgc_install_thread_exit(int idx) {
+  #ifdef VGC_NO_FLS_EXIT
+    (void)idx;
+    return; // A/B lever: no exit callback (slots never leave, the pre-#20 behaviour)
+  #endif
     if (InterlockedCompareExchange(&_vgc_fls_state, 1, 0) == 0) {
         HMODULE k32 = GetModuleHandleA("kernel32.dll");
         HMODULE nt = GetModuleHandleA("ntdll.dll");
