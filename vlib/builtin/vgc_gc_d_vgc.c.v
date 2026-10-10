@@ -433,7 +433,7 @@ fn vgc_gc_start() {
 	// can be mid add/remove except one frozen holding the lock, and an entry is
 	// only counted after its slot is written. (See vgc_spawn_roots.)
 	for i in 0 .. vgc_nspawn_roots {
-		root := usize(vgc_spawn_roots[i])
+		root := usize(unsafe { vgc_spawn_roots[i] })
 		vgc_shade_spawn_root(root)
 		// DIAGNOSTIC (root-scan-miss localizer): is the watched object the spawn
 		// arg itself (bit0), or reachable from it via arg->...->c (bit1)? Pins
@@ -749,7 +749,7 @@ fn vgc_gc_start_concurrent() {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 1)
 	vgc_mark_roots() // globals/BSS + every thread stack (snapshot)
 	for i in 0 .. vgc_nspawn_roots {
-		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
+		vgc_shade_spawn_root(usize(unsafe { vgc_spawn_roots[i] }))
 	}
 	vgc_cm_stw_exit(self_idx) // RESUME the world — mark now runs concurrently
 
@@ -762,7 +762,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_scan_suspended_roots(self_idx) // re-scan dirtied roots (stacks moved)
 	vgc_mark_roots()
 	for i in 0 .. vgc_nspawn_roots {
-		vgc_shade_spawn_root(usize(vgc_spawn_roots[i]))
+		vgc_shade_spawn_root(usize(unsafe { vgc_spawn_roots[i] }))
 	}
 	vgc_rescan_dirty_spans() // re-scan everything the barrier dirtied
 	vgc_drain_mark_work(0) // final drain of the grey set
