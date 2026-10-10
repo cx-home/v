@@ -73,6 +73,7 @@ fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping 
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
+fn C.vgc_sleep_us(us u32)
 fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
 fn C.vgc_resume_thread(t u32)
 fn C.vgc_thread_regs(t u32, sp_out &usize, regs &usize, max int) int
@@ -1500,7 +1501,7 @@ fn vgc_register_thread() {
 		// thread's slot instead; loud once a second (0x0ac7 = seconds waited) so
 		// a program past the cap is visible, never silently corrupt.
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
-		C.usleep(100)
+		C.vgc_sleep_us(100)
 		waited_us += 100
 		if waited_us % 1000000 == 0 {
 			C.vgc_say(0x0ac7, waited_us / 1000000)

@@ -446,7 +446,7 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
   }
   static inline int vgc_num_cpus(void) {
-  #if defined(ALL_PROCESSOR_GROUPS)
+  #if defined(ALL_PROCESSOR_GROUPS) && (!defined(_WIN32_WINNT) || _WIN32_WINNT >= 0x0601)
       DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
   #else
       // mingw-w64 and tcc headers below _WIN32_WINNT 0x0601 declare neither
@@ -586,6 +586,14 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
       sp = (uintptr_t)__builtin_frame_address(0);
   #endif
       return sp;
+  }
+#elif defined(_MSC_VER)
+  // cx-home/v#22: msvc has no inline asm on x64/arm64 and no
+  // __builtin_frame_address. A noinline callee's local sits BELOW every local
+  // of its caller, so its address is a conservative low bound for the scan.
+  __declspec(noinline) static uintptr_t vgc_real_sp(void) {
+      volatile char probe = 0;
+      return (uintptr_t)&probe;
   }
 #else
   static inline uintptr_t vgc_real_sp(void) { return (uintptr_t)__builtin_frame_address(0); }
@@ -831,12 +839,25 @@ static inline uint8_t vgc_size_class(uint32_t size) {
 // ============================================================
 // Pause / yield for spinlocks
 // ============================================================
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  #include <intrin.h>
+  #define vgc_cpu_pause() _mm_pause()
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+  #include <intrin.h>
+  #define vgc_cpu_pause() __yield()
+#elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
   #define vgc_cpu_pause() __asm__ __volatile__("pause")
 #elif defined(__aarch64__) || defined(_M_ARM64)
   #define vgc_cpu_pause() __asm__ __volatile__("yield")
 #else
   #define vgc_cpu_pause() ((void)0)
+#endif
+// A short back-off sleep (msvc has no usleep, cx-home/v#22).
+#ifdef _WIN32
+  static inline void vgc_sleep_us(uint32_t us) { Sleep(us >= 1000 ? us / 1000 : 0); }
+#else
+  #include <unistd.h>
+  static inline void vgc_sleep_us(uint32_t us) { usleep(us); }
 #endif
 
 #ifdef _WIN32
@@ -998,13 +1019,30 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
 // and keeps the fixed cache array from being exhausted by churn.
 // ============================================================
 #include <setjmp.h>
+// VGC_KEEP(p): the object at p is live (and its stores done) up to this point
+// — the compiler may not drop or sink the spilled register file before it.
+// msvc has no GNU asm (cx-home/v#22): an opaque noinline store does the same.
+#if defined(_MSC_VER)
+  static void* volatile vgc__keep_sink;
+  __declspec(noinline) static void vgc__keep(void* p) { vgc__keep_sink = p; _ReadWriteBarrier(); }
+  #define VGC_KEEP(p) vgc__keep((void*)(p))
+#else
+  #define VGC_KEEP(p) __asm__ __volatile__("" : : "r"(p) : "memory")
+#endif
+// V functions this header calls are exported by V as `extern __declspec(dllexport)`
+// on Windows; msvc refuses a redeclaration with another linkage (C2375).
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define VGC_V_FN extern __declspec(dllexport)
+#else
+  #define VGC_V_FN extern
+#endif
 // Run a GC cycle with the COLLECTOR thread's callee-saved registers spilled
 // onto this frame and its stack range recorded to include them. The triggering
 // thread is typically mid-mutator-loop (e.g. holding `last` in a register), and
 // its own root scan would otherwise miss those registers -> swept live data.
 // `buf` stays alive across the whole collection (mark+sweep) since the body
 // runs nested here. vgc_gc_start must NOT re-record the collector's own range.
-extern void vgc_gc_start(void);
+VGC_V_FN void vgc_gc_start(void);
 static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t base) {
     jmp_buf buf;
     setjmp(buf);
@@ -1016,7 +1054,7 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (base >= sp) { *lo = sp; *hi = base; } else { *lo = base; *hi = sp; }
     vgc_gc_start();
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    VGC_KEEP(&buf);
 }
 
 // ── Waiting out a stop-the-world (cx-private#1893) ─────────────────────────
@@ -1135,7 +1173,7 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     vgc_atomic_add_u32(stopped_count, 1);
     vgc_wait_flag_clear(stop_flag);
     vgc_atomic_store_u32(my_stopped, 0);
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    VGC_KEEP(&buf);
 }
 
 // ── GC-safe blocking regions (cx #316) ──────────────────────────────────────
@@ -1203,7 +1241,7 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
     // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
     // recorded range and the completed snapshot.
     vgc_atomic_store_u32(my_safe, 1);
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    VGC_KEEP(&buf);
 }
 
 // Leave the safe region. The order is load-bearing (the classic Dekker pairing
@@ -1244,7 +1282,7 @@ static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_fla
 }
 
 #ifndef _WIN32
-extern void vgc_thread_exit_cb(int idx);
+VGC_V_FN void vgc_thread_exit_cb(int idx);
 static pthread_key_t _vgc_exit_key;
 static pthread_once_t _vgc_exit_once = PTHREAD_ONCE_INIT;
 static void _vgc_exit_destructor(void* val) {
@@ -1268,7 +1306,7 @@ static inline void vgc_install_thread_exit(int idx) {
 // skipped while the process shuts down (RtlDllShutdownInProgress): ExitProcess
 // has already terminated the other threads, and one of them may hold
 // cache_lock.
-extern void vgc_thread_exit_cb(int idx);
+VGC_V_FN void vgc_thread_exit_cb(int idx);
 typedef void (WINAPI *vgc_fls_cb_t)(void*);
 typedef DWORD (WINAPI *vgc_fls_alloc_t)(vgc_fls_cb_t);
 typedef BOOL (WINAPI *vgc_fls_set_t)(DWORD, void*);
