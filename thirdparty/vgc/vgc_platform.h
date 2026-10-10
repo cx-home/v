@@ -984,9 +984,21 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
 #endif
 #ifdef _WIN32
   static inline int vgc_ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
+  static inline int vgc_box_busy(int ncpu) { (void)ncpu; return 0; }
 #else
   #include <unistd.h>
   static inline int vgc_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : (int)n; }
+  // cx-home/v#16: is the box oversubscribed right now? The 1-minute load
+  // average against twice the online CPUs; a pool phase whose threads get no
+  // core waits on the preempted one at the join, so the walks stay serial
+  // then. Measured on 28 cores: at load 30-35 the eight walkers still paid
+  // (T16 clear 1029 -> 220 us), at load 60-110 they lost (T8 clear 627 ->
+  // 2321 us); the line sits between.
+  static inline int vgc_box_busy(int ncpu) {
+      double la[1];
+      if (getloadavg(la, 1) != 1) return 0;
+      return la[0] >= 2.0 * (double)ncpu;
+  }
 #endif
 
 // ============================================================
@@ -2294,7 +2306,8 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
                                uint64_t susp_us, uint64_t data_us, uint64_t stacks_us,
                                uint64_t mark_us, uint64_t count_us, uint64_t sweep_us,
                                uint64_t tail_us, uint64_t seg_kb, uint64_t spans_in_use,
-                               uint64_t markers) {
+                               uint64_t markers, uint64_t walkers, uint64_t swalk_us,
+                               uint64_t sapply_us) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] phases stw="); vgc__wdec(stw_us);
     vgc__ws(" clear="); vgc__wdec(clear_us);
@@ -2308,6 +2321,9 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
     vgc__ws("us seg="); vgc__wdec(seg_kb);
     vgc__ws("KB spans_in_use="); vgc__wdec(spans_in_use);
     vgc__ws(" markers="); vgc__wdec(markers);
+    vgc__ws(" walkers="); vgc__wdec(walkers);
+    vgc__ws(" swalk="); vgc__wdec(swalk_us);
+    vgc__ws(" sapply="); vgc__wdec(sapply_us);
     vgc__ws("\n");
 }
 

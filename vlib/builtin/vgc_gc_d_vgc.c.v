@@ -90,6 +90,7 @@ fn vgc_gc_start() {
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
 	vgc_mark_nworkers_cur = vgc_mark_plan()
+	vgc_walk_nworkers_cur = vgc_walk_plan() // fable-v16: the span walks' count
 
 	// Take free_spans_lock for the WHOLE cycle, BEFORE stopping the world, so no
 	// mutator is ever frozen mid-vgc_get_free_span holding it (which, if the lock
@@ -550,6 +551,8 @@ fn vgc_gc_start() {
 	C.vgc_trace(9, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP0
 	vgc_do_sweep()
 	vgc_ph[7] = C.vgc_now_ns()
+	// cx-home/v#16: the three walks' time, for the next cycle's walker count
+	vgc_walk_adapt((vgc_ph[1] - vgc_ph[0]) + (vgc_ph[6] - vgc_ph[5]) + vgc_ph_swalk_ns)
 	C.vgc_trace(10, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP1
 
 	// Drop mcache slots whose cached span sweep just recycled to the pool (and the
@@ -850,7 +853,8 @@ fn vgc_gctrace_emit() {
 			vgc_ph[1]), vgc_ph_us(vgc_ph[1], vgc_ph[2]), vgc_ph_us(vgc_ph[2], vgc_ph[3]), vgc_ph_us(vgc_ph[3],
 			vgc_ph[4]), vgc_ph_us(vgc_ph[4], vgc_ph[5]), vgc_ph_us(vgc_ph[5], vgc_ph[6]), vgc_ph_us(vgc_ph[6],
 			vgc_ph[7]), vgc_ph_us(vgc_ph[7], vgc_gc_last_end), seg / 1024, in_use,
-			u64(vgc_mark_nworkers_cur))
+			u64(vgc_mark_nworkers_cur), u64(vgc_walk_nworkers_cur), vgc_ph_swalk_ns / 1000,
+			vgc_ph_sapply_ns / 1000)
 	}
 }
 
@@ -928,22 +932,142 @@ fn vgc_clear_mark_bits() {
 	// that keeps a retired descriptor's identity stable across any mutator frozen
 	// mid-vgc_free at the previous STW (cx #360, see span_meta_pending).
 	vgc_span_meta_promote_pending()
-	nb := (vgc_heap.nspans + 7) / 8
-	for w in 0 .. nb {
-		mut bits := unsafe { vgc_heap.inuse_bits[w] }
-		for bits != 0 {
-			bi := C.vgc_ctz8(bits)
-			bits &= bits - 1
-			span := unsafe { vgc_heap.allspans[w * 8 + bi] }
-			if span == unsafe { nil } || !span.in_use {
-				continue
-			}
-			if span.mark_bits != unsafe { nil } {
-				bitmap_size := (span.nelems + 7) / 8
-				unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+	vgc_walk_run(vgc_pool_phase_clear) // cx-home/v#16: on the pool when the table is large
+}
+
+// cx-home/v#16: one walker's share of the clear. Chunks of vgc_walk_chunk
+// inuse_bits words are claimed from vgc_walk_cursor until the table is done;
+// with one walker (n == 1) that is the whole table in order.
+fn vgc_walk_clear(w int, n int) {
+	nb := u32((vgc_heap.nspans + 7) / 8)
+	for {
+		w1 := C.vgc_atomic_add_u32(&vgc_walk_cursor, vgc_walk_chunk)
+		w0 := w1 - vgc_walk_chunk
+		if w0 >= nb {
+			return
+		}
+		hi := if w1 < nb { w1 } else { nb }
+		for wi in w0 .. hi {
+			mut bits := unsafe { vgc_heap.inuse_bits[int(wi)] }
+			for bits != 0 {
+				bi := C.vgc_ctz8(bits)
+				bits &= bits - 1
+				span := unsafe { vgc_heap.allspans[int(wi) * 8 + bi] }
+				if span == unsafe { nil } || !span.in_use {
+					continue
+				}
+				if span.mark_bits != unsafe { nil } {
+					bitmap_size := (span.nelems + 7) / 8
+					unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+				}
 			}
 		}
 	}
+}
+
+// One walker's share of the count: marked bytes into its own stride of
+// vgc_walk_sum (the collector sums the strides after the join).
+fn vgc_walk_count(w int, n int) {
+	nb := u32((vgc_heap.nspans + 7) / 8)
+	mut total := u64(0)
+	for {
+		w1 := C.vgc_atomic_add_u32(&vgc_walk_cursor, vgc_walk_chunk)
+		w0 := w1 - vgc_walk_chunk
+		if w0 >= nb {
+			break
+		}
+		hi := if w1 < nb { w1 } else { nb }
+		for wi in w0 .. hi {
+			mut bits := unsafe { vgc_heap.inuse_bits[int(wi)] }
+			for bits != 0 {
+				bi := C.vgc_ctz8(bits)
+				bits &= bits - 1
+				span := unsafe { vgc_heap.allspans[int(wi) * 8 + bi] }
+				if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
+					continue
+				}
+				nbytes := (span.nelems + 7) / 8
+				mut count := u32(0)
+				for b in 0 .. nbytes {
+					count += u32(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
+				}
+				// Clamp to nelems (last byte may have extra bits)
+				if count > span.nelems {
+					count = span.nelems
+				}
+				total += u64(count) * u64(span.elem_size)
+			}
+		}
+	}
+	vgc_walk_sum[w * 16] = total
+}
+
+// One walker's share of the sweep: the per-span bit work, and the span's
+// verdict into vgc_walk_tag[slot]. No list is touched here (the RULE at
+// vgc_walk_chunk); vgc_walk_sweep_apply applies the verdicts after the join.
+fn vgc_walk_sweep(w int, n int) {
+	nb := u32((vgc_heap.nspans + 7) / 8)
+	tags := unsafe { &u8(voidptr(vgc_walk_tag)) }
+	for {
+		w1 := C.vgc_atomic_add_u32(&vgc_walk_cursor, vgc_walk_chunk)
+		w0 := w1 - vgc_walk_chunk
+		if w0 >= nb {
+			return
+		}
+		hi := if w1 < nb { w1 } else { nb }
+		for wi in w0 .. hi {
+			mut bits := unsafe { vgc_heap.inuse_bits[int(wi)] }
+			for bits != 0 {
+				bi := C.vgc_ctz8(bits)
+				bits &= bits - 1
+				idx := int(wi) * 8 + bi
+				span := unsafe { vgc_heap.allspans[idx] }
+				if span == unsafe { nil } || !span.in_use {
+					continue
+				}
+				tag := vgc_sweep_span_bits(span)
+				if tag != vgc_walk_tag_none {
+					unsafe {
+						tags[idx] = tag
+					}
+				}
+			}
+		}
+	}
+}
+
+// The sweep's serial tail: the verdicts in slot order — the order the serial
+// sweep visited the spans — so the pool and the central lists end the cycle
+// exactly as a one-thread sweep leaves them. Clears each tag as it goes.
+fn vgc_walk_sweep_apply() {
+	tags := unsafe { &u8(voidptr(vgc_walk_tag)) }
+	for idx in 0 .. vgc_heap.nspans {
+		t := unsafe { tags[idx] }
+		if t == vgc_walk_tag_none {
+			continue
+		}
+		unsafe {
+			tags[idx] = vgc_walk_tag_none
+		}
+		span := unsafe { vgc_heap.allspans[idx] }
+		if span == unsafe { nil } || !span.in_use {
+			continue
+		}
+		vgc_sweep_span_apply(span, t)
+	}
+}
+
+// Run one walk phase: alone when this cycle has one walker (or no pool
+// thread exists), else on the pool with the collector as walker 0, joined
+// before this returns.
+fn vgc_walk_run(phase u32) {
+	C.vgc_atomic_store_u32(&vgc_walk_cursor, 0)
+	n := vgc_walk_nworkers_cur
+	if n <= 1 || vgc_mark_pool_n == 0 {
+		vgc_pool_phase_run(phase, 0, 1)
+		return
+	}
+	vgc_pool_run(phase, n)
 }
 
 // Conservative root scanning: scan thread stacks and look for pointers into the heap.
@@ -1295,9 +1419,15 @@ fn vgc_mark_plan() int {
 	if total <= 1 {
 		return 1
 	}
+	return vgc_pool_ensure(total)
+}
+
+// Grow the pool to total - 1 threads (the collector is the other one), before
+// the world stops; returns the count the pool can actually field.
+fn vgc_pool_ensure(total int) int {
 	want := total - 1
 	// a thread created now has seen every generation up to the current one;
-	// this cycle's advance (vgc_parallel_mark) is the first it drains
+	// this cycle's advance (vgc_pool_run) is the first it drains
 	C.vgc_atomic_store_u32(&vgc_mark_spawn_gen, C.vgc_atomic_load_u32(&vgc_mark_go))
 	for vgc_mark_pool_n < want {
 		if C.vgc_start_thread_rc(vgc_mark_worker_main) != 0 {
@@ -1309,6 +1439,86 @@ fn vgc_mark_plan() int {
 		return vgc_mark_pool_n + 1
 	}
 	return total
+}
+
+// cx-home/v#16 (fable-v16): this cycle's walker count for clear / count /
+// sweep. One walker per quarter of vgc_walk_min_spans (2048 spans, ~0.12 ms
+// of serial walk on 16 KB pages), from four at the floor up to the configured
+// count; one walker in a fork child, under the diagnostic builds whose sweep
+// writes shared forensic tables, while an address is watched, and while the
+// walks' own adaptation is backing off or the box is oversubscribed (a loaded
+// box: vgc_walk_adapt, vgc_box_busy). The mark's back-off is the mark's: a
+// short mark says nothing about a long table.
+fn vgc_walk_plan() int {
+	mut cfg := vgc_walk_workers_cfg
+	if cfg < 0 {
+		cfg = vgc_mark_workers_cfg
+	}
+	if cfg <= 1 || vgc_mark_forked || vgc_watch_addr != 0 || vgc_walk_min_spans == 0 {
+		return 1
+	}
+	$if vgc_keysweep ? {
+		return 1
+	}
+	$if vgc_passive ? {
+		return 1
+	}
+	$if vgc_birthcheck ? {
+		return 1
+	}
+	nsp := u64(vgc_heap.nspans)
+	if nsp < vgc_walk_min_spans {
+		return 1
+	}
+	if vgc_walk_load_gate && C.vgc_box_busy(vgc_walk_ncpu) != 0 {
+		return 1 // the pool would wait on a preempted walker at every join
+	}
+	mut total := int(nsp / (vgc_walk_min_spans / 4))
+	if total > cfg {
+		total = cfg
+	}
+	if vgc_walk_n_target > 0 && vgc_walk_n_target < total {
+		total = vgc_walk_n_target
+	}
+	if total <= 1 {
+		return 1
+	}
+	return vgc_pool_ensure(total)
+}
+
+// After the sweep: did this cycle's walkers pay off? The three walks' ns per
+// table span with one walker is remembered (a running mean); a parallel cycle
+// no cheaper than nine tenths of it — walkers that got no core, or one
+// preempted holding a chunk through the join — halves the count for the next
+// 32 parallel cycles (64, 128 ... 1024 while the retries keep not paying),
+// then the plan's count is tried again (the mark's rule, vgc_mark_adapt, on
+// the walks' own clock).
+fn vgc_walk_adapt(walked_ns u64) {
+	rate := walked_ns / (u64(vgc_heap.nspans) + 1)
+	if vgc_walk_nworkers_cur <= 1 {
+		vgc_walk_rate1 = if vgc_walk_rate1 == 0 { rate } else { (vgc_walk_rate1 * 7 + rate) / 8 }
+		return
+	}
+	if vgc_walk_backoff > 0 {
+		vgc_walk_backoff--
+		if vgc_walk_backoff == 0 {
+			vgc_walk_n_target = 0
+		}
+		return
+	}
+	if vgc_walk_rate1 > 0 && rate * 10 > vgc_walk_rate1 * 9 {
+		mut n := vgc_walk_nworkers_cur / 2
+		if n < 1 {
+			n = 1
+		}
+		vgc_walk_n_target = n
+		vgc_walk_backoff = vgc_walk_backoff_len
+		if vgc_walk_backoff_len < 1024 {
+			vgc_walk_backoff_len *= 2
+		}
+		return
+	}
+	vgc_walk_backoff_len = 32 // a parallel cycle that paid: the next back-off is short again
 }
 
 // After the count: did this cycle's markers pay off? The cost per marked KB
@@ -1353,11 +1563,22 @@ fn vgc_parallel_mark() {
 		return
 	}
 	vgc_work_flush_local(0) // the roots go to the shared list, so the pool starts with work
+	vgc_pool_run(vgc_pool_phase_mark, n)
+}
+
+// Run one phase of this cycle on the pool (cx-home/v#16): publish the phase
+// and its thread count, advance the generation, take slot 0, and return only
+// when every pool thread has reported the phase done — so no pool thread
+// touches the heap outside this stop, and the next phase starts on a joined
+// pool. Each phase of a cycle is one generation.
+fn vgc_pool_run(phase u32, n int) {
+	vgc_pool_phase = phase
+	vgc_pool_phase_n = n
 	C.vgc_atomic_store_u32(&vgc_mark_idle, 0)
 	C.vgc_atomic_store_u32(&vgc_mark_done, 0)
 	_ = C.vgc_atomic_add_u32(&vgc_mark_go, 1)
 	C.vgc_mark_wake(&vgc_mark_go)
-	vgc_drain_mark_parallel(0, n)
+	vgc_pool_phase_run(phase, 0, n)
 	mut spins := 0
 	for C.vgc_atomic_load_u32(&vgc_mark_done) < u32(vgc_mark_pool_n) {
 		spins++
@@ -1366,6 +1587,19 @@ fn vgc_parallel_mark() {
 		} else {
 			C.vgc_cpu_pause()
 		}
+	}
+}
+
+// One thread's share of a phase.
+fn vgc_pool_phase_run(phase u32, slot int, n int) {
+	if phase == vgc_pool_phase_mark {
+		vgc_drain_mark_parallel(slot, n)
+	} else if phase == vgc_pool_phase_clear {
+		vgc_walk_clear(slot, n)
+	} else if phase == vgc_pool_phase_count {
+		vgc_walk_count(slot, n)
+	} else if phase == vgc_pool_phase_sweep {
+		vgc_walk_sweep(slot, n)
 	}
 }
 
@@ -1380,15 +1614,24 @@ fn vgc_mark_worker_main() {
 	// this cycle's collector has counted this thread done.
 	mut seen := C.vgc_atomic_load_u32(&vgc_mark_spawn_gen)
 	for {
+		// The phases of one cycle follow each other within microseconds (clear,
+		// then the root scan, mark, count, sweep): spin a little for the next
+		// generation before sleeping on it, so a cycle pays one wake, not four.
+		mut sp := 0
+		for sp < 8192 && C.vgc_atomic_load_u32(&vgc_mark_go) == seen {
+			C.vgc_cpu_pause()
+			sp++
+		}
 		C.vgc_mark_wait(&vgc_mark_go, seen)
 		g := C.vgc_atomic_load_u32(&vgc_mark_go)
 		if g == seen {
 			continue
 		}
 		seen = g
-		n := vgc_mark_nworkers_cur
+		ph := vgc_pool_phase
+		n := vgc_pool_phase_n
 		if slot < n {
-			vgc_drain_mark_parallel(slot, n)
+			vgc_pool_phase_run(ph, slot, n)
 		}
 		_ = C.vgc_atomic_add_u32(&vgc_mark_done, 1)
 	}
@@ -1915,19 +2158,15 @@ fn vgc_do_sweep() {
 		vgc_ks_count = 0
 		vgc_ks_overflow = 0
 	}
-	nb := (vgc_heap.nspans + 7) / 8
-	for w in 0 .. nb {
-		mut bits := unsafe { vgc_heap.inuse_bits[w] }
-		for bits != 0 {
-			bi := C.vgc_ctz8(bits)
-			bits &= bits - 1
-			span := unsafe { vgc_heap.allspans[w * 8 + bi] }
-			if span == unsafe { nil } || !span.in_use {
-				continue
-			}
-			vgc_sweep_span(span)
-		}
-	}
+	// cx-home/v#16: the per-span bit work on the pool, then the verdicts
+	// (recycle / relink) applied here, by this thread, in slot order.
+	C.vgc_atomic_store_u32(&vgc_walk_active, 1)
+	vgc_walk_run(vgc_pool_phase_sweep)
+	C.vgc_atomic_store_u32(&vgc_walk_active, 0)
+	t_walked := C.vgc_now_ns()
+	vgc_ph_swalk_ns = t_walked - vgc_ph[6]
+	vgc_walk_sweep_apply()
+	vgc_ph_sapply_ns = C.vgc_now_ns() - t_walked
 	$if vgc_keysweep ? {
 		// #58 FORENSIC (world still stopped, sweep just freed): does any REGISTERED
 		// thread's scanned window STILL hold a word pointing into an object this
@@ -1997,9 +2236,20 @@ fn vgc_do_sweep() {
 
 // Sweep a single span: free unmarked objects.
 // Translated from Go's mspan.sweep() in mgcsweep.go.
+// cx-home/v#16: split into the per-span bit work (vgc_sweep_span_bits, run by
+// any walker) and the list work its verdict asks for (vgc_sweep_span_apply,
+// the collector only). This serial form is what vgc_sweep_finish uses.
 fn vgc_sweep_span(span &VGC_Span) {
+	vgc_sweep_span_apply(span, vgc_sweep_span_bits(span))
+}
+
+// The bit work of one span's sweep: clear the garbage bits, fix alloc_count
+// and the free_index hint, and return the verdict — recycle (empty, not
+// acquired this cycle), relink (survivors and free slots, off every list) or
+// nothing. Touches only this span.
+fn vgc_sweep_span_bits(span &VGC_Span) u8 {
 	if span.alloc_bits == unsafe { nil } || span.mark_bits == unsafe { nil } {
-		return
+		return vgc_walk_tag_none
 	}
 	// #58 ROOT CAUSE (quiet half — the workers8 sweep-while-live UAF): a mutator
 	// can be SIGNAL-FROZEN (async-suspend STW stops threads at ARBITRARY PCs)
@@ -2021,7 +2271,7 @@ fn vgc_sweep_span(span &VGC_Span) {
 	// their alloc bits, so the span fills, gets evicted from the cache, loses its
 	// stamp, and the NEXT sweep reclaims it normally.
 	if span.sweep_gen == u32(vgc_heap.gc_cycle) {
-		return
+		return vgc_walk_tag_none
 	}
 
 	// Sweep using byte-level operations for speed
@@ -2177,6 +2427,27 @@ fn vgc_sweep_span(span &VGC_Span) {
 	// SIGSEGV. Giving an in-flight span a one-cycle grace closes that window (a span
 	// genuinely emptied this cycle is reclaimed on the next, a bounded delay).
 	if span.alloc_count == 0 && span.npages > 0 && span.sweep_gen != u32(vgc_heap.gc_cycle) {
+		return vgc_walk_tag_recycle
+	}
+	if span.alloc_count > 0 && span.alloc_count < span.nelems && span.on_central == 0
+		&& span.class_idx != 0 {
+		return vgc_walk_tag_relink
+	}
+	return vgc_walk_tag_none
+}
+
+// The list work of one span's sweep, by the collector after the walk's join
+// (cx-home/v#16): an empty span leaves its central list and goes to the pool;
+// a partial span off every list is relinked onto its class's partial list.
+// The conditions were decided in vgc_sweep_span_bits; the comments below are
+// the serial sweep's, and still hold: the collector holds every central lock
+// and free_spans_lock across the cycle.
+fn vgc_sweep_span_apply(span &VGC_Span, tag u8) {
+	if C.vgc_atomic_load_u32(&vgc_walk_active) != 0 {
+		C.vgc_say(0x3a1e, u64(span.slot)) // list work inside the walk
+		C.abort()
+	}
+	if tag == vgc_walk_tag_recycle {
 		mut mspan := unsafe { &VGC_Span(span) }
 		if mspan.on_central != 0 {
 			sc := int(mspan.class_idx) * 2 + if mspan.noscan { 1 } else { 0 }
@@ -2218,8 +2489,7 @@ fn vgc_sweep_span(span &VGC_Span) {
 	// cycle and not yet popped) keeps its place. Large spans (class_idx 0,
 	// nelems 1) never qualify — alloc_count>0 means they are full — but the
 	// class_idx guard makes the exclusion explicit.
-	if span.alloc_count > 0 && span.alloc_count < span.nelems && span.on_central == 0
-		&& span.class_idx != 0 {
+	if tag == vgc_walk_tag_relink {
 		sc := int(span.class_idx) * 2 + if span.noscan { 1 } else { 0 }
 		if sc < 136 {
 			mut pspan := unsafe { &VGC_Span(span) }
@@ -2258,28 +2528,14 @@ fn vgc_sweep_finish() {
 
 // Count total marked bytes across all spans using byte-level popcount
 fn vgc_count_marked() u64 {
+	// cx-home/v#16: on the pool when the table is large (vgc_walk_count)
+	for w in 0 .. vgc_max_markers {
+		vgc_walk_sum[w * 16] = 0
+	}
+	vgc_walk_run(vgc_pool_phase_count)
 	mut total := u64(0)
-	nb := (vgc_heap.nspans + 7) / 8
-	for w in 0 .. nb {
-		mut bits := unsafe { vgc_heap.inuse_bits[w] }
-		for bits != 0 {
-			bi := C.vgc_ctz8(bits)
-			bits &= bits - 1
-			span := unsafe { vgc_heap.allspans[w * 8 + bi] }
-			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
-				continue
-			}
-			nbytes := (span.nelems + 7) / 8
-			mut count := u32(0)
-			for b in 0 .. nbytes {
-				count += u32(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
-			}
-			// Clamp to nelems (last byte may have extra bits)
-			if count > span.nelems {
-				count = span.nelems
-			}
-			total += u64(count) * u64(span.elem_size)
-		}
+	for w in 0 .. vgc_max_markers {
+		total += vgc_walk_sum[w * 16]
 	}
 	return total
 }
