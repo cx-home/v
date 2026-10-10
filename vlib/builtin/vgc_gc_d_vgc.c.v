@@ -1109,8 +1109,16 @@ fn vgc_mark_roots() {
 		if !cache.registered {
 			continue
 		}
+		C.vgc_say(u64(0x66000 + i), u64(cache.stack_lo))
+		C.vgc_say(u64(0x66100 + i), u64(cache.stack_hi))
+		C.vgc_say(u64(0x66200 + i), u64(cache.stack_limit_lo))
+		C.vgc_say(u64(0x66300 + i), u64(cache.stack_limit_hi))
+		C.vgc_say(u64(0x66400 + i), u64(cache.stack_base))
+		C.vgc_say(u64(0x66500 + i), u64(cache.mach_port))
+		C.vgc_say(u64(0x66600 + i), u64(C.vgc_atomic_load_u32(&vgc_heap.caches[i].safe)))
 		if cache.stack_lo > 0 && cache.stack_hi > 0 && cache.stack_hi > cache.stack_lo {
 			vgc_scan_range(cache.stack_lo, cache.stack_hi, 0)
+			C.vgc_say(u64(0x66700 + i), 0)
 			// DIAGNOSTIC (root-scan-miss localizer): does THIS thread's stack hold
 			// a pointer to the watched object? Bounded to the stack ranges only.
 			if vgc_watch_addr != 0 {
