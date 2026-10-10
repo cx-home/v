@@ -233,5 +233,8 @@ fn solaris_utc() Time {
 
 // sleep makes the calling thread sleep for a given duration (in nanoseconds).
 pub fn sleep(duration Duration) {
+	// cx-home/v#28: a GC-safe region (see time_nix.c.v)
+	gc_safe_region_enter()
 	C.Sleep(int(duration / millisecond))
+	gc_safe_region_exit()
 }

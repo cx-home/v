@@ -182,7 +182,10 @@ pub fn (mut sem Semaphore) wait() {
 
 	outer: for {
 		if c == 0 {
+			// cx-home/v#28: a GC-safe region (see sync_darwin.c.v's note)
+			gc_safe_region_enter()
 			C.SleepConditionVariableSRW(&sem.cond, &sem.mtx, C.INFINITE, 0)
+			gc_safe_region_exit()
 			c = C.atomic_load_u32(&sem.count)
 		}
 		for c > 0 {
