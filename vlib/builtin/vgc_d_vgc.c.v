@@ -231,6 +231,18 @@ mut:
 
 // VGC_Cache is a per-thread allocation cache.
 // Translated from Go's runtime.mcache - eliminates lock contention on hot path.
+// cx-home/v#16 (fable-v16): one thread's slot must own its cache lines. The
+// struct is 1528 bytes, so without the alignment adjacent slots share a line
+// at every boundary, and WHICH fields share depends on the BSS layout of the
+// whole program: one layout (the pinB base) put the boundary between two
+// thread's cold fields; another (two kilobytes more of globals) put thread
+// i's per-allocation alloc_delta/live_delta writes on the line thread i+1
+// reads its alloc[0..13] span pointers from — hot_loop t4 fell from 15 to 9
+// Mops/s with no code on the fast path changed, and t1 was unaffected. 128
+// bytes is Apple Silicon's line; it rounds the slot to 1536 bytes and
+// aligns vgc_heap.caches. With it the per-thread accounting is what it
+// claims to be: no shared line on the allocation fast path.
+@[aligned: 128]
 struct VGC_Cache {
 mut:
 	alloc [136]&VGC_Span // one span per span class (68 scan + 68 noscan)
