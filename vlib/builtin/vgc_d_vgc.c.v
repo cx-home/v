@@ -1673,6 +1673,17 @@ pub fn vgc_init() {
 // ============================================================
 
 fn vgc_register_thread() {
+	_ = vgc_register_thread_opt(true)
+}
+
+// vgc_register_thread_opt registers the calling thread in a cache slot. With
+// `wait`, a full table is waited out (the allocation entry points: a thread
+// about to allocate must be a mutator). Without it, a full table returns false
+// and the thread stays unregistered until its first allocation (the spawn
+// wrapper's entry-time registration, cx-home/v#26: a wait there would hold the
+// slot of a parked thread while the vgc_max_threads+1-th waited forever for it
+// — 2,000 parked workers, vgc_spawn_roots_many_live_test.v).
+fn vgc_register_thread_opt(wait bool) bool {
 	C.vgc_mutex_lock(&vgc_heap.cache_lock)
 	// Reuse a reclaimed slot before growing the high-water mark, so that
 	// churn (many short-lived threads) cannot exhaust the fixed cache array.
@@ -1688,6 +1699,10 @@ fn vgc_register_thread() {
 		}
 		if idx >= 0 {
 			break
+		}
+		if !wait {
+			C.vgc_mutex_unlock(&vgc_heap.cache_lock)
+			return false
 		}
 		// The table is full: vgc_max_threads live mutators. An UNREGISTERED
 		// mutator is unsound, not merely slow — the collector never suspends it
@@ -1789,6 +1804,24 @@ fn vgc_register_thread() {
 		C.vgc_atomic_fence()
 	}
 	C.vgc_trace(3, idx, 0, 0) // BAR_OUT
+	return true
+}
+
+// vgc_register_at_entry registers the calling thread if a cache slot is free
+// and never waits for one. Every spawned thread's wrapper calls it before the
+// first use of its arguments (cx-home/v#26, vlib/v/gen/c/spawn_and_go.v), and
+// so does vgc_free: a thread that touches the heap only to read and free what
+// another thread allocated is a mutator too, and an unregistered mutator is
+// outside the stop-the-world — not parked, not suspended, its stack and
+// registers never scanned. A thread past the table's capacity keeps the lazy
+// shape (it registers, waiting, at its first allocation; its spawn argument is
+// rooted by the spawn-root registry until its fn returns), so a program with
+// more than vgc_max_threads live threads cannot deadlock on this call.
+@[markused]
+fn vgc_register_at_entry() {
+	if C.vgc_get_cache_idx() < 0 {
+		_ = vgc_register_thread_opt(false)
+	}
 }
 
 // vgc_thread_exit_cb is invoked (via a pthread-key destructor, see
@@ -1875,6 +1908,9 @@ pub fn vgc_my_stack_info() (int, usize, usize) {
 	return idx, unsafe { vgc_heap.caches[idx].stack_lo }, unsafe { vgc_heap.caches[idx].stack_hi }
 }
 
+// vgc_ensure_registered registers the calling thread on its first call,
+// waiting for a slot when the table is full (the allocation entry points; see
+// vgc_register_at_entry for the non-waiting form).
 fn vgc_ensure_registered() {
 	if C.vgc_get_cache_idx() < 0 {
 		vgc_register_thread()
@@ -4405,6 +4441,12 @@ fn vgc_free(ptr voidptr) {
 	if ptr == unsafe { nil } {
 		return
 	}
+	// cx-home/v#26: a thread whose first heap operation is a free — one that
+	// received the object from another thread and never allocated — must be a
+	// registered mutator before it touches the span: unregistered, it is never
+	// stopped or scanned, and this free would run through mark and sweep. One
+	// TLS read when already registered (the common case); never waits.
+	vgc_register_at_entry()
 	// In a GC environment, explicit free is optional.
 	// The object will be collected if unreachable.
 	// However, we can mark it as free immediately for reuse.
