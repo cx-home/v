@@ -19,10 +19,11 @@
 // and every 256 records a 1 MB transient buffer asks for a run of pages the
 // fragmented pool cannot serve — the formatter's growing output buffer. The
 // child runs with the frag gate at its default and off (VGC_FRAG_GATE=0),
-// three times each, and counts the collections in VGC_GCTRACE. The default
-// may take at most one collection in eight more than the gate off (a growing
-// set still defragments at a cycle's last carve), and its total pause time
-// no more than 1.25x the gate off's plus 10 ms (each the least of three runs).
+// three times each, interleaved, and counts the collections in VGC_GCTRACE.
+// The default's least may take at most one collection in eight more than the
+// gate-off arm's most (a growing set still defragments at a cycle's last
+// carve), and its least total pause time no more than 1.25x the gate-off
+// arm's most plus 10 ms (see least/most below for why the off arm's range).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_frag_gate_growing_test.v
 module main
@@ -75,18 +76,26 @@ fn run_child(gate string) Trace {
 	return t
 }
 
-// least_of keeps the fewest collections and the least pause time over n runs:
-// a loaded box can add a collection or stretch a pause, never take one away.
-fn least_of(n int, gate string) Trace {
-	mut best := run_child(gate)
-	for _ in 1 .. n {
-		t := run_child(gate)
-		best = Trace{
-			cycles:   if t.cycles < best.cycles { t.cycles } else { best.cycles }
-			pause_us: if t.pause_us < best.pause_us { t.pause_us } else { best.pause_us }
-		}
+// Trace pairs: the least and the most of an arm's runs. The arms interleave
+// (off, on, x3) so both see the same load, and the default is graded against
+// the gate-off arm's MOST: the pacer is adaptive, so a loaded box takes a
+// collection away as well as adds one, and stretches or shortens a pause by
+// where the cycles fall (CI FreeBSD: default 17 / off 17 cycles with the
+// default's least pause past 1.25x the off arm's least, the gate standing
+// down; cx-home/v#16). The regression it guards is far outside that range:
+// 65 collections against 18 before the guard.
+fn least(a Trace, b Trace) Trace {
+	return Trace{
+		cycles:   if b.cycles < a.cycles { b.cycles } else { a.cycles }
+		pause_us: if b.pause_us < a.pause_us { b.pause_us } else { a.pause_us }
 	}
-	return best
+}
+
+fn most(a Trace, b Trace) Trace {
+	return Trace{
+		cycles:   if b.cycles > a.cycles { b.cycles } else { a.cycles }
+		pause_us: if b.pause_us > a.pause_us { b.pause_us } else { a.pause_us }
+	}
 }
 
 fn test_a_growing_heap_takes_no_extra_frag_gate_collections() {
@@ -94,13 +103,20 @@ fn test_a_growing_heap_takes_no_extra_frag_gate_collections() {
 		println('FRAG-DONE=${grow()}')
 		return
 	}
-	off := least_of(3, '0')
-	on := least_of(3, '')
-	println('vgc_frag_gate_growing: gate off ${off.cycles} collections ${off.pause_us} us; default ${on.cycles} collections ${on.pause_us} us')
+	mut off := run_child('0')
+	mut off_most := off
+	mut on := run_child('')
+	for _ in 1 .. 3 {
+		o := run_child('0')
+		off = least(off, o)
+		off_most = most(off_most, o)
+		on = least(on, run_child(''))
+	}
+	println('vgc_frag_gate_growing: gate off ${off.cycles}-${off_most.cycles} collections ${off.pause_us}-${off_most.pause_us} us; default ${on.cycles} collections ${on.pause_us} us')
 	assert off.cycles > 0
 	// a growing set may still defragment at a cycle's last carve: at most one
 	// collection in eight more than the gate off (measured: 17-18 against 17;
 	// 65 against 18 before the guard)
-	assert on.cycles <= off.cycles + off.cycles / 8, 'the frag gate added collections on a growing heap: ${on.cycles} against ${off.cycles} with the gate off'
-	assert on.pause_us <= off.pause_us * 5 / 4 + 10000, 'the frag gate added pause time on a growing heap: ${on.pause_us} us against ${off.pause_us} us'
+	assert on.cycles <= off_most.cycles + off_most.cycles / 8, 'the frag gate added collections on a growing heap: ${on.cycles} against ${off.cycles}-${off_most.cycles} with the gate off'
+	assert on.pause_us <= off_most.pause_us * 5 / 4 + 10000, 'the frag gate added pause time on a growing heap: ${on.pause_us} us against ${off.pause_us}-${off_most.pause_us} us'
 }
