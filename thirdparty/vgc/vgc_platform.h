@@ -2003,7 +2003,8 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
                                uint64_t susp_us, uint64_t data_us, uint64_t stacks_us,
                                uint64_t mark_us, uint64_t count_us, uint64_t sweep_us,
                                uint64_t tail_us, uint64_t seg_kb, uint64_t spans_in_use,
-                               uint64_t markers) {
+                               uint64_t markers, uint64_t walkers, uint64_t swalk_us,
+                               uint64_t sapply_us) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] phases stw="); vgc__wdec(stw_us);
     vgc__ws(" clear="); vgc__wdec(clear_us);
@@ -2017,6 +2018,9 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
     vgc__ws("us seg="); vgc__wdec(seg_kb);
     vgc__ws("KB spans_in_use="); vgc__wdec(spans_in_use);
     vgc__ws(" markers="); vgc__wdec(markers);
+    vgc__ws(" walkers="); vgc__wdec(walkers);
+    vgc__ws(" swalk="); vgc__wdec(swalk_us);
+    vgc__ws(" sapply="); vgc__wdec(sapply_us);
     vgc__ws("\n");
 }
 

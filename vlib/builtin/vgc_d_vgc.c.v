@@ -94,7 +94,7 @@ fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs searc
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
-fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers)
+fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -727,6 +727,65 @@ __global vgc_mark_n_target = int(0)
 // a reduced marker count while backing off (0 = the configured count)
 __global vgc_mark_backoff = int(0)
 // parallel cycles left at the reduced count
+
+// cx-home/v#16 (fable-v16): the span WALKS — clearing the mark bits, counting
+// the marked bytes, and the sweep's per-span bit work — run on the same pool
+// as the mark, one phase at a time, each joined before the next. A walker
+// claims vgc_walk_chunk words of inuse_bits (256 spans) at a time from a
+// shared cursor (work-stealing over the span table: a preempted walker holds
+// at most one chunk). The RULE for the sweep: a walker touches only the span
+// it is sweeping — its own bitmaps, alloc_count, free_index — and writes the
+// span's verdict (recycle / relink partial / nothing) into vgc_walk_tag; the
+// collector alone, after the join, applies the verdicts in slot order, so the
+// free-span pool, the central lists and the descriptor retire list are
+// mutated by one thread, in the same order as the serial sweep. The idle-run
+// coalesce (cx-home/v#14), the frag-gate merge and the pool trim stay in that
+// serial tail. Every list mutation asserts the walk is not active (0x3a1c /
+// 0x3a1d / 0x3a1e abort). The walks engage by table size — VGC_WALK_PAR_MIN_SPANS
+// (default 8192 spans, ~0.5 ms of serial walk on 16 KB pages; one walker per
+// quarter of it, up to VGC_WALK_WORKERS, default the marker configuration) —
+// and back off like the mark does (vgc_walk_adapt): a parallel walk no cheaper
+// per span than nine tenths of the one-walker rate halves the count for 32
+// cycles. A preempted walker holds one chunk; the join waits for it.
+const vgc_walk_chunk = u32(32)
+const vgc_walk_sum_len = 256
+const vgc_walk_tag_none = u8(0)
+const vgc_walk_tag_recycle = u8(1)
+const vgc_walk_tag_relink = u8(2)
+const vgc_pool_phase_mark = u32(0)
+const vgc_pool_phase_clear = u32(1)
+const vgc_pool_phase_count = u32(2)
+const vgc_pool_phase_sweep = u32(3)
+
+__global vgc_walk_workers_cfg = int(-1)
+// -1 = the marker count's configuration (VGC_MARK_WORKERS)
+__global vgc_walk_min_spans = u64(8192)
+// spans in the table before a walk is split; one walker per quarter of it
+__global vgc_walk_rate1 = u64(0)
+// ns per span of the three walks with one walker (a running mean)
+__global vgc_walk_n_target = int(0)
+// a reduced walker count while backing off (0 = the planned count)
+__global vgc_walk_backoff = int(0)
+// parallel cycles left at the reduced count
+__global vgc_walk_nworkers_cur = int(1)
+// this cycle's walker count (the collector included)
+__global vgc_pool_phase = u32(0)
+// the phase the pool was woken for (vgc_pool_phase_*)
+__global vgc_pool_phase_n = int(1)
+// the thread count of that phase; a pool slot at or past it skips the phase
+__global vgc_walk_cursor = u32(0)
+// the next inuse_bits word to claim (reset by the collector before each walk)
+__global vgc_walk_sum = [vgc_walk_sum_len]u64{}
+// per-walker marked-byte sums, one per 128-byte stride (vgc_walk_sum[w * 16])
+__global vgc_walk_tag = usize(0)
+// per-slot sweep verdicts (allspans_cap bytes, vgc_os_alloc'd with allspans)
+__global vgc_walk_active = u32(0)
+// 1 while the sweep walk runs (list mutations assert 0)
+__global vgc_ph_swalk_ns = u64(0)
+// this cycle's sweep walk (the parallel part, join included) in ns
+__global vgc_ph_sapply_ns = u64(0)
+// this cycle's verdict apply (the serial list work) in ns; the rest of the
+// sweep phase is the coalesce and the trim
 
 // The live-set bound's floor scales with the allocating threads (cx-home/v#16):
 // the bound holds the headroom to max(floor, live) for memory's sake, which is
@@ -1383,6 +1442,12 @@ fn vgc_atfork_child() {
 	vgc_mark_n_target = 0
 	vgc_mark_last_work_ns = 0
 	vgc_mark_backoff = 0
+	vgc_walk_nworkers_cur = 1
+	vgc_walk_n_target = 0
+	vgc_walk_backoff = 0
+	vgc_pool_phase = 0
+	vgc_pool_phase_n = 1
+	vgc_walk_active = 0
 	for i in 0 .. vgc_max_markers {
 		vgc_mark_local[i] = 0
 	}
@@ -1490,6 +1555,23 @@ pub fn vgc_init() {
 		pv := C.atoll(pm_env)
 		if pv >= 0 {
 			vgc_mark_par_min_ns = u64(pv) * 1000
+		}
+	}
+	ww_env := C.getenv(c'VGC_WALK_WORKERS')
+	if ww_env != unsafe { nil } {
+		wv := C.atoll(ww_env)
+		if wv >= 0 {
+			vgc_walk_workers_cfg = int(wv)
+		}
+	}
+	if vgc_walk_workers_cfg > vgc_max_markers {
+		vgc_walk_workers_cfg = vgc_max_markers
+	}
+	ws_env := C.getenv(c'VGC_WALK_PAR_MIN_SPANS')
+	if ws_env != unsafe { nil } {
+		sv := C.atoll(ws_env)
+		if sv >= 0 {
+			vgc_walk_min_spans = u64(sv)
 		}
 	}
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
@@ -2494,6 +2576,12 @@ fn vgc_pool_decommit_run(arena_idx int, start usize, npages u64) {
 // flavor of the arena ratchet ("no pooled span big enough, bump never rewinds")
 // is what killed the marine helm mid-persist in the cx #277 field traces.
 fn vgc_put_free_span(mut span VGC_Span) {
+	// cx-home/v#16: the pool is mutated only after the sweep walk's join (the
+	// RULE at vgc_walk_chunk); one atomic load per pooled span, always on.
+	if C.vgc_atomic_load_u32(&vgc_walk_active) != 0 {
+		C.vgc_say(0x3a1c, u64(span.slot)) // list mutation inside the walk
+		C.abort()
+	}
 	npages := span.npages
 	if npages == 0 {
 		return
@@ -2669,6 +2757,7 @@ fn vgc_new_span_desc() &VGC_Span {
 		}
 		vgc_heap.allspans = &&VGC_Span(C.vgc_os_alloc(usize(sizeof(voidptr)) * usize(cap)))
 		vgc_heap.inuse_bits = &u8(C.vgc_os_alloc(usize(cap / 8 + 8)))
+		vgc_walk_tag = usize(C.vgc_os_alloc(usize(cap) + 8)) // cx-home/v#16: sweep verdicts
 		vgc_heap.allspans_cap = cap
 	}
 	// Track in allspans. Exceeding the (mmap-reserved) capacity is NOT silently
@@ -2928,6 +3017,10 @@ fn vgc_frag_gate_defers(nbytes usize) bool {
 // its run is popped by the deferred request's retry at once. Returns the
 // bytes absorbed into runs (the merged spans' sizes, the run heads excluded).
 fn vgc_pool_defrag(min_age u32) u64 {
+	if C.vgc_atomic_load_u32(&vgc_walk_active) != 0 {
+		C.vgc_say(0x3a1d, u64(min_age)) // coalesce inside the walk (cx-home/v#16)
+		C.abort()
+	}
 	cyc := u32(vgc_heap.gc_cycle)
 	mut absorbed := u64(0)
 	for i in 0 .. vgc_heap.narenas {
