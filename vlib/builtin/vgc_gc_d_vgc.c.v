@@ -2591,6 +2591,22 @@ fn vgc_update_trigger() {
 	gc_percent := u64(vgc_heap.gc_percent)
 
 	now := C.vgc_now_ns()
+	// The adaptive floor (cx-home/v#14; vgc_headroom_adaptive_floor doc):
+	// clamp(2 x marked, lo, live_floor). hr_min follows it below 8 MB.
+	mut afloor := vgc_headroom_live_floor
+	mut hr_min := vgc_headroom_min
+	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
+		mut f := marked * 2
+		if f < vgc_headroom_floor_lo {
+			f = vgc_headroom_floor_lo
+		}
+		if f < afloor {
+			afloor = f
+		}
+		if hr_min > afloor {
+			hr_min = afloor
+		}
+	}
 	if !vgc_headroom_pinned {
 		// Cycle cost vs mutator progress. pause = this cycle (t0 stamped at the
 		// winning gc_phase CAS, so it includes the stop protocol + mark + sweep);
@@ -2637,7 +2653,7 @@ fn vgc_update_trigger() {
 		}
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
-			mut floor := vgc_headroom_live_floor
+			mut floor := afloor
 			if vgc_headroom_per_thread && nt > 1 {
 				// cx-home/v#16: floor x the threads that allocated this cycle.
 				floor *= u64(nt)
@@ -2649,8 +2665,8 @@ fn vgc_update_trigger() {
 				hr_max = live_cap
 			}
 		}
-		if hr < vgc_headroom_min {
-			hr = vgc_headroom_min
+		if hr < hr_min {
+			hr = hr_min
 		}
 		if hr > hr_max {
 			hr = hr_max
@@ -2716,8 +2732,8 @@ fn vgc_update_trigger() {
 	// under its limit) with the adaptive floor as the small-heap lower bound.
 	// Goals already more than that budget under the limit are untouched.
 	mut min_budget := marked / 16
-	if min_budget < vgc_headroom_min {
-		min_budget = vgc_headroom_min
+	if min_budget < hr_min {
+		min_budget = hr_min
 	}
 	if goal < marked + min_budget {
 		goal = marked + min_budget

@@ -699,6 +699,16 @@ __global vgc_headroom_live_pct = u64(100)
 // 5 % of Python on the same box. VGC_HEADROOM_LIVE_FLOOR_MB overrides (decimal;
 // a value below vgc_headroom_min is raised to it).
 __global vgc_headroom_live_floor = u64(32) * 1024 * 1024
+// The ADAPTIVE floor (cx-home/v#14, cx-private#1886, owner default (c)): the
+// bound's floor scales with the live set, clamp(2 x marked, vgc_headroom_floor_lo,
+// vgc_headroom_live_floor). A program that keeps 2 MB live paces to a ~6 MB goal
+// instead of 2 + 32 MB; a live set of 16 MB or more gets today's 32 MB floor,
+// and one of 32 MB or more is bounded by the marked set as before. The 8 MB
+// vgc_headroom_min and the minimum-progress budget follow the adaptive floor
+// down. VGC_HEADROOM_ADAPTIVE_FLOOR=0 restores the fixed floor;
+// VGC_HEADROOM_FLOOR_LO_MB sets the low clamp (decimal MB, default 4).
+__global vgc_headroom_adaptive_floor = true
+__global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
@@ -1568,6 +1578,20 @@ pub fn vgc_init() {
 	}
 	if vgc_headroom_live_floor < vgc_headroom_min {
 		vgc_headroom_live_floor = vgc_headroom_min
+	}
+	af_env := C.getenv(c'VGC_HEADROOM_ADAPTIVE_FLOOR')
+	if af_env != unsafe { nil } && C.atoll(af_env) == 0 {
+		vgc_headroom_adaptive_floor = false
+	}
+	lo_env := C.getenv(c'VGC_HEADROOM_FLOOR_LO_MB')
+	if lo_env != unsafe { nil } {
+		lmb := C.atoll(lo_env)
+		if lmb > 0 {
+			vgc_headroom_floor_lo = u64(lmb) * 1024 * 1024
+		}
+	}
+	if vgc_headroom_floor_lo > vgc_headroom_live_floor {
+		vgc_headroom_floor_lo = vgc_headroom_live_floor
 	}
 	// Parallel mark (cx-home/v#16): the marker count and the engage threshold.
 	mut mw := C.vgc_ncpu()
