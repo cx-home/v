@@ -1,0 +1,3 @@
+memset(&big, 0, sizeof(main__Big)); // global 3z
+memset(&big2, 0, sizeof(main__Big)); // global 5z
+.n = 5

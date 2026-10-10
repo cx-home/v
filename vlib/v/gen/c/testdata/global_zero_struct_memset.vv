@@ -1,0 +1,23 @@
+// vtest vflags: -enable-globals -no-skip-unused
+// cx-home/v#32: a global struct whose every field defaults to zero is zeroed in
+// `_vinit` with memset, not built as a stack temporary of the whole struct (at
+// -O0 vgc_heap's ~2 MB temporary overflowed a 2 MB stack in `_vinit`).
+struct Big {
+mut:
+	a    int
+	p    &u8 = unsafe { nil }
+	arr  [65536]u64
+	flag bool
+}
+
+struct WithDefault {
+	n int = 5
+}
+
+__global big = Big{}
+__global big2 Big
+__global with_default = WithDefault{}
+
+fn main() {
+	println(big.a + big2.a + with_default.n)
+}
