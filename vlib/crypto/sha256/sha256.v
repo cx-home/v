@@ -221,8 +221,17 @@ pub fn sum224(data []u8) []u8 {
 }
 
 fn block(mut dig Digest, p []u8) {
-	// For now just use block_generic until we have specific
-	// architecture optimized versions
+	// The ARMv8 cryptography extension where the C compiler has it (every
+	// Apple silicon build): about an order of magnitude faster than the
+	// generic step, byte-identical digests; block_generic everywhere else.
+	$if !tinyc {
+		n := p.len / chunk
+		if n > 0 && dig.h.len == 8 {
+			if unsafe { C.v_sha256_block_arm64(&dig.h[0], &p[0], usize(n)) } == 1 {
+				return
+			}
+		}
+	}
 	block_generic(mut dig, p)
 }
 
