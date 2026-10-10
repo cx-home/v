@@ -27,12 +27,17 @@ jobs:
       # cx-home/v#16: clear, count and the sweep's bit work on the marker pool
       # stay serial on a small or oversubscribed box (the load gate); this run
       # forces the parallel walks on every collection so they are tested here.
+      # One test at a time (VJOBS=1): with the load gate lifted, eight walkers per
+      # test on a 4-vCPU runner beside three other tests put the pacing-ratio
+      # tests' pause/carve bounds (grow_gate_growing, refute_tiny_gate) past
+      # their limits on 38046128855; the soundness the run is for does not
+      # need the box shared.
       - name: bench/parallel-alloc (walks forced)
-        run: VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
+        run: VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
 
   vgc-freebsd:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v7
       - name: Start FreeBSD VM
@@ -57,7 +62,7 @@ jobs:
           VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_idle_defrag_test.v 2>&1 | tail -80 || true
           ./v test bench/parallel-alloc
           VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc
-          VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
+          VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's
