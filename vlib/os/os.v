@@ -926,7 +926,15 @@ pub fn mkdir_all(opath string, params MkdirParams) ! {
 		if exists(p) && is_dir(p) {
 			continue
 		}
-		mkdir(p, params) or { return error('folder: ${p}, error: ${err}') }
+		mkdir(p, params) or {
+			// `mkdir -p` semantics: another process may create the same folder between the
+			// exists() check above and this mkdir (two `v test` runs sharing VTMP, cx-private's
+			// test-connector-real on the 11779c611 tick); a folder that is there now is success.
+			if is_dir(p) {
+				continue
+			}
+			return error('folder: ${p}, error: ${err}')
+		}
 	}
 }
 

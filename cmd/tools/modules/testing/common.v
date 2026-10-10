@@ -369,7 +369,9 @@ pub fn new_test_session(_vargs string, will_compile bool) TestSession {
 	}
 	skip_files = skip_files.map(os.abs_path)
 	vargs := _vargs.replace('-progress', '')
-	hash := '${sync.thread_id().hex()}_${rand.ulid()}'
+	// the pid keeps two concurrent sessions apart: the main thread id is the same address in
+	// every process on macOS, so only the ulid separated them
+	hash := '${sync.thread_id().hex()}_${os.getpid()}_${rand.ulid()}'
 	new_vtmp_dir := setup_new_vtmp_folder(hash)
 	if term.can_show_color_on_stderr() {
 		os.setenv('VCOLORS', 'always', true)
