@@ -13,9 +13,20 @@
 // beside one 2 KB transient, the way a formatter keeps its output and drops
 // its scratch. The child runs the build with the gate at its default and with
 // it off (VGC_GROW_GATE_PCT=0), three times each, and counts the collections
-// in VGC_GCTRACE. The gate at its default must take no more collections than
-// the gate off, and its total pause time no more than 1.25x the gate off's
-// plus 10 ms (each the least of its three runs).
+// in VGC_GCTRACE, the two arms interleaved (off, on, off, on, ...) so both see
+// the same load. The gate at its default must take no more collections than
+// the most the gate-off arm took, and its total pause time (the least of its
+// runs) no more than 1.25x the gate off's least plus 10 ms.
+//
+// Why the gate-off arm's MOST, not its least: the pacer is adaptive, and a
+// loaded box can take a collection AWAY as well as add one — a stretched
+// pause reads as GC overhead, the headroom doubles a cycle earlier, and the
+// run ends one collection short (CI ubuntu/FreeBSD and dev2 at load 220-310:
+// gate off 9,10,10,9,10,9 against default 10 every run; cx-home/v#16). The
+// gate's own regression is a collection beyond the whole off range: with the
+// growing guard defeated (run the test with VGC_GROW_GATE_GROWTH_PCT=100:
+// the children inherit it) the shape takes 11
+// against the off arm's 9-10, and red here.
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_grow_gate_growing_test.v
 module main
@@ -61,21 +72,12 @@ fn run_child(pct string) Trace {
 	return t
 }
 
-// least_of keeps the fewest collections and the least pause time over n
-// runs: a loaded box can add a collection or stretch a pause (a concurrent
-// mark held up by other jobs), never take one away, so the minimum is the
-// workload's own count (measured: 9 and 9 on an idle core, 9 and 10 with 28
-// test jobs beside it).
-fn least_of(n int, pct string) Trace {
-	mut best := run_child(pct)
-	for _ in 1 .. n {
-		t := run_child(pct)
-		best = Trace{
-			cycles:   if t.cycles < best.cycles { t.cycles } else { best.cycles }
-			pause_us: if t.pause_us < best.pause_us { t.pause_us } else { best.pause_us }
-		}
+// least keeps the fewer collections and the lesser pause time of two runs.
+fn least(a Trace, b Trace) Trace {
+	return Trace{
+		cycles:   if b.cycles < a.cycles { b.cycles } else { a.cycles }
+		pause_us: if b.pause_us < a.pause_us { b.pause_us } else { a.pause_us }
 	}
-	return best
 }
 
 fn line_count_ok(out string) bool {
@@ -87,10 +89,17 @@ fn test_a_growing_heap_takes_no_extra_collections() {
 		println('GROW-DONE=${grow()}')
 		return
 	}
-	off := least_of(3, '0')
-	on := least_of(3, '')
-	println('vgc_grow_gate_growing: gate off ${off.cycles} collections ${off.pause_us} us; default ${on.cycles} collections ${on.pause_us} us')
+	mut off := run_child('0')
+	mut on := run_child('')
+	mut off_most := off.cycles
+	for _ in 1 .. 3 {
+		o := run_child('0')
+		off_most = if o.cycles > off_most { o.cycles } else { off_most }
+		off = least(off, o)
+		on = least(on, run_child(''))
+	}
+	println('vgc_grow_gate_growing: gate off ${off.cycles}-${off_most} collections ${off.pause_us} us; default ${on.cycles} collections ${on.pause_us} us')
 	assert off.cycles > 0
-	assert on.cycles <= off.cycles, 'the gate added collections on a growing heap: ${on.cycles} against ${off.cycles} with the gate off'
+	assert on.cycles <= off_most, 'the gate added collections on a growing heap: ${on.cycles} against ${off.cycles}-${off_most} with the gate off'
 	assert on.pause_us <= off.pause_us * 5 / 4 + 10000, 'the gate added pause time on a growing heap: ${on.pause_us} us against ${off.pause_us} us'
 }
