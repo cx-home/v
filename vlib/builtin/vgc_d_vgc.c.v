@@ -3830,8 +3830,12 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_heap.caches[cache_idx].live_delta += i64(live_sz)
 		vgc_heap.caches[cache_idx].alloc_delta += total_n
-		vgc_heap.caches[cache_idx].alloc_gen = u32(vgc_heap.gc_cycle)
 		if vgc_heap.caches[cache_idx].alloc_delta >= vgc_acct_flush {
+			// cx-home/v#16 / cx-private#1916: the pacer counts a thread as
+			// allocating this cycle once it has flushed (~1 MB): a server's
+			// many request threads that each allocate a little no longer scale
+			// the headroom cap and floor as if each were an allocation stream
+			vgc_heap.caches[cache_idx].alloc_gen = u32(vgc_heap.gc_cycle)
 			ld := vgc_heap.caches[cache_idx].live_delta
 			if ld >= 0 {
 				C.vgc_atomic_add_u64(&vgc_heap.heap_live, u64(ld))
