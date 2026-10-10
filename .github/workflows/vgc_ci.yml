@@ -62,10 +62,16 @@ jobs:
           sysctl kern.threads.max_threads_per_proc hw.ncpu
           # cx-home/v#29 DIAGNOSTIC branch: the carve-ratio rows traced (gate lines,
           # refusals, per-cycle pause/interval), alone and three times each
-          ./v -gc e -o /tmp/p29 bench/parallel-alloc/v29_probe.v
-          for i in 1 2 3 4; do
-            echo "== probe abc run $i"; VGC_GROW_GATE_PCT=abc VGC_GCTRACE=1 /tmp/p29 2>&1 | grep -E 'CHILD-RATIO|^\[gate|^\[gc' | tail -70 || true
-            echo "== probe rate100 run $i"; VGC_GROW_GATE_RATE_PCT=100 /tmp/p29 2>&1 | grep CHILD-RATIO || true
+          ./v -gc e -o /tmp/p29 bench/v29_probe/v29_probe.v
+          for hogs in 0 4 8; do
+            i=0; while [ $i -lt $hogs ]; do (yes > /dev/null &) ; i=$((i+1)); done
+            for r in 1 2 3; do
+              VGC_GROW_GATE_PCT=abc VGC_GCTRACE=1 /tmp/p29 > /tmp/p29.out 2>&1 || true
+              echo "== hogs=$hogs run $r: $(grep CHILD-RATIO /tmp/p29.out) gc=$(grep -c 'marked=' /tmp/p29.out) gate=$(grep -c '^.gate ' /tmp/p29.out) refused=$(grep -c 'gate-refused' /tmp/p29.out)"
+              grep 'gate-refused' /tmp/p29.out | head -5 || true
+              grep 'marked=' /tmp/p29.out | tail -4 || true
+            done
+            pkill yes || true
           done
           ./v test bench/parallel-alloc/vgc_refute_tiny_gate_test.v bench/parallel-alloc/vgc_grow_gate_test.v
 
