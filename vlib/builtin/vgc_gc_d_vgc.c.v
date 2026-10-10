@@ -1470,7 +1470,7 @@ fn vgc_walk_plan() int {
 	if nsp < vgc_walk_min_spans {
 		return 1
 	}
-	mut free := vgc_walk_ncpu
+	mut free := 1 << 20 // VGC_WALK_LOAD_GATE=0: the configured count, uncapped
 	if vgc_walk_load_gate {
 		if C.vgc_box_busy(vgc_walk_ncpu) != 0 {
 			return 1 // the pool would wait on a preempted walker at every join
