@@ -60,14 +60,14 @@ jobs:
           git config --global --add safe.directory .
           gmake
           sysctl kern.threads.max_threads_per_proc hw.ncpu
-          # cx-home/v#24: the idle-run coalesce row, traced, before the suite
-          VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_idle_defrag_test.v 2>&1 | tail -80 || true
-          # every mode reports, then the job fails if any did
-          rc=0
-          ./v test bench/parallel-alloc || rc=1
-          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc || rc=1
-          VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc || rc=1
-          exit $rc
+          # cx-home/v#29 DIAGNOSTIC branch: the carve-ratio rows traced (gate lines,
+          # refusals, per-cycle pause/interval), alone and three times each
+          ./v -gc e -o /tmp/p29 bench/parallel-alloc/v29_probe.v
+          for i in 1 2 3 4; do
+            echo "== probe abc run $i"; VGC_GROW_GATE_PCT=abc VGC_GCTRACE=1 /tmp/p29 2>&1 | grep -E 'CHILD-RATIO|^\[gate|^\[gc' | tail -70 || true
+            echo "== probe rate100 run $i"; VGC_GROW_GATE_RATE_PCT=100 /tmp/p29 2>&1 | grep CHILD-RATIO || true
+          done
+          ./v test bench/parallel-alloc/vgc_refute_tiny_gate_test.v bench/parallel-alloc/vgc_grow_gate_test.v
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's

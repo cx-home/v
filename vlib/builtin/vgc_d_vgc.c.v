@@ -3083,6 +3083,12 @@ fn vgc_gate_affordable(marked u64, live u64, goal u64) bool {
 	}
 	cost := (goal - live) * 1000 / (goal - marked)
 	if cost > vgc_grow_gate_credit {
+		if vgc_gctrace != 0 {
+			// cx-home/v#29: why a gate stood down (the FreeBSD carve-ratio rows)
+			C.fprintf(C.stderr, c'[gate-refused %llu] pause=%lluus interval=%lluus cost=%llu credit=%llu marked=%lluKB live=%lluKB goal=%lluKB\n',
+				vgc_heap.gc_cycle, vgc_gate_last_pause / 1000, vgc_gate_last_interval / 1000, cost,
+				vgc_grow_gate_credit, marked / 1024, live / 1024, goal / 1024)
+		}
 		return false
 	}
 	vgc_grow_gate_credit -= cost
