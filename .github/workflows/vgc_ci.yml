@@ -70,9 +70,9 @@ jobs:
         run: |
           .\makev.bat -${{ matrix.cc }}
           .\v.exe version
-      - name: vgc_os_suspend_port_test
+      - name: vgc_os_suspend_port_test, vgc_global_root_test
         shell: pwsh
-        run: .\v.exe -cc ${{ matrix.cc }} -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v
+        run: .\v.exe -cc ${{ matrix.cc }} -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v bench/parallel-alloc/vgc_global_root_test.v
       - name: concurrent_mt_sound T=8 and T=16 (default collector)
         shell: pwsh
         timeout-minutes: 10

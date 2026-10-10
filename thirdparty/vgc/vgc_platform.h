@@ -151,8 +151,49 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
       dl_iterate_phdr(vgc__phdr_cb, &ctx);
       return ctx.n;
   }
+#elif defined(_WIN32)
+  // Windows (cx-home/v#20): the writable sections of the PE images — the
+  // program's and, when vgc rides in a DLL, the one holding this marker
+  // (VirtualQuery's AllocationBase of an address in an image is its HMODULE).
+  // Misc.VirtualSize spans the zero-filled tail (.bss). Windows answered NO
+  // data segment before (the #else below), so a heap object reachable only from
+  // a global — vgc_heap's own per-thread caches among them — was never marked:
+  // the tiny-cursor guard fired (0x717e, "TINY cursor span recycled") and
+  // mt_sound faulted at exit after bad=0 on windows-2025.
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+  static char vgc__image_marker;
+  static inline int vgc__pe_segments(const uint8_t* base, uintptr_t* los, uintptr_t* his, int max, int n) {
+      const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+      if (base == 0 || dos->e_magic != IMAGE_DOS_SIGNATURE) return n;
+      const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+      if (nt->Signature != IMAGE_NT_SIGNATURE) return n;
+      const IMAGE_SECTION_HEADER* sec = (const IMAGE_SECTION_HEADER*)((const uint8_t*)&nt->OptionalHeader
+                                         + nt->FileHeader.SizeOfOptionalHeader);
+      for (int i = 0; i < (int)nt->FileHeader.NumberOfSections && n < max; i++) {
+          if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+          uintptr_t sz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+          if (sz == 0) continue;
+          los[n] = (uintptr_t)base + (uintptr_t)sec[i].VirtualAddress;
+          his[n] = los[n] + sz;
+          n++;
+      }
+      return n;
+  }
+  static inline int vgc_data_segments(uintptr_t* los, uintptr_t* his, int max_ranges) {
+      const uint8_t* exe = (const uint8_t*)GetModuleHandleA(NULL);
+      int n = vgc__pe_segments(exe, los, his, max_ranges, 0);
+      MEMORY_BASIC_INFORMATION mbi;
+      if (VirtualQuery((const void*)&vgc__image_marker, &mbi, sizeof(mbi)) != 0) {
+          const uint8_t* self = (const uint8_t*)mbi.AllocationBase;
+          if (self != 0 && self != exe) n = vgc__pe_segments(self, los, his, max_ranges, n);
+      }
+      return n;
+  }
 #else
-  // Other platforms (Windows): not yet implemented.
+  // Other platforms: not yet implemented.
   static inline int vgc_data_segments(uintptr_t* los, uintptr_t* his, int max_ranges) {
       (void)los; (void)his; (void)max_ranges;
       return 0;
