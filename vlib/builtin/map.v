@@ -140,14 +140,22 @@ fn (mut d DenseArray) trim_deleted_tail() {
 }
 
 // Make space to append an element and return index
-// The growth-factor is roughly 1.125 `(x + (x >> 3))`
+// The growth factor is 2 while the array holds fewer than 1024 slots, then 1.5.
+// It was 1.125 `(x + (x >> 3))`: a map grown to N entries reallocated its key and
+// value arrays ~22 times by 65 entries, and under a collector that does not free
+// the old block at the realloc the bytes touched were ~9x the final arrays — 65
+// inserts of a 496-byte value touched 0.64 MB (0.20 MB at 2x, 0.28 MB at 1.5x).
+// Large maps take 1.5 so a map just past a doubling is not half empty. Max RSS
+// of 1M string-keyed 24-byte-value entries (+ 1M int->int), 1.125 -> 2 -> this:
+// 246 -> 201 -> 179 MB, 0.62 -> 0.44 -> 0.42 s; 2^20+1 entries 246 -> 251 -> 215
+// MB; 100k 50.7 -> 30.0 -> 29.4 MB (cx-core-code#124).
 @[inline]
 fn (mut d DenseArray) expand() int {
 	old_cap := d.cap
 	old_key_size := d.key_bytes * old_cap
 	old_value_size := d.value_bytes * old_cap
 	if d.cap == d.len {
-		d.cap += d.cap >> 3
+		d.cap += if d.cap < 1024 { d.cap } else { d.cap >> 1 }
 		unsafe {
 			d.keys = realloc_data(d.keys, old_key_size, d.key_bytes * d.cap)
 			d.values = realloc_data(d.values, old_value_size, d.value_bytes * d.cap)
