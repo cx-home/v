@@ -1939,6 +1939,8 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
       sigemptyset(&set);
       sigaddset(&set, VGC_SUSPEND_SIGNAL);
       pthread_sigmask(SIG_UNBLOCK, &set, 0);
+      return vgc_lin_gettid();
+  }
 
   // cx-home/v#28: two passes (see the darwin signal twin). Request arms the
   // slot's record and sends the signal; settle waits for the ack. The former
