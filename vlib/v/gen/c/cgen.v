@@ -4579,7 +4579,24 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 			}
 		}
 		if !already_generated {
-			g.expr_with_cast(expr, expr_typ, expected_type)
+			if ret_typ_is_option && !expr_typ_is_option {
+				// The payload of a plain value wrapped into an option is a value
+				// context: an option ident narrowed by `if x == none { return }`
+				// inside it reads through .data (`out = x`, `out := ?T(x)` with
+				// `out ?T`), so the assignment's option flags must not reach it.
+				old_left_is_opt := g.left_is_opt
+				old_right_is_opt := g.right_is_opt
+				old_inside_opt_or_res := g.inside_opt_or_res
+				g.left_is_opt = false
+				g.right_is_opt = false
+				g.inside_opt_or_res = false
+				g.expr_with_cast(expr, expr_typ, expected_type)
+				g.left_is_opt = old_left_is_opt
+				g.right_is_opt = old_right_is_opt
+				g.inside_opt_or_res = old_inside_opt_or_res
+			} else {
+				g.expr_with_cast(expr, expr_typ, expected_type)
+			}
 		}
 
 		if fn_option_clone {
