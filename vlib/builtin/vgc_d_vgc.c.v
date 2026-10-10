@@ -86,7 +86,7 @@ fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
-fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -613,8 +613,10 @@ fn vgc_unpin(p voidptr) {
 // flat).
 __global vgc_base_floor = u64(256 * 1024 * 1024)
 // VGC_GCTRACE=1 enables the per-cycle pacing trace (vgc_gctrace_line): cycle,
-// marked, goal, arenas, spans, live threads. Permanent observability (GODEBUG=
-// gctrace analog) — costs one integer test per cycle when off.
+// marked, goal, headroom, pause, arenas, spans, the pool's hot and trimmed KB,
+// the KB the sweep's defrag merged into runs (cx-home/v#14), live threads.
+// Permanent observability (GODEBUG=gctrace analog) — costs one integer test
+// per cycle when off.
 __global vgc_gctrace = u32(0)
 // Set by an explicit gc_collect() (vgc_force_collect_release_os) and consumed
 // by the next sweep's trim point: that one cycle runs the unbudgeted, age-blind
@@ -793,6 +795,45 @@ __global vgc_frag_gate_cycle = u64(0)
 __global vgc_frag_gate_fired = false
 __global vgc_defrag_pending = u32(0)
 // atomic: a gate deferred a carve; the next sweep defragments
+// ── IDLE-RUN COALESCE (cx-home/v#14) ───────────────────────────────────────
+// The frag gate above fires only before a NEW-ARENA carve. A program whose
+// transients grow through the size classes (pi-digits' limbs: a freed span of
+// one page count cannot serve the next class's request) carves fresh pages
+// from the arena it already has while the pool holds tens of MB of exactly
+// those freed spans: under vgc_pool_merge_min they never coalesce at free
+// time, so no pooled run ever covers the next request and the bump pointer
+// ratchets beside them (pi-digits 3000 at an 8 MB floor: a 9 MB goal and a
+// 3.4 MB in-use set every cycle, the hot pool 5 -> 21 MB, 835 -> 2440 span
+// descriptors; cx-home/v#14).
+// The rule: an IN-ARENA carve of a pooled-size request while the pool (hot +
+// cold) holds at least max(vgc_idle_defrag_min_pool, 4 x the request) asks
+// the next sweep, once per cycle, to merge the pool's adjacent runs — but
+// only runs of spans that have sat pooled through at least one full mutator
+// epoch (vgc_idle_defrag_age cycles: pooled by an EARLIER sweep and not
+// re-popped since). That age test is what keeps cx #360's thrash out: the
+// thrash was the per-size working set (freed every sweep, re-popped every
+// epoch) merged into big blocks the next epoch split straight back, which
+// pushed hot_loop's t4 equilibrium from 44 MB to ~151 MB. A span re-popped
+// every epoch is never older than the sweep that freed it, so it never
+// qualifies; the spans that do qualify are the ones nothing has asked for
+// in an epoch, and the best-fit split (vgc_get_free_span) hands the merged
+// run to the next size instead of a fresh carve. No carve is deferred and no
+// collection is forced: the merge rides the next cycle's sweep, where the
+// STW page-map walk (vgc_pool_defrag) is already the frag gate's contract.
+__global vgc_idle_defrag_cycle = u64(0)
+__global vgc_idle_defrag_fired = false
+__global vgc_idle_defrag_pending = u32(0)
+// atomic: an in-arena carve beside an idle pool; the next sweep merges the
+// pool's idle runs
+__global vgc_idle_defrag_merged_kb = u64(0)
+// KB merged into runs by the last sweep's defrag (either gate); the trace's
+// `merged=` field
+// The pool must hold this much before a carve asks for the merge: below it
+// the walk is not worth a sweep's time and the carve is the cheaper answer.
+const vgc_idle_defrag_min_pool = u64(4) * 1024 * 1024
+// Cycles a span must have sat pooled before the idle defrag merges it: one
+// means pooled by an earlier sweep and not re-popped through the epoch since.
+const vgc_idle_defrag_age = u32(1)
 // Cycle timestamps for the overhead measurement (collector-only writes: t0 is
 // stamped by the thread that won the gc_phase CAS; last_end in the STW
 // trigger recompute — never touched on the allocation path).
@@ -2626,7 +2667,15 @@ fn vgc_frag_gate_defers(nbytes usize) bool {
 // while the merged span stays a pooled size (<= vgc_max_pooled_pages). A mixed
 // run is recommitted and pooled hot; an all-cold run stays cold. The run's
 // trim clock is its oldest part's (the coalescing rule of #1295).
-fn vgc_pool_defrag() {
+// `min_age` restricts the runs to spans pooled at least that many cycles ago
+// (the idle-run coalesce of cx-home/v#14: 0 for the frag gate's merge of
+// everything; vgc_idle_defrag_age for an in-arena carve's request, where a
+// span this sweep or the last epoch's demand touched must stay out of the
+// run — see the IDLE-RUN COALESCE block). Returns the bytes absorbed into
+// runs (the merged spans' sizes, the run heads excluded).
+fn vgc_pool_defrag(min_age u32) u64 {
+	cyc := u32(vgc_heap.gc_cycle)
+	mut absorbed := u64(0)
 	for i in 0 .. vgc_heap.narenas {
 		a := unsafe { &vgc_heap.arenas[i] }
 		if a.size > vgc_arena_size || a.page_span == unsafe { nil } {
@@ -2640,7 +2689,7 @@ fn vgc_pool_defrag() {
 				p++
 				continue
 			}
-			if !s.pooled || s.in_use {
+			if !s.pooled || s.in_use || cyc - s.pool_gen < min_age {
 				p += usize(s.npages)
 				continue
 			}
@@ -2651,13 +2700,14 @@ fn vgc_pool_defrag() {
 				mut q := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[q_idx]))))) }
 				if q == unsafe { nil } || !q.pooled || q.in_use || q.npages == 0
 					|| q.base != a.base + q_idx * vgc_page_size
-					|| s.npages + q.npages > u32(vgc_max_pooled_pages) {
+					|| s.npages + q.npages > u32(vgc_max_pooled_pages) || cyc - q.pool_gen < min_age {
 					break
 				}
 				if !merged {
 					vgc_pool_unlink(mut s)
 					merged = true
 				}
+				absorbed += u64(q.npages) * u64(vgc_page_size)
 				vgc_pool_unlink(mut q)
 				if s.decommitted != q.decommitted {
 					if s.decommitted {
@@ -2682,6 +2732,35 @@ fn vgc_pool_defrag() {
 			p += usize(s.npages)
 		}
 	}
+	return absorbed
+}
+
+// vgc_idle_defrag_request is the idle-run coalesce's trigger (cx-home/v#14,
+// see the IDLE-RUN COALESCE block): called by vgc_span_alloc, vgc_heap.lock
+// held, right after a pooled-size request of `nbytes` was carved from an
+// EXISTING arena because no pooled span covered it. When the pool holds at
+// least max(vgc_idle_defrag_min_pool, 4 x nbytes) it asks the next sweep,
+// once per cycle, to merge the pool's idle runs. Nothing is deferred.
+fn vgc_idle_defrag_request(nbytes usize) {
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0 {
+		return
+	}
+	cycle := vgc_heap.gc_cycle
+	if vgc_idle_defrag_fired && cycle == vgc_idle_defrag_cycle {
+		return
+	}
+	pooled := C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) +
+		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes)
+	mut want := u64(nbytes) * 4
+	if want < vgc_idle_defrag_min_pool {
+		want = vgc_idle_defrag_min_pool
+	}
+	if pooled < want {
+		return
+	}
+	vgc_idle_defrag_fired = true
+	vgc_idle_defrag_cycle = cycle
+	C.vgc_atomic_store_u32(&vgc_idle_defrag_pending, 1)
 }
 
 fn vgc_span_alloc(npages u32) &VGC_Span {
@@ -2714,6 +2793,12 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 			}
 			break
 		}
+	}
+	if base != 0 && npages <= u32(vgc_max_pooled_pages) {
+		// An in-arena carve of a pooled size: the pool held no span covering
+		// it. Beside an idle pool that is the v#14 ratchet — ask the next sweep
+		// to merge the pool's idle runs (cx-home/v#14).
+		vgc_idle_defrag_request(nbytes)
 	}
 	// Allocate new arena if needed
 	if base == 0 {
