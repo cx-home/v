@@ -36,7 +36,8 @@ jobs:
         with:
           operating_system: freebsd
           version: '15.1'
-          memory: 4G
+          memory: 8G
+          cpu_count: 4
           shell: sh
           sync_files: runner-to-vm
       - name: bench/parallel-alloc on FreeBSD
