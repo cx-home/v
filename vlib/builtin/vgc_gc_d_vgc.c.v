@@ -811,7 +811,7 @@ fn vgc_gctrace_emit() {
 	C.vgc_gctrace_line(u64(vgc_heap.gc_cycle), C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
-		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024)
+		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024, vgc_idle_defrag_merged_kb)
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
 		// bytes the root scan walked and the spans the clear/sweep walks visited.
@@ -1790,9 +1790,17 @@ fn vgc_do_sweep() {
 	// #1892: a frag gate deferred an arena carve to this collection — merge the
 	// pool's adjacent free spans first, so the retried request finds its run
 	// (and the trim below sees the merged spans).
+	// cx-home/v#14: an in-arena carve beside an idle pool asked for the idle
+	// runs only (spans pooled by an earlier sweep and not re-popped since); a
+	// frag-gate request merges everything and covers it.
+	vgc_idle_defrag_merged_kb = 0
 	if C.vgc_atomic_load_u32(&vgc_defrag_pending) != 0 {
 		C.vgc_atomic_store_u32(&vgc_defrag_pending, 0)
-		vgc_pool_defrag()
+		C.vgc_atomic_store_u32(&vgc_idle_defrag_pending, 0)
+		vgc_idle_defrag_merged_kb = vgc_pool_defrag(0) / 1024
+	} else if C.vgc_atomic_load_u32(&vgc_idle_defrag_pending) != 0 {
+		C.vgc_atomic_store_u32(&vgc_idle_defrag_pending, 0)
+		vgc_idle_defrag_merged_kb = vgc_pool_defrag(vgc_idle_defrag_age) / 1024
 	}
 	if C.vgc_atomic_load_u32(&vgc_eager_trim_pending) != 0 {
 		C.vgc_atomic_store_u32(&vgc_eager_trim_pending, 0)

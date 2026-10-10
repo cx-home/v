@@ -1812,7 +1812,8 @@ static inline void vgc_say(uint64_t tag, uint64_t v) { // loud one-line stderr n
 
 // VGC_GCTRACE=1 per-cycle pacing line (async-signal-safe: write(2) only, no
 // stdio). Format: [gc N] marked=X goal=Y arenas=A spans=S threads=T (bytes in
-// decimal MB for readability; exact bytes matter less than the trend).
+// decimal MB for readability; exact bytes matter less than the trend);
+// merged= is the KB the sweep's pool defrag absorbed into runs (cx-home/v#14).
 static void vgc__wdec(uint64_t v) {
     char b[24]; int i = 24;
     if (v == 0) { b[--i] = '0'; }
@@ -1822,7 +1823,7 @@ static void vgc__wdec(uint64_t v) {
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
                              uint64_t narenas, uint64_t nspans, uint64_t lthreads,
                              uint64_t headroom_kb, uint64_t pause_us,
-                             uint64_t pool_kb, uint64_t trimmed_kb) {
+                             uint64_t pool_kb, uint64_t trimmed_kb, uint64_t merged_kb) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] marked="); vgc__wdec(marked / (1024 * 1024));
     vgc__ws("MB goal="); vgc__wdec(goal / (1024 * 1024));
@@ -1832,6 +1833,7 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
     vgc__ws(" spans="); vgc__wdec(nspans);
     vgc__ws(" pool="); vgc__wdec(pool_kb);
     vgc__ws("KB trimmed="); vgc__wdec(trimmed_kb);
+    vgc__ws("KB merged="); vgc__wdec(merged_kb);
     vgc__ws("KB threads="); vgc__wdec(lthreads);
     vgc__ws("\n");
 }
