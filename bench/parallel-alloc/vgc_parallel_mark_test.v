@@ -15,6 +15,7 @@ module main
 
 import os
 import sync
+import time
 
 @[heap]
 struct Node {
@@ -102,6 +103,16 @@ fn checksum(sh &Shared) u64 {
 }
 
 fn child() {
+	// cx-home/v#28 (fix/fable-v116 CI 38065594231): on Linux and FreeBSD this
+	// child did not finish within the job's timeout, and os.execute holds its
+	// output until it exits — a watchdog turns a hang into a failed run whose
+	// captured output (the collector's own diagnostics included) the test
+	// prints.
+	spawn fn () {
+		time.sleep(90 * time.second)
+		eprintln('vgc_parallel_mark child: no progress in 90 s')
+		exit(3)
+	}()
 	mut sh := &Shared{
 		ring:  []&Node{len: ring_len, init: unsafe { nil }}
 		heads: []&Node{len: nthreads, init: unsafe { nil }}
