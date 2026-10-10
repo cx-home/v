@@ -1470,12 +1470,22 @@ fn vgc_walk_plan() int {
 	if nsp < vgc_walk_min_spans {
 		return 1
 	}
-	if vgc_walk_load_gate && C.vgc_box_busy(vgc_walk_ncpu) != 0 {
-		return 1 // the pool would wait on a preempted walker at every join
+	mut free := vgc_walk_ncpu
+	if vgc_walk_load_gate {
+		if C.vgc_box_busy(vgc_walk_ncpu) != 0 {
+			return 1 // the pool would wait on a preempted walker at every join
+		}
+		free = C.vgc_box_free_cpus(vgc_walk_ncpu,
+			int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
 	}
 	mut total := int(nsp / (vgc_walk_min_spans / 4))
 	if total > cfg {
 		total = cfg
+	}
+	// no more walkers than the CPUs the rest of the box leaves free: a walker
+	// without a core holds its chunk through the join (cx-home/v#16)
+	if total > free {
+		total = free
 	}
 	if vgc_walk_n_target > 0 && vgc_walk_n_target < total {
 		total = vgc_walk_n_target

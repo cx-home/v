@@ -985,6 +985,7 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
 #ifdef _WIN32
   static inline int vgc_ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
   static inline int vgc_box_busy(int ncpu) { (void)ncpu; return 0; }
+  static inline int vgc_box_free_cpus(int ncpu, int own) { (void)own; return ncpu; }
 #else
   #include <unistd.h>
   static inline int vgc_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : (int)n; }
@@ -998,6 +999,22 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
       double la[1];
       if (getloadavg(la, 1) != 1) return 0;
       return la[0] >= 2.0 * (double)ncpu;
+  }
+  // cx-home/v#16: the CPUs the rest of the box leaves this collection, for the
+  // walks' count. The load average counts this process's own mutators, which
+  // are parked while the walks run, so they are taken back out (`own`, the
+  // registered mutators; a blocked one is subtracted too, which errs towards
+  // walking). The twice-the-CPUs line above let four walkers run on a 4-vCPU CI
+  // runner beside three other test processes (load 4-8): a phase's join then
+  // waited a scheduler quantum on a preempted walker, and vgc_grow_gate_growing's
+  // pause doubled (86 -> 130 ms, 158 -> 233 ms, CI vgc 38046128855/38047241158).
+  static inline int vgc_box_free_cpus(int ncpu, int own) {
+      double la[1];
+      if (getloadavg(la, 1) != 1) return ncpu;
+      double other = la[0] - (double)own;
+      if (other < 0) other = 0;
+      int fr = ncpu - (int)(other + 0.5);
+      return fr < 0 ? 0 : fr;
   }
 #endif
 

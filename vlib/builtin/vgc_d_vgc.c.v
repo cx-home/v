@@ -57,6 +57,7 @@ fn C.vgc_mark_wait(flag &u32, val u32)
 fn C.vgc_mark_wake(flag &u32)
 fn C.vgc_ncpu() int
 fn C.vgc_box_busy(ncpu int) int
+fn C.vgc_box_free_cpus(ncpu int, own int) int
 fn C.vgc_yield()
 fn C.vgc_popcount8(x u8) int
 fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
