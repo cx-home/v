@@ -850,8 +850,8 @@ __global vgc_grow_gate_growing_pct = u64(50)
 // cycle budgets to start (a one-shot program's gated cycles are what the gates
 // are for — cx-private#1793's convert gauges, cx-home/v#7's json 300k / fmt
 // 8k rows), plus vgc_grow_gate_rate_pct % of a budget per collection, capped
-// at two budgets. A collector whose last pause was at most 5 % of the
-// interval before it gates for free (the extra collections cost little: the
+// at two budgets. A collector whose last pause was at most 1/10 of the
+// interval before it (the pacer's own cheap-enough line) gates for free (the extra collections cost little: the
 // noscan stream of vgc_grow_gate_test.v pauses ~2 ms per cycle; the door paid
 // ~32 ms). A gate without credit stands down and the heap carves — the arena
 // that ends the gating — so a costly heap that would be gated every cycle adds
@@ -2841,15 +2841,16 @@ fn vgc_frag_pool_covers(nbytes usize) bool {
 
 // vgc_gate_affordable answers whether a grow- or frag-gate collection may end
 // this cycle early (cx-private#1916, vgc_grow_gate_credit). A cheap collector
-// (the last cycle's pause at most 1/20 of the mutator interval before it) may
-// gate every cycle: the collections it adds cost little. Otherwise the gate
+// — one the pacer itself would not buy headroom for (the last pause at most
+// 1/vgc_overhead_grow_div of the mutator interval before it) — may gate every
+// cycle: the collections it adds cost little. Otherwise the gate
 // spends `cost`, the per-mille of the cycle's budget it cuts, from the credit,
 // and stands down without it.
 fn vgc_gate_affordable(marked u64, live u64, goal u64) bool {
 	if vgc_grow_gate_rate_pct >= 100 {
 		return true
 	}
-	if vgc_gate_last_pause * 20 <= vgc_gate_last_interval {
+	if vgc_gate_last_pause * vgc_overhead_grow_div <= vgc_gate_last_interval {
 		return true
 	}
 	if goal <= live || goal <= marked || live < marked {
