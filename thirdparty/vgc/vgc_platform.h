@@ -1835,6 +1835,19 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
     vgc__ws("KB threads="); vgc__wdec(lthreads);
     vgc__ws("\n");
 }
+// VGC_GCTRACE=1 grow-gate line (cx-private#1916): a collection the grow gate
+// fired before the goal — `probe=1` when the set read as growing (the
+// cx-home/v#7 last-carve probe) — with the heap at the trigger, so a trace
+// tells gate cycles from goal cycles.
+static void vgc_gctrace_gate(uint64_t cycle, uint64_t probe, uint64_t marked,
+                             uint64_t live, uint64_t goal) {
+    vgc__ws("[gate "); vgc__wdec(cycle);
+    vgc__ws("] probe="); vgc__wdec(probe);
+    vgc__ws(" marked="); vgc__wdec(marked / (1024 * 1024));
+    vgc__ws("MB live="); vgc__wdec(live / (1024 * 1024));
+    vgc__ws("MB goal="); vgc__wdec(goal / (1024 * 1024));
+    vgc__ws("MB\n");
+}
 // VGC_GCTRACE=2 phase line (cx-home/v#15): microseconds per phase of the cycle
 // just paced — stop the world, clear mark bits, suspended-thread roots, data
 // segments, stacks, mark drain, count, sweep, trigger/trace tail — plus the

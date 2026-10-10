@@ -2134,6 +2134,8 @@ fn vgc_update_trigger() {
 		if vgc_gc_t0 > vgc_gc_last_end {
 			interval = vgc_gc_t0 - vgc_gc_last_end
 		}
+		vgc_gate_last_pause = pause
+		vgc_gate_last_interval = interval
 		mut hr := vgc_headroom
 		if pause * vgc_overhead_grow_div > interval {
 			hr *= 2 // GC overhead > ~2%: buy throughput with space
@@ -2179,6 +2181,11 @@ fn vgc_update_trigger() {
 		extra = vgc_headroom
 	}
 	mut goal := marked + extra
+	// the grow gate's credit (cx-private#1916, vgc_d_vgc.c.v)
+	vgc_grow_gate_credit += vgc_grow_gate_rate_pct * 10
+	if vgc_grow_gate_credit > 2000 {
+		vgc_grow_gate_credit = 2000
+	}
 	// A grow-gate probe that found the cycle's allocation mostly live gives the
 	// next cycle the budget it cut (cx-home/v#7, vgc_d_vgc.c.v).
 	if vgc_grow_gate_probe_armed {

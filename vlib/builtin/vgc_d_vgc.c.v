@@ -87,6 +87,7 @@ fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -762,6 +763,28 @@ __global vgc_grow_gate_prev_marked = u64(0)
 // either.
 // VGC_GROW_GATE_GROWING_PCT overrides (0: stand down while growing).
 __global vgc_grow_gate_growing_pct = u64(50)
+// cx-private#1916: the gates' RATE. A grow- or frag-gate collection ends its
+// cycle `cost` per-mille of the cycle's budget early, so a heap gated every
+// cycle pays in collections what it saves in arenas: a webhook door (70 MB
+// marked, goal 140 MB, two full 64 MB arenas, ~40 MB pooled in the wrong
+// shapes) was gated in 94 of 185 cycles at 74-121 MB live, +20 % collections
+// and its pickup row +12 % for 7 MB less RSS. The gates spend a credit: two
+// cycle budgets to start (a one-shot program's gated cycles are what the gates
+// are for — cx-private#1793's convert gauges, cx-home/v#7's json 300k / fmt
+// 8k rows), plus vgc_grow_gate_rate_pct % of a budget per collection, capped
+// at two budgets. A collector whose last pause was at most 5 % of the
+// interval before it gates for free (the extra collections cost little: the
+// noscan stream of vgc_grow_gate_test.v pauses ~2 ms per cycle; the door paid
+// ~32 ms). A gate without credit stands down and the heap carves — the arena
+// that ends the gating — so a costly heap that would be gated every cycle adds
+// at most rate_pct % collections. VGC_GROW_GATE_RATE_PCT overrides (0..100;
+// 100 restores a gate on every cycle).
+__global vgc_grow_gate_rate_pct = u64(10)
+__global vgc_grow_gate_credit = u64(2000)
+__global vgc_gate_last_pause = u64(0)
+// ns, the last cycle's pause (vgc_update_trigger)
+__global vgc_gate_last_interval = u64(0)
+// ns, the mutator interval before it
 __global vgc_grow_gate_probe_armed = false
 __global vgc_grow_gate_probe_marked = u64(0)
 __global vgc_grow_gate_probe_live = u64(0)
@@ -1272,6 +1295,7 @@ pub fn vgc_init() {
 	vgc_grow_gate_pct = vgc_env_pct(c'VGC_GROW_GATE_PCT', vgc_grow_gate_pct)
 	vgc_grow_gate_growth_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWTH_PCT', vgc_grow_gate_growth_pct)
 	vgc_grow_gate_growing_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWING_PCT', vgc_grow_gate_growing_pct)
+	vgc_grow_gate_rate_pct = vgc_env_pct(c'VGC_GROW_GATE_RATE_PCT', vgc_grow_gate_rate_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
 		cmb := C.atoll(cap_env)
@@ -2544,7 +2568,7 @@ fn vgc_env_pct(name &char, cur u64) u64 {
 
 // vgc_grow_gate_defers answers whether vgc_span_alloc defers an arena carve
 // to a collection (the VGCG-1 grow gate above). Called with vgc_heap.lock held.
-fn vgc_grow_gate_defers() bool {
+fn vgc_grow_gate_defers(nbytes usize) bool {
 	if vgc_grow_gate_pct == 0 || vgc_heap.narenas == 0
 		|| C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0
 		|| C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
@@ -2577,8 +2601,14 @@ fn vgc_grow_gate_defers() bool {
 	if (live - marked) * 100 < (goal - marked) * vgc_grow_gate_pct {
 		return false
 	}
+	if !vgc_gate_affordable(marked, live, goal) {
+		return false // cx-private#1916: the rate bound (vgc_grow_gate_credit)
+	}
 	vgc_grow_gate_fired = true
 	vgc_grow_gate_cycle = cycle
+	if vgc_gctrace > 0 {
+		C.vgc_gctrace_gate(u64(cycle), u64(growing), marked, live, goal)
+	}
 	vgc_grow_gate_probe_armed = true
 	vgc_grow_gate_probe_marked = marked
 	vgc_grow_gate_probe_live = live
@@ -2598,6 +2628,30 @@ fn vgc_frag_pool_covers(nbytes usize) bool {
 // vgc_frag_gate_defers answers whether vgc_span_alloc defers a new-arena
 // carve of `nbytes` to a defragmenting collection (the #1892 frag gate above).
 // Called with vgc_heap.lock held.
+// vgc_gate_affordable answers whether a grow- or frag-gate collection may end
+// this cycle early (cx-private#1916, vgc_grow_gate_credit). A cheap collector
+// (the last cycle's pause at most 1/20 of the mutator interval before it) may
+// gate every cycle: the collections it adds cost little. Otherwise the gate
+// spends `cost`, the per-mille of the cycle's budget it cuts, from the credit,
+// and stands down without it.
+fn vgc_gate_affordable(marked u64, live u64, goal u64) bool {
+	if vgc_grow_gate_rate_pct >= 100 {
+		return true
+	}
+	if vgc_gate_last_pause * 20 <= vgc_gate_last_interval {
+		return true
+	}
+	if goal <= live || goal <= marked || live < marked {
+		return true
+	}
+	cost := (goal - live) * 1000 / (goal - marked)
+	if cost > vgc_grow_gate_credit {
+		return false
+	}
+	vgc_grow_gate_credit -= cost
+	return true
+}
+
 fn vgc_frag_gate_defers(nbytes usize) bool {
 	if vgc_heap.narenas == 0 || C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0
 		|| C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
@@ -2613,8 +2667,17 @@ fn vgc_frag_gate_defers(nbytes usize) bool {
 	if !vgc_frag_pool_covers(nbytes) {
 		return false
 	}
+	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
+	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
+	if !vgc_gate_affordable(marked, live, goal) {
+		return false // cx-private#1916: the rate bound (vgc_grow_gate_credit)
+	}
 	vgc_frag_gate_fired = true
 	vgc_frag_gate_cycle = cycle
+	if vgc_gctrace > 0 {
+		C.vgc_gctrace_gate(u64(cycle), 9, marked, live, goal)
+	}
 	C.vgc_atomic_store_u32(&vgc_defrag_pending, 1)
 	return true
 }
@@ -2717,7 +2780,7 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	}
 	// Allocate new arena if needed
 	if base == 0 {
-		if vgc_grow_gate_defers() {
+		if vgc_grow_gate_defers(nbytes) {
 			// The grow gate's collection is the retry's one chance to find a run:
 			// the reclaim-and-retry loop that follows holds vgc_grow_gate_hold, so
 			// the frag gate stands down there and the retry carves. When the pool
