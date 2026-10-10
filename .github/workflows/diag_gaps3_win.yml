@@ -19,12 +19,26 @@ jobs:
       - name: Build V
         shell: pwsh
         run: .\makev.bat -gcc
+      - name: gc_collect probes
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          foreach ($c in 'c1', 'c2') {
+            .\v.exe -cc gcc -gc e -g -o "$c.exe" "diag/$c.v"
+            "=== $c"
+            $env:VGC_GCTRACE = '2'
+            $p = Start-Process -FilePath ".\$c.exe" -NoNewWindow -PassThru -RedirectStandardOutput "o$c.txt" -RedirectStandardError "e$c.txt"
+            $done = $p.WaitForExit(30000)
+            if (-not $done) { "HUNG after 30 s"; Stop-Process -Id $p.Id -Force } else { "exit=$($p.ExitCode)" }
+            Get-Content "o$c.txt" -Tail 5
+            Get-Content "e$c.txt" -TotalCount 40
+          }
       - name: mt_sound watched
         shell: pwsh
         continue-on-error: true
         run: |
           .\v.exe -cc gcc -gc e -g -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
-          foreach ($t in 1, 2, 4, 8) {
+          foreach ($t in 1) {
             "=== T=$t"
             $env:T = "$t"; $env:STEPS = '2000'; $env:VGC_GCTRACE = '2'
             $p = Start-Process -FilePath .\mts.exe -NoNewWindow -PassThru -RedirectStandardOutput "o$t.txt" -RedirectStandardError "e$t.txt"
