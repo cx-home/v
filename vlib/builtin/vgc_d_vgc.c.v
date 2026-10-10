@@ -1944,9 +1944,13 @@ fn vgc_span_split(mut span VGC_Span, want u32) bool {
 // here is the ONLY path that carves fresh arena space, so serving varied page
 // counts from the pool is what stops the arena bump pointer — which never
 // rewinds — from ratcheting on every previously-unseen npages.
-fn vgc_get_free_span(npages u32) &VGC_Span {
+// The second result says the span came off a COLD list (its pages were
+// decommitted and are committed again by the pop): to the process that is
+// the same event as a carve, and vgc_span_alloc compensates it the same way
+// (cx-home/v#14; see vgc_pool_compensate).
+fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 	if npages == 0 {
-		return unsafe { nil }
+		return unsafe { nil }, false
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
 	if npages <= u32(vgc_max_pooled_pages) {
@@ -1961,10 +1965,11 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 			// false the collector's clear-mark / count-marked / sweep loops skip
 			// the span, so a mutator suspended mid-init can't have its half-built
 			// span touched. See the in_use invariant in vgc_span_init.
+			cold := span.decommitted
 			vgc_pool_unlink(mut span)
 			vgc_span_pop_finish(mut span)
 			C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
-			return span
+			return span, cold
 		}
 		// Best fit: the smallest pooled span that covers the request, split down.
 		// Hot preferred at equal size; cold is still far cheaper than carving.
@@ -1974,11 +1979,12 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 				cand = vgc_heap.free_spans_cold[n]
 			}
 			if cand != unsafe { nil } {
+				cold := cand.decommitted
 				vgc_pool_unlink(mut cand)
 				vgc_span_split(mut cand, npages)
 				vgc_span_pop_finish(mut cand)
 				C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
-				return cand
+				return cand, cold
 			}
 		}
 	}
@@ -1986,16 +1992,17 @@ fn vgc_get_free_span(npages u32) &VGC_Span {
 	mut o := vgc_heap.free_oversized
 	for o != unsafe { nil } {
 		if o.npages >= npages {
+			cold := o.decommitted
 			vgc_pool_unlink(mut o)
 			vgc_span_split(mut o, npages)
 			vgc_span_pop_finish(mut o)
 			C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
-			return o
+			return o, cold
 		}
 		o = o.next
 	}
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
-	return unsafe { nil }
+	return unsafe { nil }, false
 }
 
 // vgc_span_pop_finish restores a just-popped span's data pages if a pool trim
@@ -2773,7 +2780,8 @@ fn vgc_idle_defrag_request(nbytes usize) {
 
 fn vgc_span_alloc(npages u32) &VGC_Span {
 	// First try to reuse a free span
-	recycled := vgc_get_free_span(npages)
+	recycled, cold := vgc_get_free_span(npages)
+	nbytes := usize(npages) * vgc_page_size
 	if recycled != unsafe { nil } {
 		// Stamp the current GC cycle: a concurrent sweep must not reclaim this span as
 		// "empty" (alloc_count 0) while it is in-flight to the mutator / mid-span_init.
@@ -2781,10 +2789,18 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 		unsafe {
 			recycled.sweep_gen = u32(vgc_heap.gc_cycle)
 		}
+		if cold && npages >= u32(vgc_pool_merge_min) {
+			// A large request served from a COLD run commits as many pages as a
+			// carve of it would, beside the same idle hot pool: compensate it
+			// the same way (cx-home/v#14 — once the idle merge forms cold runs
+			// that cover the emitter's buffers, json-codec 1 MB x100 read 86.7
+			// -> 99.0 MB without this: the hot idle pool stayed resident while
+			// the recommitted run was touched, where a carve would have
+			// decommitted an equal amount).
+			vgc_pool_compensate(u64(nbytes))
+		}
 		return recycled
 	}
-
-	nbytes := usize(npages) * vgc_page_size
 
 	C.vgc_mutex_lock(&vgc_heap.lock)
 	// Try to find space in existing arenas
