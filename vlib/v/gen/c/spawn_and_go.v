@@ -377,6 +377,20 @@ fn (mut g Gen) spawn_and_go_expr(node ast.SpawnExpr, mode SpawnGoMode) {
 		thread_ret_type := if g.pref.os == .windows { 'u32' } else { 'void*' }
 		g.waiter_fn_definitions.writeln('${g.static_non_parallel}${thread_ret_type} ${wrapper_fn_name}(${wrapper_struct_name} *arg);')
 		g.gowrappers.writeln('${thread_ret_type} ${wrapper_fn_name}(${wrapper_struct_name} *arg) {')
+		if is_spawn && !g.pref.prealloc && g.pref.gc_mode == .vgc {
+			// vgc (cx-home/v#26): register this thread with the collector BEFORE
+			// its first use of the arguments. Registration was lazy — at the
+			// thread's first allocation — so a spawned thread that never allocated
+			// (a consumer that pops a channel, reads the records and frees them)
+			// was never part of the stop-the-world: not in the park-wait target,
+			// never mach-suspended, its stack and registers never scanned, its
+			// frees running through mark and sweep. Every object only it held was
+			// swept while live and handed out again. Never waits for a slot: past
+			// the table's capacity the thread registers at its first allocation as
+			// before (vgc_register_at_entry). The thread exits through the
+			// pthread-key destructor installed by the registration, as before.
+			g.gowrappers.writeln('\tbuiltin__vgc_register_at_entry();')
+		}
 		if is_spawn && g.pref.prealloc && wrapper_return_type == ast.void_type {
 			g.gowrappers.writeln('\tvoid* thread_prealloc_scope = builtin__prealloc_scope_begin();')
 		}
