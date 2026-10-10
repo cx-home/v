@@ -23,6 +23,7 @@ jobs:
       - name: bench/parallel-alloc (default)
         run: ./v test bench/parallel-alloc
       - name: bench/parallel-alloc (markers forced)
+        if: ${{ !cancelled() }}
         run: VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc
       # cx-home/v#16: clear, count and the sweep's bit work on the marker pool
       # stay serial on a small or oversubscribed box (the load gate); this run
@@ -33,6 +34,7 @@ jobs:
       # their limits on 38046128855; the soundness the run is for does not
       # need the box shared.
       - name: bench/parallel-alloc (walks forced)
+        if: ${{ !cancelled() }}
         run: VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
 
   vgc-freebsd:
@@ -60,9 +62,12 @@ jobs:
           sysctl kern.threads.max_threads_per_proc hw.ncpu
           # cx-home/v#24: the idle-run coalesce row, traced, before the suite
           VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_idle_defrag_test.v 2>&1 | tail -80 || true
-          ./v test bench/parallel-alloc
-          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc
-          VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
+          # every mode reports, then the job fails if any did
+          rc=0
+          ./v test bench/parallel-alloc || rc=1
+          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc || rc=1
+          VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc || rc=1
+          exit $rc
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's
