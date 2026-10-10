@@ -735,6 +735,13 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 				// e.g. `__global ( mygblobal = 'hello ' + world' )`
 				if field.name in ['g_main_argc', 'g_main_argv'] {
 					init = '\t// skipping ${final_c_name}, it was initialised in main'
+				} else if field.expr is ast.StructInit && field.expr.init_fields.len == 0
+					&& !field.expr.has_update_expr && g.global_zero_default(field.typ, 0) {
+					// `__global x = T{}` of a T whose every field defaults to
+					// zero: `x = (T){…}` builds the whole T as a stack temporary
+					// in `_vinit` at -O0 (vgc_heap: ~2 MB, cx-home/v#32 — a 2 MB
+					// stack overflowed in `_vinit`); memset writes the same zeros
+					init = '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 3z'
 				} else {
 					init = '\t${final_c_name} = ${g.expr_string(field.expr)}; // global 3'
 				}
@@ -758,7 +765,11 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// type ... is not assignable") when this runs in `_vinit` rather
 					// than at declaration — the path taken under `-usecache`/build_module.
 					// memcpy the default in, mirroring the `{E_STRUCT}` path above.
-					if g.table.final_sym(field.typ).kind == .array_fixed {
+					if g.table.final_sym(field.typ).kind == .struct && g.global_zero_default(field.typ, 0) {
+						// every field of the struct defaults to zero: memset, not a
+						// stack temporary of the whole struct (cx-home/v#32)
+						init += '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 5z'
+					} else if g.table.final_sym(field.typ).kind == .array_fixed {
 						init += '\tmemcpy(${final_c_name}, (${styp}[]){${default_initializer}}, sizeof(${styp})); // global 5'
 					} else {
 						init += '\t${final_c_name} = *(${styp}*)&((${styp}[]){${default_initializer}}[0]); // global 5'
@@ -777,6 +788,58 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			init:      init
 			dep_names: g.table.dependent_names_in_expr(field.expr)
 		}
+	}
+}
+
+// global_zero_default reports whether the default value of `typ` is all zero
+// bytes: a number, a bool, a pointer (nil), a fixed array of such, or a V
+// struct whose every field is one and whose field defaults are `0`, `false`
+// or `nil`. Anything else — a string, a dynamic array, a map, an enum (its
+// first value may be non-zero), an option or result, a sum type, a union, a
+// field with another default — answers false, and the global keeps its
+// literal initialisation (cx-home/v#32).
+fn (mut g Gen) global_zero_default(typ ast.Type, depth int) bool {
+	if depth > 16 || typ.has_flag(.option) || typ.has_flag(.result) || typ.has_flag(.shared_f)
+		|| typ.has_flag(.atomic_f) {
+		return false
+	}
+	if typ.is_ptr() || typ.is_pointer() || typ.is_number() || typ.is_bool() {
+		return true
+	}
+	sym := g.table.final_sym(typ)
+	match sym.info {
+		ast.ArrayFixed {
+			return g.global_zero_default(sym.info.elem_type, depth + 1)
+		}
+		ast.Struct {
+			if sym.info.is_union || sym.info.is_generic || sym.language != .v {
+				return false
+			}
+			for f in sym.info.fields {
+				if f.has_default_expr && !global_zero_expr(f.default_expr) {
+					return false
+				}
+				if !g.global_zero_default(f.typ, depth + 1) {
+					return false
+				}
+			}
+			return true
+		}
+		else {
+			return false
+		}
+	}
+}
+
+// global_zero_expr: a field default that is zero bytes — `0`, `false`, `nil`,
+// `unsafe { nil }`
+fn global_zero_expr(e ast.Expr) bool {
+	return match e {
+		ast.Nil { true }
+		ast.UnsafeExpr { global_zero_expr(e.expr) }
+		ast.IntegerLiteral { e.val in ['0', '0x0', '0b0', '0o0'] }
+		ast.BoolLiteral { !e.val }
+		else { false }
 	}
 }
 
