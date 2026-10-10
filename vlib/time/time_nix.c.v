@@ -142,6 +142,13 @@ pub fn (d Duration) timespec() C.timespec {
 pub fn sleep(duration Duration) {
 	mut req := C.timespec{duration / second, duration % second}
 	rem := C.timespec{}
+	// cx-home/v#28: a sleeping thread is a GC-safe region (cx #316): the
+	// collector covers it from its entry-time stack prefix and register snapshot
+	// and never signals or suspends it. nanosleep holds no GC state.
+	gc_safe_region_enter()
+	defer {
+		gc_safe_region_exit()
+	}
 	for C.nanosleep(&req, &rem) < 0 {
 		if C.errno == C.EINTR {
 			// Interrupted by a signal handler

@@ -318,7 +318,10 @@ pub fn (mut sem Semaphore) wait() {
 	c = C.atomic_load_u32(&sem.count)
 	outer: for {
 		if c == 0 {
+			// see the note at timed_wait (cx-home/v#28)
+			gc_safe_region_enter()
 			C.pthread_cond_wait(&sem.cond, &sem.mtx)
+			gc_safe_region_exit()
 			c = C.atomic_load_u32(&sem.count)
 		}
 		for c > 0 {
@@ -347,6 +350,14 @@ pub fn (mut sem Semaphore) try_wait() bool {
 	return false
 }
 
+// cx-home/v#28: the blocking wait is a GC-safe region (gc_safe_region_enter /
+// exit, cx #316): a thread parked here holds no in-flight GC state — the
+// contract's three clauses hold trivially for a condition/semaphore wait — so
+// the collector covers it from its entry-time stack prefix and register
+// snapshot and never signals or suspends it. Before this every parked channel
+// reader (every spawned thread registers since v#26) was signal-suspended
+// once per collection, one ack at a time.
+//
 // timed_wait is similar to .wait(), but it also accepts a timeout duration,
 // thus it can return false early, if the timeout passed before the semaphore was posted.
 pub fn (mut sem Semaphore) timed_wait(timeout time.Duration) bool {
@@ -363,7 +374,9 @@ pub fn (mut sem Semaphore) timed_wait(timeout time.Duration) bool {
 
 	outer: for {
 		if c == 0 {
+			gc_safe_region_enter()
 			res = C.pthread_cond_timedwait(&sem.cond, &sem.mtx, &t_spec)
+			gc_safe_region_exit()
 			if res == C.ETIMEDOUT {
 				break outer
 			}

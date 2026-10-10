@@ -282,9 +282,19 @@ pub fn (mut sem Semaphore) post() {
 // When that happens, it will decrease the semaphore count (lock the semaphore), and will return.
 // In effect, it allows you to block threads, until the semaphore, is posted by another thread.
 // See also .post().
+// cx-home/v#28: the blocking wait is a GC-safe region (gc_safe_region_enter /
+// exit, cx #316): a thread parked here holds no in-flight GC state — the
+// contract's three clauses hold trivially for a condition/semaphore wait — so
+// the collector covers it from its entry-time stack prefix and register
+// snapshot and never signals or suspends it. Before this every parked channel
+// reader (every spawned thread registers since v#26) was signal-suspended
+// once per collection, one ack at a time.
 pub fn (mut sem Semaphore) wait() {
 	for {
-		if C.sem_wait(&sem.sem) == 0 {
+		gc_safe_region_enter()
+		r := C.sem_wait(&sem.sem)
+		gc_safe_region_exit()
+		if r == 0 {
 			return
 		}
 		e := C.errno
@@ -332,7 +342,10 @@ pub fn (mut sem Semaphore) timed_wait(timeout time.Duration) bool {
 	t_spec := timeout.timespec()
 	for {
 		$if !macos {
-			if C.sem_timedwait(&sem.sem, &t_spec) == 0 {
+			gc_safe_region_enter()
+			r := C.sem_timedwait(&sem.sem, &t_spec)
+			gc_safe_region_exit()
+			if r == 0 {
 				return true
 			}
 		}

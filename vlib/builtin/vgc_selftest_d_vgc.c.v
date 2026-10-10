@@ -74,14 +74,14 @@ pub fn vgc_residual4_selftest() u32 {
 	span.alloc_count = 0 // empty -> reclaim-eligible
 	span.sweep_gen = old_gen - 1 // stale -> WOULD be reclaimed without the stamp
 	// install in THIS thread's mcache slot (save + restore; no allocation in the window)
-	saved_slot := unsafe { vgc_heap.caches[idx].alloc[sc] }
+	saved_slot := unsafe { vgc_cache(idx).alloc[sc] }
 	unsafe {
-		vgc_heap.caches[idx].alloc[sc] = span
+		vgc_cache(idx).alloc[sc] = span
 	}
 	vgc_protect_cached_spans()
 	stamped := span.sweep_gen
 	unsafe {
-		vgc_heap.caches[idx].alloc[sc] = saved_slot
+		vgc_cache(idx).alloc[sc] = saved_slot
 	}
 	mut rc := u32(0)
 	if stamped != u32(vgc_heap.gc_cycle) {

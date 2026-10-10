@@ -17,8 +17,8 @@ module builtin
 // not a live re-read — so the scan and the probe see EXACTLY the set the
 // suspend loop exempted, even if a thread flips safe mid-cycle (it then spins
 // in its exit handshake; its recorded roots stay valid — see
-// vgc_safe_exit_handshake in vgc_platform.h).
-__global vgc_safe_cov = [vgc_max_threads]bool{}
+// vgc_safe_exit_handshake in vgc_platform.h). cx-home/v#27: the snapshot is
+// VGC_Cache.cov_safe, per slot — no array sized to a cap.
 
 // cx #316 observability: mach suspensions actually ACKed across all STW cycles
 // (collector-exclusive increments). The safe-region selftest asserts this does
@@ -129,10 +129,12 @@ fn vgc_gc_start() {
 		vgc_watch_marked = 0
 	}
 	C.vgc_trace(5, self_idx, u64(vgc_heap.gc_cycle), u64(vgc_heap.ncaches)) // GC_BEG
-	// susp[i] records which slots THIS cycle mach-suspended, so resume targets exactly
-	// them. Default path: every other registered mutator. Cooperative path: only the
-	// stragglers that did not self-park. Used by both branches + the resume loop.
-	mut susp := [vgc_max_threads]bool{}
+	// VGC_Cache.cov_susp records which slots THIS cycle suspended, so resume targets
+	// exactly them. Default path: every other registered mutator. Cooperative path:
+	// only the stragglers that did not self-park. Used by both branches + the
+	// resume loop. cx-home/v#28: every suspend is two passes — request for all,
+	// then settle (ack) for all — so N parked stragglers cost one scheduling
+	// latency per cycle, not N.
 	$if !vgc_legacy_stw ? {
 		// #63 COOPERATIVE STW (DEFAULT; -d vgc_legacy_stw reverts to legacy mach-suspend-all):
 		// request a cooperative stop; each RUNNING
@@ -166,10 +168,12 @@ fn vgc_gc_start() {
 		// cache_lock) and set at the authoritative read.
 		mut want := u32(0)
 		for i in 0 .. vgc_heap.ncaches {
-			vgc_safe_cov[i] = false
-			c := unsafe { &vgc_heap.caches[i] }
+			mut c := unsafe { vgc_cache(i) }
+			c.cov_safe = false
+			c.cov_req = false
+			c.cov_susp = false
 			if c.registered && i != self_idx && c.mach_port != 0
-				&& C.vgc_atomic_load_u32(&vgc_heap.caches[i].safe) == 0 {
+				&& C.vgc_atomic_load_u32(&vgc_cache(i).safe) == 0 {
 				want++
 			}
 		}
@@ -270,11 +274,12 @@ fn vgc_gc_start() {
 		C.vgc_mutex_lock(&vgc_spawn_root_lock)
 		// Mach-suspend only stragglers (registered, not self, not self-parked). Allocator
 		// locks are held first, so a straggler cannot be frozen holding one.
+		// Pass 1 (v#28): decide, and REQUEST every suspend (no ack waited here).
 		for i in 0 .. vgc_heap.ncaches {
-			c := unsafe { &vgc_heap.caches[i] }
+			mut c := unsafe { vgc_cache(i) }
 			C.vgc_trace(6, i, if c.registered { u64(1) } else { u64(0) }, u64(c.mach_port))
 			if c.registered && i != self_idx && c.mach_port != 0
-				&& (C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) == 0
+				&& (C.vgc_atomic_load_u32(&vgc_cache(i).stopped) == 0
 				|| c.park_seq != C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)) {
 				// cx #316: the AUTHORITATIVE safe-region read. A thread seen safe==1
 				// here holds no in-flight GC state (contract at vgc_safe_enter_spill):
@@ -287,17 +292,24 @@ fn vgc_gc_start() {
 				// until resume — it can never run through mark+sweep uncovered.
 				// vgc_safe_cov[] snapshots the decision so the root scan and the
 				// passive probe treat exactly the same set as covered.
-				if C.vgc_atomic_load_u32(&vgc_heap.caches[i].safe) != 0 {
-					vgc_safe_cov[i] = true
+				if C.vgc_atomic_load_u32(&vgc_cache(i).safe) != 0 {
+					c.cov_safe = true
 					continue
 				}
 				// stopped==1 counts ONLY with a matching park_seq: a stale park from
 				// the previous cycle is a WAKING thread that will run through this
-				// GC — suspend it like any straggler. susp[i] reflects the ACK, not
-				// the attempt: an un-acked target is a gone thread (safe to skip),
-				// never a running mutator (the suspend waits for live targets).
-				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
-				if susp[i] {
+				// GC — suspend it like any straggler. cov_susp (pass 2) reflects the
+				// ACK, not the attempt: an un-acked target is a gone thread (safe to
+				// skip), never a running mutator (the settle waits for live targets).
+				c.cov_req = C.vgc_suspend_request(i, c.mach_port) != 0
+			}
+		}
+		// Pass 2: settle every requested suspend (ack / register capture).
+		for i in 0 .. vgc_heap.ncaches {
+			mut c := unsafe { vgc_cache(i) }
+			if c.cov_req {
+				c.cov_susp = C.vgc_suspend_settle(i, c.mach_port) != 0
+				if c.cov_susp {
 					vgc_stat_mach_suspends++
 				}
 				C.vgc_trace(7, i, u64(c.mach_port), 0)
@@ -327,14 +339,22 @@ fn vgc_gc_start() {
 			// blocked thread; suspending it is today's proven-sound behavior) and
 			// scans everyone externally. Reset the coverage snapshot so the shared
 			// root-scan path takes the external branch for all of them.
-			vgc_safe_cov[i] = false
-			c := unsafe { &vgc_heap.caches[i] }
+			mut c := unsafe { vgc_cache(i) }
+			c.cov_safe = false
+			c.cov_req = false
+			c.cov_susp = false
 			reg := if c.registered { u64(1) } else { u64(0) }
 			C.vgc_trace(6, i, reg, u64(c.mach_port)) // SUSP? (decision inputs for EVERY slot)
 			if c.registered && i != self_idx && c.mach_port != 0 {
-				// susp[i] reflects the ACK (see the cooperative branch above).
-				susp[i] = C.vgc_suspend_thread(c.mach_port) != 0
-				if susp[i] {
+				c.cov_req = C.vgc_suspend_request(i, c.mach_port) != 0
+			}
+		}
+		for i in 0 .. vgc_heap.ncaches {
+			mut c := unsafe { vgc_cache(i) }
+			if c.cov_req {
+				// cov_susp reflects the ACK (see the cooperative branch above).
+				c.cov_susp = C.vgc_suspend_settle(i, c.mach_port) != 0
+				if c.cov_susp {
 					vgc_stat_mach_suspends++
 				}
 				C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
@@ -350,14 +370,14 @@ fn vgc_gc_start() {
 		// per-word cost, cannot mask the race.
 		mut uncovered := u32(0)
 		for i in 0 .. vgc_heap.ncaches {
-			c := unsafe { &vgc_heap.caches[i] }
+			c := unsafe { vgc_cache(i) }
 			if c.registered && i != self_idx && c.mach_port != 0 {
-				parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
+				parked_now := C.vgc_atomic_load_u32(&vgc_cache(i).stopped) != 0
 					&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
 				// cx #316: a safe-region thread is covered by its entry-time
 				// stack prefix + register snapshot (vgc_safe_cov, the suspend
 				// loop's authoritative decision), not by park or suspension.
-				if !parked_now && !susp[i] && !vgc_safe_cov[i] {
+				if !parked_now && !c.cov_susp && !c.cov_safe {
 					uncovered++
 				}
 			}
@@ -388,7 +408,7 @@ fn vgc_gc_start() {
 		// rootfind EXTERNAL holder can be correlated — is it below stack_lo (size under-
 		// estimated), above stack_hi (base wrong), or in no range at all (unregistered peer)?
 		for di in 0 .. vgc_heap.ncaches {
-			dc := unsafe { &vgc_heap.caches[di] }
+			dc := unsafe { vgc_cache(di) }
 			if dc.registered && dc.mach_port != 0 {
 				C.write(2, c'[rangedump] ', usize(12))
 				C.vgc_say(0x5a9e, u64(di))
@@ -404,12 +424,12 @@ fn vgc_gc_start() {
 		// ranges were just refreshed from their captured SP (vgc_scan_suspended_roots);
 		// parkers self-recorded theirs in vgc_park_spill. World is stopped: consistent.
 		for si in 0 .. vgc_heap.ncaches {
-			sc := unsafe { &vgc_heap.caches[si] }
+			sc := unsafe { vgc_cache(si) }
 			if sc.registered && si < 64 {
 				vgc_spchk_lo[si] = sc.stack_lo
 				vgc_spchk_hi[si] = sc.stack_hi
 				vgc_spchk_cyc[si] = u64(vgc_heap.gc_cycle)
-				vgc_spchk_parked[si] = u64(C.vgc_atomic_load_u32(&vgc_heap.caches[si].stopped))
+				vgc_spchk_parked[si] = u64(C.vgc_atomic_load_u32(&vgc_cache(si).stopped))
 			}
 		}
 	}
@@ -499,9 +519,9 @@ fn vgc_gc_start() {
 	// deltas. Safe: the world is stopped, so no mutator is mid-update.
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
-			vgc_heap.total_alloc += vgc_heap.caches[ci].alloc_delta
-			vgc_heap.caches[ci].alloc_delta = 0
-			vgc_heap.caches[ci].live_delta = 0
+			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_delta = 0
+			vgc_cache(ci).live_delta = 0
 		}
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
@@ -604,9 +624,9 @@ fn vgc_gc_start() {
 	// (susp[]); cooperative parkers are released via gc_stop_flag above.
 	C.vgc_atomic_fence()
 	for i in 0 .. vgc_heap.ncaches {
-		if susp[i] {
-			c := unsafe { &vgc_heap.caches[i] }
-			C.vgc_resume_thread(c.mach_port)
+		c := unsafe { vgc_cache(i) }
+		if c.cov_susp {
+			C.vgc_resume_slot(i, c.mach_port)
 			C.vgc_trace(11, i, u64(c.mach_port), 0) // RESUME
 		}
 	}
@@ -642,10 +662,18 @@ fn vgc_cm_stw_enter(self_idx int) {
 		// suspend EVERY registered thread (safe regions are a cooperative-STW
 		// optimization); reset the coverage snapshot so the shared root scan
 		// refreshes everyone externally.
-		vgc_safe_cov[i] = false
-		c := unsafe { &vgc_heap.caches[i] }
+		mut c := unsafe { vgc_cache(i) }
+		c.cov_safe = false
+		c.cov_req = false
+		c.cov_susp = false
 		if c.registered && i != self_idx && c.mach_port != 0 {
-			_ = C.vgc_suspend_thread(c.mach_port)
+			c.cov_req = C.vgc_suspend_request(i, c.mach_port) != 0
+		}
+	}
+	for i in 0 .. vgc_heap.ncaches {
+		mut c := unsafe { vgc_cache(i) }
+		if c.cov_req {
+			c.cov_susp = C.vgc_suspend_settle(i, c.mach_port) != 0
 		}
 	}
 	// The work queue is collector-exclusive (mutators never enqueue — the write barrier
@@ -665,9 +693,9 @@ fn vgc_cm_stw_exit(self_idx int) {
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	C.vgc_atomic_fence()
 	for i in 0 .. vgc_heap.ncaches {
-		c := unsafe { &vgc_heap.caches[i] }
-		if c.registered && i != self_idx && c.mach_port != 0 {
-			C.vgc_resume_thread(c.mach_port)
+		c := unsafe { vgc_cache(i) }
+		if c.cov_susp {
+			C.vgc_resume_slot(i, c.mach_port)
 		}
 	}
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock) // release the registration gate last
@@ -777,9 +805,9 @@ fn vgc_gc_start_concurrent() {
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
-			vgc_heap.total_alloc += vgc_heap.caches[ci].alloc_delta
-			vgc_heap.caches[ci].alloc_delta = 0
-			vgc_heap.caches[ci].live_delta = 0
+			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_delta = 0
+			vgc_cache(ci).live_delta = 0
 		}
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
@@ -864,7 +892,7 @@ fn vgc_gctrace_emit() {
 // stack-only-scan gap that dropped live values. (stw_root_scan.c prototype.)
 fn vgc_scan_suspended_roots(self_idx int) {
 	for i in 0 .. vgc_heap.ncaches {
-		c := unsafe { &vgc_heap.caches[i] }
+		c := unsafe { vgc_cache(i) }
 		if !c.registered || i == self_idx || c.mach_port == 0 {
 			continue
 		}
@@ -876,7 +904,7 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			// cycle's seq) means the thread was signal-suspended above — its range
 			// MUST be refreshed externally (the stale self-recorded one no longer
 			// covers its current frames).
-			if C.vgc_atomic_load_u32(&vgc_heap.caches[i].stopped) != 0
+			if C.vgc_atomic_load_u32(&vgc_cache(i).stopped) != 0
 				&& c.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq) {
 				continue
 			}
@@ -887,9 +915,9 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			// shade its off-stack callee-saved snapshot here — the stack scan cannot
 			// see it (the enter frame died and the blocking call reused its
 			// addresses; that is exactly why the spill is off-stack).
-			if vgc_safe_cov[i] {
+			if c.cov_safe {
 				for k in 0 .. vgc_safe_spill_words {
-					vgc_shade(unsafe { vgc_heap.caches[i].safe_regs[k] }, 0)
+					vgc_shade(unsafe { vgc_cache(i).safe_regs[k] }, 0)
 				}
 				continue
 			}
@@ -898,7 +926,7 @@ fn vgc_scan_suspended_roots(self_idx int) {
 		// 31 GP (x0–x28 + fp + lr) + 64 NEON lanes (v0–v31 × 2) = 95 conservative
 		// root candidates per suspended thread (arm64; x86_64 fills only the first 15).
 		mut regs := [95]usize{}
-		n := C.vgc_thread_regs(c.mach_port, &sp, &regs[0], 95)
+		n := C.vgc_thread_regs(i, &sp, &regs[0], 95)
 		C.vgc_trace(8, i, u64(sp), u64(n)) // SCAN (sp + reg count actually captured)
 		if n > 0 && sp != 0 {
 			vgc_refresh_stack_range_for_sp(i, sp) // [sp, stack_base]
@@ -1095,7 +1123,7 @@ fn C.vgc_data_segments(los &usize, his &usize, max_ranges int) int
 // gc_cycle still holds this cycle's value.
 fn vgc_protect_cached_spans() {
 	for i in 0 .. vgc_heap.ncaches {
-		c := unsafe { &vgc_heap.caches[i] }
+		c := unsafe { vgc_cache(i) }
 		if !c.registered {
 			continue
 		}
@@ -1142,7 +1170,7 @@ fn vgc_protect_cached_spans() {
 // double-membership, no span-init race).
 fn vgc_fixup_caches() {
 	for i in 0 .. vgc_heap.ncaches {
-		mut c := unsafe { &vgc_heap.caches[i] }
+		mut c := unsafe { vgc_cache(i) }
 		// #58 ROOT CAUSE (workers8 string_clone segfault, lldb-captured): the tiny
 		// cursor was UNCONDITIONALLY dropped here. But a mutator can be SIGNAL-
 		// FROZEN (darwin/linux async-suspend STW stops threads at arbitrary PCs)
@@ -1217,11 +1245,26 @@ fn vgc_mark_roots() {
 			vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k])
 		}
 	}
+	// The per-thread cache slots, to the high-water mark only (cx-home/v#27): the
+	// tiny cursor and the in-flight mcache spans are load-bearing roots during
+	// thread create/exit churn (see above); the slots live in vgc_os_alloc'd
+	// chunks now, outside the data segment, so they are scanned here, chunk by
+	// chunk, ncaches records in all — not a fixed 1,024 x 1.5 KB array.
+	mut left := vgc_heap.ncaches
+	for ci in 0 .. C.vgc_ncache_chunks() {
+		if left <= 0 {
+			break
+		}
+		n := if left < vgc_cache_chunk_slots { left } else { vgc_cache_chunk_slots }
+		base := usize(C.vgc_cache_chunk(ci))
+		vgc_scan_range(base, base + usize(n) * usize(sizeof(VGC_Cache)), 0)
+		left -= n
+	}
 	vgc_ph[3] = C.vgc_now_ns()
 
 	// Scan each registered thread's stack
 	for i in 0 .. vgc_heap.ncaches {
-		cache := unsafe { &vgc_heap.caches[i] }
+		cache := unsafe { vgc_cache(i) }
 		if !cache.registered {
 			continue
 		}
@@ -1267,15 +1310,15 @@ fn vgc_mark_roots() {
 // scanned: their tiny cursor and in-flight spans are load-bearing roots during
 // thread create/exit churn (see vgc_mark_roots).
 fn vgc_scan_data_range(lo usize, hi usize) {
+	// cx-home/v#27: the caches no longer sit inside vgc_heap (chunks, scanned to
+	// the high-water mark by vgc_mark_roots), so the whole struct is excluded.
 	heap_lo := usize(voidptr(&vgc_heap))
-	caches_lo := usize(voidptr(&vgc_heap.caches[0]))
-	caches_hi := caches_lo + usize(sizeof(vgc_heap.caches))
 	heap_hi := heap_lo + usize(sizeof(VGC_Heap))
 	w := usize(sizeof(usize))
-	ex_los := [heap_lo, caches_hi, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
+	ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
 		usize(voidptr(&vgc_workbuf_end))]!
-	ex_his := [caches_lo, heap_hi, usize(voidptr(&vgc_arena_lo)) + w,
-		usize(voidptr(&vgc_workbuf_cur)) + w, usize(voidptr(&vgc_workbuf_end)) + w]!
+	ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
+		usize(voidptr(&vgc_workbuf_end)) + w]!
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur
@@ -2116,7 +2159,7 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 						&& C.vgc_bitmap_get(span.mark_bits, tidx) == 0 {
 						mut in_stack := 0
 						for i in 0 .. vgc_heap.ncaches {
-							c := unsafe { &vgc_heap.caches[i] }
+							c := unsafe { vgc_cache(i) }
 							if c.registered && c.stack_lo > 0 && c.stack_hi > c.stack_lo
 								&& addr >= c.stack_lo && addr < c.stack_hi {
 								in_stack = 1
@@ -2152,13 +2195,13 @@ fn vgc_do_sweep() {
 		// leaker: 0x57ac + slot index.
 		swp_self := C.vgc_get_cache_idx()
 		for ci in 0 .. vgc_heap.ncaches {
-			cc := unsafe { &vgc_heap.caches[ci] }
+			cc := unsafe { vgc_cache(ci) }
 			if !cc.registered || ci == swp_self || cc.mach_port == 0 {
 				continue
 			}
-			parked_now := C.vgc_atomic_load_u32(&vgc_heap.caches[ci].stopped) != 0
+			parked_now := C.vgc_atomic_load_u32(&vgc_cache(ci).stopped) != 0
 				&& cc.park_seq == C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
-			if !parked_now && C.vgc_port_is_acked(cc.mach_port) == 0 {
+			if !parked_now && C.vgc_slot_is_acked(ci) == 0 {
 				C.vgc_say(0x57ac, u64(u32(ci)))
 			}
 		}
@@ -2194,7 +2237,7 @@ fn vgc_do_sweep() {
 					// only the frozen mutators' windows are meaningful here.
 					continue
 				}
-				tc := unsafe { &vgc_heap.caches[ti] }
+				tc := unsafe { vgc_cache(ti) }
 				if !tc.registered || tc.stack_lo == 0 || tc.stack_hi <= tc.stack_lo {
 					continue
 				}
@@ -2578,7 +2621,7 @@ const vgc_overhead_shrink_div = u64(50)
 fn vgc_alloc_threads() int {
 	mut n := 0
 	for i in 0 .. vgc_heap.ncaches {
-		c := unsafe { &vgc_heap.caches[i] }
+		c := unsafe { vgc_cache(i) }
 		if c.registered && c.alloc_gen == u32(vgc_heap.gc_cycle) {
 			n++
 		}
@@ -2750,7 +2793,7 @@ fn vgc_heap_usage() (usize, usize, usize, usize, usize) {
 	// flushed — a racy read of each slot, exact once the threads are quiet.
 	mut pending := u64(0)
 	for ci in 0 .. vgc_heap.ncaches {
-		pending += unsafe { vgc_heap.caches[ci].alloc_delta }
+		pending += unsafe { vgc_cache(ci).alloc_delta }
 	}
 	all := total_alloc + pending
 	since := if all > vgc_heap.total_alloc_at_gc { all - vgc_heap.total_alloc_at_gc } else { u64(0) }

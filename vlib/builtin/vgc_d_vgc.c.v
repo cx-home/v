@@ -75,9 +75,19 @@ fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping 
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
-fn C.vgc_suspend_thread(t u32) int // 1 = target acked/parked; 0 = target gone (skip safely)
-fn C.vgc_resume_thread(t u32)
-fn C.vgc_thread_regs(t u32, sp_out &usize, regs &usize, max int) int
+// cx-home/v#28: the stop-the-world is two passes over the slots — request a
+// suspend of every straggler (a mach thread_suspend, a signal, a SuspendThread),
+// then settle each (wait for its ack / capture its register file) — so the
+// per-thread scheduling latency of an ack is paid once per cycle, not once per
+// thread. Both take the SLOT INDEX: the suspend record is the slot's own
+// (vgc_susp_at, chunked beside the caches), no table search.
+fn C.vgc_suspend_request(idx int, t u32) int // 1 = requested; 0 = target gone (skip safely)
+fn C.vgc_suspend_settle(idx int, t u32) int // 1 = target acked/parked, registers captured; 0 = gone
+fn C.vgc_resume_slot(idx int, t u32)
+fn C.vgc_cache_chunk(ci int) voidptr // chunk ci of the mutator slot table (cx-home/v#27)
+fn C.vgc_ncache_chunks() int
+fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
+fn C.vgc_thread_regs(idx int, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_num_cpus() int
 fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default ceiling)
@@ -93,7 +103,7 @@ fn C.vgc_ra2() voidptr // #58 freering: two frames up
 fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
-fn C.vgc_port_is_acked(t u32) int // #58 forensic: is this port parked in the suspend handler?
+fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
@@ -146,7 +156,25 @@ const vgc_max_arenas = 1024
 // Floor for the RAM-derived default ceiling: never below the historical
 // 64-arena (4 GB) capacity, however small the machine reports.
 const vgc_default_min_arenas = 64
-const vgc_max_threads = 1024
+// cx-home/v#27 / v#28 / cx-core-code#116: the mutator slot table has no fixed
+// cap. Slots live in chunks of vgc_cache_chunk_slots VGC_Cache records, each
+// chunk one vgc_os_alloc (zero-filled, never freed; ~96 KB), reached through
+// vgc_cache_chunk(idx >> shift)[idx & mask] (vgc_cache; the pointer table is a C static, see VGC_Heap). The top-level
+// table holds vgc_max_cache_chunks pointers (32 KB of BSS): 262,144 slots, more
+// than any supported kernel lets one process hold (macOS 16,384, FreeBSD 1,500
+// by default, Linux threads-max on a 64 GB box ~500k but RLIMIT_NPROC far
+// below) — it is a bound on the pointer table, never one a program reaches
+// before the OS refuses the thread. Every per-slot walk (park-wait count,
+// suspend, root scan, resume, the mark_roots scan of the slots themselves)
+// runs to vgc_heap.ncaches, the high-water mark, so a program with eight
+// threads pays for eight slots and one with ten thousand pays for ten
+// thousand — not for a fixed 1,024 x 1.5 KB array in the scanned data segment.
+const vgc_cache_chunk_shift = 6
+const vgc_cache_chunk_slots = 1 << vgc_cache_chunk_shift
+const vgc_cache_chunk_mask = vgc_cache_chunk_slots - 1
+const vgc_max_cache_chunks = 4096
+// #58 -d vgc_spcheck shadow tables (diagnostic only): the first 1,024 slots.
+const vgc_spchk_slots = 1024
 // cx #316: words captured per safe-region register snapshot. Sized to hold a
 // full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
 // x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
@@ -303,6 +331,43 @@ mut:
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
 	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
+	// cx-home/v#27: the free-slot list is threaded through the slots (an exited
+	// thread's slot names the next reclaimed one as index+1; 0 = end — vgc_heap
+	// is a zero-initialized global, so 0 must mean empty), so slot reuse is O(1)
+	// and needs no second table sized to a cap.
+	next_free_p1 int
+	// cx-home/v#28: this cycle's per-slot STW decisions, written only by the
+	// collector under cache_lock (they replaced the [vgc_max_threads] arrays
+	// vgc_safe_cov and susp): cov_safe = covered by its safe-region snapshot,
+	// cov_req = a suspend was requested in pass 1, cov_susp = the suspend was
+	// acked in pass 2 (the authoritative resume set).
+	cov_safe bool
+	cov_req  bool
+	cov_susp bool
+}
+
+// vgc_cache answers slot idx's VGC_Cache (cx-home/v#27). Two dependent loads:
+// the chunk pointer (written once, under cache_lock, before any index into the
+// chunk is handed out; a thread reaches its own slot after its registration in
+// program order, the collector under cache_lock, a suspend handler through its
+// own TLS index) and the record. Callers index only slots below ncaches.
+@[inline]
+fn vgc_cache(idx int) &VGC_Cache {
+	return unsafe {
+		&(&VGC_Cache(C.vgc_cache_chunk(idx >> vgc_cache_chunk_shift)))[idx & vgc_cache_chunk_mask]
+	}
+}
+
+// vgc_cache_chunk_ensure makes slot idx addressable: allocates its cache chunk
+// and its suspend-record chunk if the table has not reached it yet. Under
+// cache_lock. False only when the pointer table is exhausted (262,144 slots)
+// or the OS refuses the chunk — loud, never silent (0x0ac8).
+fn vgc_cache_chunk_ensure(idx int) bool {
+	if C.vgc_cache_chunks_ensure(idx, usize(sizeof(VGC_Cache))) == 0 {
+		C.vgc_say(0x0ac8, u64(idx))
+		return false
+	}
+	return true
 }
 
 // VGC_Central is a central free list for one span class.
@@ -425,13 +490,18 @@ mut:
 	// oversized arena hosts exactly its one span, so it has no in-arena neighbors).
 	// Short by construction, so trim/reuse walk it whole.
 	free_oversized &VGC_Span = unsafe { nil }
-	// Per-thread caches
-	caches       [vgc_max_threads]VGC_Cache
-	ncaches      int                  // high-water mark of slots ever used
-	live_threads u32                  // atomic-ish (guarded by cache_lock): currently-registered mutators
-	free_slots   [vgc_max_threads]int // reclaimed cache indices, reused before growing ncaches
-	nfree_slots  int
-	cache_lock   u32
+	// Per-thread caches (cx-home/v#27): the chunk-pointer table lives in C
+	// (vgc_cache_chunk / vgc_cache_chunks_ensure in vgc_platform.h), NOT here:
+	// _vinit zero-inits this global AFTER the module initialisers' first
+	// allocations registered the main thread (the heap-init ordering quirk;
+	// vgc_init runs after _vinit and registers main again at slot 0), and a
+	// table wiped in between would strand main's TLS index on a nil chunk. The
+	// table is not a root (vgc_os_alloc memory is outside the arenas); the
+	// chunks are scanned to ncaches by vgc_mark_roots, as the fixed array was.
+	ncaches       int // high-water mark of slots ever used
+	live_threads  u32 // atomic-ish (guarded by cache_lock): currently-registered mutators
+	free_head_p1  int // reclaimed slots, threaded through VGC_Cache.next_free_p1 (index+1; 0 = none); reused before growing ncaches
+	cache_lock    u32
 	// GC state
 	gc_phase   u32 // atomic: current GC phase
 	gc_enabled u32 // atomic: 1 = GC enabled
@@ -1052,10 +1122,10 @@ __global vgc_gc_last_end = u64(0)
 // frame depth against its own last-scanned window — a holder frame below the
 // scanned lo is the root-miss, localized. Written only under STW; read only on
 // the rare catch path — cannot mask.
-__global vgc_spchk_lo = [vgc_max_threads]usize{}
-__global vgc_spchk_hi = [vgc_max_threads]usize{}
-__global vgc_spchk_cyc = [vgc_max_threads]u64{}
-__global vgc_spchk_parked = [vgc_max_threads]u64{}
+__global vgc_spchk_lo = [vgc_spchk_slots]usize{}
+__global vgc_spchk_hi = [vgc_spchk_slots]usize{}
+__global vgc_spchk_cyc = [vgc_spchk_slots]u64{}
+__global vgc_spchk_parked = [vgc_spchk_slots]u64{}
 
 // vgc_map_backing_status: #58 cx_envcheck probe support. Reports whether a live
 // map's key/value backing arrays are still ALLOCATED in the vgc heap. An
@@ -1297,7 +1367,7 @@ fn vgc_bw_whereis(obj usize) {
 		if ti == self_idx {
 			continue // the collector's own frames legitimately reference sweep victims
 		}
-		tc := unsafe { &vgc_heap.caches[ti] }
+		tc := unsafe { vgc_cache(ti) }
 		if !tc.registered || tc.stack_lo == 0 || tc.stack_hi <= tc.stack_lo {
 			continue
 		}
@@ -1677,24 +1747,26 @@ fn vgc_register_thread() {
 	_ = vgc_register_thread_opt(true)
 }
 
-// vgc_register_thread_opt registers the calling thread in a cache slot. With
-// `wait`, a full table is waited out (the allocation entry points: a thread
-// about to allocate must be a mutator). Without it, a full table returns false
-// and the thread stays unregistered until its first allocation (the spawn
-// wrapper's entry-time registration, cx-home/v#26: a wait there would hold the
-// slot of a parked thread while the vgc_max_threads+1-th waited forever for it
-// — 2,000 parked workers, vgc_spawn_roots_many_live_test.v).
+// vgc_register_thread_opt registers the calling thread in a cache slot. The
+// slot table grows on demand (cx-home/v#27, cx-core-code#116: the fixed 1,024
+// made the 1,025th live worker wait forever — a chain of 2,000 cx workers
+// hung), so registration never waits for an exiting thread. `wait` is kept for
+// the allocation entry points as the backstop against the one remaining bound,
+// the chunk-pointer table (262,144 slots): a thread about to allocate must be a
+// mutator, so it waits there, loud once a second (0x0ac7); the spawn wrapper's
+// entry-time registration (v#26) returns false instead and the thread
+// registers at its first allocation.
 fn vgc_register_thread_opt(wait bool) bool {
 	C.vgc_mutex_lock(&vgc_heap.cache_lock)
-	// Reuse a reclaimed slot before growing the high-water mark, so that
-	// churn (many short-lived threads) cannot exhaust the fixed cache array.
+	// Reuse a reclaimed slot before growing the high-water mark, so churn (many
+	// short-lived threads) keeps ncaches — every per-cycle walk's bound — low.
 	mut idx := -1
 	mut waited_us := u64(0)
 	for {
-		if vgc_heap.nfree_slots > 0 {
-			vgc_heap.nfree_slots--
-			idx = vgc_heap.free_slots[vgc_heap.nfree_slots]
-		} else if vgc_heap.ncaches < vgc_max_threads {
+		if vgc_heap.free_head_p1 > 0 {
+			idx = vgc_heap.free_head_p1 - 1
+			vgc_heap.free_head_p1 = vgc_cache(idx).next_free_p1
+		} else if vgc_cache_chunk_ensure(vgc_heap.ncaches) {
 			idx = vgc_heap.ncaches
 			vgc_heap.ncaches = idx + 1
 		}
@@ -1705,16 +1777,12 @@ fn vgc_register_thread_opt(wait bool) bool {
 			C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 			return false
 		}
-		// The table is full: vgc_max_threads live mutators. An UNREGISTERED
-		// mutator is unsound, not merely slow — the collector never suspends it
-		// and never scans its stack or registers, so every object only it holds
-		// is freed under it while it runs through the mark (cx-core-code#113: 64
-		// [?async] futures + the main thread overflowed the old 64-slot table and
-		// the overflow threads died of reused memory — SIGSEGV, SIGBUS,
-		// `map.hash_fn is nil`). This thread holds no heap object yet (its spawn
-		// argument sits in the spawn-root registry), so it WAITS for an exiting
-		// thread's slot instead; loud once a second (0x0ac7 = seconds waited) so
-		// a program past the cap is visible, never silently corrupt.
+		// The pointer table is exhausted. An UNREGISTERED mutator is unsound, not
+		// merely slow — the collector never suspends it and never scans its stack
+		// or registers, so every object only it holds is freed under it while it
+		// runs through the mark (cx-core-code#113). This thread holds no heap
+		// object yet (its spawn argument sits in the spawn-root registry), so it
+		// WAITS for an exiting thread's slot; loud once a second (0x0ac7).
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 		C.usleep(100)
 		waited_us += 100
@@ -1745,20 +1813,24 @@ fn vgc_register_thread_opt(wait bool) bool {
 	// refills from central fresh.
 	unsafe {
 		for c in 0 .. 136 {
-			vgc_heap.caches[idx].alloc[c] = nil
+			vgc_cache(idx).alloc[c] = nil
 		}
-		vgc_heap.caches[idx].tiny = 0
-		vgc_heap.caches[idx].tiny_offset = 0
-		vgc_heap.caches[idx].tiny_allocs = 0
-		vgc_heap.caches[idx].stopped = 0
-		vgc_heap.caches[idx].live_delta = 0
-		vgc_heap.caches[idx].alloc_delta = 0
+		vgc_cache(idx).tiny = 0
+		vgc_cache(idx).tiny_offset = 0
+		vgc_cache(idx).tiny_allocs = 0
+		vgc_cache(idx).stopped = 0
+		vgc_cache(idx).live_delta = 0
+		vgc_cache(idx).alloc_delta = 0
+		vgc_cache(idx).next_free_p1 = 0
+		vgc_cache(idx).cov_safe = false
+		vgc_cache(idx).cov_req = false
+		vgc_cache(idx).cov_susp = false
 		// cx #316: a reused slot must not inherit the previous owner's safe-region
 		// state — a stale safe==1 would exempt the NEW thread from suspension with
 		// a dead range; a stale snapshot would pin the old owner's objects.
-		C.vgc_atomic_store_u32(&vgc_heap.caches[idx].safe, 0)
+		C.vgc_atomic_store_u32(&vgc_cache(idx).safe, 0)
 		for w in 0 .. vgc_safe_spill_words {
-			vgc_heap.caches[idx].safe_regs[w] = 0
+			vgc_cache(idx).safe_regs[w] = 0
 		}
 	}
 	C.vgc_set_cache_idx(idx)
@@ -1778,17 +1850,17 @@ fn vgc_register_thread_opt(wait bool) bool {
 		stack_base = if dist_hi <= dist_lo { stack_hi } else { stack_lo }
 	}
 	unsafe {
-		vgc_heap.caches[idx].registered = true
-		vgc_heap.caches[idx].stack_base = stack_base
+		vgc_cache(idx).registered = true
+		vgc_cache(idx).stack_base = stack_base
 		// cx #743: keep the TRUE bounds too (0/0 when unknown) — the scan-range
 		// refresh validates externally-captured SPs against them, so a thread
 		// suspended on a foreign (host-runtime) stack never poisons its range.
-		vgc_heap.caches[idx].stack_limit_lo = if stack_lo < stack_hi { stack_lo } else { usize(0) }
-		vgc_heap.caches[idx].stack_limit_hi = if stack_lo < stack_hi { stack_hi } else { usize(0) }
-		vgc_heap.caches[idx].mach_port = C.vgc_thread_self_port() // for OS-level STW
+		vgc_cache(idx).stack_limit_lo = if stack_lo < stack_hi { stack_lo } else { usize(0) }
+		vgc_cache(idx).stack_limit_hi = if stack_lo < stack_hi { stack_hi } else { usize(0) }
+		vgc_cache(idx).mach_port = C.vgc_thread_self_port() // for OS-level STW
 	}
 	vgc_refresh_stack_range_for_sp(idx, sp)
-	C.vgc_trace(1, idx, u64(stack_base), u64(vgc_heap.caches[idx].mach_port)) // REG
+	C.vgc_trace(1, idx, u64(stack_base), u64(vgc_cache(idx).mach_port)) // REG
 	C.vgc_trace(2, idx, u64(C.vgc_atomic_load_u32(&vgc_heap.gc_phase)), 0) // BAR_IN
 
 	// Slot is now fully registered and suspendable; release the registration gate
@@ -1814,10 +1886,11 @@ fn vgc_register_thread_opt(wait bool) bool {
 // so does vgc_free: a thread that touches the heap only to read and free what
 // another thread allocated is a mutator too, and an unregistered mutator is
 // outside the stop-the-world — not parked, not suspended, its stack and
-// registers never scanned. A thread past the table's capacity keeps the lazy
-// shape (it registers, waiting, at its first allocation; its spawn argument is
-// rooted by the spawn-root registry until its fn returns), so a program with
-// more than vgc_max_threads live threads cannot deadlock on this call.
+// registers never scanned. The slot table grows on demand (cx-home/v#27), so
+// this succeeds for every thread the OS lets the process create; only past the
+// chunk-pointer table (262,144 slots) does a thread keep the lazy shape (it
+// registers, waiting, at its first allocation; its spawn argument is rooted by
+// the spawn-root registry until its fn returns).
 @[markused]
 fn vgc_register_at_entry() {
 	if C.vgc_get_cache_idx() < 0 {
@@ -1832,12 +1905,12 @@ fn vgc_register_at_entry() {
 // thread counts as already-stopped (it has no more roots).
 @[export: 'vgc_thread_exit_cb']
 fn vgc_thread_exit_cb(idx int) {
-	if idx < 0 || idx >= vgc_max_threads {
+	if idx < 0 || idx >= vgc_heap.ncaches {
 		return
 	}
 	C.vgc_trace(4, idx, 0, 0) // EXIT
 	C.vgc_mutex_lock(&vgc_heap.cache_lock)
-	if !vgc_heap.caches[idx].registered {
+	if !vgc_cache(idx).registered {
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 		return
 	}
@@ -1846,28 +1919,31 @@ fn vgc_thread_exit_cb(idx int) {
 		// counters before the slot is released, so churn (frequent thread exit)
 		// doesn't drift heap_live between GC rebaselines. Under cache_lock, which
 		// the collector also holds across its cycle, so this is serialized.
-		ld := vgc_heap.caches[idx].live_delta
+		ld := vgc_cache(idx).live_delta
 		if ld >= 0 {
 			C.vgc_atomic_add_u64(&vgc_heap.heap_live, u64(ld))
 		} else {
 			C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-ld))
 		}
-		C.vgc_atomic_add_u64(&vgc_heap.total_alloc, vgc_heap.caches[idx].alloc_delta)
-		vgc_heap.caches[idx].live_delta = 0
-		vgc_heap.caches[idx].alloc_delta = 0
-		vgc_heap.caches[idx].registered = false
-		vgc_heap.caches[idx].stack_lo = 0
-		vgc_heap.caches[idx].stack_hi = 0
-		C.vgc_atomic_store_u32(&vgc_heap.caches[idx].safe, 0) // cx #316 hygiene (also reset at register)
+		C.vgc_atomic_add_u64(&vgc_heap.total_alloc, vgc_cache(idx).alloc_delta)
+		vgc_cache(idx).live_delta = 0
+		vgc_cache(idx).alloc_delta = 0
+		vgc_cache(idx).registered = false
+		vgc_cache(idx).stack_lo = 0
+		vgc_cache(idx).stack_hi = 0
+		C.vgc_atomic_store_u32(&vgc_cache(idx).safe, 0) // cx #316 hygiene (also reset at register)
 	}
 	// Atomic decrement — see the bump in vgc_register_thread (lock-free PACE reader).
 	if C.vgc_atomic_load_u32(&vgc_heap.live_threads) > 0 {
 		C.vgc_atomic_sub_u32(&vgc_heap.live_threads, 1)
 	}
-	if vgc_heap.nfree_slots < vgc_max_threads {
-		vgc_heap.free_slots[vgc_heap.nfree_slots] = idx
-		vgc_heap.nfree_slots++
+	// Push the slot on the free list (threaded through the slots, O(1)). Its
+	// suspend record is quiescent: an exiting thread is not inside a suspend
+	// handler, and the collector holds cache_lock across its cycle.
+	unsafe {
+		vgc_cache(idx).next_free_p1 = vgc_heap.free_head_p1
 	}
+	vgc_heap.free_head_p1 = idx + 1
 	C.vgc_mutex_unlock(&vgc_heap.cache_lock)
 
 	// NOTE: do NOT touch gc_stopped_count here. An exiting thread simply
@@ -1892,7 +1968,7 @@ pub fn vgc_my_stack_base() usize {
 	if idx < 0 {
 		return 0
 	}
-	return unsafe { vgc_heap.caches[idx].stack_base }
+	return unsafe { vgc_cache(idx).stack_base }
 }
 
 // vgc_my_stack_info returns THIS thread's (cache_idx, stack_lo, stack_hi) — the FULL
@@ -1906,7 +1982,7 @@ pub fn vgc_my_stack_info() (int, usize, usize) {
 	if idx < 0 {
 		return -1, usize(0), usize(0)
 	}
-	return idx, unsafe { vgc_heap.caches[idx].stack_lo }, unsafe { vgc_heap.caches[idx].stack_hi }
+	return idx, unsafe { vgc_cache(idx).stack_lo }, unsafe { vgc_cache(idx).stack_hi }
 }
 
 // vgc_ensure_registered registers the calling thread on its first call,
@@ -2000,7 +2076,7 @@ fn vgc_refresh_stack_range() {
 }
 
 fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
-	if cache_idx < 0 || cache_idx >= vgc_max_threads {
+	if cache_idx < 0 || cache_idx >= vgc_heap.ncaches {
 		return
 	}
 	// cx #743: a registered thread suspended while executing on a FOREIGN stack
@@ -2013,21 +2089,21 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 	// mapped for the thread's lifetime, and its captured registers are still
 	// shaded by the caller. Bounds 0/0 (platform can't report) disable the
 	// check — prior behavior.
-	limit_lo := unsafe { vgc_heap.caches[cache_idx].stack_limit_lo }
-	limit_hi := unsafe { vgc_heap.caches[cache_idx].stack_limit_hi }
+	limit_lo := unsafe { vgc_cache(cache_idx).stack_limit_lo }
+	limit_hi := unsafe { vgc_cache(cache_idx).stack_limit_hi }
 	if limit_lo < limit_hi && (sp < limit_lo || sp > limit_hi) {
 		return
 	}
-	stack_base := unsafe { vgc_heap.caches[cache_idx].stack_base }
+	stack_base := unsafe { vgc_cache(cache_idx).stack_base }
 	if stack_base <= sp {
 		unsafe {
-			vgc_heap.caches[cache_idx].stack_lo = stack_base
-			vgc_heap.caches[cache_idx].stack_hi = sp
+			vgc_cache(cache_idx).stack_lo = stack_base
+			vgc_cache(cache_idx).stack_hi = sp
 		}
 	} else {
 		unsafe {
-			vgc_heap.caches[cache_idx].stack_lo = sp
-			vgc_heap.caches[cache_idx].stack_hi = stack_base
+			vgc_cache(cache_idx).stack_lo = sp
+			vgc_cache(cache_idx).stack_hi = stack_base
 		}
 	}
 }
@@ -3779,7 +3855,7 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 		// same crash (infinite recursion).
 		return vgc_central_get_span(span_class)
 	}
-	span := unsafe { vgc_heap.caches[cache_idx].alloc[span_class] }
+	span := unsafe { vgc_cache(cache_idx).alloc[span_class] }
 	if span != unsafe { nil } {
 		// Check if span has free objects
 		if span.alloc_count < span.nelems {
@@ -3801,7 +3877,7 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	// carves a new span under vgc_heap.lock).
 	new_span := vgc_central_get_span(span_class)
 	unsafe {
-		vgc_heap.caches[cache_idx].alloc[span_class] = new_span
+		vgc_cache(cache_idx).alloc[span_class] = new_span
 	}
 	$if !vgc_concurrent ? {
 		if new_span != unsafe { nil } {
@@ -3936,8 +4012,8 @@ fn vgc_force_collect() {
 	ci := C.vgc_get_cache_idx()
 	if ci >= 0 {
 		unsafe {
-			C.vgc_run_gc_spilled(&vgc_heap.caches[ci].stack_lo, &vgc_heap.caches[ci].stack_hi,
-				vgc_heap.caches[ci].stack_base)
+			C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
+				vgc_cache(ci).stack_base)
 		}
 	} else {
 		vgc_gc_start()
@@ -4035,23 +4111,23 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 		return
 	}
 	unsafe {
-		vgc_heap.caches[cache_idx].live_delta += i64(live_sz)
-		vgc_heap.caches[cache_idx].alloc_delta += total_n
-		if vgc_heap.caches[cache_idx].alloc_delta >= vgc_acct_flush {
+		vgc_cache(cache_idx).live_delta += i64(live_sz)
+		vgc_cache(cache_idx).alloc_delta += total_n
+		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush {
 			// cx-home/v#16 / cx-private#1916: the pacer counts a thread as
 			// allocating this cycle once it has flushed (~1 MB): a server's
 			// many request threads that each allocate a little no longer scale
 			// the headroom cap and floor as if each were an allocation stream
-			vgc_heap.caches[cache_idx].alloc_gen = u32(vgc_heap.gc_cycle)
-			ld := vgc_heap.caches[cache_idx].live_delta
+			vgc_cache(cache_idx).alloc_gen = u32(vgc_heap.gc_cycle)
+			ld := vgc_cache(cache_idx).live_delta
 			if ld >= 0 {
 				C.vgc_atomic_add_u64(&vgc_heap.heap_live, u64(ld))
 			} else {
 				C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-ld))
 			}
-			C.vgc_atomic_add_u64(&vgc_heap.total_alloc, vgc_heap.caches[cache_idx].alloc_delta)
-			vgc_heap.caches[cache_idx].live_delta = 0
-			vgc_heap.caches[cache_idx].alloc_delta = 0
+			C.vgc_atomic_add_u64(&vgc_heap.total_alloc, vgc_cache(cache_idx).alloc_delta)
+			vgc_cache(cache_idx).live_delta = 0
+			vgc_cache(cache_idx).alloc_delta = 0
 		}
 	}
 }
@@ -4067,10 +4143,10 @@ fn vgc_acct_free(sz u64) {
 		return
 	}
 	unsafe {
-		vgc_heap.caches[idx].live_delta -= i64(sz)
-		if vgc_heap.caches[idx].live_delta <= -i64(vgc_acct_flush) {
-			C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-vgc_heap.caches[idx].live_delta))
-			vgc_heap.caches[idx].live_delta = 0
+		vgc_cache(idx).live_delta -= i64(sz)
+		if vgc_cache(idx).live_delta <= -i64(vgc_acct_flush) {
+			C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-vgc_cache(idx).live_delta))
+			vgc_cache(idx).live_delta = 0
 		}
 	}
 }
@@ -4096,8 +4172,8 @@ fn vgc_maybe_gc() {
 			ci := C.vgc_get_cache_idx()
 			if ci >= 0 {
 				unsafe {
-					C.vgc_run_gc_spilled(&vgc_heap.caches[ci].stack_lo,
-						&vgc_heap.caches[ci].stack_hi, vgc_heap.caches[ci].stack_base)
+					C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo,
+						&vgc_cache(ci).stack_hi, vgc_cache(ci).stack_base)
 				}
 			} else {
 				vgc_gc_start()
@@ -4157,7 +4233,7 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 
 	// Tiny allocator for very small objects (translated from Go's mcache tiny allocator)
 	if n < vgc_tiny_size && cache_idx >= 0 {
-		cache := unsafe { &vgc_heap.caches[cache_idx] }
+		cache := unsafe { vgc_cache(cache_idx) }
 		if cache.tiny != 0 {
 			// Align up for the allocation
 			mut off := cache.tiny_offset
@@ -4179,8 +4255,8 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 					unsafe { C.memset(ptr, 0, n) }
 				}
 				unsafe {
-					vgc_heap.caches[cache_idx].tiny_offset = off + n
-					vgc_heap.caches[cache_idx].tiny_allocs++
+					vgc_cache(cache_idx).tiny_offset = off + n
+					vgc_cache(cache_idx).tiny_allocs += 1
 				}
 				// tiny-block reuse: bytes already counted live at span alloc, so
 				// only the total-alloc stat is bumped (per-thread).
@@ -4222,9 +4298,9 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 					// reclaim it on an individual free (it would clobber live
 					// siblings). Only the tracing collector reclaims tiny blocks.
 					span.is_tiny = true
-					vgc_heap.caches[cache_idx].tiny = usize(ptr)
-					vgc_heap.caches[cache_idx].tiny_offset = n
-					vgc_heap.caches[cache_idx].tiny_allocs++
+					vgc_cache(cache_idx).tiny = usize(ptr)
+					vgc_cache(cache_idx).tiny_offset = n
+					vgc_cache(cache_idx).tiny_allocs += 1
 				}
 				vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
 				if span.alloc_count >= span.nelems {
@@ -5016,9 +5092,9 @@ fn vgc_safepoint() {
 	}
 	unsafe {
 		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq, &vgc_heap.gc_stopped_count,
-			&vgc_heap.caches[cache_idx].stopped, &vgc_heap.caches[cache_idx].park_seq,
-			&vgc_heap.caches[cache_idx].stack_lo, &vgc_heap.caches[cache_idx].stack_hi,
-			vgc_heap.caches[cache_idx].stack_base)
+			&vgc_cache(cache_idx).stopped, &vgc_cache(cache_idx).park_seq,
+			&vgc_cache(cache_idx).stack_lo, &vgc_cache(cache_idx).stack_hi,
+			vgc_cache(cache_idx).stack_base)
 	}
 }
 
@@ -5040,9 +5116,9 @@ fn vgc_safe_region_enter() {
 		return
 	}
 	unsafe {
-		C.vgc_safe_enter_spill(&vgc_heap.caches[cache_idx].safe,
-			&vgc_heap.caches[cache_idx].stack_lo, &vgc_heap.caches[cache_idx].stack_hi,
-			vgc_heap.caches[cache_idx].stack_base, &vgc_heap.caches[cache_idx].safe_regs[0],
+		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe,
+			&vgc_cache(cache_idx).stack_lo, &vgc_cache(cache_idx).stack_hi,
+			vgc_cache(cache_idx).stack_base, &vgc_cache(cache_idx).safe_regs[0],
 			vgc_safe_spill_words)
 	}
 }
@@ -5062,9 +5138,9 @@ fn vgc_safe_region_exit() {
 		return
 	}
 	unsafe {
-		C.vgc_safe_exit_handshake(&vgc_heap.caches[cache_idx].safe, &vgc_heap.gc_stop_flag)
+		C.vgc_safe_exit_handshake(&vgc_cache(cache_idx).safe, &vgc_heap.gc_stop_flag)
 		for w in 0 .. vgc_safe_spill_words {
-			vgc_heap.caches[cache_idx].safe_regs[w] = 0
+			vgc_cache(cache_idx).safe_regs[w] = 0
 		}
 	}
 }
