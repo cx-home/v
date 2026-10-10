@@ -49,3 +49,41 @@ jobs:
           gmake
           ./v test bench/parallel-alloc
           VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc
+
+  # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
+  # the stack bounds and the thread-exit callback. bench/parallel-alloc's
+  # drivers spawn children through `ENV=v cmd`, which cmd.exe does not read,
+  # so this job runs the port test and the soundness driver directly.
+  vgc-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        # msvc is not in the matrix: vgc does not compile under msvc (GNU inline
+        # asm, __builtin_frame_address; an msvc build defaults to no GC) — its own item
+        cc: [gcc]
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build V (${{ matrix.cc }})
+        shell: pwsh
+        run: |
+          .\makev.bat -${{ matrix.cc }}
+          .\v.exe version
+      - name: vgc_os_suspend_port_test, vgc_global_root_test
+        shell: pwsh
+        run: .\v.exe -cc ${{ matrix.cc }} -gc e test bench/parallel-alloc/vgc_os_suspend_port_test.v bench/parallel-alloc/vgc_global_root_test.v
+      - name: concurrent_mt_sound T=8 and T=16 (default collector)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          .\v.exe -cc ${{ matrix.cc }} -gc e -o mts.exe bench/parallel-alloc/concurrent_mt_sound/mt_sound.v
+          foreach ($t in 8, 16) {
+            $env:T = "$t"; $env:STEPS = '20000'
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $out = (.\mts.exe 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+            "T=$t exit=$code secs=$($sw.Elapsed.TotalSeconds)"
+            $out.Trim().Split("`n") | Select-Object -Last 3
+            if ($code -ne 0 -or $out -notmatch ' bad=0') { throw "mt_sound T=$t unsound or failed" }
+          }
