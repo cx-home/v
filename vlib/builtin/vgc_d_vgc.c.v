@@ -56,6 +56,7 @@ fn C.vgc_start_thread_rc(f voidptr) int
 fn C.vgc_mark_wait(flag &u32, val u32)
 fn C.vgc_mark_wake(flag &u32)
 fn C.vgc_ncpu() int
+fn C.vgc_box_busy(ncpu int) int
 fn C.vgc_yield()
 fn C.vgc_popcount8(x u8) int
 fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
@@ -759,7 +760,10 @@ __global vgc_mark_backoff = int(0)
 // quarter of it, up to VGC_WALK_WORKERS, default the marker configuration) —
 // and back off like the mark does (vgc_walk_adapt): a parallel walk no cheaper
 // per span than nine tenths of the one-walker rate halves the count for 32
-// cycles. A preempted walker holds one chunk; the join waits for it.
+// cycles, then 64, 128 ... 1024 while it keeps not paying. A preempted walker
+// holds one chunk and the join waits for it — a scheduler quantum — so on an
+// oversubscribed box (1-minute load at or past the online CPUs, vgc_box_busy)
+// the walks stay serial; VGC_WALK_LOAD_GATE=0 lifts that for measurement.
 const vgc_walk_chunk = u32(32)
 const vgc_walk_sum_len = 256
 const vgc_walk_tag_none = u8(0)
@@ -780,6 +784,13 @@ __global vgc_walk_n_target = int(0)
 // a reduced walker count while backing off (0 = the planned count)
 __global vgc_walk_backoff = int(0)
 // parallel cycles left at the reduced count
+__global vgc_walk_backoff_len = int(32)
+// the next back-off's length: doubles per back-off up to 1024, resets to 32
+// after a parallel cycle that paid
+__global vgc_walk_ncpu = int(1)
+// online CPUs at init, for the load gate (vgc_box_busy)
+__global vgc_walk_load_gate = true
+// VGC_WALK_LOAD_GATE=0 switches the load gate off (measurement)
 __global vgc_walk_nworkers_cur = int(1)
 // this cycle's walker count (the collector included)
 __global vgc_pool_phase = u32(0)
@@ -1458,6 +1469,7 @@ fn vgc_atfork_child() {
 	vgc_walk_nworkers_cur = 1
 	vgc_walk_n_target = 0
 	vgc_walk_backoff = 0
+	vgc_walk_backoff_len = 32
 	vgc_pool_phase = 0
 	vgc_pool_phase_n = 1
 	vgc_walk_active = 0
@@ -1586,6 +1598,11 @@ pub fn vgc_init() {
 		if sv >= 0 {
 			vgc_walk_min_spans = u64(sv)
 		}
+	}
+	vgc_walk_ncpu = C.vgc_ncpu()
+	lg_env := C.getenv(c'VGC_WALK_LOAD_GATE')
+	if lg_env != unsafe { nil } {
+		vgc_walk_load_gate = C.atoll(lg_env) != 0
 	}
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
 	// see vgc_heap_soft_limit / cx #282), env-overridable.
