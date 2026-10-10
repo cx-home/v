@@ -12,7 +12,24 @@ import os
 import sync
 import time
 
-const n_threads = 2000
+const n_threads_want = 2000
+
+// FreeBSD caps a process at kern.threads.max_threads_per_proc threads (1,500
+// by default): 2,000 live threads fail `go` with EAGAIN there (cx-home/v CI
+// vgc FreeBSD, 38031157713). The count stays above the old 1,024-slot table
+// either way, so the 1,025th live spawn is still the case under test.
+fn thread_count() int {
+	$if freebsd {
+		r := os.execute('sysctl -n kern.threads.max_threads_per_proc')
+		if r.exit_code == 0 {
+			limit := r.output.trim_space().int()
+			if limit > 0 && limit - 64 < n_threads_want {
+				return limit - 64
+			}
+		}
+	}
+	return n_threads_want
+}
 
 struct Arg {
 	id  int
@@ -27,6 +44,8 @@ fn parked(a &Arg, mut wg sync.WaitGroup, gate chan bool, out chan string) {
 }
 
 fn test_more_than_1024_live_spawned_threads() {
+	n_threads := thread_count()
+	assert n_threads > 1024, 'this box allows ${n_threads + 64} threads a process: the case needs more than 1,024 live'
 	spawn fn () {
 		time.sleep(120 * time.second)
 		eprintln('vgc_spawn_roots_many_live_test: no progress in 120 s (spawn-root table full?)')
@@ -63,5 +82,4 @@ fn test_more_than_1024_live_spawned_threads() {
 		seen[id] = true
 	}
 	assert seen.len == n_threads
-	_ = os.getpid()
 }
