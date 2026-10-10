@@ -1402,6 +1402,10 @@ static inline int vgc_cache_chunks_ensure(int idx, size_t slot_size) {
     if (idx < 0) return 0;
     int ci = idx >> VGC_SUSP_CHUNK_SHIFT;
     if (ci >= VGC_SUSP_MAX_CHUNKS) return 0;
+    // The high-water mark moves for EVERY slot, not only for a new chunk: the
+    // handler's fallback walk and the forensic walks run to it (an early return
+    // here left it at 1 and the walk at slot 0 — the fixed tcc lane still wedged).
+    if (idx + 1 > vgc_susp_hwm) vgc_susp_hwm = idx + 1;
     if (ci < vgc_ncache_chunk_cnt) return 1;
     if (vgc_susp_chunks[ci] == 0) {
         void* p = vgc_os_alloc(sizeof(vgc_susp) * VGC_SUSP_CHUNK);
@@ -1415,7 +1419,6 @@ static inline int vgc_cache_chunks_ensure(int idx, size_t slot_size) {
     }
     vgc_atomic_fence(); // both zeroed chunks and their pointers are visible before the count moves
     vgc_ncache_chunk_cnt = ci + 1;
-    if (idx + 1 > vgc_susp_hwm) vgc_susp_hwm = idx + 1;
     return 1;
 }
 // #58 forensic: is `val` present in ANY currently-suspended thread's captured
@@ -1436,6 +1439,29 @@ static inline int vgc_captured_regs_contain(uintptr_t val) {
 static inline int vgc_slot_is_acked(int idx) {
     vgc_susp* s = vgc_susp_at(idx);
     return (s != 0 && vgc_atomic_load_u32(&s->port) != 0 && vgc_atomic_load_u32(&s->acked) != 0) ? 1 : 0;
+}
+// A signal handler's own record: the slot the thread's TLS cache index names,
+// when that record is armed for this thread (port == key) — O(1). Otherwise a
+// walk of the armed records to the high-water mark: under the pthread-key TLS
+// (tcc, VGC_FORCE_TLS_BY_KEY) the index is GONE while the thread runs its exit
+// destructors — glibc's __nptl_deallocate_tsd and darwin's _pthread_tsd_cleanup
+// clear every key's value before calling its destructor, and the cache-index
+// key is created before the exit key — so an exiting builder spinning on
+// cache_lock in vgc_thread_exit_cb while the collector's pass 1 signals it read
+// -1 here, never acked, and the collector waited in settle for ever (CI vgc
+// 38065594231 / 38070815065: Linux and FreeBSD, both on tcc, wedged in
+// vgc_parallel_mark_test's child with the stop flag up; macOS falls back to
+// cc, Windows has no handler). The walk is bounded by the live slots and only
+// runs for a thread whose index does not name its record.
+static inline vgc_susp* vgc_susp_self(int tls_idx, uint32_t key) {
+    vgc_susp* s = vgc_susp_at(tls_idx);
+    if (s != 0 && vgc_atomic_load_u32(&s->port) == key) return s;
+    int n = vgc_susp_hwm;
+    for (int i = 0; i < n; i++) {
+        vgc_susp* c = vgc_susp_at(i);
+        if (c != 0 && vgc_atomic_load_u32(&c->port) == key) return c;
+    }
+    return 0;
 }
 // Read the SP + registers captured for slot idx. Returns 0 if the slot was not
 // suspended this cycle (gone thread, skipped, or self-parked).
@@ -1621,9 +1647,8 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   // atomics, register copy, sched_yield. No malloc/locks/stdio.
   static void vgc_suspend_handler(int sig, siginfo_t* si, void* uctx) {
       (void)sig; (void)si;
-      vgc_susp* s = vgc_susp_at(vgc_get_cache_idx());
-      if (s == 0 || __atomic_load_n(&s->port, __ATOMIC_ACQUIRE) == 0
-          || !pthread_equal(pthread_self(), s->pt)) return; // spurious / not a target this cycle
+      vgc_susp* s = vgc_susp_self(vgc_get_cache_idx(), (uint32_t)pthread_mach_thread_np(pthread_self()));
+      if (s == 0 || !pthread_equal(pthread_self(), s->pt)) return; // spurious / not a target this cycle
       ucontext_t* uc = (ucontext_t*)uctx;
       int c = 0;
     #if defined(__arm64__) || defined(__aarch64__)
@@ -1872,8 +1897,8 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   static void vgc_suspend_handler(int sig, siginfo_t* si, void* uctx) {
       (void)sig; (void)si;
       uint32_t me = vgc_lin_gettid();
-      vgc_susp* s = vgc_susp_at(vgc_get_cache_idx());
-      if (s == 0 || __atomic_load_n(&s->port, __ATOMIC_ACQUIRE) != me) return; // spurious / not a target of this cycle
+      vgc_susp* s = vgc_susp_self(vgc_get_cache_idx(), me);
+      if (s == 0) return; // spurious / not a target of this cycle
       ucontext_t* uc = (ucontext_t*)uctx;
       int c = 0;
     #if defined(__FreeBSD__) && defined(__aarch64__)
