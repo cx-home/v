@@ -19,9 +19,10 @@
 // churn and a last collection. The child prints a checksum over every
 // surviving node's payload and buffer byte, and the last phase line's
 // spans_in_use. The one-walker run (VGC_WALK_WORKERS=1) and the eight-walker
-// run (VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64; one marker both times, so
-// the mark's back-off cannot cap the walkers) must print the same line, both
-// must exit 0, and the parallel run's phase lines must say walkers=8.
+// run (VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0: the
+// mechanism is under test, not the load gate; one marker both times) must
+// print the same line, both must exit 0, and the parallel run's phase lines
+// must say walkers=8.
 //
 // Run: ./v test bench/parallel-alloc/vgc_parallel_sweep_test.v
 module main
@@ -124,7 +125,8 @@ fn test_parallel_walks_leave_the_heap_as_the_serial_walks_do() {
 		return
 	}
 	one, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
-	par, out := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 ')
+	par, out :=
+		run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ')
 	println('vgc_parallel_sweep: one walker ${one}; eight walkers ${par}')
 	assert one == par, 'the parallel walks left a different heap: ${one} against ${par}'
 	assert out.contains('walkers=8'), 'the walks did not engage (no walkers=8 phase line):\n${out}'

@@ -1446,8 +1446,9 @@ fn vgc_pool_ensure(total int) int {
 // of serial walk on 16 KB pages), from four at the floor up to the configured
 // count; one walker in a fork child, under the diagnostic builds whose sweep
 // writes shared forensic tables, while an address is watched, and while the
-// walks' own adaptation is backing off (a loaded box: vgc_walk_adapt). The
-// mark's back-off is the mark's: a short mark says nothing about a long table.
+// walks' own adaptation is backing off or the box is oversubscribed (a loaded
+// box: vgc_walk_adapt, vgc_box_busy). The mark's back-off is the mark's: a
+// short mark says nothing about a long table.
 fn vgc_walk_plan() int {
 	mut cfg := vgc_walk_workers_cfg
 	if cfg < 0 {
@@ -1469,6 +1470,9 @@ fn vgc_walk_plan() int {
 	if nsp < vgc_walk_min_spans {
 		return 1
 	}
+	if vgc_walk_load_gate && C.vgc_box_busy(vgc_walk_ncpu) != 0 {
+		return 1 // the pool would wait on a preempted walker at every join
+	}
 	mut total := int(nsp / (vgc_walk_min_spans / 4))
 	if total > cfg {
 		total = cfg
@@ -1486,8 +1490,9 @@ fn vgc_walk_plan() int {
 // table span with one walker is remembered (a running mean); a parallel cycle
 // no cheaper than nine tenths of it — walkers that got no core, or one
 // preempted holding a chunk through the join — halves the count for the next
-// 32 parallel cycles, then the plan's count is tried again (the mark's rule,
-// vgc_mark_adapt, on the walks' own clock).
+// 32 parallel cycles (64, 128 ... 1024 while the retries keep not paying),
+// then the plan's count is tried again (the mark's rule, vgc_mark_adapt, on
+// the walks' own clock).
 fn vgc_walk_adapt(walked_ns u64) {
 	rate := walked_ns / (u64(vgc_heap.nspans) + 1)
 	if vgc_walk_nworkers_cur <= 1 {
@@ -1507,8 +1512,13 @@ fn vgc_walk_adapt(walked_ns u64) {
 			n = 1
 		}
 		vgc_walk_n_target = n
-		vgc_walk_backoff = 32
+		vgc_walk_backoff = vgc_walk_backoff_len
+		if vgc_walk_backoff_len < 1024 {
+			vgc_walk_backoff_len *= 2
+		}
+		return
 	}
+	vgc_walk_backoff_len = 32 // a parallel cycle that paid: the next back-off is short again
 }
 
 // After the count: did this cycle's markers pay off? The cost per marked KB
