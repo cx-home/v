@@ -789,6 +789,14 @@ __global vgc_grow_gate_probe_goal = u64(0)
 // vgc_grow_gate_hold, where this gate stands down, so a grow-gate deferral
 // whose request the pool could hold (vgc_frag_pool_covers) requests the same
 // defragmenting sweep (cx-home/v#12).
+// VGC_FRAG_GATE=0 turns the frag gate off (decimal 0..100; any other value in
+// range keeps it on) — the A/B of bench/parallel-alloc/vgc_frag_gate_growing_test.v.
+__global vgc_frag_gate_on = u64(1)
+// The frag gate fires only once the cycle has run vgc_frag_gate_late_pct of
+// the way from the marked set to the goal: its collection then advances the
+// next one by at most that share of a cycle (cx-private #1914). 0: anywhere.
+// VGC_FRAG_GATE_LATE_PCT overrides (decimal 0..100).
+__global vgc_frag_gate_late_pct = u64(0)
 __global vgc_frag_gate_cycle = u64(0)
 __global vgc_frag_gate_fired = false
 __global vgc_defrag_pending = u32(0)
@@ -1272,6 +1280,8 @@ pub fn vgc_init() {
 	vgc_grow_gate_pct = vgc_env_pct(c'VGC_GROW_GATE_PCT', vgc_grow_gate_pct)
 	vgc_grow_gate_growth_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWTH_PCT', vgc_grow_gate_growth_pct)
 	vgc_grow_gate_growing_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWING_PCT', vgc_grow_gate_growing_pct)
+	vgc_frag_gate_on = vgc_env_pct(c'VGC_FRAG_GATE', vgc_frag_gate_on)
+	vgc_frag_gate_late_pct = vgc_env_pct(c'VGC_FRAG_GATE_LATE_PCT', vgc_frag_gate_late_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
 		cmb := C.atoll(cap_env)
@@ -2565,13 +2575,7 @@ fn vgc_grow_gate_defers() bool {
 	if goal <= marked || live <= marked || (goal - marked) * 2 < marked {
 		return false
 	}
-	// the live set still grows (or no collection has measured it yet): a
-	// collection early in the cycle would mark a set that is mostly live, so
-	// the gate probes only at the cycle's last carve (cx-home/v#7 above)
-	prev := vgc_grow_gate_prev_marked
-	growing := prev == 0 || marked * 100 > prev * (100 + vgc_grow_gate_growth_pct)
-	if growing && (vgc_grow_gate_growing_pct == 0 || live + u64(vgc_arena_size) <= goal
-		|| (live - marked) * 100 < (goal - marked) * vgc_grow_gate_growing_pct) {
+	if vgc_gate_early_while_growing(marked, live, goal) {
 		return false
 	}
 	if (live - marked) * 100 < (goal - marked) * vgc_grow_gate_pct {
@@ -2584,6 +2588,29 @@ fn vgc_grow_gate_defers() bool {
 	vgc_grow_gate_probe_live = live
 	vgc_grow_gate_probe_goal = goal
 	return true
+}
+
+// vgc_gate_early_while_growing answers whether a gate collection now would
+// come early in a cycle whose live set still grows (or that no collection has
+// measured yet): it would mark a set that is mostly live, so a gate probes
+// only at the cycle's last carve (cx-home/v#7 above). Both gates ask it — the
+// frag gate too (cx-private #1914: `cx fmt` on a 1.4 MB document fired it
+// right after the collection that marked its growing 264 MB tree, marked
+// 257 MB again for nothing, and the cycle phase it shifted landed the next
+// collection on the formatter's 349 MB live peak, so the pacer's goal went to
+// 698 MB: peak RSS 616 -> 768 MB, wall 1.22 -> 1.45 s). Expects goal > marked
+// and live > marked (the grow gate's first test); otherwise it answers true.
+fn vgc_gate_early_while_growing(marked u64, live u64, goal u64) bool {
+	prev := vgc_grow_gate_prev_marked
+	growing := prev == 0 || marked * 100 > prev * (100 + vgc_grow_gate_growth_pct)
+	if !growing {
+		return false
+	}
+	if goal <= marked || live <= marked || vgc_grow_gate_growing_pct == 0 {
+		return true
+	}
+	return live + u64(vgc_arena_size) <= goal
+		|| (live - marked) * 100 < (goal - marked) * vgc_grow_gate_growing_pct
 }
 
 // vgc_frag_pool_covers answers whether the pool (hot + trimmed) holds at least
@@ -2599,7 +2626,8 @@ fn vgc_frag_pool_covers(nbytes usize) bool {
 // carve of `nbytes` to a defragmenting collection (the #1892 frag gate above).
 // Called with vgc_heap.lock held.
 fn vgc_frag_gate_defers(nbytes usize) bool {
-	if vgc_heap.narenas == 0 || C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0
+	if vgc_frag_gate_on == 0 || vgc_heap.narenas == 0
+		|| C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) == 0
 		|| C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
 		return false
 	}
@@ -2611,6 +2639,19 @@ fn vgc_frag_gate_defers(nbytes usize) bool {
 		return false
 	}
 	if !vgc_frag_pool_covers(nbytes) {
+		return false
+	}
+	// a growing live set early in its cycle: the collection would mark a set
+	// that is mostly live and shift the cycle onto the program's live peak —
+	// carve now; the cycle's last carve may still defragment (cx-private #1914)
+	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
+	live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
+	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	if vgc_gate_early_while_growing(marked, live, goal) {
+		return false
+	}
+	if vgc_frag_gate_late_pct > 0 && (goal <= marked || live <= marked
+		|| (live - marked) * 100 < (goal - marked) * vgc_frag_gate_late_pct) {
 		return false
 	}
 	vgc_frag_gate_fired = true
