@@ -61,6 +61,7 @@ fn C.vgc_box_free_cpus(ncpu int, own int) int
 fn C.vgc_yield()
 fn C.vgc_popcount8(x u8) int
 fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
+fn C.vgc_ctz64(x u64) int // lowest set bit of a non-zero word (cx-private#1910: the pool summary)
 fn C.vgc_size_class(size u32) u8
 fn C.vgc_get_class_size(cls int) u32
 fn C.vgc_get_class_npages(cls int) u32
@@ -346,6 +347,41 @@ mut:
 	cov_safe bool
 	cov_req  bool
 	cov_susp bool
+	// cx-private#1910: this thread's stash of free spans by page count — index =
+	// npages (1..vgc_tpool_max_pages, every size class's span size), singly
+	// linked through span.next. A stashed span is in the same state as one in
+	// flight between vgc_get_free_span and vgc_span_init: in_use=false (the
+	// walks skip it), pooled=false (the coalescer ignores it), on no list and
+	// not in pool_bytes. The owner pops without a lock; the refill takes
+	// free_spans_lock ONCE for up to vgc_tpool_batch spans; the collector
+	// returns a parked or safe thread's stash to the pool at every stop
+	// (vgc_tpool_drain_stw) and the exit callback returns the rest — a
+	// mach-suspended straggler may be frozen inside its own pop, so its stash
+	// is left to it (at most 26 pages = 208 KB).
+	tpool   [11]&VGC_Span
+	tpool_n int
+	// refill statistics (cx-private#1910 evidence; slow path only)
+	pool_refills    u64 // vgc_get_free_span_cached calls
+	pool_lock_takes u64 // of which took free_spans_lock
+}
+
+// cx-private#1910: the stash covers the size classes' span sizes (vgc_class_npages
+// is at most 10 pages); larger requests take the locked path as before.
+const vgc_tpool_max_pages = 10
+
+// How many exact-fit spans one lock take moves into the stash: four 1- and
+// 2-page spans (a thread's working set of small classes refills from the
+// stash three times in four), two 3- and 4-page spans, one above (the lock
+// take is then the span itself, as before).
+@[inline]
+fn vgc_tpool_batch(npages u32) int {
+	if npages <= 2 {
+		return 4
+	}
+	if npages <= 4 {
+		return 2
+	}
+	return 1
 }
 
 // vgc_cache answers slot idx's VGC_Cache (cx-home/v#27). Two dependent loads:
@@ -1858,6 +1894,15 @@ fn vgc_register_thread_opt(wait bool) bool {
 		vgc_cache(idx).tiny = 0
 		vgc_cache(idx).tiny_offset = 0
 		vgc_cache(idx).tiny_allocs = 0
+		// cx-private#1910: a fresh registration starts with an empty stash. The
+		// exit callback drained the previous owner's; after V's _vinit wipe
+		// (cx-home/v#27) a stash that survived in the C-side chunk would name
+		// descriptors of the wiped slab and pages of an arena the table no
+		// longer knows — those spans are dropped, never reused.
+		for n in 0 .. vgc_tpool_max_pages + 1 {
+			vgc_cache(idx).tpool[n] = nil
+		}
+		vgc_cache(idx).tpool_n = 0
 		vgc_cache(idx).stopped = 0
 		vgc_cache(idx).live_delta = 0
 		vgc_cache(idx).alloc_delta = 0
@@ -1949,6 +1994,18 @@ fn vgc_thread_exit_cb(idx int) {
 		return
 	}
 	C.vgc_trace(4, idx, 0, 0) // EXIT
+	// cx-private#1910: the stash goes back to the pool first, BEFORE cache_lock
+	// (free_spans_lock is taken after cache_lock by the cooperative collector
+	// but before it by the legacy and concurrent-mark stops; taking it here
+	// while holding cache_lock would order the two both ways). The slot is
+	// still this thread's: nobody else pops it, and the collector drains it
+	// only under a stop this thread is parked or safe in.
+	if vgc_cache(idx).registered && vgc_cache(idx).tpool_n > 0 {
+		C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+		mut xc := unsafe { vgc_cache(idx) }
+		vgc_tpool_drain_slot(mut xc)
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	}
 	C.vgc_mutex_lock(&vgc_heap.cache_lock)
 	if !vgc_cache(idx).registered {
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
@@ -2192,6 +2249,36 @@ fn vgc_arena_of(addr usize) int {
 // or the oversized list for spans larger than one arena). Caller holds
 // free_spans_lock (mutator split-remainder path) or IS the collector with that
 // lock held across the cycle (sweep/coalesce path).
+// cx-private#1910: one bit per sized pool list (hot and cold), set while the
+// list is non-empty — maintained by vgc_pool_push (the only head-linker) and
+// vgc_pool_unlink (the only head-emptier; vgc_pool_push_aged re-links inside a
+// list that stays non-empty). vgc_get_free_span's best-fit miss walked both
+// 8193-entry head arrays under free_spans_lock on every refill the exact-fit
+// list could not serve (every growth phase: ~16k loads inside the critical
+// section, the hold the other threads' spin-yields in vgc_get_free_span paid
+// for); it is a word scan now. Guarded by free_spans_lock like the lists.
+__global vgc_pool_hot_bits = [129]u64{}
+__global vgc_pool_cold_bits = [129]u64{}
+
+// The smallest non-empty sized list (hot or cold) holding spans of at least n
+// pages, within the pooled range; 0 = none. Under free_spans_lock.
+fn vgc_pool_first_at_least(n u32) u32 {
+	mut w := int(n >> 6)
+	mut bit := int(n & 63)
+	for w < 129 {
+		mut m := vgc_pool_hot_bits[w] | vgc_pool_cold_bits[w]
+		if bit > 0 {
+			m &= ~u64(0) << u64(bit)
+		}
+		if m != 0 {
+			return u32(w << 6) + u32(C.vgc_ctz64(m))
+		}
+		w++
+		bit = 0
+	}
+	return 0
+}
+
 fn vgc_pool_push(mut span VGC_Span) {
 	span.pooled = true
 	span.pool_gen = u32(vgc_heap.gc_cycle)
@@ -2217,6 +2304,7 @@ fn vgc_pool_push(mut span VGC_Span) {
 				span.next.prev = span
 			}
 			vgc_heap.free_spans_cold[span.npages] = span
+			vgc_pool_cold_bits[span.npages >> 6] |= u64(1) << u64(span.npages & 63)
 		} else {
 			span.next = vgc_heap.free_spans[span.npages]
 			if span.next != nil {
@@ -2225,6 +2313,7 @@ fn vgc_pool_push(mut span VGC_Span) {
 				vgc_heap.free_spans_tail[span.npages] = span
 			}
 			vgc_heap.free_spans[span.npages] = span
+			vgc_pool_hot_bits[span.npages >> 6] |= u64(1) << u64(span.npages & 63)
 		}
 	}
 }
@@ -2356,6 +2445,16 @@ fn vgc_pool_unlink(mut span VGC_Span) {
 		} else if span.npages <= u32(vgc_max_pooled_pages) && !span.decommitted {
 			vgc_heap.free_spans_tail[span.npages] = span.prev
 		}
+		// cx-private#1910: the summary bit follows the head
+		if span.npages <= u32(vgc_max_pooled_pages) {
+			if span.decommitted {
+				if vgc_heap.free_spans_cold[span.npages] == nil {
+					vgc_pool_cold_bits[span.npages >> 6] &= ~(u64(1) << u64(span.npages & 63))
+				}
+			} else if vgc_heap.free_spans[span.npages] == nil {
+				vgc_pool_hot_bits[span.npages >> 6] &= ~(u64(1) << u64(span.npages & 63))
+			}
+		}
 		span.next = nil
 		span.prev = nil
 	}
@@ -2439,6 +2538,14 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 		return unsafe { nil }, false
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	span, cold := vgc_get_free_span_locked(npages)
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	return span, cold
+}
+
+// The pool lookup proper, under free_spans_lock (cx-private#1910: shared by the
+// locked path above and the stash refill below).
+fn vgc_get_free_span_locked(npages u32) (&VGC_Span, bool) {
 	if npages <= u32(vgc_max_pooled_pages) {
 		// Exact fit, hot first (no recommit), then cold.
 		mut span := vgc_heap.free_spans[npages]
@@ -2454,12 +2561,14 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 			cold := span.decommitted
 			vgc_pool_unlink(mut span)
 			vgc_span_pop_finish(mut span)
-			C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 			return span, cold
 		}
 		// Best fit: the smallest pooled span that covers the request, split down.
 		// Hot preferred at equal size; cold is still far cheaper than carving.
-		for n := npages + 1; n <= u32(vgc_max_pooled_pages); n++ {
+		// cx-private#1910: the summary bits name the list; the walk over 8192
+		// heads is gone.
+		n := vgc_pool_first_at_least(npages + 1)
+		if n != 0 && n <= u32(vgc_max_pooled_pages) {
 			mut cand := vgc_heap.free_spans[n]
 			if cand == unsafe { nil } {
 				cand = vgc_heap.free_spans_cold[n]
@@ -2469,7 +2578,6 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 				vgc_pool_unlink(mut cand)
 				vgc_span_split(mut cand, npages)
 				vgc_span_pop_finish(mut cand)
-				C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 				return cand, cold
 			}
 		}
@@ -2482,13 +2590,143 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 			vgc_pool_unlink(mut o)
 			vgc_span_split(mut o, npages)
 			vgc_span_pop_finish(mut o)
-			C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 			return o, cold
 		}
 		o = o.next
 	}
-	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	return unsafe { nil }, false
+}
+
+// vgc_get_free_span_cached is the mutator's pool lookup (cx-private#1910): a
+// registered thread's small request is served from its own stash without a
+// lock; an empty stash refills from the exact-fit HOT list with ONE lock take
+// for up to vgc_tpool_batch spans (cold spans and splits stay on the locked
+// path: a recommit or a split is work the stash should not hide). Anything
+// else — an unregistered thread, a request past the stash's range — is the
+// locked path as before. The spans' state is documented at VGC_Cache.tpool.
+fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
+	if cache_idx < 0 || cache_idx >= vgc_heap.ncaches || npages == 0
+		|| npages > u32(vgc_tpool_max_pages) {
+		return vgc_get_free_span(npages)
+	}
+	mut c := unsafe { vgc_cache(cache_idx) }
+	c.pool_refills++
+	mut s := unsafe { c.tpool[npages] }
+	if s != unsafe { nil } {
+		unsafe {
+			c.tpool[npages] = s.next
+			s.next = nil
+		}
+		c.tpool_n--
+		// a cold span's recommit (a syscall) happens here, outside the lock
+		cold := s.decommitted
+		vgc_pool_unlink_finish(mut s)
+		return s, cold
+	}
+	c.pool_lock_takes++
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	// Exact fit, hot first then cold, up to the batch; the recommits of cold
+	// spans are left to the pops above (the trim files a pooled span cold after
+	// two cycles — at a server's 40 cycles/s that is most of the pool, and each
+	// recommit sat inside this critical section before).
+	mut first := vgc_heap.free_spans[npages]
+	if first == unsafe { nil } {
+		first = vgc_heap.free_spans_cold[npages]
+	}
+	if first != unsafe { nil } {
+		cold := first.decommitted
+		vgc_pool_unlink(mut first)
+		want := vgc_tpool_batch(npages) - 1
+		mut got := 0
+		for got < want {
+			mut more := vgc_heap.free_spans[npages]
+			if more == unsafe { nil } {
+				more = vgc_heap.free_spans_cold[npages]
+			}
+			if more == unsafe { nil } {
+				break
+			}
+			vgc_pool_unlink(mut more)
+			unsafe {
+				more.next = c.tpool[npages]
+				c.tpool[npages] = more
+			}
+			c.tpool_n++
+			got++
+		}
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+		vgc_pool_unlink_finish(mut first)
+		return first, cold
+	}
+	span, cold := vgc_get_free_span_locked(npages)
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	return span, cold
+}
+
+// vgc_pool_unlink_finish recommits a cold span popped for use (the same work as
+// vgc_span_pop_finish), off the lock: the span is this thread's alone.
+@[inline]
+fn vgc_pool_unlink_finish(mut span VGC_Span) {
+	if span.decommitted {
+		C.vgc_os_recommit(voidptr(span.base), usize(span.npages) * vgc_page_size)
+		span.decommitted = false
+	}
+}
+
+// vgc_tpool_drain_slot returns one slot's stash to the pool. Under
+// free_spans_lock, and only when the owner cannot be inside its own pop: the
+// owner itself (exit), or the collector with the owner parked or safe.
+fn vgc_tpool_drain_slot(mut c VGC_Cache) {
+	for n in 1 .. vgc_tpool_max_pages + 1 {
+		for {
+			mut s := unsafe { c.tpool[n] }
+			if s == unsafe { nil } {
+				break
+			}
+			unsafe {
+				c.tpool[n] = s.next
+				s.next = nil
+			}
+			vgc_pool_push(mut s)
+		}
+	}
+	c.tpool_n = 0
+}
+
+// vgc_tpool_drain_stw runs under the stop with free_spans_lock held: every
+// stash whose owner is this thread, self-parked at the poll (stopped==1 with
+// this cycle's park_seq), inside a safe region (cov_safe) or gone (the slot
+// unregistered) goes back to the pool, so the pool the trim, the defrag and
+// the trace line see is the whole free set. A mach-suspended straggler
+// (cov_susp) is skipped: it may be frozen between loading its stash head and
+// popping it.
+fn vgc_tpool_drain_stw(self_idx int) {
+	seq := C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
+	for i in 0 .. vgc_heap.ncaches {
+		mut c := unsafe { vgc_cache(i) }
+		if c.tpool_n == 0 {
+			continue
+		}
+		parked := C.vgc_atomic_load_u32(&vgc_cache(i).stopped) != 0 && c.park_seq == seq
+		if i == self_idx || !c.registered || parked || c.cov_safe {
+			vgc_tpool_drain_slot(mut c)
+		}
+	}
+}
+
+// vgc_pool_lock_takes answers (refills, lock takes) summed over every slot
+// ever used — the cx-private#1910 evidence: the share of span refills that
+// took free_spans_lock. Racy reads of slow-path counters; exact enough.
+@[markused]
+pub fn vgc_pool_refill_stats() (u64, u64) {
+	mut refills := u64(0)
+	mut takes := u64(0)
+	for i in 0 .. vgc_heap.ncaches {
+		c := unsafe { vgc_cache(i) }
+		refills += c.pool_refills
+		takes += c.pool_lock_takes
+	}
+	return refills, takes
 }
 
 // vgc_span_pop_finish restores a just-popped span's data pages if a pool trim
@@ -3441,8 +3679,8 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 // vgc_span_alloc_once answers the span, and whether it returned nil because it
 // waited for a collection in flight instead of carving (may_wait only).
 fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
-	// First try to reuse a free span
-	recycled, cold := vgc_get_free_span(npages)
+	// First try to reuse a free span (cx-private#1910: this thread's stash first)
+	recycled, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
 	nbytes := usize(npages) * vgc_page_size
 	if recycled != unsafe { nil } {
 		// Stamp the current GC cycle: a concurrent sweep must not reclaim this span as

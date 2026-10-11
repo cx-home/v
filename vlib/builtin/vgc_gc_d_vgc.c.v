@@ -401,6 +401,10 @@ fn vgc_gc_start() {
 	// under full-STW (the write barrier never fires while mutators are frozen), so a
 	// plain reset is enough (it is not pre-acquired since the collector re-enters it).
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
+	// cx-private#1910: the parked and safe threads' span stashes return to the
+	// pool (free_spans_lock is held, the world is stopped), so the trim, the
+	// defrag and the trace line below see the whole free set.
+	vgc_tpool_drain_stw(self_idx)
 
 	// Clear mark bits on all spans (prepare for new cycle)
 	vgc_ph[0] = C.vgc_now_ns()
@@ -691,6 +695,9 @@ fn vgc_cm_stw_enter(self_idx int) {
 	// only dirties spans, and GC-assist is not wired; see vgc_maybe_gc), so no holder can
 	// be frozen mid-op; a plain reset suffices.
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
+	// cx-private#1910: every other thread is mach-suspended here (possibly inside
+	// its own stash pop), so only this thread's stash returns to the pool.
+	vgc_tpool_drain_stw(self_idx)
 }
 
 // Release every allocator lock (reverse order) and resume every other mutator.
