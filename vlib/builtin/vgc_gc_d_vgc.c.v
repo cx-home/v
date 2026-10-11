@@ -100,6 +100,9 @@ fn vgc_gc_start() {
 	}
 	// cx-home/v#17: the collector's own carves never wait for its collection
 	vgc_gc_owner = C.vgc_get_cache_idx()
+	$if vgc_concurrent ? {
+		vgc_cm_this_cycle = false
+	}
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
@@ -719,6 +722,8 @@ fn vgc_stw_resume(self_idx int) {
 // `pause=` the trace line reports under the concurrent collector; the pacer
 // keeps the whole cycle as its cost (conservative).
 __global vgc_cm_pause_ns = u64(0)
+// true while the cycle being paced is a concurrent one (the trace line's pause)
+__global vgc_cm_this_cycle = false
 __global vgc_cm_stop1_ns = u64(0)
 __global vgc_cm_middle_ns = u64(0)
 __global vgc_cm_stop2_ns = u64(0)
@@ -885,6 +890,7 @@ fn vgc_gc_start_concurrent() {
 		return
 	}
 	vgc_gc_owner = C.vgc_get_cache_idx()
+	vgc_cm_this_cycle = true
 	vgc_gc_t0 = C.vgc_now_ns() // the pacer's cycle cost (#71): the whole cycle, middle included
 	vgc_mark_nworkers_cur = vgc_mark_plan()
 	vgc_walk_nworkers_cur = vgc_walk_plan()
@@ -995,8 +1001,11 @@ fn vgc_gctrace_emit() {
 		pause_us = (vgc_gc_last_end - vgc_gc_t0) / 1000
 	}
 	$if vgc_concurrent ? {
-		// cx-private#1910: the stops, not the cycle (the middle ran beside the mutators)
-		pause_us = vgc_cm_pause_ns / 1000
+		// cx-private#1910: a concurrent cycle's pause is its two stops (the
+		// middle ran beside the mutators); a stop-the-world cycle's is the cycle
+		if vgc_cm_this_cycle {
+			pause_us = vgc_cm_pause_ns / 1000
+		}
 	}
 	C.vgc_gctrace_line(u64(vgc_heap.gc_cycle), C.vgc_atomic_load_u64(&vgc_heap.heap_marked),
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
@@ -1024,9 +1033,11 @@ fn vgc_gctrace_emit() {
 		$if vgc_concurrent ? {
 			// cx-private#1910: the concurrent cycle's shape — the two stops, the
 			// middle, the termination re-scan's spans/objects and time
-			C.vgc_gctrace_cm(u64(vgc_heap.gc_cycle), vgc_cm_stop1_ns / 1000, vgc_cm_middle_ns / 1000,
+			if vgc_cm_this_cycle {
+				C.vgc_gctrace_cm(u64(vgc_heap.gc_cycle), vgc_cm_stop1_ns / 1000, vgc_cm_middle_ns / 1000,
 				vgc_cm_stop2_ns / 1000, vgc_cm_rescan_ns / 1000, vgc_cm_rescan_spans, vgc_cm_rescan_objs,
-				vgc_cm_verify_missed)
+					vgc_cm_verify_missed)
+			}
 		}
 	}
 }
