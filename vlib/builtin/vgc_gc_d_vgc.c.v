@@ -2861,8 +2861,20 @@ fn vgc_update_trigger() {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
 			mut floor := afloor
 			if vgc_headroom_per_thread && nt > 1 {
-				// cx-home/v#16: floor x the threads that allocated this cycle.
+				// cx-home/v#16: floor x the threads that allocated this cycle —
+				// cx-private#1910 (integrator ruling 08:19:47Z 10-11): only up to
+				// 4 x the marked set. The per-thread headroom is a grace for
+				// threads that each flush a working set; past 4 x live it is idle
+				// space (xap#20 at 10k TLS: 18-38 MB marked carried 128-192 MB of
+				// it; the concurrent cycle makes the extra collections cheap).
 				floor *= u64(nt)
+				mut cap := marked * 4
+				if cap < afloor {
+					cap = afloor
+				}
+				if floor > cap {
+					floor = cap
+				}
 			}
 			if live_cap < floor {
 				live_cap = floor
