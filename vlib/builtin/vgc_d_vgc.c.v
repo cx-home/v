@@ -799,6 +799,11 @@ __global vgc_headroom_cap = u64(64 * 1024 * 1024)
 // (dev2, the same build): json-codec 1 MB peak 153 → 73 MB, 1 KB 88 → 47 MB.
 // VGC_HEADROOM_LIVE_PCT overrides (decimal; 0 removes the bound).
 __global vgc_headroom_live_pct = u64(100)
+// Whether the per-thread floor (floor x the allocating threads, cx-home/v#16)
+// is capped at 4 x the marked set (cx-private#1910): set by the overhead band
+// in vgc_update_trigger — true after a cycle read cheap (< ~0.25 % overhead),
+// false after one read expensive (> ~2 %). Starts capped.
+__global vgc_headroom_floor_capped = true
 // The bound's FLOOR: a live set smaller than this still gets this much
 // headroom, so a small-live-set program is not driven to a cycle every 8 MB.
 // The 8 MB vgc_headroom_min floor measured too low on dev2 (bound at 100 %,

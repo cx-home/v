@@ -2869,8 +2869,10 @@ fn vgc_update_trigger() {
 		mut hr := vgc_headroom
 		if pause * vgc_overhead_grow_div > interval {
 			hr *= 2 // GC overhead > ~2%: buy throughput with space
+			vgc_headroom_floor_capped = false
 		} else if pause * vgc_overhead_shrink_div < interval {
 			hr /= 2 // GC overhead < ~0.25%: collections are cheap, collect eagerly
+			vgc_headroom_floor_capped = true
 		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
@@ -2903,17 +2905,29 @@ fn vgc_update_trigger() {
 			if vgc_headroom_per_thread && nt > 1 {
 				// cx-home/v#16: floor x the threads that allocated this cycle —
 				// cx-private#1910 (integrator ruling 08:19:47Z 10-11): only up to
-				// 4 x the marked set. The per-thread headroom is a grace for
-				// threads that each flush a working set; past 4 x live it is idle
-				// space (xap#20 at 10k TLS: 18-38 MB marked carried 128-192 MB of
-				// it; the concurrent cycle makes the extra collections cheap).
+				// 4 x the marked set WHILE the collections are cheap. The
+				// per-thread headroom is a grace for threads that each flush a
+				// working set; past 4 x live it is idle space (xap#20 at 10k TLS:
+				// 18-38 MB marked carried 128-192 MB of it) — but only where the
+				// cycles cost the mutator nothing. The cap bites once the band
+				// above read the overhead under ~0.25 % (collections are cheap)
+				// and lifts once it read over ~2 % (the full per-thread floor
+				// is the bound again, so hr doubles back up to it); in between
+				// the last reading stands. An unconditional cap held the k=8
+				// http-json-echo (2 MB marked, 10 allocating threads: a 3 ms
+				// stop every cycle, the mark too small for the concurrent
+				// cycle) to 8 MB of headroom against 32-40: 2.5-2.8x the
+				// collections and 79k -> 57-62k req/s on a quiet box
+				// (cx-private#1910 PERF-EVID, 2026-10-11).
 				floor *= u64(nt)
-				mut cap := marked * 4
-				if cap < afloor {
-					cap = afloor
-				}
-				if floor > cap {
-					floor = cap
+				if vgc_headroom_floor_capped {
+					mut cap := marked * 4
+					if cap < afloor {
+						cap = afloor
+					}
+					if floor > cap {
+						floor = cap
+					}
 				}
 			}
 			if live_cap < floor {
