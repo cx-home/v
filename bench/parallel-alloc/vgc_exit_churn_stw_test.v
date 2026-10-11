@@ -30,8 +30,14 @@ fn build_fixture(cflags string) string {
 	return exe
 }
 
+// 100 waves and a 300 s watchdog: on the 4-vCPU FreeBSD runner at 4 jobs with
+// every marker forced (VGC_MARK_PAR_MIN_US=0; the pool wakes by 200 us usleep
+// polls there) a collection every millisecond made 200 waves crawl past 90 s
+// (CI vgc 38089325669: both arms' watchdogs fired with the stop flag DOWN —
+// a crawl, not the wedge; default and walks-forced passed). The old handler's
+// wedge came in the first wave, so the red stays deterministic.
 fn run_churn(exe string, label string) {
-	r := os.execute('WAVES=200 PER_WAVE=16 WATCHDOG_S=90 ${os.quoted_path(exe)}')
+	r := os.execute('WAVES=100 PER_WAVE=16 WATCHDOG_S=300 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, '${label}: exit ${r.exit_code}: ${r.output}'
 	assert r.output.contains(' ok '), '${label}: ${r.output}'
 	println('${label}: ${r.output.trim_space()}')
