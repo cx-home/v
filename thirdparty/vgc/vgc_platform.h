@@ -1481,6 +1481,20 @@ static inline vgc_susp* vgc_susp_self(int tls_idx, uint32_t key) {
 // were scanned whole every cycle — captured register files of earlier cycles
 // included — and the chunked records are vgc_os_alloc memory, outside it; the
 // scan keeps that coverage. Returns 0 when the chunk holds no record.
+// cx-private#1910: a fork child's suspend records. The parent's other threads
+// did not survive the fork; a record whose handler instance had not left yet
+// (acked still 1 — the straggler the scheduler had not run since the resume)
+// would spin the child's first vgc_suspend_request forever (0x0acf). With the
+// concurrent cycle the fork window covers the whole middle, not the few
+// microseconds after a stop-the-world cycle's resume. Called from the child's
+// atfork handler, single-threaded.
+static inline void vgc_susp_reset_all(void) {
+    for (int ci = 0; ci < VGC_SUSP_MAX_CHUNKS; ci++) {
+        vgc_susp* c = vgc_susp_chunks[ci];
+        if (c == 0) continue;
+        for (int k = 0; k < VGC_SUSP_CHUNK; k++) { c[k].port = 0; c[k].acked = 0; c[k].release = 0; }
+    }
+}
 static inline int vgc_susp_chunk_bounds(int ci, uintptr_t* lo, uintptr_t* hi) {
     if (ci < 0 || ci >= VGC_SUSP_MAX_CHUNKS) return 0;
     vgc_susp* c = vgc_susp_chunks[ci];

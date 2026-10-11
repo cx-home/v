@@ -87,6 +87,7 @@ fn C.vgc_suspend_settle(idx int, t u32) int // 1 = target acked/parked, register
 fn C.vgc_resume_slot(idx int, t u32)
 fn C.vgc_cache_chunk(ci int) voidptr // chunk ci of the mutator slot table (cx-home/v#27)
 fn C.vgc_ncache_chunks() int
+fn C.vgc_susp_reset_all() // cx-private#1910: the fork child's suspend records, cleared
 fn C.vgc_susp_chunk_bounds(ci int, lo &usize, hi &usize) int // chunk ci's suspend records to the high-water mark (scanned by vgc_mark_roots)
 fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
 fn C.vgc_thread_regs(idx int, sp_out &usize, regs &usize, max int) int
@@ -1644,6 +1645,30 @@ fn vgc_atfork_child() {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
 	vgc_gc_owner = -1
+	// The peers did not survive the fork: their slots are unregistered (their
+	// stacks are not the child's roots) and every suspend record is cleared —
+	// a record a straggler had not left (acked still 1) spun the child's first
+	// cycle forever in vgc_suspend_request (0x0acf; vgc_fork_child_mark_test on
+	// FreeBSD CI 38142770813). Their span stashes return to the pool at the
+	// child's first stop (vgc_tpool_drain_stw drains unregistered slots).
+	self := C.vgc_get_cache_idx()
+	for i in 0 .. vgc_heap.ncaches {
+		if i == self {
+			continue
+		}
+		mut c := unsafe { vgc_cache(i) }
+		if c.registered {
+			c.registered = false
+			c.mach_port = 0
+			C.vgc_atomic_store_u32(&vgc_cache(i).stopped, 0)
+			C.vgc_atomic_store_u32(&vgc_cache(i).safe, 0)
+			c.stack_lo = 0
+			c.stack_hi = 0
+		}
+	}
+	C.vgc_susp_reset_all()
+	C.vgc_atomic_store_u32(&vgc_heap.live_threads, if self >= 0 { u32(1) } else { u32(0) })
+	C.vgc_atomic_store_u32(&vgc_heap.gc_stopped_count, 0)
 }
 
 @[markused]
