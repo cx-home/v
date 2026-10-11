@@ -433,8 +433,20 @@ void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
         ssl->in_buf == NULL || ssl->out_buf == NULL) {
         return;
     }
-    /* (TLS 1.3 keeps ssl->handshake after the handshake is over, so the state
-     * is the test, not the pointer.) */
+    /* TLS 1.3 keeps ssl->handshake after the handshake is over, so the state
+     * is the test, not the pointer. A TLS 1.2 handshake frees it at wrapup; a
+     * TLS 1.3 client still needs it for NewSessionTicket messages, but a TLS
+     * 1.3 server answers every post-handshake message with
+     * UNEXPECTED_MESSAGE (ssl_tls13_handle_hs_message_post_handshake), so its
+     * ~3.5 KB of handshake parameters are dead weight from here on. */
+#if defined(MBEDTLS_SSL_SRV_C) && defined(MBEDTLS_SSL_PROTO_TLS1_3)
+    if (ssl->handshake != NULL && ssl->conf->endpoint == MBEDTLS_SSL_IS_SERVER &&
+        ssl->tls_version == MBEDTLS_SSL_VERSION_TLS1_3) {
+        mbedtls_ssl_handshake_free(ssl);
+        mbedtls_free(ssl->handshake);
+        ssl->handshake = NULL;
+    }
+#endif
     in_new = ssl->in_buf_len;
     out_new = ssl->out_buf_len;
     /* The input buffer shrinks only when everything it still holds lies in
