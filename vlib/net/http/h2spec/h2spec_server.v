@@ -16,7 +16,9 @@ struct H2SpecHandler {}
 fn (mut h H2SpecHandler) handle(req http.Request) http.Response {
 	return http.Response{
 		status_code: 200
-		body:        'ok'
+		// at least 5 bytes: h2spec skips 6.9.2/2 (the negative flow-control
+		// window) when the response body is shorter (cx-home/v#35)
+		body:        'h2spec ok'
 	}
 }
 
