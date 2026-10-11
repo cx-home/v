@@ -2648,7 +2648,12 @@ fn vgc_update_trigger() {
 		// reduce the overhead ratio). Floor = vgc_headroom_min (8 MB default).
 		mut hr_max := vgc_headroom_cap
 		mut nt := 1
-		if vgc_headroom_per_thread {
+		// cx-core-code#123: not after the first collection. Its cycle is the
+		// program's start-up (the runtime and the program loading on the main
+		// thread before the work moves to its own threads), so two threads that
+		// each flushed a start-up megabyte doubled the second cycle's floor to
+		// 8 MB, and that cycle's free pool stayed resident.
+		if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
 			// cx-home/v#16: the threads that allocated this cycle scale the flat
 			// cap too — x ceil(nt / 4), at most x4 (eight threads: 128 MB; the
 			// reference, Python's multiprocessing, spends eight heaps).
