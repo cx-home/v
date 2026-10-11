@@ -2662,10 +2662,32 @@ fn vgc_update_trigger() {
 	// clamp(2 x marked, lo, live_floor). hr_min follows it below 8 MB.
 	mut afloor := vgc_headroom_live_floor
 	mut hr_min := vgc_headroom_min
+	// The threads that allocated this cycle (cx-home/v#16), read here because
+	// the floor depends on it (cx-home/v#14 below). Never on the first
+	// collection (cx-core-code#123: its cycle is the program's start-up).
+	mut nt := 1
+	if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
+		nt = vgc_alloc_threads()
+	}
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
+		// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's
+		// GOGC=100 goal, clamp(1 x marked, vgc_headroom_floor_lo1, live_floor),
+		// so a 1-2 MB live set runs a 3-4 MB goal, not 5-6 MB (3x marked under
+		// the 4 MB clamp): fasta 19.5 -> 17.4 MB (Python 8.8), pi-digits
+		// 25.0 -> 18.8 (9.8), json-codec 66-74 -> 59.5 (32-36), at about twice
+		// the collections of a cycle that costs 0.45-0.6 ms. Several allocating
+		// threads keep clamp(2 x marked, vgc_headroom_floor_lo, live_floor) as
+		// the base the per-thread scaling multiplies (integrator ruling
+		// 2026-10-11T08:19:47Z: that scaling is bounded by the live set only
+		// after the cx-private#1910 cycle-cost work).
 		mut f := marked * 2
-		if f < vgc_headroom_floor_lo {
-			f = vgc_headroom_floor_lo
+		mut lo := vgc_headroom_floor_lo
+		if nt <= 1 {
+			f = marked
+			lo = vgc_headroom_floor_lo1
+		}
+		if f < lo {
+			f = lo
 		}
 		if f < afloor {
 			afloor = f
@@ -2701,17 +2723,15 @@ fn vgc_update_trigger() {
 		// the pause is span-walk-dominated up there, so more headroom does not
 		// reduce the overhead ratio). Floor = vgc_headroom_min (8 MB default).
 		mut hr_max := vgc_headroom_cap
-		mut nt := 1
-		// cx-core-code#123: not after the first collection. Its cycle is the
-		// program's start-up (the runtime and the program loading on the main
-		// thread before the work moves to its own threads), so two threads that
-		// each flushed a start-up megabyte doubled the second cycle's floor to
-		// 8 MB, and that cycle's free pool stayed resident.
+		// cx-core-code#123: nt is 1 on the first collection (read above). Its
+		// cycle is the program's start-up (the runtime and the program loading
+		// on the main thread before the work moves to its own threads), so two
+		// threads that each flushed a start-up megabyte doubled the second
+		// cycle's floor to 8 MB, and that cycle's free pool stayed resident.
 		if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
 			// cx-home/v#16: the threads that allocated this cycle scale the flat
 			// cap too — x ceil(nt / 4), at most x4 (eight threads: 128 MB; the
 			// reference, Python's multiprocessing, spends eight heaps).
-			nt = vgc_alloc_threads()
 			if nt > 4 {
 				mut mult := u64((nt + 3) / 4)
 				if mult > 4 {

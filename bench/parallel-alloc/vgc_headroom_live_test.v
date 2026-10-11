@@ -146,3 +146,72 @@ fn test_the_adaptive_floor_follows_a_tiny_live_set() {
 	assert fixed >= 20.0, 'the fixed floor carved only ${fixed:.1f} MB over 2 MB live (expected ~34 MB)'
 	assert adaptive <= 14.0, 'the adaptive floor carved ${adaptive:.1f} MB over 2 MB live (expected ~6-10 MB)'
 }
+
+// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's GOGC=100
+// goal, clamp(1 x marked, 2 MB, 32 MB), so the 8 MB set carves ~2x, not the
+// ~3x of clamp(2 x marked, 4 MB, 32 MB) (fasta 19.5 -> 17.4 MB, pi-digits
+// 25.0 -> 18.8, Python 8.8 / 9.8). VGC_PACE_THREADS=4 runs the same churn on
+// four allocating threads, whose floor keeps the 2 x marked base the
+// per-thread scaling multiplies (integrator ruling 2026-10-11T08:19:47Z).
+fn churn_threads(live_bytes int, nthreads int) {
+	mut head := &Node(unsafe { nil })
+	for i in 0 .. live_bytes / node_bytes {
+		mut n := &Node{
+			next: head
+		}
+		n.pad[0] = u64(i)
+		head = n
+	}
+	gc_collect()
+	// each thread samples the carved high-water as it churns and returns it
+	mut hs := []thread usize{}
+	for t in 0 .. nthreads {
+		hs << spawn fn (t int) usize {
+			mut s := u64(0)
+			mut h := usize(0)
+			for i in 0 .. 96 * 1024 * 1024 / chunk / 4 {
+				x := []u8{len: chunk, init: u8(i + t)}
+				s += x[i % chunk]
+				if i % 64 == 0 {
+					c := gc_memory_use()
+					if c > h {
+						h = c
+					}
+				}
+			}
+			return h + usize(s % 2)
+		}(t)
+	}
+	sink := u64(0)
+	mut high := gc_memory_use()
+	for th in hs {
+		c := th.wait()
+		if c > high {
+			high = c
+		}
+	}
+	mut kept := 0
+	for n := head; n != unsafe { nil }; n = n.next {
+		kept++
+	}
+	println('RATIO=${f64(high) / f64(live_bytes):.3f} sink=${sink} kept=${kept}')
+}
+
+fn test_one_allocating_thread_paces_to_twice_the_live_set() {
+	which := os.getenv('VGC_LIVE_CHILD')
+	if which == 'small4' {
+		churn_threads(small_live_bytes, 4)
+		return
+	}
+	if which != '' {
+		return
+	}
+	one := ratio('', 'small')
+	one_old := ratio('VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
+	println('vgc_headroom_live: 8 MB live, one allocating thread — ${one:.3f}x (GOGC=100 floor), ${one_old:.3f}x (2 x marked)')
+	assert one <= 2.5, 'one allocating thread carved ${one:.3f}x over 8 MB live (expected ~2x: live + 1 x marked)'
+	assert one < one_old, 'the 1 x marked floor carved ${one:.3f}x, not less than ${one_old:.3f}x'
+	four := ratio('', 'small4')
+	println('vgc_headroom_live: 8 MB live, four allocating threads — ${four:.3f}x')
+	assert four > one, 'four allocating threads carved ${four:.3f}x, not more than one thread ${one:.3f}x: the per-thread floor lost its 2 x marked base'
+}

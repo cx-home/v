@@ -781,6 +781,11 @@ __global vgc_headroom_live_floor = u64(32) * 1024 * 1024
 // VGC_HEADROOM_FLOOR_LO_MB sets the low clamp (decimal MB, default 4).
 __global vgc_headroom_adaptive_floor = true
 __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
+// The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
+// live_floor) (cx-home/v#14, vgc_update_trigger). The first collection still
+// triggers at vgc_headroom_floor_lo. VGC_HEADROOM_FLOOR_LO1_MB overrides
+// (decimal MB, default 2).
+__global vgc_headroom_floor_lo1 = u64(2) * 1024 * 1024
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
@@ -1664,6 +1669,16 @@ pub fn vgc_init() {
 	}
 	if vgc_headroom_floor_lo > vgc_headroom_live_floor {
 		vgc_headroom_floor_lo = vgc_headroom_live_floor
+	}
+	lo1_env := C.getenv(c'VGC_HEADROOM_FLOOR_LO1_MB')
+	if lo1_env != unsafe { nil } {
+		l1 := C.atoll(lo1_env)
+		if l1 > 0 {
+			vgc_headroom_floor_lo1 = u64(l1) * 1024 * 1024
+		}
+	}
+	if vgc_headroom_floor_lo1 > vgc_headroom_floor_lo {
+		vgc_headroom_floor_lo1 = vgc_headroom_floor_lo
 	}
 	// Parallel mark (cx-home/v#16): the marker count and the engage threshold.
 	mut mw := C.vgc_ncpu()
