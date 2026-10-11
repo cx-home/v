@@ -672,6 +672,9 @@ pub fn copy[T](mut dst []T, src []T) int {
 	}
 	if can_copy_bits[T]() {
 		blen := min_len * isize(sizeof(T))
+		$if vgc_concurrent ? {
+			vgc_wb_store(dst.data) // concurrent-mark barrier: elements copied into the heap buffer (cx-private#1910)
+		}
 		unsafe { vmemmove(&T(dst.data), src.data, blen) }
 	} else {
 		for i in 0 .. min_len {

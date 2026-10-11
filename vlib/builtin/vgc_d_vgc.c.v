@@ -108,6 +108,7 @@ fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs searc
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
+fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -229,6 +230,10 @@ mut:
 	// mark-termination (vgc_rescan_dirty_spans), then clears it. Unused (always 0)
 	// under the default STW build.
 	dirty u32
+	// cx-private#1910 (vgc_concurrent): set by vgc_alloc_black_hook when an
+	// object is born in this scan span during the concurrent mark; the span is
+	// re-scanned at termination (alloc-gray) and the flag cleared there.
+	born u32
 	// Linked list pointers — SHARED between the central partial/full lists and the
 	// free_spans recycle list (a span is on at most one at a time).
 	next &VGC_Span = unsafe { nil }
@@ -838,6 +843,12 @@ const vgc_max_markers = 16
 __global vgc_mark_workers_cfg = int(-1)
 // -1 = decide at init
 __global vgc_mark_par_min_ns = u64(1000) * 1000
+// cx-private#1910: the concurrent cycle's selection (vgc_gc_start). VGC_CM: 0 =
+// the stop-the-world cycle always, 1 = the concurrent cycle always, 2 (default)
+// = concurrent when the last mark's work reached VGC_CM_MIN_US (default 1000
+// us, the marker pool's own threshold).
+__global vgc_cm_mode = int(2)
+__global vgc_cm_min_ns = u64(1000) * 1000
 __global vgc_mark_local = [vgc_max_markers]usize{}
 // each marker's current &VGC_WorkBuf
 __global vgc_mark_go = u32(0)
@@ -1732,6 +1743,23 @@ pub fn vgc_init() {
 			vgc_mark_par_min_ns = u64(pv) * 1000
 		}
 	}
+	$if vgc_concurrent ? {
+		// cx-private#1910: the concurrent cycle's selection (see vgc_gc_start)
+		cm_env := C.getenv(c'VGC_CM')
+		if cm_env != unsafe { nil } {
+			cv := C.atoll(cm_env)
+			if cv >= 0 && cv <= 2 {
+				vgc_cm_mode = int(cv)
+			}
+		}
+		cmm_env := C.getenv(c'VGC_CM_MIN_US')
+		if cmm_env != unsafe { nil } {
+			cmv := C.atoll(cmm_env)
+			if cmv >= 0 {
+				vgc_cm_min_ns = u64(cmv) * 1000
+			}
+		}
+	}
 	ww_env := C.getenv(c'VGC_WALK_WORKERS')
 	if ww_env != unsafe { nil } {
 		wv := C.atoll(ww_env)
@@ -2271,7 +2299,7 @@ fn vgc_pool_first_at_least(n u32) u32 {
 			m &= ~u64(0) << u64(bit)
 		}
 		if m != 0 {
-			return u32(w << 6) + u32(C.vgc_ctz64(m))
+			return (u32(w) << 6) + u32(C.vgc_ctz64(m))
 		}
 		w++
 		bit = 0
@@ -3897,6 +3925,7 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	span.alloc_count = 0
 	span.is_tiny = false // reset on (re)use; set true only when the tiny allocator carves a packed block
 	span.dirty = 0 // concurrent mark: a recycled span starts clean
+	span.born = 0
 
 	// Bitmaps are inline in the span (alloc_buf/mark_buf); point the working pointers
 	// at them and zero the bytes in use. nobjs <= 1024 -> bitmap_size <= 128 <= 136,
@@ -3968,6 +3997,17 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 			unsafe {
 				_ =
 					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
+			}
+			$if vgc_concurrent ? {
+				// alloc-GRAY (cx-private#1910): the newborn's span is re-scanned at
+				// termination, so whatever fills the object after this point —
+				// stores of a decl_assign, a memdup, a realloc copy — is seen
+				// without a barrier. One flag per span, set once per cycle.
+				if !span.noscan && C.vgc_atomic_load_u32(&span.born) == 0 {
+					unsafe {
+						C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 1)
+					}
+				}
 			}
 		}
 	}
@@ -4204,13 +4244,18 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	unsafe {
 		vgc_cache(cache_idx).alloc[span_class] = new_span
 	}
-	$if !vgc_concurrent ? {
-		if new_span != unsafe { nil } {
-			// The cache slot now protects the span (vgc_protect_cached_spans):
-			// drop the acquisition stamp so the span is swept like any other
-			// once it leaves the cache (see vgc_span_release_acquisition).
-			vgc_span_release_acquisition(new_span)
-		}
+	if new_span != unsafe { nil } {
+		// The cache slot now protects the span (vgc_protect_cached_spans):
+		// drop the acquisition stamp so the span is swept like any other
+		// once it leaves the cache (see vgc_span_release_acquisition).
+		// cx-private#1910: under the concurrent collector too — its stops are
+		// the same cooperative stop, vgc_protect_cached_spans runs at its
+		// termination, and every object born in the middle is marked at birth,
+		// so a span dropped from the cache before termination holds nothing
+		// the sweep may not reclaim. Keeping the stamp exempted every span
+		// acquired in an epoch from the sweep that ends it: the pacer tests'
+		// carve ratios read 3-5x the live set.
+		vgc_span_release_acquisition(new_span)
 	}
 	return new_span
 }
@@ -4334,6 +4379,17 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 // vgc_gc_start's phase CAS makes this a no-op; the caller's retry loop then either
 // benefits from that concurrent cycle or forces another.
 fn vgc_force_collect() {
+	$if vgc_concurrent ? {
+		// cx-private#1910: a forced collection beside a cycle in flight waits
+		// for that cycle (its sweep is the reclaim the caller is after) instead
+		// of returning at the phase CAS with nothing swept — the retry loop
+		// (vgc_collect_and_retry_span) would otherwise spend its eight tries
+		// inside one long middle and report an OOM that is not one.
+		if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+			vgc_wait_gc_done()
+			return
+		}
+	}
 	ci := C.vgc_get_cache_idx()
 	if ci >= 0 {
 		unsafe {
