@@ -69,6 +69,12 @@ mut:
 	file_descriptors [4096]&Target // TODO: use max_fds here, instead of the hardcoded size, when the compiler allows it
 	timeouts         map[int]i64
 	num_loops        int
+	// timeouts_scanned_at is the second handle_timeout last ran in. Deadlines are
+	// whole seconds (`get_time` is `time(NULL)`), so an entry can only expire
+	// when the second changes: one scan per second is exact, where a scan per
+	// loop pass walked every live connection's entry on every event.
+	timeouts_scanned_at i64 = -1
+	timeout_scans       int
 
 	buf &u8 = unsafe { nil }
 	idx [max_fds]int
@@ -147,8 +153,21 @@ fn (mut pv Picoev) loop_once(max_wait_in_sec int) int {
 	}
 	// Update loop start time again if waiting occurred
 	pv.loop.now = get_time()
-	pv.handle_timeout()
+	pv.handle_timeout_once_per_second()
 	return 0
+}
+
+// handle_timeout_once_per_second runs handle_timeout when the loop's second has
+// changed since its last run. A deadline is `now + secs` with `secs >= 1` in
+// whole seconds, so none can expire between two passes in the same second.
+@[inline]
+fn (mut pv Picoev) handle_timeout_once_per_second() {
+	if pv.loop.now == pv.timeouts_scanned_at {
+		return
+	}
+	pv.timeouts_scanned_at = pv.loop.now
+	pv.timeout_scans++
+	pv.handle_timeout()
 }
 
 // set_timeout sets the timeout in seconds for a file descriptor. If a timeout occurs
