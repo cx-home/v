@@ -87,7 +87,11 @@ fn vgc_gc_start() {
 		// registers + data segments + stacks). The k=8 echo (mark 1.2 ms, roots
 		// 0.9 ms) stays on the STW cycle; the door (mark 20-40 ms, roots 1-2 ms)
 		// takes the concurrent one.
-		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_mark_last_work_ns >= vgc_cm_min_ns
+		// The feedback (vgc_cm_backoff, vgc_d_vgc.c.v): a concurrent cycle whose
+		// stops were no shorter than the last STW pause sends the next cycles
+		// here, and the concurrent cycle is probed again after them.
+		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
+			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns) {
 			vgc_gc_start_concurrent()
 			return
@@ -97,6 +101,13 @@ fn vgc_gc_start() {
 	mut expected := vgc_phase_off
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return
+	}
+	$if vgc_concurrent ? {
+		// one backoff cycle spent (after the CAS: every thread that reached the
+		// pacer calls in for the same cycle)
+		if vgc_cm_backoff > 0 {
+			vgc_cm_backoff--
+		}
 	}
 	// cx-home/v#17: the collector's own carves never wait for its collection
 	vgc_gc_owner = C.vgc_get_cache_idx()
@@ -359,6 +370,12 @@ fn vgc_gc_start() {
 	// spans acquired during THIS cycle. Doing the bump here closes the window: every
 	// post-resume acquisition stamps exactly the cycle the next sweep checks against.
 	vgc_update_trigger()
+	$if vgc_concurrent ? {
+		// cx-private#1910: what the next concurrent cycle's stops are judged by
+		if vgc_gc_last_end > vgc_gc_t0 {
+			vgc_stw_last_pause_ns = vgc_gc_last_end - vgc_gc_t0
+		}
+	}
 	vgc_gctrace_emit()
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
@@ -976,6 +993,20 @@ fn vgc_gc_start_concurrent() {
 	vgc_update_trigger()
 	vgc_cm_stop2_ns = vgc_gc_last_end - t_stop2
 	vgc_cm_pause_ns = vgc_cm_stop1_ns + vgc_cm_stop2_ns
+	// the feedback (vgc_cm_backoff): this cycle's stops against the last
+	// stop-the-world pause
+	if vgc_cm_mode == 2 && vgc_stw_last_pause_ns > 0 {
+		// at least half the pause must be bought: the middle costs the mutators
+		// the markers' cores and the allocation that runs through it (RSS)
+		if vgc_cm_pause_ns * 2 >= vgc_stw_last_pause_ns {
+			vgc_cm_backoff = vgc_cm_backoff_len
+			if vgc_cm_backoff_len < 64 {
+				vgc_cm_backoff_len *= 2
+			}
+		} else {
+			vgc_cm_backoff_len = 8
+		}
+	}
 	vgc_gctrace_emit()
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
