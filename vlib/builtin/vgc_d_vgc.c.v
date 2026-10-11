@@ -113,6 +113,7 @@ fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u
 fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
+fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_addr_to_arena(addr usize) int
 
 // ============================================================
@@ -1757,6 +1758,15 @@ pub fn vgc_init() {
 	// eagerness). An allocation-heavy program doubles its way to the ceiling in
 	// a handful of cheap early cycles (~log2(ceiling/min) collections).
 	vgc_heap.next_gc = vgc_headroom
+	// cx-home/v#14: with the adaptive floor the first cycle triggers at its low
+	// clamp too, not at the 8 MB initial headroom. The first cycle's heap stayed
+	// resident as the free-span pool for the life of the process: a program that
+	// keeps nothing live (cx-core-code#123's discarded [?for], 3M items) peaked
+	// at 19.8 MB on an empty program's 9.5.
+	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0
+		&& vgc_headroom_floor_lo < vgc_heap.next_gc {
+		vgc_heap.next_gc = vgc_headroom_floor_lo
+	}
 	vgc_gc_last_end = C.vgc_now_ns()
 	vgc_heap.gc_phase = vgc_phase_off
 	// NOTE: allspans is allocated LAZILY on the first vgc_span_alloc (under
