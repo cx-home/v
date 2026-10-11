@@ -1,7 +1,7 @@
 // vgc_span_stash_test.v — cx-private#1910: a registered thread refills its span
 // cache from its own stash (VGC_Cache.tpool) and takes free_spans_lock once per
 // batch, not once per span. Eight threads each keep a rolling window of 2048
-// pointer-bearing records alive while a ninth forces a collection every 3 ms:
+// pointer-bearing records alive while a ninth forces a collection every 400 refills:
 // every window is re-verified after each refill (soundness: a stashed span
 // handed out twice, or swept while stashed, corrupts a record), and over the
 // steady phase the share of refills that took the pool lock is asserted below
@@ -64,10 +64,31 @@ fn worker(id u64) u64 {
 	return bad
 }
 
+// The collection cadence is paced by the workers' refills, not by the clock:
+// every stop drains every thread's stash, so the share of refills that took
+// the lock depends on how many refills a thread makes between stops. A 3 ms
+// clock gave ~15 per thread per cycle on a loaded 4-vCPU runner (FreeBSD CI
+// 38184127117: 68 %) against hundreds on a quiet box; a cycle now waits for
+// cycle_refills refills across the workers (at most cycle_wait).
+const cycle_refills = u64(400)
+const cycle_wait = 20 * time.millisecond
+
 fn collector(n int) u64 {
 	for _ in 0 .. n {
 		gc_collect()
-		time.sleep(3 * time.millisecond)
+		$if vgc ? {
+			base, _ := vgc_pool_refill_stats()
+			sw := time.new_stopwatch()
+			for sw.elapsed() < cycle_wait {
+				time.sleep(time.millisecond)
+				r, _ := vgc_pool_refill_stats()
+				if r - base >= cycle_refills {
+					break
+				}
+			}
+		} $else {
+			time.sleep(3 * time.millisecond)
+		}
 	}
 	return 0
 }
