@@ -398,6 +398,56 @@ static void handle_buffer_resizing(mbedtls_ssl_context *ssl, int downsizing,
         ssl->in_iv = ssl->in_buf + iv_offset_in;
     }
 }
+
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+/* cx fork (cx-platform-xap#20): see MBEDTLS_SSL_CX_RELEASE_BUFFERS. A resize
+ * keeps every offset into the buffer (handle_buffer_resizing). */
+void mbedtls_ssl_cx_grow_in(mbedtls_ssl_context *ssl)
+{
+    size_t full = mbedtls_ssl_get_input_buflen(ssl);
+    if (ssl->in_buf != NULL && ssl->in_buf_len < full) {
+        handle_buffer_resizing(ssl, 0, full, 0);
+    }
+}
+
+void mbedtls_ssl_cx_grow_out(mbedtls_ssl_context *ssl)
+{
+    size_t full = mbedtls_ssl_get_output_buflen(ssl);
+    if (ssl->out_buf != NULL && ssl->out_buf_len < full) {
+        handle_buffer_resizing(ssl, 0, 0, full);
+    }
+}
+
+void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
+{
+    size_t in_new, out_new;
+    if (ssl == NULL || ssl->conf == NULL ||
+        ssl->conf->transport != MBEDTLS_SSL_TRANSPORT_STREAM ||
+        !mbedtls_ssl_is_handshake_over(ssl) ||
+        ssl->in_buf == NULL || ssl->out_buf == NULL) {
+        return;
+    }
+    /* (TLS 1.3 keeps ssl->handshake after the handshake is over, so the state
+     * is the test, not the pointer.) */
+    in_new = ssl->in_buf_len;
+    out_new = ssl->out_buf_len;
+    /* Nothing of a record, a handshake message or application data is held
+     * in the input buffer: only the offsets of the next record's fields. */
+    if (ssl->in_left == 0 && ssl->in_msglen == 0 && ssl->in_offt == NULL &&
+        ssl->in_hslen == 0 && ssl->badmac_seen_or_in_hsfraglen == 0 &&
+        ssl->keep_current_message == 0 &&
+        (size_t) (ssl->in_msg - ssl->in_buf) < MBEDTLS_SSL_CX_IDLE_IN_LEN / 2) {
+        in_new = MBEDTLS_SSL_CX_IDLE_IN_LEN;
+    }
+    if (ssl->out_left == 0 &&
+        (size_t) (ssl->out_msg - ssl->out_buf) < MBEDTLS_SSL_CX_IDLE_OUT_LEN / 2) {
+        out_new = MBEDTLS_SSL_CX_IDLE_OUT_LEN;
+    }
+    if (in_new < ssl->in_buf_len || out_new < ssl->out_buf_len) {
+        handle_buffer_resizing(ssl, 1, in_new, out_new);
+    }
+}
+#endif /* MBEDTLS_SSL_CX_RELEASE_BUFFERS */
 #endif /* MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH */
 
 #if defined(MBEDTLS_SSL_PROTO_TLS1_2)
@@ -4570,6 +4620,11 @@ int mbedtls_ssl_handshake_step(mbedtls_ssl_context *ssl)
         return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
     }
 
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    mbedtls_ssl_cx_grow_in(ssl);
+    mbedtls_ssl_cx_grow_out(ssl);
+#endif
+
     ret = ssl_prepare_handshake_step(ssl);
     if (ret != 0) {
         return ret;
@@ -4764,6 +4819,9 @@ int mbedtls_ssl_renegotiate(mbedtls_ssl_context *ssl)
     if (ssl == NULL || ssl->conf == NULL) {
         return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
     }
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    mbedtls_ssl_cx_grow_out(ssl);
+#endif
 
 #if defined(MBEDTLS_SSL_SRV_C)
     /* On server, just send the request */
