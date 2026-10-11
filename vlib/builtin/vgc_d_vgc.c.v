@@ -494,10 +494,10 @@ mut:
 	free_oversized &VGC_Span = unsafe { nil }
 	// Per-thread caches (cx-home/v#27): the chunk-pointer table lives in C
 	// (vgc_cache_chunk / vgc_cache_chunks_ensure in vgc_platform.h), NOT here:
-	// _vinit zero-inits this global AFTER the module initialisers' first
-	// allocations registered the main thread (the heap-init ordering quirk;
-	// vgc_init runs after _vinit and registers main again at slot 0), and a
-	// table wiped in between would strand main's TLS index on a nil chunk. The
+	// _vinit zero-inits this global AFTER builtin's HEAP consts registered the
+	// main thread (the heap-init ordering quirk; main's slot is re-registered
+	// at its next allocation, vgc_ensure_registered), and a table wiped in
+	// between would strand main's TLS index on a nil chunk. The
 	// table is not a root (vgc_os_alloc memory is outside the arenas); the
 	// chunks are scanned to ncaches by vgc_mark_roots, as the fixed array was.
 	ncaches       int // high-water mark of slots ever used
@@ -1765,8 +1765,12 @@ pub fn vgc_init() {
 	// vgc_heap.lock), not here — spans can be allocated during _vinit, BEFORE
 	// vgc_init runs (the heap-init ordering quirk), so the registry must be brought
 	// up by whoever adds the first span, not by vgc_init.
-	// Register the main thread
-	vgc_register_thread()
+	// Register the main thread — unless its first allocation after _vinit's
+	// zeroing already re-registered it (vgc_ensure_registered): an unconditional
+	// registration here then took a SECOND slot and left the first one
+	// registered with main's port, and the next cycle thread_suspend'ed the
+	// collector itself.
+	vgc_ensure_registered()
 }
 
 // ============================================================
@@ -2017,9 +2021,25 @@ pub fn vgc_my_stack_info() (int, usize, usize) {
 
 // vgc_ensure_registered registers the calling thread on its first call,
 // waiting for a slot when the table is full (the allocation entry points; see
-// vgc_register_at_entry for the non-waiting form).
+// vgc_register_at_entry for the non-waiting form). It also RE-registers a
+// thread whose index names a slot vgc_heap does not know (idx >= ncaches, the
+// signature of a wiped table): V's _vinit zero-assigns vgc_heap AFTER builtin's
+// HEAP consts (error_sentinel, none__) registered the main thread at slot 0 —
+// the heap-init ordering quirk — and since the slot table moved out of vgc_heap
+// into C-side chunks (cx-home/v#27) main's slot survived that zeroing with
+// alloc[] and tiny still naming spans of the WIPED arena table. Every object a
+// module initialiser then carved from them — registries, mutexes, map headers
+// of the 16- and 32-byte classes — sat outside the collector's world: vgc_shade
+// ignores a pointer to it, it is never scanned, and what is reachable only
+// through it (a registry's grown backing, a cache entry) was swept while live
+// (cx-platform-reference webhook-saga on fix/fable-v116: every request refused
+// with E_NO_CALLABLE after the first cycles, the re2 cache entry freed under a
+// match; bench/parallel-alloc/vinit_window). Re-registering clears the slot, so
+// main refills from the live arena — what the zeroing of the in-struct array
+// made it do before.
 fn vgc_ensure_registered() {
-	if C.vgc_get_cache_idx() < 0 {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 || idx >= vgc_heap.ncaches {
 		vgc_register_thread()
 	}
 }
