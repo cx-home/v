@@ -1328,6 +1328,13 @@ pub fn parse_args_and_show_errors(known_external_commands []string, args []strin
 			}
 		}
 	}
+	// cx-private#1910: `-gc e` / `-gc vgc` compile the concurrent-mark cycle and
+	// its write barrier in (vgc_gc_start picks it per cycle by the last mark's
+	// work; VGC_CM=0/1 force); `-d vgc_stw` leaves both out.
+	if res.gc_mode == .vgc && 'vgc_stw' !in res.compile_defines
+		&& 'vgc_concurrent' !in res.compile_defines {
+		res.parse_define('vgc_concurrent')
+	}
 	if res.force_bounds_checking {
 		res.no_bounds_checking = false
 		res.compile_defines = res.compile_defines.filter(it == 'no_bounds_checking')
