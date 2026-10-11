@@ -1281,10 +1281,14 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	caches_hi := caches_lo + usize(nc) * usize(sizeof(VGC_Cache))
 	heap_hi := heap_lo + usize(sizeof(VGC_Heap))
 	w := usize(sizeof(usize))
-	ex_los := [heap_lo, caches_hi, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
-		usize(voidptr(&vgc_workbuf_end))]!
-	ex_his := [caches_lo, heap_hi, usize(voidptr(&vgc_arena_lo)) + w,
-		usize(voidptr(&vgc_workbuf_cur)) + w, usize(voidptr(&vgc_workbuf_end)) + w]!
+	mut ex_los := [heap_lo, caches_hi, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
+		usize(voidptr(&vgc_workbuf_end)), 0, 0]!
+	mut ex_his := [caches_lo, heap_hi, usize(voidptr(&vgc_arena_lo)) + w,
+		usize(voidptr(&vgc_workbuf_cur)) + w, usize(voidptr(&vgc_workbuf_end)) + w, 0, 0]!
+	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
+	// vgc_platform.h): the suspend slots and the arena address map. An unused
+	// entry stays [0, 0) and is never chosen.
+	C.vgc_static_tables(&ex_los[5], &ex_his[5])
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur

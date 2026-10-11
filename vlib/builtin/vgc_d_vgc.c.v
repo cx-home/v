@@ -103,6 +103,7 @@ fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u
 fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
+fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_addr_to_arena(addr usize) int
 
 // ============================================================

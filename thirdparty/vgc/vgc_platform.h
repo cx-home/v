@@ -1394,6 +1394,7 @@ static inline void vgc_install_thread_exit(int idx) {
       volatile int nregs;
   } vgc_mac_susp;
   static vgc_mac_susp vgc_mac_slots[VGC_MAC_MAXTH];
+  #define VGC_SUSP_SLOTS vgc_mac_slots // the root scan skips it (vgc_static_tables)
 
   // #58 forensic: is `val` present in ANY currently-suspended thread's captured
   // register file? Returns slot index+1, or 0. Collector-context only (slots
@@ -1561,6 +1562,7 @@ static inline void vgc_install_thread_exit(int idx) {
       volatile uint32_t sem_init;
   } vgc_mac_susp;
   static vgc_mac_susp vgc_mac_slots[VGC_MAC_MAXTH];
+  #define VGC_SUSP_SLOTS vgc_mac_slots // the root scan skips it (vgc_static_tables)
 
   // #58 forensic: is `val` present in ANY currently-parked thread's captured
   // register file? Returns slot index+1, or 0. Collector-context only (slots are
@@ -1887,6 +1889,7 @@ static inline void vgc_install_thread_exit(int idx) {
       volatile int nregs;
   } vgc_lin_susp;
   static vgc_lin_susp vgc_lin_slots[VGC_LINUX_MAXTH];
+  #define VGC_SUSP_SLOTS vgc_lin_slots // the root scan skips it (vgc_static_tables)
 
   // #58 forensic twin of the darwin helper: search parked threads' captured regs.
   static inline int vgc_captured_regs_contain(uintptr_t val) {
@@ -2114,6 +2117,7 @@ static inline void vgc_install_thread_exit(int idx) {
       volatile int nregs;
   } vgc_win_susp;
   static vgc_win_susp vgc_win_slots[VGC_WIN_MAXTH];
+  #define VGC_SUSP_SLOTS vgc_win_slots // the root scan skips it (vgc_static_tables)
 
   static inline int vgc_captured_regs_contain(uintptr_t val) {
       for (int i = 0; i < VGC_WIN_MAXTH; i++) {
@@ -2560,5 +2564,27 @@ static inline void vgc_trace_init(void) {
 static inline void vgc_trace(int ev, int slot, uint64_t a, uint64_t b) { (void)ev; (void)slot; (void)a; (void)b; }
 static inline void vgc_trace_init(void) {}
 #endif // VGC_DIAG
+
+// cx-home/v#15: the collector's own static tables, which the data-segment root
+// scan leaves out (vgc_scan_data_range). They hold no object reference the
+// collector does not shade by other means, and they are most of a small
+// program's data segment: the suspend slots' register snapshots (darwin: 1024 x
+// ~790 B) are shaded explicitly for every suspended thread by
+// vgc_scan_suspended_roots, and vgc_addr_map's uint16 arena indices are not
+// pointers (four packed into one word can still read as a heap address, which
+// rooted a dead object). Scanning them was ~1 MB of conservative words per
+// cycle: pi-digits' data phase 120 us of a ~430 us cycle.
+static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
+    int n = 0;
+    los[n] = (uintptr_t)&vgc_addr_map[0];
+    his[n] = (uintptr_t)&vgc_addr_map[0] + sizeof(vgc_addr_map);
+    n++;
+#ifdef VGC_SUSP_SLOTS
+    los[n] = (uintptr_t)&VGC_SUSP_SLOTS[0];
+    his[n] = (uintptr_t)&VGC_SUSP_SLOTS[0] + sizeof(VGC_SUSP_SLOTS);
+    n++;
+#endif
+    return n;
+}
 
 #endif // VGC_PLATFORM_H
