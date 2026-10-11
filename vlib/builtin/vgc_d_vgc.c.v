@@ -863,6 +863,17 @@ __global vgc_mark_par_min_ns = u64(1000) * 1000
 // us, the marker pool's own threshold).
 __global vgc_cm_mode = int(2)
 __global vgc_cm_min_ns = u64(1000) * 1000
+// The selection's feedback (cx-private#1910): a concurrent cycle whose two
+// stops together took at least half as long as the last stop-the-world
+// cycle's pause lost (its termination re-scan of every span the mutators dirtied
+// outweighed the mark it moved out of the stop: stw_scaling T=16, sixteen hot
+// allocators, stops 15.7 ms against a 5 ms STW cycle), so the next
+// vgc_cm_backoff cycles are stop-the-world and the concurrent cycle is probed
+// again after them; a probe that loses doubles the backoff (8 .. 64), one
+// that wins resets it. VGC_CM=1 ignores the feedback.
+__global vgc_stw_last_pause_ns = u64(0)
+__global vgc_cm_backoff = int(0)
+__global vgc_cm_backoff_len = int(8)
 // the last cycle's root scan (suspended registers, data segments, stacks)
 __global vgc_root_last_ns = u64(0)
 __global vgc_mark_local = [vgc_max_markers]usize{}
