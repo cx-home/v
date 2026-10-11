@@ -849,6 +849,8 @@ __global vgc_mark_par_min_ns = u64(1000) * 1000
 // us, the marker pool's own threshold).
 __global vgc_cm_mode = int(2)
 __global vgc_cm_min_ns = u64(1000) * 1000
+// the last cycle's root scan (suspended registers, data segments, stacks)
+__global vgc_root_last_ns = u64(0)
 __global vgc_mark_local = [vgc_max_markers]usize{}
 // each marker's current &VGC_WorkBuf
 __global vgc_mark_go = u32(0)
