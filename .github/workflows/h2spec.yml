@@ -50,6 +50,7 @@ jobs:
         env:
           # VEXE: ./vnew
           VFLAGS_CC: -cc gcc # mbedtls needs a real C compiler, not tcc
+          H2SPEC_DIAG: '1' # cx-home/v#35 diagnostic branch only
         run: bash vlib/net/http/h2spec/run_h2spec.sh
 
       - name: Upload h2spec report

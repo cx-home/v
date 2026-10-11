@@ -126,4 +126,39 @@ if [ -n "$now_passing" ]; then
     rc=1
 fi
 [ "$rc" -eq 0 ] && echo "==> h2spec: no regressions vs baseline"
+
+# cx-home/v#35 DIAGNOSTIC (fix/plat-v35-diag only, never merged): does http2/6.9.2/2's
+# 'tls: DialWithDialer timed out' need the earlier cases (accumulation: workers held,
+# a long collection) or does it fail alone? Fresh server per pass; established
+# connections to the server sampled every 0.25 s; h2spec lines timestamped.
+if [ "${H2SPEC_DIAG:-0}" = "1" ]; then
+    kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=''
+    "$VEXE" ${VFLAGS_CC:-} -o "$SERVER_BIN" "$here/h2spec_server.v" || exit 1
+    dport=$((PORT + 10))
+    diag_pass() { # <label> <vjobs> <h2spec args...>
+        local label=$1 vj=$2; shift 2
+        dport=$((dport + 1))
+        echo "==== DIAG $label (VJOBS=$vj, port $dport) $(date -u +%T)"
+        VJOBS=$vj H2SPEC_PORT="$dport" "$SERVER_BIN" > "$here/diag_$label.srv" 2>&1 &
+        local sp=$!
+        for _ in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$dport") 2>/dev/null && { exec 3>&- 3<&-; break; }; sleep 0.1; done
+        ( while kill -0 $sp 2>/dev/null; do echo "$(date -u +%T.%N | cut -c1-12) est=$(ss -Htn state established "( sport = :$dport )" | wc -l) synrecv=$(ss -Htn state syn-recv "( sport = :$dport )" | wc -l) cpu=$(ps -o %cpu= -p $sp) thr=$(ls /proc/$sp/task | wc -l)"; sleep 0.25; done ) > "$here/diag_$label.ss" &
+        local smp=$!
+        "$H2SPEC_BIN" -t -k -h 127.0.0.1 -p "$dport" --timeout "$TIMEOUT" "$@" 2>&1 | while IFS= read -r l; do echo "$(date -u +%T.%N | cut -c1-12) $l"; done > "$here/diag_$label.out"
+        grep -nE '×|Error|Tests|failed' "$here/diag_$label.out" | head -20
+        local t; t=$(grep -m1 -n 'DialWithDialer' "$here/diag_$label.out" | cut -c1-40)
+        if [ -n "$t" ]; then
+            echo "-- context (h2spec):"; grep -B14 -A3 -m1 'DialWithDialer' "$here/diag_$label.out"
+            ts=$(grep -m1 'DialWithDialer' "$here/diag_$label.out" | cut -c1-8)
+            echo "-- sampler around $ts:"; grep -B40 -A8 -m1 "^$ts" "$here/diag_$label.ss" | head -60
+        fi
+        echo "-- server stderr tail:"; tail -5 "$here/diag_$label.srv"
+        kill $sp 2>/dev/null; wait $sp 2>/dev/null; kill $smp 2>/dev/null
+    }
+    diag_pass full4 4
+    diag_pass full64 64
+    diag_pass only692 4 http2/6.9.2
+    diag_pass sect69 4 http2/6.9
+    diag_pass sect6 4 http2/6
+fi
 exit "$rc"
