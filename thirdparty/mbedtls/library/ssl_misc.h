@@ -582,6 +582,20 @@ static inline int mbedtls_ssl_chk_buf_ptr(const uint8_t *cur,
 extern "C" {
 #endif
 
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+#if !defined(MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH)
+#error "MBEDTLS_SSL_CX_RELEASE_BUFFERS requires MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH"
+#endif
+/* An idle stream connection's record buffer sizes (cx fork, cx-platform-xap#20).
+ * The input one holds a record header and any record that fits; larger ones
+ * grow it first. */
+#define MBEDTLS_SSL_CX_IDLE_IN_LEN  1024
+#define MBEDTLS_SSL_CX_IDLE_OUT_LEN 1024
+void mbedtls_ssl_cx_grow_in(mbedtls_ssl_context *ssl);
+void mbedtls_ssl_cx_grow_out(mbedtls_ssl_context *ssl);
+void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl);
+#endif
+
 typedef int  mbedtls_ssl_tls_prf_cb(const unsigned char *secret, size_t slen,
                                     const char *label,
                                     const unsigned char *random, size_t rlen,

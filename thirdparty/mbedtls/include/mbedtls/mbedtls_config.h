@@ -2103,7 +2103,24 @@
  *
  * Requires: MBEDTLS_SSL_MAX_FRAGMENT_LENGTH
  */
-//#define MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH
+#define MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH
+
+/**
+ * \def MBEDTLS_SSL_CX_RELEASE_BUFFERS
+ *
+ * cx fork (cx-platform-xap#20): a stream (TLS) connection keeps its record
+ * buffers small (MBEDTLS_SSL_CX_IDLE_IN_LEN / _OUT_LEN) while it is idle, the
+ * way OpenSSL's SSL_MODE_RELEASE_BUFFERS does. The input buffer grows to its
+ * full size only when a record header announces a record that does not fit;
+ * the output buffer grows on entry to mbedtls_ssl_write(), an alert, a
+ * handshake step or a renegotiation. Both shrink back when mbedtls_ssl_read()
+ * or mbedtls_ssl_write() returns with nothing buffered in that direction and
+ * the handshake over. A server holding 10,000 idle TLS connections keeps
+ * ~2 KB of record buffers per connection instead of ~33 KB.
+ *
+ * Requires: MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH
+ */
+#define MBEDTLS_SSL_CX_RELEASE_BUFFERS
 
 /**
  * \def MBEDTLS_TEST_CONSTANT_FLOW_MEMSAN
