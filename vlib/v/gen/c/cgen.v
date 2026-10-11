@@ -1311,6 +1311,13 @@ pub fn (mut g Gen) init() {
 		} else {
 			g.cheaders.writeln(c_headers)
 		}
+		if g.pref.gc_mode == .vgc && 'vgc_concurrent' in g.pref.compile_defines {
+			// cx-private#1910: codegen emits the concurrent-mark write barrier in every
+			// module's stores, but the builtin's @[export] prototype lives only in the
+			// unit that compiles builtin; a -usecache module unit (term.termios, ...)
+			// called it undeclared, which C99 refuses.
+			g.cheaders.writeln('void vgc_wb_store(void* obj);')
+		}
 		g.cheaders.writeln(c_float_to_unsigned_conversion_functions)
 		if !g.pref.skip_unused || g.table.used_features.safe_int {
 			g.cheaders.writeln(c_unsigned_comparison_functions)
