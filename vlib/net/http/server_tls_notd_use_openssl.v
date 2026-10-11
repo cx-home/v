@@ -5,6 +5,7 @@ module http
 
 import io
 import net
+import sync
 import time
 import net.mbedtls
 
@@ -83,10 +84,11 @@ fn (mut s Server) listen_and_serve_tls() {
 		s.tls_handshake_timeout)
 	ch := chan &mbedtls.SSLConn{cap: s.pool_channel_slots}
 	mut idle_conns := &TlsIdleConnTracker{}
+	mut h2_conns := &TlsH2Conns{}
 	mut ws := []thread{cap: s.worker_num}
 	for wid in 0 .. s.worker_num {
 		ws << new_tls_handler_worker(wid, ch, s.handler, s.max_keep_alive_requests,
-			handshake_timeout, idle_conns)
+			handshake_timeout, idle_conns, h2_conns)
 	}
 
 	if s.show_startup_message {
@@ -142,6 +144,51 @@ fn (mut s Server) listen_and_serve_tls() {
 	ch.close()
 	idle_conns.close_idle()
 	ws.wait()
+	// The HTTP/2 connections run on their own threads (cx-home/v#35); close_idle
+	// shut their fds down, so each reader ends. Wait for every one to release its
+	// TLS state before the deferred listener shutdown frees the shared conf, as
+	// ws.wait() did when the workers served them.
+	h2_conns.wait_idle()
+}
+
+// TlsH2Conns counts the HTTP/2 connections served on their own threads.
+// cx-home/v#35: an h2 connection is long-lived by design (a browser keeps one
+// open while the page is up); served on a pool worker it held that worker for
+// its whole life, so worker_num idle h2 clients left no worker to complete a
+// new handshake. h2spec's run on a 4-vCPU runner (worker_num 4) left four
+// connections open across section 6 and timed out in the TLS dial of 6.9.2/2.
+// The worker now hands an h2 connection to its own thread after the handshake
+// and returns to the pool; the handshakes and HTTP/1.1 stay on the pool.
+@[heap]
+struct TlsH2Conns {
+mut:
+	mu &sync.Mutex = sync.new_mutex()
+	n  int
+}
+
+fn (mut t TlsH2Conns) add() {
+	t.mu.lock()
+	t.n++
+	t.mu.unlock()
+}
+
+fn (mut t TlsH2Conns) done() {
+	t.mu.lock()
+	t.n--
+	t.mu.unlock()
+}
+
+fn (mut t TlsH2Conns) live() int {
+	t.mu.lock()
+	n := t.n
+	t.mu.unlock()
+	return n
+}
+
+fn (mut t TlsH2Conns) wait_idle() {
+	for t.live() > 0 {
+		time.sleep(5 * time.millisecond)
+	}
 }
 
 // TlsHandlerWorker serves HTTP/1.1 requests on TLS-wrapped connections.
@@ -152,11 +199,12 @@ struct TlsHandlerWorker {
 	handshake_timeout       time.Duration
 mut:
 	idle_conns &TlsIdleConnTracker = unsafe { nil }
+	h2_conns   &TlsH2Conns         = unsafe { nil }
 pub mut:
 	handler Handler
 }
 
-fn new_tls_handler_worker(wid int, ch chan &mbedtls.SSLConn, handler Handler, max_keep_alive_requests int, handshake_timeout time.Duration, idle_conns &TlsIdleConnTracker) thread {
+fn new_tls_handler_worker(wid int, ch chan &mbedtls.SSLConn, handler Handler, max_keep_alive_requests int, handshake_timeout time.Duration, idle_conns &TlsIdleConnTracker, h2_conns &TlsH2Conns) thread {
 	mut w := &TlsHandlerWorker{
 		id:                      wid
 		ch:                      ch
@@ -164,6 +212,7 @@ fn new_tls_handler_worker(wid int, ch chan &mbedtls.SSLConn, handler Handler, ma
 		max_keep_alive_requests: max_keep_alive_requests
 		handshake_timeout:       handshake_timeout
 		idle_conns:              idle_conns
+		h2_conns:                h2_conns
 	}
 	return spawn w.process_requests()
 }
@@ -184,22 +233,11 @@ fn (mut w TlsHandlerWorker) handle_conn(mut conn mbedtls.SSLConn) {
 	// would silently evict it, preventing close_idle from ever shutting it
 	// down and leaking the reader goroutine.
 	mut is_h2 := false
+	mut handed_off := false
 	defer {
-		if !is_h2 {
-			w.idle_conns.unmark_idle(conn.handle)
+		if !handed_off {
+			w.finish_conn(mut conn, is_h2)
 		}
-		// close_idle may have already closed conn.handle on Windows (a forced
-		// closesocket to wake this worker from a blocked read). conn.shutdown()
-		// both frees the mbedtls TLS resources (SSL ctx, config, certs, RNG,
-		// ALPN alloc) AND closes the socket; we must always do the former but
-		// must not close the socket a second time — that would race process-wide
-		// SOCKET reuse and could close an unrelated socket. So relinquish socket
-		// ownership and still call shutdown for the TLS cleanup. On non-Windows
-		// was_force_closed is always false and the worker remains the sole closer.
-		if w.idle_conns.was_force_closed(conn.handle) {
-			conn.owns_socket = false
-		}
-		conn.shutdown() or {}
 	}
 	// Run the TLS handshake here on the worker thread (the accept thread only does
 	// the raw TCP accept), so handshakes proceed in parallel up to worker_num and a
@@ -223,11 +261,11 @@ fn (mut w TlsHandlerWorker) handle_conn(mut conn mbedtls.SSLConn) {
 	// driver; otherwise fall through to the existing HTTP/1.1 path unchanged.
 	if conn.negotiated_alpn() == 'h2' {
 		is_h2 = true
-		serve_h2_conn_with_idle_tracker(mut conn, mut w.handler, w.idle_conns, conn.handle) or {
-			$if debug {
-				eprintln('h2 server error: ${err}')
-			}
-		}
+		// cx-home/v#35: the connection gets its own thread and this worker goes
+		// back to the pool (see TlsH2Conns); that thread does the cleanup.
+		handed_off = true
+		w.h2_conns.add()
+		spawn tls_serve_h2_owned(mut conn, w.handler, w.idle_conns, w.h2_conns)
 		return
 	}
 	mut reader := io.new_buffered_reader(reader: conn)
@@ -300,4 +338,43 @@ fn (mut w TlsHandlerWorker) handle_conn(mut conn mbedtls.SSLConn) {
 			return
 		}
 	}
+}
+
+// finish_conn releases a TLS connection the worker served: the idle mark (an
+// h2 connection's serve owns its own) and the TLS state, exactly once.
+fn (mut w TlsHandlerWorker) finish_conn(mut conn mbedtls.SSLConn, is_h2 bool) {
+	tls_finish_conn(mut conn, is_h2, w.idle_conns)
+}
+
+fn tls_finish_conn(mut conn mbedtls.SSLConn, is_h2 bool, idle_conns &TlsIdleConnTracker) {
+	mut ic := unsafe { idle_conns }
+	if !is_h2 {
+		ic.unmark_idle(conn.handle)
+	}
+	// close_idle may have already closed conn.handle on Windows (a forced
+	// closesocket to wake this worker from a blocked read). conn.shutdown()
+	// both frees the mbedtls TLS resources (SSL ctx, config, certs, RNG,
+	// ALPN alloc) AND closes the socket; we must always do the former but
+	// must not close the socket a second time — that would race process-wide
+	// SOCKET reuse and could close an unrelated socket. So relinquish socket
+	// ownership and still call shutdown for the TLS cleanup. On non-Windows
+	// was_force_closed is always false and the worker remains the sole closer.
+	if ic.was_force_closed(conn.handle) {
+		conn.owns_socket = false
+	}
+	conn.shutdown() or {}
+}
+
+// tls_serve_h2_owned serves one HTTP/2 connection on its own thread and then
+// releases it (cx-home/v#35).
+fn tls_serve_h2_owned(mut conn mbedtls.SSLConn, handler Handler, idle_conns &TlsIdleConnTracker, h2_conns &TlsH2Conns) {
+	mut h := handler
+	mut counter := unsafe { h2_conns }
+	serve_h2_conn_with_idle_tracker(mut conn, mut h, idle_conns, conn.handle) or {
+		$if debug {
+			eprintln('h2 server error: ${err}')
+		}
+	}
+	tls_finish_conn(mut conn, true, idle_conns)
+	counter.done()
 }

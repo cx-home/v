@@ -100,6 +100,81 @@ fn test_server_tls_round_trip() {
 	assert resp.body == 'tls hello /hello'
 }
 
+// cx-home/v#35: an HTTP/2 connection is long-lived by design (a browser keeps
+// one open while the page is up). Served on a pool worker it held that worker
+// for its whole life, so worker_num idle h2 clients left no worker to complete
+// a new TLS handshake: h2spec's run on a 4-vCPU runner (worker_num 4) left four
+// connections open across section 6 and timed out in the dial of 6.9.2/2.
+fn test_server_tls_idle_h2_connections_do_not_hold_the_workers() {
+	$if use_openssl ? {
+		eprintln('skipping: TLS server not implemented for -d use_openssl yet')
+		return
+	}
+	port := pick_port() or {
+		assert false, 'pick_port: ${err}'
+		return
+	}
+	mut srv := &http.Server{
+		addr:                   '127.0.0.1:${port}'
+		cert:                   server_tls_cert
+		cert_key:               server_tls_key
+		in_memory_verification: true
+		accept_timeout:         time.second
+		enable_http2:           true
+		worker_num:             2
+		handler:                EchoHandler{}
+		show_startup_message:   false
+	}
+	t := spawn srv.listen_and_serve()
+	srv.wait_till_running() or {
+		srv.close()
+		t.wait()
+		assert false, 'server failed to start: ${err}'
+		return
+	}
+	mut idle := []&mbedtls.SSLConn{}
+	defer {
+		for mut c in idle {
+			c.shutdown() or {}
+		}
+		srv.close()
+		t.wait()
+	}
+	// one more idle h2 connection than there are workers: each completes its
+	// handshake, sends the preface and an empty SETTINGS frame, and stays open
+	for i in 0 .. 3 {
+		mut c := mbedtls.new_ssl_conn(mbedtls.SSLConnectConfig{
+			validate:       false
+			alpn_protocols: ['h2']
+			read_timeout:   3 * time.second
+		}) or {
+			assert false, 'new_ssl_conn: ${err}'
+			return
+		}
+		c.dial('127.0.0.1', port) or {
+			assert false, 'idle h2 connection ${i + 1} of 3 never completed its handshake with 2 workers: ${err}'
+			return
+		}
+		assert c.negotiated_alpn() == 'h2'
+		mut preface := 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'.bytes()
+		preface << [u8(0), 0, 0, 4, 0, 0, 0, 0, 0]
+		c.write(preface) or {
+			assert false, 'preface: ${err}'
+			return
+		}
+		idle << c
+	}
+	resp := http.fetch(
+		url:      'https://127.0.0.1:${port}/after-idle'
+		validate: false
+	) or {
+		assert false, 'a request behind 3 idle h2 connections failed: ${err}'
+		return
+	}
+	assert resp.status_code == 200
+	assert resp.body == 'tls hello /after-idle'
+}
+
 fn test_server_tls_stop() {
 	$if use_openssl ? {
 		eprintln('skipping: TLS server not implemented for -d use_openssl yet')
