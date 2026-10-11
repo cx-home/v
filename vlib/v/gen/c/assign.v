@@ -626,6 +626,16 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	if left_type == 0 || !g.contains_ptr(left_type) {
 		return
 	}
+	// A `shared` target is stored through its heap wrapper (`x->val = v`, the
+	// wrapper allocated by __dup__shared_*), a separate object from the owner:
+	// dirty the wrapper. `x` is a shared local or a shared field (`h.f = v` writes
+	// h->f->val, so dirtying h alone missed the store).
+	if left_type.has_flag(.shared_f) && left in [ast.Ident, ast.SelectorExpr]
+		&& g.cm_is_pure_lvalue(left) {
+		wrapper := g.expr_string(left)
+		g.writeln('vgc_wb_store((voidptr)(${wrapper}));')
+		return
+	}
 	match left {
 		ast.SelectorExpr {
 			// (*base).field = v : dirty *base's span, but only when base is a pointer
@@ -647,9 +657,11 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			if g.cm_is_pure_lvalue(left.left) {
 				base := g.expr_string(left.left)
 				if left.is_array {
-					// a[i] = v : dirty the dynamic array's backing buffer.
+					// a[i] = v : dirty the dynamic array's backing buffer. A shared
+					// array's is behind its wrapper (`a->val.data`, as index.v emits).
 					arrow := if left.left_type.is_ptr() { '->' } else { '.' }
-					g.writeln('vgc_wb_store((voidptr)((${base})${arrow}data));')
+					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
+					g.writeln('vgc_wb_store((voidptr)((${base})${arrow}${val}data));')
 				} else if left.is_farray {
 					// fixed array element: its address is interior to the owning object.
 					g.writeln('vgc_wb_store((voidptr)(&(${base})));')
