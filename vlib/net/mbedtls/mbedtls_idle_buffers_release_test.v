@@ -8,6 +8,7 @@ import time
 #include "@VMODROOT/vlib/net/mbedtls/testdata/idle_buffers.h"
 
 fn C.cx_test_ssl_buffer_bytes(&C.mbedtls_ssl_context) int
+fn C.cx_test_ssl_holds_handshake(&C.mbedtls_ssl_context) int
 
 // mbedtls_idle_buffers_release_test.v — a TLS connection does not hold its
 // two ~16.7 KB record buffers while it is idle (cx-platform-xap#20, the cx
@@ -47,7 +48,8 @@ fn read_exactly(mut c mbedtls.SSLConn, n int) ![]u8 {
 }
 
 // serve answers one small and one big exchange, reporting its record-buffer
-// bytes after each: [after the handshake, after small, after big].
+// bytes after each: [after the handshake, after small, holds its handshake
+// parameters (0/1) after small, after big].
 fn serve(mut l mbedtls.SSLListener) ![]int {
 	mut c := l.accept()!
 	mut sizes := []int{}
@@ -56,6 +58,7 @@ fn serve(mut l mbedtls.SSLListener) ![]int {
 	assert small.bytestr() == 'ping\n'
 	c.write_string('pong\n')!
 	sizes << C.cx_test_ssl_buffer_bytes(&c.ssl)
+	sizes << C.cx_test_ssl_holds_handshake(&c.ssl)
 	got := read_exactly(mut c, big_len)!
 	assert got == big_message(1), 'the server read a corrupted 40,000-byte message'
 	c.write(big_message(2))!
@@ -95,9 +98,10 @@ fn test_idle_tls_connection_releases_its_record_buffers() {
 	client.shutdown() or {}
 	listener.shutdown() or {}
 
-	eprintln('record buffer bytes: server after the handshake ${sizes[0]}, after small ${sizes[1]}, after big ${sizes[2]}; client idle ${client_idle}')
+	eprintln('record buffer bytes: server after the handshake ${sizes[0]}, after small ${sizes[1]}, after big ${sizes[3]}; client idle ${client_idle}; server holds handshake params ${sizes[2]}')
 	assert sizes[0] <= idle_buffer_bound, 'a server connection waiting for its first request holds ${sizes[0]} bytes of TLS record buffers (bound ${idle_buffer_bound})'
 	assert sizes[1] <= idle_buffer_bound, 'an idle server connection holds ${sizes[1]} bytes of TLS record buffers (bound ${idle_buffer_bound})'
-	assert sizes[2] <= idle_buffer_bound, 'after a 40,000-byte exchange the server connection still holds ${sizes[2]} bytes'
+	assert sizes[3] <= idle_buffer_bound, 'after a 40,000-byte exchange the server connection still holds ${sizes[3]} bytes'
+	assert sizes[2] == 0, 'a TLS 1.3 server connection still holds its handshake parameters after the handshake'
 	assert client_idle <= idle_buffer_bound, 'an idle client connection holds ${client_idle} bytes'
 }

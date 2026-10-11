@@ -10,3 +10,10 @@ static inline int cx_test_ssl_buffer_bytes(mbedtls_ssl_context *s) {
 	return (int) (MBEDTLS_SSL_IN_CONTENT_LEN + MBEDTLS_SSL_OUT_CONTENT_LEN);
 #endif
 }
+
+// cx_test_ssl_holds_handshake — 1 while the connection still holds its
+// handshake parameters (a TLS 1.3 server no longer needs them once the
+// handshake is over).
+static inline int cx_test_ssl_holds_handshake(mbedtls_ssl_context *s) {
+	return s->private_handshake != NULL;
+}
