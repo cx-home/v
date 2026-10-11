@@ -81,7 +81,14 @@ fn vgc_gc_start() {
 		// p50 129 ms / p99 443 ms, concurrent 8.9 / 17.6 ms; on the k=8 echo
 		// (2 MB marked, a 1.2 ms mark): STW 3.4 ms, concurrent 5-8 ms. VGC_CM=0
 		// never, VGC_CM=1 always, VGC_CM_MIN_US the threshold.
-		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_mark_last_work_ns >= vgc_cm_min_ns) {
+		// The concurrent cycle scans the roots a second time at termination, so
+		// it pays when the mark is the larger part: the last mark's work at
+		// least VGC_CM_MIN_US AND at least twice the last root scan (suspended
+		// registers + data segments + stacks). The k=8 echo (mark 1.2 ms, roots
+		// 0.9 ms) stays on the STW cycle; the door (mark 20-40 ms, roots 1-2 ms)
+		// takes the concurrent one.
+		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_mark_last_work_ns >= vgc_cm_min_ns
+			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns) {
 			vgc_gc_start_concurrent()
 			return
 		}
@@ -198,6 +205,7 @@ fn vgc_gc_start() {
 
 	// Scan roots: stacks + globals (conservative scanning)
 	vgc_mark_roots()
+	vgc_root_last_ns = vgc_ph[4] - vgc_ph[1] // cx-private#1910: the next cycle's selection
 	vgc_watch_snapshot(2) // STAGE 2: post stack roots
 
 	// Shade in-flight spawn-argument structs. These are live (a freshly created
@@ -895,6 +903,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_scan_suspended_roots(self_idx)
 	vgc_ph[2] = C.vgc_now_ns()
 	vgc_mark_roots() // sets vgc_ph[3], vgc_ph[4]
+	vgc_root_last_ns = vgc_ph[4] - vgc_ph[1]
 	for i in 0 .. vgc_nspawn_roots {
 		vgc_shade_spawn_root(usize(unsafe { vgc_spawn_roots[i] }))
 	}
