@@ -1463,6 +1463,22 @@ static inline vgc_susp* vgc_susp_self(int tls_idx, uint32_t key) {
     }
     return 0;
 }
+// The byte range of chunk ci's suspend records up to the high-water mark, for
+// the collector's conservative scan (vgc_mark_roots). The fixed BSS tables these
+// records replaced (vgc_mac/lin/win_slots[1024]) sat in the data segment and
+// were scanned whole every cycle — captured register files of earlier cycles
+// included — and the chunked records are vgc_os_alloc memory, outside it; the
+// scan keeps that coverage. Returns 0 when the chunk holds no record.
+static inline int vgc_susp_chunk_bounds(int ci, uintptr_t* lo, uintptr_t* hi) {
+    if (ci < 0 || ci >= VGC_SUSP_MAX_CHUNKS) return 0;
+    vgc_susp* c = vgc_susp_chunks[ci];
+    int n = vgc_susp_hwm - (ci << VGC_SUSP_CHUNK_SHIFT);
+    if (c == 0 || n <= 0) return 0;
+    if (n > VGC_SUSP_CHUNK) n = VGC_SUSP_CHUNK;
+    *lo = (uintptr_t)c;
+    *hi = (uintptr_t)c + (uintptr_t)n * sizeof(vgc_susp);
+    return 1;
+}
 // Read the SP + registers captured for slot idx. Returns 0 if the slot was not
 // suspended this cycle (gone thread, skipped, or self-parked).
 static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, int max) {

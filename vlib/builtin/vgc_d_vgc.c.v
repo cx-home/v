@@ -86,6 +86,7 @@ fn C.vgc_suspend_settle(idx int, t u32) int // 1 = target acked/parked, register
 fn C.vgc_resume_slot(idx int, t u32)
 fn C.vgc_cache_chunk(ci int) voidptr // chunk ci of the mutator slot table (cx-home/v#27)
 fn C.vgc_ncache_chunks() int
+fn C.vgc_susp_chunk_bounds(ci int, lo &usize, hi &usize) int // chunk ci's suspend records to the high-water mark (scanned by vgc_mark_roots)
 fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
 fn C.vgc_thread_regs(idx int, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
