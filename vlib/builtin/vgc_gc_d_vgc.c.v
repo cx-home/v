@@ -302,6 +302,17 @@ fn vgc_gc_start() {
 				// ACK, not the attempt: an un-acked target is a gone thread (safe to
 				// skip), never a running mutator (the settle waits for live targets).
 				c.cov_req = C.vgc_suspend_request(i, c.mach_port) != 0
+				$if vgc_serial_suspend ? {
+					// A/B lever (cx-home/v#28 bisect): settle each slot right after
+					// its request — the pre-two-pass interleaving.
+					if c.cov_req {
+						c.cov_req = false
+						c.cov_susp = C.vgc_suspend_settle(i, c.mach_port) != 0
+						if c.cov_susp {
+							vgc_stat_mach_suspends++
+						}
+					}
+				}
 			}
 		}
 		// Pass 2: settle every requested suspend (ack / register capture).
@@ -1259,6 +1270,16 @@ fn vgc_mark_roots() {
 		base := usize(C.vgc_cache_chunk(ci))
 		vgc_scan_range(base, base + usize(n) * usize(sizeof(VGC_Cache)), 0)
 		left -= n
+	}
+	// The suspend records too (the captured register files, this cycle's and
+	// earlier ones'): the fixed BSS tables they replaced were scanned whole with
+	// the data segment every cycle, and this keeps exactly that coverage.
+	for ci in 0 .. C.vgc_ncache_chunks() {
+		mut slo := usize(0)
+		mut shi := usize(0)
+		if C.vgc_susp_chunk_bounds(ci, &slo, &shi) != 0 {
+			vgc_scan_range(slo, shi, 0)
+		}
 	}
 	vgc_ph[3] = C.vgc_now_ns()
 
