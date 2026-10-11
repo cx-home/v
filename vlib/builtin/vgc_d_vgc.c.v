@@ -1634,6 +1634,17 @@ fn vgc_atfork_child() {
 	C.vgc_mutex_unlock(&vgc_pin_lock)
 	C.vgc_mutex_unlock(&vgc_alloc_lock)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0)
+	// cx-private#1910: a fork during a concurrent cycle's middle (the forking
+	// thread is a running mutator there; under the stop-the-world cycle it is
+	// stopped) leaves the child in phase mark with the barrier on and no
+	// collector thread: every later cycle's CAS would fail and a carve would
+	// wait forever. The child starts with no cycle in flight; the partial mark
+	// bits are cleared by its first cycle, a span's dirty/born flags cost one
+	// re-scan at most.
+	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
+	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
+	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
+	vgc_gc_owner = -1
 }
 
 @[markused]
