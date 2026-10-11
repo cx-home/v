@@ -2298,6 +2298,23 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
     vgc__ws("\n");
 }
 
+// VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910): the two stops, the
+// middle the mutators ran beside, the termination re-scan and the verifier's
+// running miss count (-d vgc_cm_verify; 0 otherwise).
+static void vgc_gctrace_cm(uint64_t cycle, uint64_t stop1_us, uint64_t middle_us,
+                           uint64_t stop2_us, uint64_t rescan_us, uint64_t rescan_spans,
+                           uint64_t rescan_objs, uint64_t missed) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] cm stop1="); vgc__wdec(stop1_us);
+    vgc__ws(" middle="); vgc__wdec(middle_us);
+    vgc__ws(" stop2="); vgc__wdec(stop2_us);
+    vgc__ws(" rescan="); vgc__wdec(rescan_us);
+    vgc__ws("us rescan_spans="); vgc__wdec(rescan_spans);
+    vgc__ws(" rescan_objs="); vgc__wdec(rescan_objs);
+    vgc__ws(" missed="); vgc__wdec(missed);
+    vgc__ws("\n");
+}
+
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
 // object holds a pointer to an ALLOCATED-but-UNMARKED object that sweep is about
 // to reclaim — i.e. the mark did not reach closure. `kind`: 0 = referrer is a

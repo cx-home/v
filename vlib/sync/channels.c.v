@@ -214,6 +214,9 @@ fn (mut ch Channel) try_push_priv(src voidptr, no_block bool) ChanState {
 				isize(0))
 			{
 				// there is a reader waiting for us
+				$if vgc_concurrent ? {
+					vgc_wb_store(wradr) // concurrent-mark barrier: the element is copied into the reader's slot (cx-private#1910)
+				}
 				unsafe { C.memcpy(wradr, src, ch.objsize) }
 				mut nulladr := unsafe { nil }
 				for !C.atomic_compare_exchange_weak_ptr(voidptr(&ch.adr_written),
@@ -350,6 +353,9 @@ fn (mut ch Channel) try_push_priv(src voidptr, no_block bool) ChanState {
 					u16(BufferElemStat.writing)) {
 					expected_status = u16(BufferElemStat.unused)
 				}
+				$if vgc_concurrent ? {
+					vgc_wb_store(wr_ptr) // concurrent-mark barrier: the element is copied into the ring buffer (cx-private#1910)
+				}
 				unsafe {
 					C.memcpy(wr_ptr, src, ch.objsize)
 				}
@@ -409,6 +415,9 @@ fn (mut ch Channel) try_pop_priv(dest voidptr, no_block bool) ChanState {
 					isize(0))
 				{
 					// there is a writer waiting for us
+					$if vgc_concurrent ? {
+						vgc_wb_store(dest) // concurrent-mark barrier: dest may be a heap location (cx-private#1910)
+					}
 					unsafe { C.memcpy(dest, rdadr, ch.objsize) }
 					mut nulladr := unsafe { nil }
 					for !C.atomic_compare_exchange_weak_ptr(voidptr(&ch.adr_read),
@@ -480,6 +489,9 @@ fn (mut ch Channel) try_pop_priv(dest voidptr, no_block bool) ChanState {
 					expected_status = u16(BufferElemStat.written)
 				}
 				unsafe {
+					$if vgc_concurrent ? {
+						vgc_wb_store(dest) // concurrent-mark barrier (cx-private#1910)
+					}
 					C.memcpy(dest, rd_ptr, ch.objsize)
 				}
 				C.atomic_store_u16(unsafe { &u16(status_adr) }, u16(BufferElemStat.unused))
