@@ -721,6 +721,18 @@ static inline int vgc_ctz8(uint8_t x) {
     return n;
 }
 
+// Index of the lowest set bit of a NON-ZERO 64-bit word (cx-private#1910: the
+// pool's non-empty-list summary words). The builtin where there is one.
+static inline int vgc_ctz64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#else
+    int n = 0;
+    while ((x & 1ull) == 0) { x >>= 1; n++; }
+    return n;
+#endif
+}
+
 // Popcount on a byte - count number of set bits
 static inline int vgc_popcount8(uint8_t x) {
     x = x - ((x >> 1) & 0x55);
