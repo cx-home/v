@@ -3360,6 +3360,10 @@ int mbedtls_ssl_prepare_handshake_record(mbedtls_ssl_context *ssl)
     } else
 #endif /* MBEDTLS_SSL_PROTO_DTLS */
     {
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+        /* a handshake message reassembled from fragments needs the full buffer */
+        mbedtls_ssl_cx_grow_in(ssl);
+#endif
         unsigned char *const reassembled_record_start =
             ssl->in_buf + MBEDTLS_SSL_SEQUENCE_NUMBER_LEN;
         unsigned char *const payload_start =
@@ -5016,6 +5020,16 @@ static int ssl_get_next_record(mbedtls_ssl_context *ssl)
         return ret;
     }
 
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    /* An idle connection's small input buffer grows before the record header
+     * is parsed (rec points into the buffer) when the record will not fit. */
+    if (ssl->conf->transport == MBEDTLS_SSL_TRANSPORT_STREAM &&
+        mbedtls_ssl_in_hdr_len(ssl) + (size_t) MBEDTLS_GET_UINT16_BE(ssl->in_hdr, 3) >
+        ssl->in_buf_len - (size_t) (ssl->in_hdr - ssl->in_buf)) {
+        mbedtls_ssl_cx_grow_in(ssl);
+    }
+#endif
+
     ret = ssl_parse_record_header(ssl, ssl->in_hdr, ssl->in_left, &rec);
     if (ret != 0) {
 #if defined(MBEDTLS_SSL_PROTO_DTLS)
@@ -5346,6 +5360,9 @@ int mbedtls_ssl_send_alert_message(mbedtls_ssl_context *ssl,
     if (ssl->out_left != 0) {
         return mbedtls_ssl_flush_output(ssl);
     }
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    mbedtls_ssl_cx_grow_out(ssl);
+#endif
 
     MBEDTLS_SSL_DEBUG_MSG(2, ("=> send alert message"));
     MBEDTLS_SSL_DEBUG_MSG(3, ("send alert level=%u message=%u", level, message));
@@ -5978,7 +5995,11 @@ static int ssl_read_application_data(
 /*
  * Receive application data decrypted from the SSL layer
  */
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+static int ssl_cx_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t len)
+#else
 int mbedtls_ssl_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t len)
+#endif
 {
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
 
@@ -6244,7 +6265,11 @@ static int ssl_write_real(mbedtls_ssl_context *ssl,
 /*
  * Write application data (public-facing wrapper)
  */
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+static int ssl_cx_write(mbedtls_ssl_context *ssl, const unsigned char *buf, size_t len)
+#else
 int mbedtls_ssl_write(mbedtls_ssl_context *ssl, const unsigned char *buf, size_t len)
+#endif
 {
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
 
@@ -6607,5 +6632,27 @@ void mbedtls_ssl_pend_fatal_alert(mbedtls_ssl_context *ssl,
     ssl->alert_type = alert_type;
     ssl->alert_reason = alert_reason;
 }
+
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+/* cx fork (cx-platform-xap#20): the record buffers shrink when a read or a
+ * write returns with nothing held in them (MBEDTLS_SSL_CX_RELEASE_BUFFERS). */
+int mbedtls_ssl_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t len)
+{
+    int ret = ssl_cx_read(ssl, buf, len);
+    mbedtls_ssl_cx_release(ssl);
+    return ret;
+}
+
+int mbedtls_ssl_write(mbedtls_ssl_context *ssl, const unsigned char *buf, size_t len)
+{
+    int ret;
+    if (ssl != NULL && ssl->conf != NULL) {
+        mbedtls_ssl_cx_grow_out(ssl);
+    }
+    ret = ssl_cx_write(ssl, buf, len);
+    mbedtls_ssl_cx_release(ssl);
+    return ret;
+}
+#endif /* MBEDTLS_SSL_CX_RELEASE_BUFFERS */
 
 #endif /* MBEDTLS_SSL_TLS_C */
