@@ -2487,4 +2487,23 @@ static inline void vgc_trace(int ev, int slot, uint64_t a, uint64_t b) { (void)e
 static inline void vgc_trace_init(void) {}
 #endif // VGC_DIAG
 
+// cx-home/v#15: the collector's own static tables, which the data-segment root
+// scan leaves out (vgc_scan_data_range). None holds an object reference:
+// vgc_addr_map's uint16 arena indices are not pointers (four packed into one
+// word can still read as a heap address, which rooted a dead object), and the
+// suspend-record and slot-chunk tables hold the addresses of vgc_os_alloc'd
+// chunks outside the arenas, which vgc_mark_roots walks explicitly to the
+// high-water mark. Scanning them was ~190 KB of conservative words per cycle
+// (before cx-home/v#27 the fixed suspend tables made it ~1 MB on darwin:
+// pi-digits' data phase 120 -> 57 us of a ~430 us cycle).
+static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
+    los[0] = (uintptr_t)&vgc_addr_map[0];
+    his[0] = (uintptr_t)&vgc_addr_map[0] + sizeof(vgc_addr_map);
+    los[1] = (uintptr_t)&vgc_susp_chunks[0];
+    his[1] = (uintptr_t)&vgc_susp_chunks[0] + sizeof(vgc_susp_chunks);
+    los[2] = (uintptr_t)&vgc_cache_chunk_tab[0];
+    his[2] = (uintptr_t)&vgc_cache_chunk_tab[0] + sizeof(vgc_cache_chunk_tab);
+    return 3;
+}
+
 #endif // VGC_PLATFORM_H

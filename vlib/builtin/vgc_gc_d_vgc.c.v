@@ -1315,10 +1315,13 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	heap_lo := usize(voidptr(&vgc_heap))
 	heap_hi := heap_lo + usize(sizeof(VGC_Heap))
 	w := usize(sizeof(usize))
-	ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
-		usize(voidptr(&vgc_workbuf_end))]!
-	ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
-		usize(voidptr(&vgc_workbuf_end)) + w]!
+	mut ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
+		usize(voidptr(&vgc_workbuf_end)), 0, 0, 0]!
+	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
+		usize(voidptr(&vgc_workbuf_end)) + w, 0, 0, 0]!
+	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
+	// vgc_platform.h): the arena address map and the chunk tables.
+	C.vgc_static_tables(&ex_los[4], &ex_his[4])
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur
