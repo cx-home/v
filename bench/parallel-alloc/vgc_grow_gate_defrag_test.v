@@ -36,16 +36,22 @@ const big = 8 * 1024 * 1024 // 1,024 pages: past any size-class span and the are
 struct Hold {
 mut:
 	keep [][]u8
+	drop [][]u8
 	ring [][]u8
 	n    int
 }
 
+// drop_fill builds the set the test drops. It stays reachable (h.drop) until
+// the retained filler below is in place: a collection during the filler (the
+// pacer's first trigger, or any cycle the filler's allocation reaches) would
+// otherwise hand the dropped spans to the filler and leave no pooled run for
+// the large request to find.
 fn drop_fill(mut h Hold) {
-	mut drop := [][]u8{cap: drop_bytes / small}
+	h.drop = [][]u8{cap: drop_bytes / small}
 	for i in 0 .. drop_bytes / small {
-		drop << []u8{len: small, init: u8(i)}
+		h.drop << []u8{len: small, init: u8(i)}
 	}
-	h.n += drop.len
+	h.n += h.drop.len
 }
 
 // transient allocates `bytes` of 1 KB garbage (a short ring keeps the
@@ -69,6 +75,7 @@ fn test_a_grow_gate_deferral_defragments_before_a_new_arena() {
 	for (arena - int(gc_memory_use() % usize(arena))) >= tail_max {
 		h.keep << []u8{len: small, init: 1}
 	}
+	h.drop = [][]u8{}
 	gc_collect()
 	gc_collect()
 	// learn the headroom: transients until a collection resets bytes_since_gc

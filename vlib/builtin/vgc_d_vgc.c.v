@@ -1759,6 +1759,12 @@ pub fn vgc_init() {
 	// eagerness). An allocation-heavy program doubles its way to the ceiling in
 	// a handful of cheap early cycles (~log2(ceiling/min) collections).
 	vgc_heap.next_gc = vgc_headroom
+	// cx-home/v#14: with the adaptive floor the first cycle triggers at its low
+	// clamp too, not at the 8 MB initial headroom (cx-core-code#123).
+	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0
+		&& vgc_headroom_floor_lo < vgc_heap.next_gc {
+		vgc_heap.next_gc = vgc_headroom_floor_lo
+	}
 	vgc_gc_last_end = C.vgc_now_ns()
 	vgc_heap.gc_phase = vgc_phase_off
 	// NOTE: allspans is allocated LAZILY on the first vgc_span_alloc (under
