@@ -366,6 +366,9 @@ mut:
 	// is left to it (at most 26 pages = 208 KB).
 	tpool   [11]&VGC_Span
 	tpool_n int
+	// cx-home/v#36: gc_cycle + 1 at this thread's last safe-region cache flush
+	// (vgc_safe_cache_flush): a thread that parks often flushes once per cycle.
+	flush_gen u32
 	// refill statistics (cx-private#1910 evidence; slow path only)
 	pool_refills    u64 // vgc_get_free_span_cached calls
 	pool_lock_takes u64 // of which took free_spans_lock
@@ -4183,8 +4186,9 @@ fn vgc_central_get_span(span_class int) &VGC_Span {
 	central := unsafe { &vgc_heap.central[span_class] }
 	// cx-home/v#16 (fable-v16): an empty partial list is the common refill — a
 	// fresh carve follows — and the lock bought nothing for it: a list that
-	// reads empty here is refilled only by the sweep (under the stop), so the
-	// peek is exact. At T16 on stw_scaling the yield tier of this lock was 9 %
+	// reads empty here is refilled by the sweep (under the stop) and by a thread
+	// entering a safe region (vgc_safe_cache_flush, cx-home/v#36), so a racing
+	// peek at worst carves one span the flush would have supplied. At T16 on stw_scaling the yield tier of this lock was 9 %
 	// of every worker's time (sample: vgc_central_get_span -> swtch_pri).
 	if unsafe { voidptr(central.partial) } == unsafe { nil } {
 		return vgc_central_get_fresh(span_class)
@@ -5565,11 +5569,67 @@ fn vgc_safe_region_enter() {
 	if cache_idx < 0 {
 		return
 	}
+	vgc_safe_cache_flush(cache_idx)
 	unsafe {
 		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe,
 			&vgc_cache(cache_idx).stack_lo, &vgc_cache(cache_idx).stack_hi,
 			vgc_cache(cache_idx).stack_base, &vgc_cache(cache_idx).safe_regs[0],
 			vgc_safe_spill_words)
+	}
+}
+
+// vgc_safe_cache_flush hands this thread's cached spans to the other threads as
+// it enters a GC-safe region, once per collection cycle (cx-home/v#36). A
+// parked channel worker had touched about ten size classes, and each class left
+// a fresh 8 KB span in its cache a few objects in. 10,000 parked workers held
+// 1.25 GB against a 63 MB live set, because no other thread could allocate into
+// those free slots. Each span with free slots goes onto its class's
+// central.partial list, where the next refill of that class (any thread's)
+// takes it. A full span is dropped: it stays in allspans and the sweep returns
+// it to circulation, the B18 case of vgc_cache_get_span. The thread refills
+// each class it touches after the region, once.
+// SOUND: the read of alloc[sc], the push and the clear all happen under
+// central[sc].lock. The collector takes every central lock before it stops the
+// world and holds them through mark and sweep, so no sweep can run between the
+// read and the push. Until the push the span is this cache's, protected like
+// any cached span. Only the owner writes its alloc[] outside a stop. The
+// semaphore waits enter the region holding sem.mtx, and that adds no lock
+// cycle: a mutator holds a central lock only for one push or pop, the
+// collector takes it before the stop (a mutator spinning on it then is
+// suspended like any allocating thread), and neither ever waits for a user
+// semaphore. The tiny cursor stays: its block is an allocated object, and
+// vgc_protect_cached_spans stamps its span.
+fn vgc_safe_cache_flush(cache_idx int) {
+	mut c := unsafe { vgc_cache(cache_idx) }
+	gen := u32(vgc_heap.gc_cycle) + 1
+	if c.flush_gen == gen {
+		return
+	}
+	c.flush_gen = gen
+	for sc in 0 .. 136 {
+		if unsafe { c.alloc[sc] } == unsafe { nil } {
+			continue
+		}
+		central := unsafe { &vgc_heap.central[sc] }
+		C.vgc_mutex_lock(&central.lock)
+		mut s := unsafe { c.alloc[sc] }
+		if s != unsafe { nil } {
+			if s.in_use && s.alloc_count < s.nelems && s.on_central == 0 && s.class_idx != 0 {
+				unsafe {
+					s.next = central.partial
+					s.prev = nil
+					if s.next != nil {
+						s.next.prev = s
+					}
+					vgc_heap.central[sc].partial = s
+					s.on_central = 1
+				}
+			}
+			unsafe {
+				c.alloc[sc] = nil
+			}
+		}
+		C.vgc_mutex_unlock(&central.lock)
 	}
 }
 

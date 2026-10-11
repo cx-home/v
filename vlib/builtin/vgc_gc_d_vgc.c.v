@@ -665,6 +665,41 @@ fn vgc_stw_stop(self_idx int) {
 	// pool (free_spans_lock is held, the world is stopped), so the trim, the
 	// defrag and the trace line below see the whole free set.
 	vgc_tpool_drain_stw(self_idx)
+	// cx-home/v#36: a thread inside a GC-safe region gives up its cached spans.
+	vgc_safe_cache_drain_stw()
+}
+
+// vgc_safe_cache_drain_stw drops the span cache of every thread that is inside a
+// GC-safe region at this stop (cov_safe), the shape of a parked channel worker.
+// Each class it allocated in left a fresh span in its cache, a few objects into
+// 8 KB. 10,000 parked workers kept ~10 spans each (1.25 GB against a 63 MB live
+// set), and no other thread could allocate into their free slots (cx-home/v#36).
+// A dropped span is the B18 case of vgc_cache_get_span: it stays in allspans,
+// and this cycle's sweep returns it to circulation. An empty span goes to the
+// free-span pool, and a partly used one is relinked onto central.partial, where
+// the next refill of that class (any thread's) takes it. The tiny cursor goes too:
+// its block is an allocated object that is swept like any other once nothing
+// roots it. SOUND: by the safe-region contract the thread allocates nothing until
+// it leaves, and it holds no span pointer across the region (it entered outside
+// the allocator). A thread parked at the allocation poll (stopped) or
+// mach-suspended (cov_susp) may be frozen mid-carve, so its cache is left alone.
+// The drain runs at the stop, before vgc_protect_cached_spans stamps the cached
+// spans, so the dropped spans are swept this cycle. On leaving the region the
+// thread refills each class it touches from central, once.
+fn vgc_safe_cache_drain_stw() {
+	for i in 0 .. vgc_heap.ncaches {
+		mut c := unsafe { vgc_cache(i) }
+		if !c.registered || !c.cov_safe {
+			continue
+		}
+		for sc in 0 .. 136 {
+			unsafe {
+				c.alloc[sc] = nil
+			}
+		}
+		c.tiny = 0
+		c.tiny_offset = 0
+	}
 }
 
 // vgc_stw_resume releases the locks vgc_stw_stop took (reverse order), lets the
