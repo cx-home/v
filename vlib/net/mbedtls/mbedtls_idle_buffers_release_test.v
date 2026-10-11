@@ -14,7 +14,8 @@ fn C.cx_test_ssl_buffer_bytes(&C.mbedtls_ssl_context) int
 // fork's MBEDTLS_SSL_CX_RELEASE_BUFFERS, OpenSSL's SSL_MODE_RELEASE_BUFFERS).
 // A server holding 10,000 keep-alive TLS connections spent ~33 KB on each in
 // record buffers alone. The test checks three things. First, the server
-// side of a connection shrinks to the idle size after a small exchange.
+// side of a connection is at the idle size once its handshake is done and
+// again after a small exchange.
 // Second, a 40,000-byte message, three full-size records each way, still
 // crosses intact, so the buffers grow back for it. Third, they shrink again
 // afterwards.
@@ -46,10 +47,11 @@ fn read_exactly(mut c mbedtls.SSLConn, n int) ![]u8 {
 }
 
 // serve answers one small and one big exchange, reporting its record-buffer
-// bytes after each: [after handshake+small, after big].
+// bytes after each: [after the handshake, after small, after big].
 fn serve(mut l mbedtls.SSLListener) ![]int {
 	mut c := l.accept()!
 	mut sizes := []int{}
+	sizes << C.cx_test_ssl_buffer_bytes(&c.ssl) // handshake done, no request yet
 	small := read_exactly(mut c, 5)!
 	assert small.bytestr() == 'ping\n'
 	c.write_string('pong\n')!
@@ -93,8 +95,9 @@ fn test_idle_tls_connection_releases_its_record_buffers() {
 	client.shutdown() or {}
 	listener.shutdown() or {}
 
-	eprintln('record buffer bytes: server after small ${sizes[0]}, after big ${sizes[1]}; client idle ${client_idle}')
-	assert sizes[0] <= idle_buffer_bound, 'an idle server connection holds ${sizes[0]} bytes of TLS record buffers (bound ${idle_buffer_bound})'
-	assert sizes[1] <= idle_buffer_bound, 'after a 40,000-byte exchange the server connection still holds ${sizes[1]} bytes'
+	eprintln('record buffer bytes: server after the handshake ${sizes[0]}, after small ${sizes[1]}, after big ${sizes[2]}; client idle ${client_idle}')
+	assert sizes[0] <= idle_buffer_bound, 'a server connection waiting for its first request holds ${sizes[0]} bytes of TLS record buffers (bound ${idle_buffer_bound})'
+	assert sizes[1] <= idle_buffer_bound, 'an idle server connection holds ${sizes[1]} bytes of TLS record buffers (bound ${idle_buffer_bound})'
+	assert sizes[2] <= idle_buffer_bound, 'after a 40,000-byte exchange the server connection still holds ${sizes[2]} bytes'
 	assert client_idle <= idle_buffer_bound, 'an idle client connection holds ${client_idle} bytes'
 }

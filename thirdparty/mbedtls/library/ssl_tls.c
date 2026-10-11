@@ -406,7 +406,13 @@ void mbedtls_ssl_cx_grow_in(mbedtls_ssl_context *ssl)
 {
     size_t full = mbedtls_ssl_get_input_buflen(ssl);
     if (ssl->in_buf != NULL && ssl->in_buf_len < full) {
+        /* handle_buffer_resizing does not carry in_offt (pending application
+         * data); keep its offset too */
+        size_t offt = ssl->in_offt != NULL ? (size_t) (ssl->in_offt - ssl->in_buf) : 0;
         handle_buffer_resizing(ssl, 0, full, 0);
+        if (ssl->in_offt != NULL) {
+            ssl->in_offt = ssl->in_buf + offt;
+        }
     }
 }
 
@@ -431,13 +437,23 @@ void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
      * is the test, not the pointer.) */
     in_new = ssl->in_buf_len;
     out_new = ssl->out_buf_len;
-    /* Nothing of a record, a handshake message or application data is held
-     * in the input buffer: only the offsets of the next record's fields. */
-    if (ssl->in_left == 0 && ssl->in_msglen == 0 && ssl->in_offt == NULL &&
-        ssl->in_hslen == 0 && ssl->badmac_seen_or_in_hsfraglen == 0 &&
-        ssl->keep_current_message == 0 &&
-        (size_t) (ssl->in_msg - ssl->in_buf) < MBEDTLS_SSL_CX_IDLE_IN_LEN / 2) {
-        in_new = MBEDTLS_SSL_CX_IDLE_IN_LEN;
+    /* The input buffer shrinks only when everything it still holds lies in
+     * its first MBEDTLS_SSL_CX_IDLE_IN_LEN / 2 bytes: the bytes fetched past
+     * the record header (in_left) and the current message (in_msglen: after
+     * a handshake the last handshake message stays current until the next
+     * read consumes it). The resize copies those bytes and keeps every
+     * offset. No pending application data (in_offt, which the resize would
+     * not carry) and no handshake message in reassembly. */
+    {
+        size_t live = (size_t) (ssl->in_msg - ssl->in_buf) + ssl->in_msglen;
+        size_t fetched = (size_t) (ssl->in_hdr - ssl->in_buf) + ssl->in_left;
+        if (fetched > live) {
+            live = fetched;
+        }
+        if (ssl->in_offt == NULL && ssl->badmac_seen_or_in_hsfraglen == 0 &&
+            live <= MBEDTLS_SSL_CX_IDLE_IN_LEN / 2) {
+            in_new = MBEDTLS_SSL_CX_IDLE_IN_LEN;
+        }
     }
     if (ssl->out_left == 0 &&
         (size_t) (ssl->out_msg - ssl->out_buf) < MBEDTLS_SSL_CX_IDLE_OUT_LEN / 2) {
@@ -4733,6 +4749,13 @@ int mbedtls_ssl_handshake(mbedtls_ssl_context *ssl)
 
     MBEDTLS_SSL_DEBUG_MSG(2, ("<= handshake"));
 
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    /* a connection that completed its handshake and waits for its first
+     * request is idle too */
+    if (ret == 0) {
+        mbedtls_ssl_cx_release(ssl);
+    }
+#endif
     return ret;
 }
 
