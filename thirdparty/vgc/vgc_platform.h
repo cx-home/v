@@ -2317,7 +2317,8 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
 // running miss count (-d vgc_cm_verify; 0 otherwise).
 static void vgc_gctrace_cm(uint64_t cycle, uint64_t stop1_us, uint64_t middle_us,
                            uint64_t stop2_us, uint64_t rescan_us, uint64_t rescan_spans,
-                           uint64_t rescan_objs, uint64_t missed) {
+                           uint64_t rescan_objs, uint64_t missed, uint64_t born_kb,
+                           uint64_t cut) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] cm stop1="); vgc__wdec(stop1_us);
     vgc__ws(" middle="); vgc__wdec(middle_us);
@@ -2326,6 +2327,10 @@ static void vgc_gctrace_cm(uint64_t cycle, uint64_t stop1_us, uint64_t middle_us
     vgc__ws("us rescan_spans="); vgc__wdec(rescan_spans);
     vgc__ws(" rescan_objs="); vgc__wdec(rescan_objs);
     vgc__ws(" missed="); vgc__wdec(missed);
+    /* cx-private#1910 cut 1: the middle's births (netted out of the pacing
+       input) and whether they cut the middle short */
+    vgc__ws(" born="); vgc__wdec(born_kb);
+    vgc__ws("KB cut="); vgc__wdec(cut);
     vgc__ws("\n");
 }
 

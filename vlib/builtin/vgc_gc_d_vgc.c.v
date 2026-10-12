@@ -90,9 +90,12 @@ fn vgc_gc_start() {
 		// The feedback (vgc_cm_backoff, vgc_d_vgc.c.v): a concurrent cycle whose
 		// stops were no shorter than the last STW pause sends the next cycles
 		// here, and the concurrent cycle is probed again after them.
+		// cut 1: and only when the middle's births are expected to fit the
+		// born bound (vgc_cm_born_fits) — sixteen hot allocators at ~10 GB/s
+		// put 300 MB through a 30 ms middle, a probe that lost before it ran.
 		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
-			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns) {
+			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits()) {
 			vgc_gc_start_concurrent()
 			return
 		}
@@ -770,6 +773,42 @@ fn vgc_stw_resume(self_idx int) {
 // under the termination stop and names every object the concurrent mark
 // missed (0x1910), the oracle the door and the suite ran under.
 
+// cx-private#1910 cut 1: the births a concurrent middle would see, predicted
+// from the allocation since the last cycle over its interval (the rate) times
+// twice the last mark's wall (the middle runs beside the mutators, so it is
+// slower than the stop's mark), against the born bound (VGC_CM_BORN_PCT of the
+// live set, at least 4 MB; 0 = no bound, always fits). Read at the trigger,
+// before the stop: the per-thread deltas are a racy read, the rate an
+// estimate — the cut (vgc_cm_cut) is the bound's guarantee, this is its
+// forecast, so a probe known to lose on space is not run.
+fn vgc_cm_born_fits() bool {
+	if vgc_cm_born_pct == 0 || vgc_gc_last_end == 0 {
+		return true
+	}
+	now := C.vgc_now_ns()
+	if now <= vgc_gc_last_end {
+		return true
+	}
+	interval := now - vgc_gc_last_end
+	mut since := C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
+	for ci in 0 .. vgc_heap.ncaches {
+		since += unsafe { vgc_cache(ci).alloc_delta }
+	}
+	if since <= vgc_heap.total_alloc_at_gc {
+		return true
+	}
+	since -= vgc_heap.total_alloc_at_gc
+	mut bound := C.vgc_atomic_load_u64(&vgc_heap.heap_marked) * vgc_cm_born_pct / 100
+	if bound < vgc_cm_born_min {
+		bound = vgc_cm_born_min
+	}
+	// since x (2 x mark) / interval, without overflow: the rate in bytes per
+	// millisecond first
+	rate_per_ms := since / (interval / 1000000 + 1)
+	pred := rate_per_ms * (2 * vgc_mark_last_ns / 1000000 + 1)
+	return pred <= bound
+}
+
 // cx-private#1910: this cycle's stop-the-world time (the two windows), the
 // `pause=` the trace line reports under the concurrent collector; the pacer
 // keeps the whole cycle as its cost (conservative).
@@ -952,6 +991,23 @@ fn vgc_gc_start_concurrent() {
 	// ===== STOP 1: the snapshot of the roots =====
 	vgc_stw_stop(self_idx)
 	vgc_ph[0] = C.vgc_now_ns()
+	// cut 1: this cycle's births start at zero (every thread is stopped: its
+	// born_delta is reset here, not by it), and the middle's bound is a share
+	// of the last live set
+	C.vgc_atomic_store_u64(&vgc_cm_born, 0)
+	C.vgc_atomic_store_u32(&vgc_cm_cut, 0)
+	for ci in 0 .. vgc_heap.ncaches {
+		unsafe {
+			vgc_cache(ci).born_delta = 0
+		}
+	}
+	vgc_cm_born_bound = 0
+	if vgc_cm_born_pct > 0 {
+		vgc_cm_born_bound = C.vgc_atomic_load_u64(&vgc_heap.heap_marked) * vgc_cm_born_pct / 100
+		if vgc_cm_born_bound < vgc_cm_born_min {
+			vgc_cm_born_bound = vgc_cm_born_min
+		}
+	}
 	vgc_clear_mark_bits()
 	vgc_ph[1] = C.vgc_now_ns()
 	// The barrier and alloc-gray are live BEFORE the roots are taken and
@@ -977,6 +1033,20 @@ fn vgc_gc_start_concurrent() {
 	// ===== STOP 2: termination =====
 	vgc_stw_stop(self_idx)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_mark_term)
+	// cut 1: the middle's births (every thread is stopped: the deltas are
+	// final), and whether they cut the middle short; the cut flag is down
+	// before the termination drains (they run under the stop, to the end)
+	vgc_cm_cut_last = C.vgc_atomic_load_u32(&vgc_cm_cut) != 0
+	C.vgc_atomic_store_u32(&vgc_cm_cut, 0)
+	vgc_cm_born_bound = 0
+	mut born := C.vgc_atomic_load_u64(&vgc_cm_born)
+	for ci in 0 .. vgc_heap.ncaches {
+		unsafe {
+			born += vgc_cache(ci).born_delta
+			vgc_cache(ci).born_delta = 0
+		}
+	}
+	vgc_cm_born_last = born
 	vgc_cm_roots(self_idx)
 	t_rescan := C.vgc_now_ns()
 	vgc_rescan_dirty_spans()
@@ -998,7 +1068,18 @@ fn vgc_gc_start_concurrent() {
 	vgc_ph[6] = C.vgc_now_ns()
 	vgc_mark_adapt(marked)
 	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
-	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
+	// cut 1: the count read every bit the alloc-black hook set — the middle's
+	// births, alive or already dead, which this cycle could not judge. The
+	// pacer's live set (heap_marked, the goal's base and the trace's marked=)
+	// is the count less the births; heap_live keeps the whole count, so the
+	// births stand as allocation since this cycle and the next one judges them.
+	mut net := marked
+	if born < net {
+		net -= born
+	} else {
+		net = 0
+	}
+	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, net)
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
@@ -1033,7 +1114,9 @@ fn vgc_gc_start_concurrent() {
 	if vgc_cm_mode == 2 && vgc_stw_last_pause_ns > 0 {
 		// at least half the pause must be bought: the middle costs the mutators
 		// the markers' cores and the allocation that runs through it (RSS)
-		if vgc_cm_pause_ns * 2 >= vgc_stw_last_pause_ns {
+		// (cut 1: a middle the births cut short is a loss too — its mark
+		// ran under the stop, and the probe cost its bound in floating garbage)
+		if vgc_cm_pause_ns * 2 >= vgc_stw_last_pause_ns || vgc_cm_cut_last {
 			vgc_cm_backoff = vgc_cm_backoff_len
 			if vgc_cm_backoff_len < 64 {
 				vgc_cm_backoff_len *= 2
@@ -1102,7 +1185,7 @@ fn vgc_gctrace_emit() {
 			if vgc_cm_this_cycle {
 				C.vgc_gctrace_cm(u64(vgc_heap.gc_cycle), vgc_cm_stop1_ns / 1000, vgc_cm_middle_ns / 1000,
 				vgc_cm_stop2_ns / 1000, vgc_cm_rescan_ns / 1000, vgc_cm_rescan_spans, vgc_cm_rescan_objs,
-					vgc_cm_verify_missed)
+					vgc_cm_verify_missed, vgc_cm_born_last / 1024, u64(if vgc_cm_cut_last { 1 } else { 0 }))
 			}
 		}
 	}
@@ -1956,6 +2039,13 @@ fn vgc_mark_scan_obj(obj_addr usize, w int) {
 // Drain the mark work queue on one marker (translated from Go's gcDrain()).
 fn vgc_drain_mark_work(w int) {
 	for {
+		$if vgc_concurrent ? {
+			// cut 1: the middle's births reached their bound — the rest of the
+			// mark runs under the termination stop (the flag is down there)
+			if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
+				return
+			}
+		}
 		obj_addr := vgc_work_get(w)
 		if obj_addr == 0 {
 			break
@@ -1973,6 +2063,14 @@ fn vgc_drain_mark_work(w int) {
 // (Go's gcWork.balance), so the tail of a cycle is not one marker's walk.
 fn vgc_drain_mark_parallel(w int, n int) {
 	for {
+		$if vgc_concurrent ? {
+			// cut 1 (see vgc_drain_mark_work): this marker's grey objects go
+			// to the shared list, for whichever marker drains at termination
+			if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
+				vgc_work_flush_local(w)
+				return
+			}
+		}
 		obj_addr := vgc_work_get(w)
 		if obj_addr != 0 {
 			vgc_mark_scan_obj(obj_addr, w)
@@ -1987,6 +2085,11 @@ fn vgc_drain_mark_parallel(w int, n int) {
 		for {
 			if C.vgc_atomic_load_u32(&vgc_mark_idle) >= u32(n) {
 				return
+			}
+			$if vgc_concurrent ? {
+				if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
+					return
+				}
 			}
 			if unsafe { voidptr(vgc_heap.work_full) } != unsafe { nil } {
 				_ = C.vgc_atomic_sub_u32(&vgc_mark_idle, 1)
