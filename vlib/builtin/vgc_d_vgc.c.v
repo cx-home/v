@@ -44,6 +44,7 @@ fn C.vgc_cpu_pause()
 fn C.vgc_os_alloc(size usize) voidptr
 fn C.vgc_os_free(ptr voidptr, size usize)
 fn C.vgc_os_decommit(ptr voidptr, size usize)
+fn C.vgc_os_page() usize
 fn C.vgc_os_recommit(ptr voidptr, size usize) // undo decommit before reuse (cx #360)
 fn C.vgc_get_sp() voidptr
 fn C.vgc_get_stack_bounds(lo &usize, hi &usize) int
@@ -3125,9 +3126,69 @@ fn vgc_pool_trim_all() {
 // pool_gen restamp on the cold push is irrelevant — cold spans never age.
 fn vgc_pool_trim_decommit(mut span VGC_Span) {
 	vgc_pool_unlink(mut span)
-	C.vgc_os_decommit(voidptr(span.base), usize(span.npages) * vgc_page_size)
+	vgc_pool_decommit_pages(span.base, usize(span.npages) * vgc_page_size)
 	span.decommitted = true
 	vgc_pool_push(mut span)
+}
+
+// vgc_pool_decommit_pages returns the pooled range [base, base + size) to the
+// OS, widened to whole hardware pages where the vgc pages it would share a
+// hardware page with are themselves pooled (cx-private#1886). vgc_os_decommit
+// returns only the hardware-aligned INNER range — a neighbour sharing the page
+// may be live (cx #360's collateral corruption) — so on a 16 KB-page host a lone
+// 8 KB span, or a 16 KB run at an odd page, returned nothing while the trim
+// flagged it cold and counted it in trimmed=: pi-digits 3000 read trimmed=7.7 MB
+// with 10.5 MB of its arena resident for a 2.5 MB in-use + 2.3 MB hot pool, the
+// committed-above-goal compensation (vgc_committed_above_goal) subtracting the
+// unreturned pages as cold. A cold pooled neighbour holds no object, no
+// mutator can reach it (popping it takes free_spans_lock, which every caller
+// holds) and its pop already runs vgc_os_recommit, so its share of the hardware
+// page goes too and reads back zero-filled, as a fresh carve does; a pair of
+// lone spans is returned when the second of them is trimmed. A HOT neighbour is
+// never widened into: it pops without a recommit, which VGC_TRIM_PROTECT (and
+// Windows' MEM_DECOMMIT) would fault. Only where the hardware page is larger
+// than a vgc page.
+fn vgc_pool_decommit_pages(base usize, size usize) {
+	mut lo := base
+	mut hi := base + size
+	$if !windows {
+		pg := usize(C.vgc_os_page())
+		if pg > vgc_page_size {
+			alo := lo & ~(pg - 1)
+			ahi := (hi + pg - 1) & ~(pg - 1)
+			if alo < lo && vgc_pages_pooled(alo, lo) {
+				lo = alo
+			}
+			if ahi > hi && vgc_pages_pooled(hi, ahi) {
+				hi = ahi
+			}
+		}
+	}
+	C.vgc_os_decommit(voidptr(lo), hi - lo)
+}
+
+// vgc_pages_pooled: every vgc page of [lo, hi) lies in one carved arena and
+// belongs to a pooled, not-in-use, decommitted (cold) span. Caller holds
+// free_spans_lock.
+fn vgc_pages_pooled(lo usize, hi usize) bool {
+	arena_idx := vgc_arena_of(lo)
+	if arena_idx < 0 {
+		return false
+	}
+	a := unsafe { &vgc_heap.arenas[arena_idx] }
+	if hi > a.base + usize(a.used) {
+		return false
+	}
+	mut addr := lo
+	for addr < hi {
+		p := (addr - a.base) / vgc_page_size
+		s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[p]))))) }
+		if s == unsafe { nil } || !s.pooled || s.in_use || !s.decommitted {
+			return false
+		}
+		addr += vgc_page_size
+	}
+	return true
 }
 
 // ── RTMEM-1: retention on a monotone build-up (cx-home/v#6) ─────────────────
@@ -3334,7 +3395,7 @@ fn vgc_pool_compensate_arena(arena_idx int, start usize, want u64) (u64, usize, 
 // which is a no-op on unix and harmless on committed pages under Windows.
 fn vgc_pool_decommit_run(arena_idx int, start usize, npages u64) {
 	a := unsafe { &vgc_heap.arenas[arena_idx] }
-	C.vgc_os_decommit(voidptr(a.base + start * vgc_page_size), usize(npages) * vgc_page_size)
+	vgc_pool_decommit_pages(a.base + start * vgc_page_size, usize(npages) * vgc_page_size)
 	end := start + usize(npages)
 	mut p := start
 	for p < end {

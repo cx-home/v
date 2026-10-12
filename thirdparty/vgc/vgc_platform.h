@@ -532,9 +532,14 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   }
   static inline void vgc_os_recommit(void* ptr, size_t size) {
   #ifdef VGC_TRIM_PROTECT
+      // OUTWARD to hardware pages (cx-private#1886): the trim widens a decommit
+      // over a cold pooled neighbour's share of a hardware page, so a popped
+      // 8 KB span may sit in a PROT_NONE page its own inner range is empty of.
+      // Re-enabling the whole page cannot fault anyone; it only lets the
+      // detector miss a read of the cold half that shares it.
       size_t pg = vgc_os_page();
-      uintptr_t lo = ((uintptr_t)ptr + pg - 1) & ~(uintptr_t)(pg - 1);
-      uintptr_t hi = ((uintptr_t)ptr + size) & ~(uintptr_t)(pg - 1);
+      uintptr_t lo = (uintptr_t)ptr & ~(uintptr_t)(pg - 1);
+      uintptr_t hi = ((uintptr_t)ptr + size + pg - 1) & ~(uintptr_t)(pg - 1);
       if (hi <= lo) return;
       mprotect((void*)lo, hi - lo, PROT_READ | PROT_WRITE);
   #else
