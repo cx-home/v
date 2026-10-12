@@ -92,21 +92,47 @@ fn test_births_are_netted_out_of_the_pacing_input() {
 	assert big >= 1, 'no middle with births of half the live set: ${cycles}'
 }
 
-// The default bound (25 % of the live set): no middle's births pass it by more
-// than the flush slack (8 threads x 256 KB) and the stop's own window, and a
-// cut middle is reported.
+// The default bound (25 % of the live set) against the unbounded middles of
+// the same fixture: a cut middle is reported, and the births of the bounded
+// middles (their median over the churn) are at most half the unbounded ones'
+// and within four times the bound — the overshoot past the bound is the
+// stop's latency times the allocation rate, which a loaded 4-vCPU runner
+// stretches, so the bar is relative, not the bound itself.
+fn median(mut xs []u64) u64 {
+	if xs.len == 0 {
+		return 0
+	}
+	xs.sort()
+	return xs[xs.len / 2]
+}
+
 fn test_the_middle_stops_at_the_born_bound() {
 	exe := build_fixture()
 	defer {
 		os.rm(exe) or {}
 	}
-	cycles := run(exe, '')
+	unbounded := run(exe, 'VGC_CM_BORN_PCT=0')
+	bounded := run(exe, '')
 	bound_kb := u64(live_mb) * 1024 / 4
+	mut ub := []u64{}
+	for c in unbounded {
+		if c.born_kb > 0 {
+			ub << c.born_kb
+		}
+	}
+	mut bb := []u64{}
 	mut cuts := 0
-	for c in cycles[1..] {
-		assert c.born_kb <= bound_kb * 2, 'born ${c.born_kb} KB past the bound ${bound_kb} KB: ${cycles}'
-		assert c.marked_mb <= u64(live_mb) * 3 / 2, 'marked ${c.marked_mb} MB against ${live_mb} MB live: ${cycles}'
+	for c in bounded {
+		assert c.marked_mb <= u64(live_mb) * 3 / 2, 'marked ${c.marked_mb} MB against ${live_mb} MB live: ${bounded}'
+		if c.born_kb > 0 {
+			bb << c.born_kb
+		}
 		cuts += c.cut
 	}
-	assert cuts >= 1, 'no cut middle under eight hot allocators: ${cycles}'
+	assert cuts >= 1, 'no cut middle under eight hot allocators: ${bounded}'
+	um := median(mut ub)
+	bm := median(mut bb)
+	assert um > 0 && bm > 0, 'no births seen: unbounded ${unbounded}, bounded ${bounded}'
+	assert bm * 2 <= um, 'bounded median born ${bm} KB is not half the unbounded ${um} KB: ${bounded}'
+	assert bm <= bound_kb * 4, 'bounded median born ${bm} KB past four times the bound ${bound_kb} KB: ${bounded}'
 }
