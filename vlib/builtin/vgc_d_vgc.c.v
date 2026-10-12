@@ -1736,6 +1736,13 @@ pub fn vgc_init() {
 	}
 	vgc_heap.gc_enabled = 1
 	vgc_heap.gc_percent = 100
+	gogc_env := C.getenv(c'VGC_GOGC')
+	if gogc_env != unsafe { nil } {
+		gp := C.atoll(gogc_env)
+		if gp > 0 {
+			vgc_heap.gc_percent = int(gp)
+		}
+	}
 	mb_env := C.getenv(c'VGC_NEXT_GC_MB')
 	if mb_env != unsafe { nil } {
 		mb := C.atoll(mb_env)

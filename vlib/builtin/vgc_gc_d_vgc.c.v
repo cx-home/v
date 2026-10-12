@@ -1168,6 +1168,45 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024, vgc_idle_defrag_merged_kb)
+	if vgc_gctrace >= 3 {
+		// EXPERIMENT (gaps2, #1869): marked bytes per element size
+		mut cb := [70]u64{}
+		mut cn := [70]u64{}
+		for wi in 0 .. (vgc_heap.nspans + 7) / 8 {
+			mut bits := unsafe { vgc_heap.inuse_bits[wi] }
+			for bits != 0 {
+				bi := C.vgc_ctz8(bits)
+				bits &= bits - 1
+				span := unsafe { vgc_heap.allspans[wi * 8 + bi] }
+				if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
+					continue
+				}
+				nbytes := (span.nelems + 7) / 8
+				mut count := u32(0)
+				for b in 0 .. nbytes {
+					count += u32(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
+				}
+				if count > span.nelems {
+					count = span.nelems
+				}
+				mut k := 69
+				for c in 1 .. 68 {
+					if C.vgc_get_class_size(c) == u32(span.elem_size) {
+						k = c
+						break
+					}
+				}
+				cb[k] += u64(count) * u64(span.elem_size)
+				cn[k] += u64(count)
+			}
+		}
+		for k in 0 .. 70 {
+			if cb[k] >= 262144 {
+				sz := if k == 69 { u32(0) } else { C.vgc_get_class_size(k) }
+				C.fprintf(C.stderr, c'[census %d] size=%u n=%llu kb=%llu\n', int(vgc_heap.gc_cycle), sz, cn[k], cb[k] / 1024)
+			}
+		}
+	}
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
 		// bytes the root scan walked and the spans the clear/sweep walks visited.
