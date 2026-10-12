@@ -19,28 +19,65 @@ static const uint32_t v_sha256_arm64_k[64] = {
 	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
 	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
+// Four rounds on the message words m (W[4i .. 4i+3]) and the constants k.
+#define V_SHA256_ARM64_R4(m, k) \
+	do { \
+		const uint32x4_t v_wk = vaddq_u32((m), (k)); \
+		const uint32x4_t v_a = abcd; \
+		abcd = vsha256hq_u32(abcd, efgh, v_wk); \
+		efgh = vsha256h2q_u32(efgh, v_a, v_wk); \
+	} while (0)
+// W[t+16 .. t+19] from W[t ..] (m0), W[t+4 ..], W[t+8 ..], W[t+12 ..], in place in m0.
+#define V_SHA256_ARM64_SU(m0, m1, m2, m3) (m0) = vsha256su1q_u32(vsha256su0q_u32((m0), (m1)), (m2), (m3))
+// The step is written out round group by round group, with the message words in four named
+// vectors and the 64 constants loaded into sixteen vectors once per call: a rolled loop over
+// m[i & 3] kept the message schedule on the stack (a load and a store around every
+// SHA256SU0/SU1 pair) and ran bulk input 1.25x slower than OpenSSL (cx-home/v#21).
 static int v_sha256_block_arm64(uint32_t *state, const uint8_t *data, size_t nblocks) {
 	uint32x4_t abcd = vld1q_u32(state);
 	uint32x4_t efgh = vld1q_u32(state + 4);
+	const uint32_t *kp = v_sha256_arm64_k;
+	const uint32x4_t k0 = vld1q_u32(kp + 0), k1 = vld1q_u32(kp + 4), k2 = vld1q_u32(kp + 8),
+		k3 = vld1q_u32(kp + 12), k4 = vld1q_u32(kp + 16), k5 = vld1q_u32(kp + 20),
+		k6 = vld1q_u32(kp + 24), k7 = vld1q_u32(kp + 28), k8 = vld1q_u32(kp + 32),
+		k9 = vld1q_u32(kp + 36), k10 = vld1q_u32(kp + 40), k11 = vld1q_u32(kp + 44),
+		k12 = vld1q_u32(kp + 48), k13 = vld1q_u32(kp + 52), k14 = vld1q_u32(kp + 56),
+		k15 = vld1q_u32(kp + 60);
 	while (nblocks--) {
 		const uint32x4_t abcd0 = abcd;
 		const uint32x4_t efgh0 = efgh;
-		uint32x4_t m[4];
-		m[0] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data)));
-		m[1] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 16)));
-		m[2] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 32)));
-		m[3] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 48)));
-		for (int i = 0; i < 16; i++) {
-			const uint32x4_t wk = vaddq_u32(m[i & 3], vld1q_u32(v_sha256_arm64_k + 4 * i));
-			const uint32x4_t a = abcd;
-			abcd = vsha256hq_u32(abcd, efgh, wk);
-			efgh = vsha256h2q_u32(efgh, a, wk);
-			if (i < 12) {
-				// W[4i+16 .. 4i+19] from W[4i ..], W[4i+4 ..], W[4i+8 ..], W[4i+12 ..]
-				m[i & 3] = vsha256su1q_u32(vsha256su0q_u32(m[i & 3], m[(i + 1) & 3]),
-					m[(i + 2) & 3], m[(i + 3) & 3]);
-			}
-		}
+		uint32x4_t m0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data)));
+		uint32x4_t m1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 16)));
+		uint32x4_t m2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 32)));
+		uint32x4_t m3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 48)));
+		V_SHA256_ARM64_R4(m0, k0);
+		V_SHA256_ARM64_SU(m0, m1, m2, m3);
+		V_SHA256_ARM64_R4(m1, k1);
+		V_SHA256_ARM64_SU(m1, m2, m3, m0);
+		V_SHA256_ARM64_R4(m2, k2);
+		V_SHA256_ARM64_SU(m2, m3, m0, m1);
+		V_SHA256_ARM64_R4(m3, k3);
+		V_SHA256_ARM64_SU(m3, m0, m1, m2);
+		V_SHA256_ARM64_R4(m0, k4);
+		V_SHA256_ARM64_SU(m0, m1, m2, m3);
+		V_SHA256_ARM64_R4(m1, k5);
+		V_SHA256_ARM64_SU(m1, m2, m3, m0);
+		V_SHA256_ARM64_R4(m2, k6);
+		V_SHA256_ARM64_SU(m2, m3, m0, m1);
+		V_SHA256_ARM64_R4(m3, k7);
+		V_SHA256_ARM64_SU(m3, m0, m1, m2);
+		V_SHA256_ARM64_R4(m0, k8);
+		V_SHA256_ARM64_SU(m0, m1, m2, m3);
+		V_SHA256_ARM64_R4(m1, k9);
+		V_SHA256_ARM64_SU(m1, m2, m3, m0);
+		V_SHA256_ARM64_R4(m2, k10);
+		V_SHA256_ARM64_SU(m2, m3, m0, m1);
+		V_SHA256_ARM64_R4(m3, k11);
+		V_SHA256_ARM64_SU(m3, m0, m1, m2);
+		V_SHA256_ARM64_R4(m0, k12);
+		V_SHA256_ARM64_R4(m1, k13);
+		V_SHA256_ARM64_R4(m2, k14);
+		V_SHA256_ARM64_R4(m3, k15);
 		abcd = vaddq_u32(abcd, abcd0);
 		efgh = vaddq_u32(efgh, efgh0);
 		data += 64;
@@ -49,6 +86,8 @@ static int v_sha256_block_arm64(uint32_t *state, const uint8_t *data, size_t nbl
 	vst1q_u32(state + 4, efgh);
 	return 1;
 }
+#undef V_SHA256_ARM64_R4
+#undef V_SHA256_ARM64_SU
 #else
 static int v_sha256_block_arm64(uint32_t *state, const uint8_t *data, size_t nblocks) {
 	(void)state;
