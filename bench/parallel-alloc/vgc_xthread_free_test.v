@@ -42,7 +42,11 @@ fn test_consumers_are_registered_and_held_messages_survive() {
 		r := os.execute('HOLD_EVERY=300 HOLD_US=50000 T=16 STEPS=60000 ${os.quoted_path(exe)}')
 		assert r.exit_code == 0, 'hold run ${run}: exit ${r.exit_code}: ${r.output}'
 		mut holds := 0
+		mut reached := 0
 		for line in r.output.split_into_lines() {
+			if line.starts_with('RECV c') && line.all_after('n=').int() > 300 {
+				reached++
+			}
 			if !line.starts_with('HOLD c') {
 				continue
 			}
@@ -51,7 +55,12 @@ fn test_consumers_are_registered_and_held_messages_survive() {
 			assert idx >= 0, 'hold run ${run}: a consumer was never registered: ${line}'
 			assert line.contains('id_ok=true'), 'hold run ${run}: a held message was touched: ${line}'
 		}
-		assert holds == 8, 'hold run ${run}: ${holds} consumers held (want 8): ${r.output}'
+		// every consumer that got past its 300th message held it; the channel
+		// does not share the messages out evenly, and under load one consumer
+		// can be starved below 300 (FreeBSD CI 38234998934: 7 of 8 held, all
+		// registered and intact) — that consumer has nothing to hold
+		assert holds == reached, 'hold run ${run}: ${holds} consumers held, ${reached} got past 300 messages: ${r.output}'
+		assert holds >= 4, 'hold run ${run}: only ${holds} of 8 consumers held a message (want >= 4): ${r.output}'
 		assert r.output.contains(' bad=0 '), 'hold run ${run}: ${r.output}'
 	}
 }

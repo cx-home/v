@@ -20,7 +20,8 @@
 // HOLD_EVERY/HOLD_US: each consumer holds its HOLD_EVERY-th message for HOLD_US
 // microseconds before verifying it (a deschedule under load, made deterministic),
 // NOFREE=1 (no explicit frees), NOGC=1 (no forced collections).
-// Prints one `HOLD c<i> idx=<cache idx> ...` line per consumer that held
+// Prints one `RECV c<i> n=<messages>` line per consumer, one
+// `HOLD c<i> idx=<cache idx> ...` line per consumer that held
 // (idx -1 = the thread was never registered) and the summary line; exit 1 on
 // any checksum mismatch.
 module main
@@ -34,6 +35,7 @@ __global hold_done = [64]bool{}
 __global hold_idx = [64]int{}
 __global hold_idok = [64]bool{}
 __global hold_cyc = [64]u64{}
+__global recv_n = [64]int{}
 
 struct Rec {
 mut:
@@ -169,6 +171,7 @@ fn consumer(ci int, ch chan Msg, bad &int, done chan int, nofree bool, hold_ever
 		}
 		n++
 	}
+	recv_n[ci] = n
 	done <- n
 }
 
@@ -210,6 +213,7 @@ fn main() {
 	stop = true
 	c.wait()
 	for ci in 0 .. nc {
+		println('RECV c${ci} n=${recv_n[ci]}')
 		if hold_done[ci] {
 			println('HOLD c${ci} idx=${hold_idx[ci]} cycles=${hold_cyc[ci]} id_ok=${hold_idok[ci]}')
 		}
