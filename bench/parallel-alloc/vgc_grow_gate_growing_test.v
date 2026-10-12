@@ -28,10 +28,38 @@
 // the children inherit it) the shape takes 11
 // against the off arm's 9-10, and red here.
 //
+// The pause bound is wall time, so it is judged only when the runner is not
+// oversubscribed: the one-minute load average at the start and at the end of
+// the six runs at most the CPU count. On FreeBSD's 4-vCPU CI runner with four
+// test binaries in parallel (the markers-forced suite) the least of three
+// gate-on pause sums read 974 ms against the gate-off arm's 550 with the same
+// collection counts (vgc 38204997509 twice, 38229128715), and green in the
+// serial and default modes of the same runs — the load stretched the pauses,
+// not the gate. A loaded run still judges the collection count, which is the
+// gate's own regression; cx-private's perf-pair leaves time rows unjudged on a
+// loaded box the same way (cx-private#1450).
+//
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_grow_gate_growing_test.v
 module main
 
 import os
+import runtime
+
+fn C.getloadavg(loadavg &f64, nelem int) int
+
+// load1 is the one-minute load average, or -1 where getloadavg answers nothing
+// (and on Windows, which has none: the bound is judged there as before).
+fn load1() f64 {
+	$if windows {
+		return -1
+	} $else {
+		mut la := [3]f64{}
+		if C.getloadavg(&la[0], 1) != 1 {
+			return -1
+		}
+		return la[0]
+	}
+}
 
 const rec = 2048
 const live_bytes = 256 * 1024 * 1024
@@ -89,6 +117,7 @@ fn test_a_growing_heap_takes_no_extra_collections() {
 		println('GROW-DONE=${grow()}')
 		return
 	}
+	load_start := load1()
 	mut off := run_child('0')
 	mut on := run_child('')
 	mut off_most := off.cycles
@@ -101,5 +130,11 @@ fn test_a_growing_heap_takes_no_extra_collections() {
 	println('vgc_grow_gate_growing: gate off ${off.cycles}-${off_most} collections ${off.pause_us} us; default ${on.cycles} collections ${on.pause_us} us')
 	assert off.cycles > 0
 	assert on.cycles <= off_most, 'the gate added collections on a growing heap: ${on.cycles} against ${off.cycles}-${off_most} with the gate off'
-	assert on.pause_us <= off.pause_us * 5 / 4 + 10000, 'the gate added pause time on a growing heap: ${on.pause_us} us against ${off.pause_us} us'
+	load_end := load1()
+	ncpu := f64(runtime.nr_cpus())
+	if load_start > ncpu || load_end > ncpu {
+		println('vgc_grow_gate_growing: pause bound not judged: load ${load_start:.1f} -> ${load_end:.1f} on ${ncpu} CPUs (wall time on an oversubscribed runner)')
+		return
+	}
+	assert on.pause_us <= off.pause_us * 5 / 4 + 10000, 'the gate added pause time on a growing heap: ${on.pause_us} us against ${off.pause_us} us (load ${load_start:.1f} -> ${load_end:.1f} on ${ncpu} CPUs)'
 }
