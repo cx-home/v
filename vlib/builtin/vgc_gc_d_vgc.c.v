@@ -90,9 +90,10 @@ fn vgc_gc_start() {
 		// The feedback (vgc_cm_backoff, vgc_d_vgc.c.v): a concurrent cycle whose
 		// stops were no shorter than the last STW pause sends the next cycles
 		// here, and the concurrent cycle is probed again after them.
-		// cut 1: and only when the middle's births are expected to fit the
-		// born bound (vgc_cm_born_fits) — sixteen hot allocators at ~10 GB/s
-		// put 300 MB through a 30 ms middle, a probe that lost before it ran.
+		// cut 1: and only when the middle's births are forecast to fit twice
+		// the born bound (vgc_cm_born_fits) — sixteen hot allocators at ~10
+		// GB/s put 300 MB through a 30 ms middle, a probe that lost before it
+		// ran; the bound's throttle (vgc_cm_throttle) is the guarantee.
 		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits()) {
@@ -1040,8 +1041,8 @@ fn vgc_gc_start_concurrent() {
 	vgc_stw_stop(self_idx)
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_mark_term)
 	// cut 1: the middle's births (every thread is stopped: the deltas are
-	// final), and whether they cut the middle short; the cut flag is down
-	// before the termination drains (they run under the stop, to the end)
+	// final), and whether they throttled the allocators; the flag is down
+	// before the resume
 	vgc_cm_cut_last = C.vgc_atomic_load_u32(&vgc_cm_cut) != 0
 	C.vgc_atomic_store_u32(&vgc_cm_cut, 0)
 	vgc_cm_born_bound = 0
@@ -1120,10 +1121,9 @@ fn vgc_gc_start_concurrent() {
 	if vgc_cm_mode == 2 && vgc_stw_last_pause_ns > 0 {
 		// at least half the pause must be bought: the middle costs the mutators
 		// the markers' cores and the allocation that runs through it (RSS)
-		// (cut 1: a middle the births cut short is judged by its stops like
-		// any other — the cut bounds what the probe cost in floating garbage,
-		// and a workload whose middles always cut still keeps the shorter
-		// stops it buys; the pacing is netted either way)
+		// (cut 1: a middle whose births throttled the allocators is judged
+		// by its stops like any other — the bound is what the probe may cost
+		// in floating garbage, the netting takes the rest)
 		if vgc_cm_pause_ns * 2 >= vgc_stw_last_pause_ns {
 			vgc_cm_backoff = vgc_cm_backoff_len
 			if vgc_cm_backoff_len < 64 {
@@ -2047,13 +2047,6 @@ fn vgc_mark_scan_obj(obj_addr usize, w int) {
 // Drain the mark work queue on one marker (translated from Go's gcDrain()).
 fn vgc_drain_mark_work(w int) {
 	for {
-		$if vgc_concurrent ? {
-			// cut 1: the middle's births reached their bound — the rest of the
-			// mark runs under the termination stop (the flag is down there)
-			if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
-				return
-			}
-		}
 		obj_addr := vgc_work_get(w)
 		if obj_addr == 0 {
 			break
@@ -2071,14 +2064,6 @@ fn vgc_drain_mark_work(w int) {
 // (Go's gcWork.balance), so the tail of a cycle is not one marker's walk.
 fn vgc_drain_mark_parallel(w int, n int) {
 	for {
-		$if vgc_concurrent ? {
-			// cut 1 (see vgc_drain_mark_work): this marker's grey objects go
-			// to the shared list, for whichever marker drains at termination
-			if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
-				vgc_work_flush_local(w)
-				return
-			}
-		}
 		obj_addr := vgc_work_get(w)
 		if obj_addr != 0 {
 			vgc_mark_scan_obj(obj_addr, w)
@@ -2093,11 +2078,6 @@ fn vgc_drain_mark_parallel(w int, n int) {
 		for {
 			if C.vgc_atomic_load_u32(&vgc_mark_idle) >= u32(n) {
 				return
-			}
-			$if vgc_concurrent ? {
-				if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
-					return
-				}
 			}
 			if unsafe { voidptr(vgc_heap.work_full) } != unsafe { nil } {
 				_ = C.vgc_atomic_sub_u32(&vgc_mark_idle, 1)

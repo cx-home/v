@@ -5,9 +5,10 @@
 // pacer doubled the goal on it (stw_scaling T=16: 152-392 MB marked against 82
 // live, RSS 375 -> 447 MB; json-codec 24 against 19, 59.4 -> 71.7 MB). Now the
 // cycle counts its births (`born=` on the VGC_GCTRACE=2 cm line), the pacer's
-// marked set is the count less the births, and the middle stops once the births
-// reach VGC_CM_BORN_PCT of the last live set (the rest of the mark runs under
-// the termination stop), so a probe costs at most that much floating garbage.
+// marked set is the count less the births, and once the births reach
+// VGC_CM_BORN_PCT of the last live set the allocators wait at their pacer poll
+// until the middle ends (the markers finish the mark), so a probe costs at most
+// that much floating garbage.
 //
 // concurrent_born/born.v: main holds LIVE_MB of pointer-bearing records while
 // THREADS workers allocate 1 KB records into rolling windows for OPS steps each,
@@ -99,7 +100,7 @@ fn test_births_are_netted_out_of_the_pacing_input() {
 }
 
 // The default bound (25 % of the live set) against the unbounded middles of
-// the same fixture: a cut middle is reported, and the births of the bounded
+// the same fixture: a throttled middle is reported (cut=1), and the births of the bounded
 // middles (their median over the churn) are at most half the unbounded ones'
 // and within four times the bound — the overshoot past the bound is the
 // stop's latency times the allocation rate, which a loaded 4-vCPU runner
@@ -135,7 +136,7 @@ fn test_the_middle_stops_at_the_born_bound() {
 		}
 		cuts += c.cut
 	}
-	assert cuts >= 1, 'no cut middle under ${threads} hot allocators: ${bounded}'
+	assert cuts >= 1, 'no throttled middle under ${threads} hot allocators: ${bounded}'
 	um := median(mut ub)
 	bm := median(mut bb)
 	assert um > 0 && bm > 0, 'no births seen: unbounded ${unbounded}, bounded ${bounded}'

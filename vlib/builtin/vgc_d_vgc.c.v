@@ -888,9 +888,9 @@ __global vgc_cm_backoff_len = int(8)
 // against 19) while heap_live keeps the whole marked set (the births count as
 // allocation since). The middle is also bounded: once the births reach
 // vgc_cm_born_bound (VGC_CM_BORN_PCT of the last live set, default 25, at
-// least 4 MB; 0 = unbounded) the markers stop (vgc_cm_cut) and the rest of the
-// mark runs under the termination stop — a probe costs at most that much
-// floating garbage, and the feedback counts a cut probe as a loss.
+// least 4 MB; 0 = unbounded) vgc_cm_cut goes up and every allocating mutator
+// waits at its pacer poll until the middle ends (vgc_cm_throttle) — a probe
+// costs at most that much floating garbage, and the markers finish the mark.
 __global vgc_cm_born = u64(0)
 __global vgc_cm_born_bound = u64(0)
 __global vgc_cm_born_pct = u64(25)
@@ -4069,8 +4069,8 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 // a different object sharing the same mark_bits byte. Compiled out (and the
 // gc_phase load skipped) under the default build.
 // cx-private#1910 cut 1: a birth during the concurrent middle (see vgc_cm_born).
-// Thread-private until 256 KB, then one atomic add; past the bound the markers
-// are told to stop (vgc_cm_cut, read in their drain loops).
+// Thread-private until 256 KB, then one atomic add; past the bound the
+// allocators are told to wait (vgc_cm_cut, read at the pacer poll).
 @[inline]
 fn vgc_cm_born_add(n u64) {
 	$if vgc_concurrent ? {
@@ -4090,6 +4090,32 @@ fn vgc_cm_born_add(n u64) {
 		// (the add's return differs between the platform macros: a load)
 		if vgc_cm_born_bound != 0 && C.vgc_atomic_load_u64(&vgc_cm_born) >= vgc_cm_born_bound {
 			C.vgc_atomic_store_u32(&vgc_cm_cut, 1)
+		}
+	}
+}
+
+// cx-private#1910 cut 1: the throttle. Once the middle's births reach their
+// bound (vgc_cm_born_add raised vgc_cm_cut) an allocating mutator waits at its
+// pacer poll until the middle ends — the markers keep the cores and finish the
+// mark beside the mutators that do not allocate, so the termination stop
+// stays the roots and the re-scan, not the mark (stopping the markers instead
+// moved the rest of the mark under the stop: the door at load 40 lost every
+// probe to the backoff and ran stop-the-world at pause p50 22 ms against 9.6).
+// The collector (the owner) never waits; the wait parks at the stop like any
+// poll (gc_stop_flag), and the collector lowers vgc_cm_cut under stop 2.
+fn vgc_cm_throttle() {
+	$if vgc_concurrent ? {
+		ci := C.vgc_get_cache_idx()
+		if ci < 0 || ci == vgc_gc_owner {
+			return
+		}
+		for C.vgc_atomic_load_u32(&vgc_cm_cut) != 0
+			&& C.vgc_atomic_load_u32(&vgc_heap.gc_phase) == vgc_phase_mark {
+			if C.vgc_atomic_load_u32(&vgc_heap.gc_stop_flag) != 0 {
+				vgc_safepoint()
+			} else {
+				C.vgc_yield()
+			}
 		}
 	}
 }
@@ -4697,6 +4723,13 @@ fn vgc_maybe_gc() {
 		}
 		if C.vgc_atomic_load_u32(&vgc_heap.gc_stop_flag) != 0 {
 			vgc_safepoint()
+		}
+		$if vgc_concurrent ? {
+			// cx-private#1910 cut 1: the concurrent middle's births reached
+			// their bound — this allocator pauses until the middle ends
+			if C.vgc_atomic_load_u32(&vgc_cm_cut) != 0 {
+				vgc_cm_throttle()
+			}
 		}
 	}
 	// NOTE: GC-assist (a mutator draining a proportional slice of the grey set when it
