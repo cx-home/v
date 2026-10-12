@@ -109,7 +109,7 @@ fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs searc
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
-fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
+fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -340,6 +340,11 @@ mut:
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
 	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
+	// cx-private#1910: bytes of the objects this thread's alloc-black hook marked
+	// during the concurrent middle (the cycle's births), flushed into
+	// vgc_cm_born every vgc_cm_born_flush bytes; summed and reset at the
+	// termination stop. The pacer nets them out of the marked set.
+	born_delta u64
 	// cx-home/v#27: the free-slot list is threaded through the slots (an exited
 	// thread's slot names the next reclaimed one as index+1; 0 = end — vgc_heap
 	// is a zero-initialized global, so 0 must mean empty), so slot reuse is O(1)
@@ -874,6 +879,26 @@ __global vgc_cm_min_ns = u64(1000) * 1000
 __global vgc_stw_last_pause_ns = u64(0)
 __global vgc_cm_backoff = int(0)
 __global vgc_cm_backoff_len = int(8)
+// cx-private#1910 cut 1: the concurrent middle's births. Every object the
+// alloc-black hook marks during the middle is counted (vgc_cm_born_add: a
+// thread-private born_delta, flushed into vgc_cm_born every 256 KB); at
+// termination the pacer takes marked - born as the live set (the births are
+// floating garbage this cycle could not judge, not growth to double the goal
+// on: stw_scaling T=16 read 152-392 MB marked against 82 live, json-codec 24
+// against 19) while heap_live keeps the whole marked set (the births count as
+// allocation since). The middle is also bounded: once the births reach
+// vgc_cm_born_bound (VGC_CM_BORN_PCT of the last live set, default 25, at
+// least 4 MB; 0 = unbounded) the markers stop (vgc_cm_cut) and the rest of the
+// mark runs under the termination stop — a probe costs at most that much
+// floating garbage, and the feedback counts a cut probe as a loss.
+__global vgc_cm_born = u64(0)
+__global vgc_cm_born_bound = u64(0)
+__global vgc_cm_born_pct = u64(25)
+__global vgc_cm_cut = u32(0)
+__global vgc_cm_born_last = u64(0)
+__global vgc_cm_cut_last = false
+const vgc_cm_born_flush = u64(256) * 1024
+const vgc_cm_born_min = u64(4) << 20
 // the last cycle's root scan (suspended registers, data segments, stacks)
 __global vgc_root_last_ns = u64(0)
 __global vgc_mark_local = [vgc_max_markers]usize{}
@@ -1829,6 +1854,13 @@ pub fn vgc_init() {
 			cmv := C.atoll(cmm_env)
 			if cmv >= 0 {
 				vgc_cm_min_ns = u64(cmv) * 1000
+			}
+		}
+		cmb_env := C.getenv(c'VGC_CM_BORN_PCT')
+		if cmb_env != unsafe { nil } {
+			cmb := C.atoll(cmb_env)
+			if cmb >= 0 && cmb <= 1000 {
+				vgc_cm_born_pct = u64(cmb)
 			}
 		}
 	}
@@ -4036,6 +4068,32 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 // write barrier. Atomic test_and_set because the collector may concurrently shade
 // a different object sharing the same mark_bits byte. Compiled out (and the
 // gc_phase load skipped) under the default build.
+// cx-private#1910 cut 1: a birth during the concurrent middle (see vgc_cm_born).
+// Thread-private until 256 KB, then one atomic add; past the bound the markers
+// are told to stop (vgc_cm_cut, read in their drain loops).
+@[inline]
+fn vgc_cm_born_add(n u64) {
+	$if vgc_concurrent ? {
+		idx := C.vgc_get_cache_idx()
+		if idx < 0 {
+			C.vgc_atomic_add_u64(&vgc_cm_born, n)
+		} else {
+			unsafe {
+				vgc_cache(idx).born_delta += n
+				if vgc_cache(idx).born_delta < vgc_cm_born_flush {
+					return
+				}
+				C.vgc_atomic_add_u64(&vgc_cm_born, vgc_cache(idx).born_delta)
+				vgc_cache(idx).born_delta = 0
+			}
+		}
+		// (the add's return differs between the platform macros: a load)
+		if vgc_cm_born_bound != 0 && C.vgc_atomic_load_u64(&vgc_cm_born) >= vgc_cm_born_bound {
+			C.vgc_atomic_store_u32(&vgc_cm_cut, 1)
+		}
+	}
+}
+
 @[inline]
 fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 	// ALLOC-BLACK IS UNCONDITIONAL (was gated behind vgc_concurrent). Rationale
@@ -4066,9 +4124,8 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 			// torn mark byte here ERASES freshly-set neighbor marks => sweep
 			// frees live objects — worse than no hook at all.
 			mask := u8(1) << (obj_idx & 7)
-			unsafe {
-				_ =
-					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
+			old := unsafe {
+				C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
 			}
 			$if vgc_concurrent ? {
 				// alloc-GRAY (cx-private#1910): the newborn's span is re-scanned at
@@ -4079,6 +4136,11 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 					unsafe {
 						C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 1)
 					}
+				}
+				// cut 1: a bit this hook set (not one the markers reached first)
+				// is a birth the count will read as marked
+				if (old & mask) == 0 {
+					vgc_cm_born_add(u64(span.elem_size))
 				}
 			}
 		}
