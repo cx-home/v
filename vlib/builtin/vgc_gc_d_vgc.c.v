@@ -879,8 +879,11 @@ fn vgc_rescan_dirty_spans(term bool) {
 			if span == unsafe { nil } || !span.in_use {
 				continue
 			}
-			dirty := C.vgc_atomic_load_u32(&span.dirty) != 0 || C.vgc_atomic_load_u32(&span.born) != 0
+			mut dirty := C.vgc_atomic_load_u32(&span.dirty) != 0 || C.vgc_atomic_load_u32(&span.born) != 0
 			if span.perm != 0 && span.perm_bits != unsafe { nil } && !span.noscan {
+				if vgc_perm_cards_take(span) {
+					dirty = true
+				}
 				// cx-home/v#15: a permanent span. Dirtied since the last stop: its
 				// PERMANENT objects are scanned (every other object in it is traced
 				// or swept as usual — scanning a dead one would keep what it points
@@ -929,6 +932,29 @@ fn vgc_rescan_dirty_spans(term bool) {
 			}
 		}
 	}
+}
+
+// vgc_perm_cards_take reads and clears the cards of a permanent span's pages
+// (STW): true when a store landed in the span since the last stop.
+fn vgc_perm_cards_take(span &VGC_Span) bool {
+	if vgc_perm_cards == unsafe { nil } || span.base < vgc_perm_lo {
+		return false
+	}
+	first := (span.base - vgc_perm_lo) / vgc_page_size
+	mut any := false
+	for k in 0 .. usize(span.npages) {
+		pg := first + k
+		if pg >= vgc_perm_cards_n {
+			break
+		}
+		if unsafe { vgc_perm_cards[pg] } != 0 {
+			any = true
+			unsafe {
+				vgc_perm_cards[pg] = 0
+			}
+		}
+	}
+	return any
 }
 
 // vgc_scan_perm_obj scans one object's words as vgc_scan_range does (every
@@ -1119,7 +1145,20 @@ fn vgc_perm_promote() {
 		}
 		vgc_perm_lo = lo
 		vgc_perm_hi = hi
-		vgc_perm_len = hi - lo
+		// the card table over the range, before the length that opens the gate
+		if hi > lo {
+			ncards := (hi - lo) / vgc_page_size + 1
+			if ncards > vgc_perm_cards_n || vgc_perm_cards == unsafe { nil } {
+				vgc_perm_cards = unsafe { &u8(C.vgc_os_alloc(ncards)) }
+				vgc_perm_cards_n = if vgc_perm_cards != unsafe { nil } { ncards } else { 0 }
+			}
+			if vgc_perm_cards != unsafe { nil } {
+				unsafe { C.memset(vgc_perm_cards, 0, ncards) }
+			}
+		}
+		vgc_perm_len = if vgc_perm_cards != unsafe { nil } { hi - lo } else { 0 }
+		vgc_wb_lo = vgc_perm_lo
+		vgc_wb_len = vgc_perm_len
 		// the page bitmap over the range (a promotion that widened the range
 		// takes a fresh one; the old is left to the OS at exit — promotions are
 		// one or two per process)
@@ -2646,17 +2685,17 @@ pub fn vgc_wb_store(obj voidptr) {
 			return
 		}
 		if (mode & 1) == 0 {
-			// the permanent regime alone: only a store into a permanent span's
-			// page can matter
+			// the permanent regime alone: the page's card, set when not set
+			// (vgc_perm_cards doc); the stop reads it as the span's dirty bit
 			addr := usize(obj)
-			if addr < vgc_perm_lo || addr >= vgc_perm_hi {
+			if addr < vgc_perm_lo || addr - vgc_perm_lo >= vgc_perm_len || vgc_perm_cards == unsafe { nil } {
 				return
 			}
-			pg := (addr - vgc_perm_lo) / vgc_page_size
-			if vgc_perm_pages == unsafe { nil }
-				|| (unsafe { vgc_perm_pages[pg / 64] } & (u64(1) << (pg % 64))) == 0 {
-				return
+			card := unsafe { &u8(voidptr(usize(vgc_perm_cards) + (addr - vgc_perm_lo) / vgc_page_size)) }
+			if unsafe { *card } == 0 {
+				_ = C.vgc_atomic_fetch_or_u8(card, 1)
 			}
+			return
 		}
 		span := vgc_find_span(obj)
 		if span != unsafe { nil } && span.in_use && !span.noscan {

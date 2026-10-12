@@ -944,12 +944,24 @@ __global vgc_perm_hi = usize(0)
 // returns from the barrier after two loads, without the span lookup
 __global vgc_perm_pages = &u64(unsafe { nil })
 __global vgc_perm_pages_n = usize(0)
-// what the generated C's inline gate reads before calling vgc_wb_store
-// (cgen cheaders, vgc_wb_gate): the barrier mode (a mirror of
-// vgc_heap.wb_enabled, stored by vgc_wb_set) and the permanent range's length
-// (0 until the promotion: no call at all)
+// what the generated C's inline gate tests before calling vgc_wb_store (cgen
+// cheaders, vgc_wb_gate): the range [vgc_wb_lo, +vgc_wb_len) a store must land
+// in to need the barrier — empty before the promotion, the permanent range
+// after it, the whole address space during a concurrent middle (vgc_wb_set).
+// vgc_wb_mode mirrors vgc_heap.wb_enabled for vgc_wb_store's own test.
 __global vgc_wb_mode = u32(0)
+__global vgc_wb_lo = usize(0)
+__global vgc_wb_len = usize(0)
 __global vgc_perm_len = usize(0)
+// the card table: one byte per page of [vgc_perm_lo, vgc_perm_lo + len).
+// vgc_wb_store sets the page's card (an atomic byte store when it reads 0: a
+// line sixteen threads wrote on every ring store cost stw_scaling T=16
+// -12..-30 %; set once per stop it stays shared) before and after a pointer
+// store into the range; the stop reads a permanent span's cards as its dirty
+// bit (vgc_perm_cards_take) and clears them. A card of a page no permanent
+// span covers is never read.
+__global vgc_perm_cards = &u8(unsafe { nil })
+__global vgc_perm_cards_n = usize(0)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime.
@@ -957,6 +969,14 @@ __global vgc_perm_len = usize(0)
 fn vgc_wb_set(mode u32) {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, mode)
 	C.vgc_atomic_store_u32(&vgc_wb_mode, mode)
+	// the gate's range (stored under the stop: the resumed mutators read it)
+	if (mode & 1) != 0 {
+		vgc_wb_lo = 0
+		vgc_wb_len = ~usize(0)
+	} else {
+		vgc_wb_lo = vgc_perm_lo
+		vgc_wb_len = vgc_perm_len
+	}
 }
 // the verifier's full re-mark clears to zero (every object traced)
 __global vgc_perm_clear_zero = false
