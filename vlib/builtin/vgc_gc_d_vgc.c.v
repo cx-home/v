@@ -1657,12 +1657,29 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 			}
 		}
 		if ex_lo > cur {
-			vgc_scan_range(cur, if ex_lo < hi { ex_lo } else { hi }, 0)
+			vgc_scan_touched(cur, if ex_lo < hi { ex_lo } else { hi })
 		}
 		if ex_hi <= cur {
 			break
 		}
 		cur = ex_hi
+	}
+}
+
+// vgc_scan_touched scans the pages of a data-segment range the process has
+// touched since exec (cx-home/v#15; vgc_touched_ranges doc, vgc_platform.h): a
+// never-written zero-fill page holds no reference, and reading it faulted a
+// zeroed page in, so the scan kept the whole data segment resident and spent
+// about half its time on zero pages. Off darwin (or on any mincore failure)
+// the range is scanned whole, as before.
+fn vgc_scan_touched(lo usize, hi usize) {
+	mut los := [usize(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0]!
+	mut his := [usize(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0]!
+	n := C.vgc_touched_ranges(lo, hi, &los[0], &his[0], 32)
+	for k in 0 .. n {
+		vgc_scan_range(los[k], his[k], 0)
 	}
 }
 

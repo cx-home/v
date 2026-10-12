@@ -118,6 +118,7 @@ fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
 fn C.vgc_static_tables(los &usize, his &usize) int
+fn C.vgc_touched_ranges(lo usize, hi usize, los &usize, his &usize, max int) int // cx-home/v#15
 fn C.vgc_addr_to_arena(addr usize) int
 
 // ============================================================

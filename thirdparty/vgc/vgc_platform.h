@@ -2570,4 +2570,73 @@ static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
     return 3;
 }
 
+// cx-home/v#15: the data-segment root scan reads only the pages a process has
+// touched. A zero-fill __DATA/__bss/__common page the program never wrote is
+// all zeros, so it can hold no object reference — but READING it faults a real
+// zeroed page in on darwin (no shared zero page for anonymous memory: an 8 MB
+// static array read once took the process from 1.5 to 9.7 MB resident). The
+// conservative scan read every page of the 1.5 MB data segment on every cycle,
+// so every cx program carried its whole data segment resident (~0.8 MB of it
+// never written) and paid ~half of the ~100 us data phase on zero pages.
+// vgc_touched_ranges splits [lo, hi) into the runs of pages that must be
+// scanned: mincore(2) reports a page in core (resident: scanned) or paged out
+// (MINCORE_PAGED_OUT: in the compressor or the pager — it holds whatever was
+// written, so it is scanned, which faults it back in, as before); a page that
+// is neither was never touched since exec. A file-backed __DATA page that was
+// never written holds only its link-time contents, which cannot address the
+// collector's heap (mmapped at run time). Linux is left out: its mincore has
+// no paged-out bit (a swapped page reads as not resident), and its zero-fill
+// read maps the shared zero page anyway (no RSS cost). Any failure — mincore
+// refusing the range, more pages than the vector, more runs than `max` — falls
+// back to the whole range, the scan before this change.
+#if defined(__APPLE__) && defined(MINCORE_PAGED_OUT)
+static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los, uintptr_t* his, int max) {
+    if (hi <= lo || max < 1) {
+        return 0;
+    }
+    uintptr_t ps = (uintptr_t)getpagesize();
+    uintptr_t base = lo & ~(ps - 1);
+    uintptr_t npages = (hi - base + ps - 1) / ps;
+    unsigned char vec[1024];
+    if (npages <= sizeof(vec) && mincore((caddr_t)base, (size_t)(npages * ps), (char*)vec) == 0) {
+        int n = 0;
+        int overflow = 0;
+        for (uintptr_t i = 0; i < npages; i++) {
+            if ((vec[i] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) == 0) {
+                continue; // never touched since exec: all zeros
+            }
+            uintptr_t plo = base + i * ps;
+            uintptr_t phi = plo + ps;
+            if (plo < lo) plo = lo;
+            if (phi > hi) phi = hi;
+            if (n > 0 && his[n - 1] == plo) {
+                his[n - 1] = phi;
+            } else if (n < max) {
+                los[n] = plo;
+                his[n] = phi;
+                n++;
+            } else {
+                overflow = 1;
+                break;
+            }
+        }
+        if (!overflow) {
+            return n;
+        }
+    }
+    los[0] = lo;
+    his[0] = hi;
+    return 1;
+}
+#else
+static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los, uintptr_t* his, int max) {
+    if (hi <= lo || max < 1) {
+        return 0;
+    }
+    los[0] = lo;
+    his[0] = hi;
+    return 1;
+}
+#endif
+
 #endif // VGC_PLATFORM_H
