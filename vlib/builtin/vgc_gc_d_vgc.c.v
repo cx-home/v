@@ -1917,8 +1917,25 @@ fn vgc_walk_adapt(walked_ns u64) {
 fn vgc_mark_adapt(marked u64) {
 	kb := marked / 1024 + 1
 	rate := vgc_mark_last_ns / kb
+	// cx-private#1910 cut 1: a concurrent cycle's mark is its middle, run
+	// beside the mutators, so it is slower per KB than a stop-the-world mark
+	// of the same heap; a parallel probe is judged against the single-marker
+	// baseline of its own kind. One baseline for both let a probe of one kind
+	// meet the other kind's baseline: the door's first parallel probe landing
+	// on a concurrent cycle lost against the start-up's stop-the-world rate,
+	// the plan halved to one marker for 32 cycles and never ramped (0 of 189
+	// cycles at eight markers against bump H's 158, its stop-the-world cycles
+	// marking 62 MB in 20 ms, pause p99 26-28 ms against 5-11).
+	mut cm := false
+	$if vgc_concurrent ? {
+		cm = vgc_cm_this_cycle
+	}
 	if vgc_mark_nworkers_cur <= 1 {
-		vgc_mark_rate1 = if vgc_mark_rate1 == 0 { rate } else { (vgc_mark_rate1 * 7 + rate) / 8 }
+		if cm {
+			vgc_mark_rate1_cm = if vgc_mark_rate1_cm == 0 { rate } else { (vgc_mark_rate1_cm * 7 + rate) / 8 }
+		} else {
+			vgc_mark_rate1 = if vgc_mark_rate1 == 0 { rate } else { (vgc_mark_rate1 * 7 + rate) / 8 }
+		}
 		return
 	}
 	if vgc_mark_backoff > 0 {
@@ -1928,7 +1945,8 @@ fn vgc_mark_adapt(marked u64) {
 		}
 		return
 	}
-	if vgc_mark_rate1 > 0 && rate * 10 > vgc_mark_rate1 * 9 {
+	base := if cm { vgc_mark_rate1_cm } else { vgc_mark_rate1 }
+	if base > 0 && rate * 10 > base * 9 {
 		mut n := vgc_mark_nworkers_cur / 2
 		if n < 1 {
 			n = 1

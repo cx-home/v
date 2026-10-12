@@ -930,6 +930,8 @@ __global vgc_mark_nworkers_cur = int(1)
 // marker count — what the next cycle plans its marker count from
 __global vgc_mark_last_work_ns = u64(0)
 __global vgc_mark_rate1 = u64(0)
+// cx-private#1910 cut 1: the single-marker baseline of the concurrent middles (vgc_mark_adapt)
+__global vgc_mark_rate1_cm = u64(0)
 // ns per marked KB with one marker (a running mean)
 __global vgc_mark_n_target = int(0)
 // a reduced marker count while backing off (0 = the configured count)
