@@ -219,7 +219,7 @@ fn vgc_gc_start() {
 
 	// === Phase 2: Mark (parallel) ===
 	// Enable write barrier (for concurrent correctness)
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 1)
+	vgc_wb_set(1)
 
 	// NOTE: the collector's own stack range was already recorded (with
 	// registers spilled) by the vgc_run_gc_spilled trampoline before this
@@ -308,7 +308,7 @@ fn vgc_gc_start() {
 	}
 
 	// Disable write barrier (cx-home/v#15: the permanent regime stays)
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, vgc_perm_on * 2)
+	vgc_wb_set(vgc_perm_on * 2)
 
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
@@ -1066,6 +1066,8 @@ fn vgc_perm_promote() {
 	$if vgc_concurrent ? {
 		mut nsp := u64(0)
 		mut nbytes_total := u64(0)
+		mut lo := vgc_perm_lo
+		mut hi := vgc_perm_hi
 		for i in 0 .. vgc_heap.nspans {
 			span := unsafe { vgc_heap.allspans[i] }
 			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
@@ -1107,6 +1109,45 @@ fn vgc_perm_promote() {
 			}
 			nsp++
 			nbytes_total += u64(count) * u64(span.elem_size)
+			if lo == 0 || span.base < lo {
+				lo = span.base
+			}
+			end := span.base + usize(span.npages) * vgc_page_size
+			if end > hi {
+				hi = end
+			}
+		}
+		vgc_perm_lo = lo
+		vgc_perm_hi = hi
+		vgc_perm_len = hi - lo
+		// the page bitmap over the range (a promotion that widened the range
+		// takes a fresh one; the old is left to the OS at exit — promotions are
+		// one or two per process)
+		if hi > lo {
+			npg := (hi - lo + vgc_page_size - 1) / vgc_page_size
+			nwords := (npg + 63) / 64
+			if nwords > vgc_perm_pages_n || vgc_perm_pages == unsafe { nil } {
+				vgc_perm_pages = unsafe { &u64(C.vgc_os_alloc(nwords * 8)) }
+				vgc_perm_pages_n = if vgc_perm_pages != unsafe { nil } { nwords } else { 0 }
+			}
+			if vgc_perm_pages != unsafe { nil } {
+				unsafe { C.memset(vgc_perm_pages, 0, nwords * 8) }
+				for i in 0 .. vgc_heap.nspans {
+					span := unsafe { vgc_heap.allspans[i] }
+					if span == unsafe { nil } || !span.in_use || span.perm == 0 {
+						continue
+					}
+					p0 := (span.base - lo) / vgc_page_size
+					for k in 0 .. usize(span.npages) {
+						pg := p0 + k
+						if pg < npg {
+							unsafe {
+								vgc_perm_pages[pg / 64] |= u64(1) << (pg % 64)
+							}
+						}
+					}
+				}
+			}
 		}
 		vgc_perm_spans = nsp
 		vgc_perm_bytes = nbytes_total
@@ -1226,7 +1267,7 @@ fn vgc_gc_start_concurrent() {
 	// The barrier and alloc-gray are live BEFORE the roots are taken and
 	// before any mutator runs again: gc_phase is already vgc_phase_mark (the
 	// CAS above), which vgc_alloc_black_hook tests; wb_enabled gates the barrier.
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 1)
+	vgc_wb_set(1)
 	vgc_scan_suspended_roots(self_idx)
 	vgc_ph[2] = C.vgc_now_ns()
 	vgc_mark_roots() // sets vgc_ph[3], vgc_ph[4]
@@ -1281,7 +1322,7 @@ fn vgc_gc_start_concurrent() {
 	} else {
 		1
 	})
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, vgc_perm_on * 2) // cx-home/v#15: the permanent regime stays
+	vgc_wb_set(vgc_perm_on * 2) // cx-home/v#15: the permanent regime stays
 
 	marked := vgc_count_marked()
 	vgc_ph[6] = C.vgc_now_ns()
@@ -2603,6 +2644,19 @@ pub fn vgc_wb_store(obj voidptr) {
 		}
 		if obj == unsafe { nil } {
 			return
+		}
+		if (mode & 1) == 0 {
+			// the permanent regime alone: only a store into a permanent span's
+			// page can matter
+			addr := usize(obj)
+			if addr < vgc_perm_lo || addr >= vgc_perm_hi {
+				return
+			}
+			pg := (addr - vgc_perm_lo) / vgc_page_size
+			if vgc_perm_pages == unsafe { nil }
+				|| (unsafe { vgc_perm_pages[pg / 64] } & (u64(1) << (pg % 64))) == 0 {
+				return
+			}
 		}
 		span := vgc_find_span(obj)
 		if span != unsafe { nil } && span.in_use && !span.noscan {

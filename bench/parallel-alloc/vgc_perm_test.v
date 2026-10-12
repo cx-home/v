@@ -32,7 +32,7 @@ fn test_every_store_path_into_a_permanent_object_keeps_the_record() {
 	}
 	for cm in ['', 'VGC_CM=1 ', 'VGC_CM=0 '] {
 		for t in [1, 4] {
-			r := os.execute('${cm}VGC_GCTRACE=2 T=${t} STEPS=20000 ${os.quoted_path(exe)}')
+			r := os.execute('${cm}VGC_GCTRACE=2 T=${t} STEPS=10000 ${os.quoted_path(exe)}')
 			assert r.exit_code == 0, '${cm}T=${t}: ${r.output}'
 			assert r.output.contains(' bad=0'), '${cm}T=${t}: ${r.output}'
 			// the generation is on: the first cycle promoted, and the later

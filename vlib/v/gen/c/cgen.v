@@ -1317,6 +1317,12 @@ pub fn (mut g Gen) init() {
 			// unit that compiles builtin; a -usecache module unit (term.termios, ...)
 			// called it undeclared, which C99 refuses.
 			g.cheaders.writeln('void vgc_wb_store(void* obj);')
+			// cx-home/v#15: the gate the stores call instead — no call unless a
+			// concurrent middle is on (vgc_wb_mode bit 0) or the store lands in the
+			// permanent generation's address range (vgc_perm_lo/len, 0 before the
+			// promotion). The globals are builtin's; extern for -usecache units.
+			g.cheaders.writeln('extern unsigned int vgc_wb_mode; extern size_t vgc_perm_lo; extern size_t vgc_perm_len;')
+			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if ((vgc_wb_mode & 1u) || (size_t)(uintptr_t)p - vgc_perm_lo < vgc_perm_len) vgc_wb_store(p); }')
 		}
 		g.cheaders.writeln(c_float_to_unsigned_conversion_functions)
 		if !g.pref.skip_unused || g.table.used_features.safe_int {

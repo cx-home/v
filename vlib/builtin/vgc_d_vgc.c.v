@@ -933,6 +933,31 @@ __global vgc_perm_spans = u64(0)
 __global vgc_perm_bytes = u64(0)
 __global vgc_perm_rescan_ns = u64(0)
 __global vgc_perm_promoted_cycle = u64(0)
+// the address range the permanent spans lie in (vgc_perm_promote): a store
+// outside it cannot target a permanent object, so the barrier returns before
+// the span lookup — nearly every store of a program whose heap grew past its
+// start-up set
+__global vgc_perm_lo = usize(0)
+__global vgc_perm_hi = usize(0)
+// one bit per page of [vgc_perm_lo, vgc_perm_hi): the pages of the permanent
+// spans (vgc_perm_promote), so a store into a page no permanent span covers
+// returns from the barrier after two loads, without the span lookup
+__global vgc_perm_pages = &u64(unsafe { nil })
+__global vgc_perm_pages_n = usize(0)
+// what the generated C's inline gate reads before calling vgc_wb_store
+// (cgen cheaders, vgc_wb_gate): the barrier mode (a mirror of
+// vgc_heap.wb_enabled, stored by vgc_wb_set) and the permanent range's length
+// (0 until the promotion: no call at all)
+__global vgc_wb_mode = u32(0)
+__global vgc_perm_len = usize(0)
+
+// vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
+// middle, bit 1 the permanent regime.
+@[inline]
+fn vgc_wb_set(mode u32) {
+	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, mode)
+	C.vgc_atomic_store_u32(&vgc_wb_mode, mode)
+}
 // the verifier's full re-mark clears to zero (every object traced)
 __global vgc_perm_clear_zero = false
 // the perm_bits slab: 272-byte buffers (perm_bits + young_bits), bump-carved,
@@ -1767,7 +1792,7 @@ fn vgc_atfork_child() {
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 	// cx-home/v#15: the permanent generation survives the fork (the heap is
 	// the parent's copy), so its barrier regime stays on
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, if vgc_perm_on != 0 { u32(2) } else { u32(0) })
+	vgc_wb_set(if vgc_perm_on != 0 { u32(2) } else { u32(0) })
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
 	vgc_gc_owner = -1
 	// The peers did not survive the fork: their slots are unregistered (their

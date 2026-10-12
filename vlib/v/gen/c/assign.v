@@ -611,7 +611,9 @@ fn (g &Gen) cm_is_pure_lvalue(e ast.Expr) bool {
 	}
 }
 
-// gen_cm_write_barrier emits `vgc_wb_store(<base>);` immediately before a
+// gen_cm_write_barrier emits `vgc_wb_gate(<base>);` (the inline gate of
+// cheaders: vgc_wb_store when a concurrent middle is on or the store lands in
+// the permanent generation's range, cx-home/v#15) immediately before a
 // heap-targeted, pointer-bearing store, under `-d vgc_concurrent`. It marks the
 // mutated object's span dirty so the collector re-scans it at mark-termination
 // (vlib/builtin/vgc_gc_d_vgc.c.v::vgc_wb_store / vgc_rescan_dirty_spans). It is
@@ -633,7 +635,7 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	if left_type.has_flag(.shared_f) && left in [ast.Ident, ast.SelectorExpr]
 		&& g.cm_is_pure_lvalue(left) {
 		wrapper := g.expr_string(left)
-		g.writeln('vgc_wb_store((voidptr)(${wrapper}));')
+		g.writeln('vgc_wb_gate((voidptr)(${wrapper}));')
 		return
 	}
 	match left {
@@ -647,7 +649,7 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			if left.expr_type.is_ptr() {
 				if g.cm_is_pure_lvalue(left.expr) {
 					base := g.expr_string(left.expr)
-					g.writeln('vgc_wb_store((voidptr)(${base}));')
+					g.writeln('vgc_wb_gate((voidptr)(${base}));')
 				}
 			} else if left.expr in [ast.SelectorExpr, ast.IndexExpr] {
 				g.gen_cm_write_barrier(left.expr, left.expr_type)
@@ -657,7 +659,7 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			// *p = v
 			if left.op == .mul && g.cm_is_pure_lvalue(left.right) {
 				base := g.expr_string(left.right)
-				g.writeln('vgc_wb_store((voidptr)(${base}));')
+				g.writeln('vgc_wb_gate((voidptr)(${base}));')
 			}
 		}
 		ast.IndexExpr {
@@ -668,10 +670,10 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 					// array's is behind its wrapper (`a->val.data`, as index.v emits).
 					arrow := if left.left_type.is_ptr() { '->' } else { '.' }
 					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
-					g.writeln('vgc_wb_store((voidptr)((${base})${arrow}${val}data));')
+					g.writeln('vgc_wb_gate((voidptr)((${base})${arrow}${val}data));')
 				} else if left.is_farray {
 					// fixed array element: its address is interior to the owning object.
-					g.writeln('vgc_wb_store((voidptr)(&(${base})));')
+					g.writeln('vgc_wb_gate((voidptr)(&(${base})));')
 				}
 				// maps: handled by map_set's own barrier (the key/value buffers move
 				// in bulk inside the builtin, where codegen has no per-store hook).
