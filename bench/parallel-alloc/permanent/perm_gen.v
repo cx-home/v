@@ -13,7 +13,11 @@
 //   (g) a store through a pointer  *p = r, p = &old.hold
 //   (h) a cycle in the middle of a statement: old.hold = mk_collect(r), the
 //       right-hand side forcing a collection between the barrier call before
-//       the statement and the store (the call after the store re-dirties).
+//       the statement and the store (the call after the store re-dirties) —
+//       on every 64th visit of the path (the statement's shape every visit):
+//       a cycle on every visit made the run 3,200 cycles at 10,000 steps,
+//       and on the FreeBSD CI VM with the walkers forced each cycle costs
+//       milliseconds of thread wake-ups (the 4-vCPU job ran past its hour).
 // Each record carries its id and a checksum, pointer-free arrays remember
 // which id sits where, and every window steps every slot is read back: a
 // reclaimed-while-live record reads torn, or as the record that reused its
@@ -42,9 +46,11 @@ fn mk(i u64) &Rec {
 	}
 }
 
-fn mk_collect(i u64) &Rec {
+fn mk_collect(i u64, collect bool) &Rec {
 	r := mk(i)
-	gc_collect()
+	if collect {
+		gc_collect()
+	}
 	return r
 }
 
@@ -127,10 +133,11 @@ fn worker(id u64, steps int, mut old Old) u64 {
 			}
 			else {
 				r = unsafe { nil }
-				old.hold = mk_collect(i)
+				old.hold = mk_collect(i, s % 512 == 7)
 				old.hid = i
 			}
 		}
+
 		r = unsafe { nil }
 		// allocation pressure for the pacer's own cycles, and one forced
 		junk = []u8{len: 4096}

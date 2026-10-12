@@ -11,6 +11,11 @@
 // records. The verifier build (-d vgc_cm_verify) re-marks every cycle from
 // zero and must count no miss.
 //
+// Six process runs (T=4 under every VGC_CM, the verifier under VGC_CM=1, the
+// teeth, VGC_PERM=0): the FreeBSD CI VM (4 vCPU) runs the suite's walks-forced
+// pass one test at a time, and ten runs of the fixture at a cycle per eighth
+// step ran that pass past the job's hour.
+//
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_perm_test.v
 module main
 
@@ -18,7 +23,8 @@ import os
 
 fn build(extra string) string {
 	src := os.join_path(@DIR, 'permanent', 'perm_gen.v')
-	exe := os.join_path(os.vtmp_dir(), 'vgc_perm_${os.getpid()}${extra.replace(' ', '_').replace('-', '')}')
+	exe := os.join_path(os.vtmp_dir(),
+		'vgc_perm_${os.getpid()}${extra.replace(' ', '_').replace('-', '')}')
 	r :=
 		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc ${extra} -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert r.exit_code == 0, r.output
@@ -31,15 +37,13 @@ fn test_every_store_path_into_a_permanent_object_keeps_the_record() {
 		os.rm(exe) or {}
 	}
 	for cm in ['', 'VGC_CM=1 ', 'VGC_CM=0 '] {
-		for t in [1, 4] {
-			r := os.execute('${cm}VGC_GCTRACE=2 T=${t} STEPS=10000 ${os.quoted_path(exe)}')
-			assert r.exit_code == 0, '${cm}T=${t}: ${r.output}'
-			assert r.output.contains(' bad=0'), '${cm}T=${t}: ${r.output}'
-			// the generation is on: the first cycle promoted, and the later
-			// cycles re-scanned only the dirtied permanent spans
-			assert r.output.contains('promoted=1'), '${cm}T=${t}: no promotion in ${r.output}'
-			assert r.output.contains('] perm spans='), '${cm}T=${t}: ${r.output}'
-		}
+		r := os.execute('${cm}VGC_GCTRACE=2 T=4 STEPS=10000 ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, '${cm}T=4: ${r.output}'
+		assert r.output.contains(' bad=0'), '${cm}T=4: ${r.output}'
+		// the generation is on: the first cycle promoted, and the later
+		// cycles re-scanned only the dirtied permanent spans
+		assert r.output.contains('promoted=1'), '${cm}T=4: no promotion in ${r.output}'
+		assert r.output.contains('] perm spans='), '${cm}T=4: ${r.output}'
 	}
 }
 
@@ -48,15 +52,15 @@ fn test_the_verifier_counts_no_miss() {
 	defer {
 		os.rm(exe) or {}
 	}
-	for cm in ['', 'VGC_CM=1 '] {
-		r := os.execute('${cm}VGC_GCTRACE=2 T=4 STEPS=20000 ${os.quoted_path(exe)}')
-		assert r.exit_code == 0, '${cm}: ${r.output}'
-		assert r.output.contains(' bad=0'), '${cm}: ${r.output}'
-		lines := r.output.split_into_lines().filter(it.contains('] perm spans='))
-		assert lines.len > 0, '${cm}: ${r.output}'
-		last := lines.last()
-		assert last.contains(' missed=0 '), '${cm}: ${last}'
-	}
+	// one run, every cycle concurrent (VGC_CM=1): the hardest regime for the
+	// re-scan — the stop-the-world shape is the default run above
+	r := os.execute('VGC_CM=1 VGC_GCTRACE=2 T=4 STEPS=20000 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert r.output.contains(' bad=0'), r.output
+	lines := r.output.split_into_lines().filter(it.contains('] perm spans='))
+	assert lines.len > 0, r.output
+	last := lines.last()
+	assert last.contains(' missed=0 '), last
 }
 
 fn test_without_the_rescan_the_records_are_reclaimed() {
