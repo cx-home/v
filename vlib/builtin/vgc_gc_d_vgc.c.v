@@ -1592,10 +1592,16 @@ fn vgc_mark_roots() {
 			}
 		}
 	}
+	if vgc_rd_on != 0 {
+		vgc_rd_cat = 1
+	}
 	for k in 0 .. nseg {
 		if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
 			vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k])
 		}
+	}
+	if vgc_rd_on != 0 {
+		vgc_rd_cat = 2
 	}
 	// The per-thread cache slots, to the high-water mark only (cx-home/v#27): the
 	// tiny cursor and the in-flight mcache spans are load-bearing roots during
@@ -1611,6 +1617,9 @@ fn vgc_mark_roots() {
 		base := usize(C.vgc_cache_chunk(ci))
 		vgc_scan_range(base, base + usize(n) * usize(sizeof(VGC_Cache)), 0)
 		left -= n
+	}
+	if vgc_rd_on != 0 {
+		vgc_rd_cat = 3
 	}
 	// The suspend records too (the captured register files, this cycle's and
 	// earlier ones'): the fixed BSS tables they replaced were scanned whole with
@@ -1631,7 +1640,15 @@ fn vgc_mark_roots() {
 			continue
 		}
 		if cache.stack_lo > 0 && cache.stack_hi > 0 && cache.stack_hi > cache.stack_lo {
+			if vgc_rd_on != 0 {
+				vgc_rd_cat = u32(10 + i)
+				vgc_rd_base = cache.stack_hi
+			}
 			vgc_scan_range(cache.stack_lo, cache.stack_hi, 0)
+			if vgc_rd_on != 0 {
+				vgc_rd_cat = 0
+				vgc_rd_base = 0
+			}
 			// DIAGNOSTIC (root-scan-miss localizer): does THIS thread's stack hold
 			// a pointer to the watched object? Bounded to the stack ranges only.
 			if vgc_watch_addr != 0 {
@@ -1640,6 +1657,9 @@ fn vgc_mark_roots() {
 		}
 	}
 
+	if vgc_rd_on != 0 {
+		vgc_rd_cat = 5
+	}
 	vgc_ph[4] = C.vgc_now_ns()
 
 	// Shade pinned objects — cgo-safe explicit roots (see vgc_pin). A live object
@@ -1651,6 +1671,7 @@ fn vgc_mark_roots() {
 	for k in 0 .. np {
 		vgc_shade(usize(unsafe { vgc_pins[k] }), 0)
 	}
+	vgc_rd_cat = 0
 }
 
 // vgc_scan_data_range scans a data-segment range as vgc_scan_range does, minus
@@ -1727,6 +1748,15 @@ fn vgc_scan_touched(lo usize, hi usize) {
 // Translated from Go's scanblock() with conservative pointer finding.
 // `w` is the marker's slot (0 = the collector; cx-home/v#16): the work buffer
 // a newly greyed object is pushed to.
+__global vgc_rd_on = u32(0)
+__global vgc_rd_cat = u32(0)
+__global vgc_rd_where = usize(0)
+__global vgc_rd_base = usize(0)
+__global vgc_rd_min = u64(65536)
+__global vgc_rd_count = u64(0)
+__global vgc_rd_bt_done = u64(999999)
+__global vgc_rd_sz = u64(512)
+
 fn vgc_scan_range(lo usize, hi usize, w int) {
 	// Align to word boundaries
 	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
@@ -1734,7 +1764,25 @@ fn vgc_scan_range(lo usize, hi usize, w int) {
 	for addr + sizeof(usize) <= hi {
 		val := unsafe { *(&usize(voidptr(addr))) }
 		if val != 0 {
-			vgc_shade(val, w)
+			if vgc_rd_cat != 0 {
+				vgc_rd_where = addr
+				cat := vgc_rd_cat
+				before := vgc_rd_count
+				vgc_shade(val, w)
+				vgc_rd_cat = 0
+				vgc_drain_mark_work(w)
+				vgc_rd_cat = cat
+				got := vgc_rd_count - before
+				if got >= 4000 && cat >= 10 && vgc_rd_bt_done != vgc_heap.gc_cycle {
+					vgc_rd_bt_done = vgc_heap.gc_cycle
+					C.vgc_rd_bt(vgc_rd_base)
+				}
+				if got >= 200 {
+					C.fprintf(C.stderr, c'[rootdiag gc %llu] cat=%u where=%p off=%lld val=%p reaches=%llu objs of %llu B\n', vgc_heap.gc_cycle, cat, voidptr(addr), i64(vgc_rd_base) - i64(addr), voidptr(val), got, vgc_rd_sz)
+				}
+			} else {
+				vgc_shade(val, w)
+			}
 		}
 		addr += sizeof(usize)
 	}
@@ -1782,6 +1830,12 @@ fn vgc_shade(addr usize, w int) {
 			} else {
 				C.vgc_bitmap_test_and_set(span.mark_bits, obj_idx)
 			}
+		}
+		if was == 0 && vgc_rd_on != 0 && u64(span.elem_size) == vgc_rd_sz {
+			vgc_rd_count++
+		}
+		if was == 0 && vgc_rd_cat != 0 && u64(span.elem_size) >= vgc_rd_min {
+			C.fprintf(C.stderr, c'[rootdiag gc %llu] cat=%u where=%p off=%lld obj=%p size=%u\n', vgc_heap.gc_cycle, vgc_rd_cat, voidptr(vgc_rd_where), i64(vgc_rd_base) - i64(vgc_rd_where), voidptr(span.base + usize(obj_idx) * usize(span.elem_size)), span.elem_size)
 		}
 		if was == 0 {
 			// Newly marked - add to work queue for scanning (only if it may contain pointers)

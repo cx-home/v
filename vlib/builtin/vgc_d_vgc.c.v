@@ -64,6 +64,7 @@ fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
 fn C.vgc_ctz64(x u64) int // lowest set bit of a non-zero word (cx-private#1910: the pool summary)
 fn C.vgc_size_class(size u32) u8
 fn C.vgc_get_class_size(cls int) u32
+fn C.vgc_rd_bt(hi usize)
 fn C.vgc_get_class_npages(cls int) u32
 fn C.vgc_get_class_nobjs(cls int) u32
 fn C.vgc_init_size_tables()
@@ -1736,6 +1737,17 @@ pub fn vgc_init() {
 	}
 	vgc_heap.gc_enabled = 1
 	vgc_heap.gc_percent = 100
+	if C.getenv(c'VGC_ROOTDIAG') != unsafe { nil } {
+		vgc_rd_on = 1
+		rds := C.getenv(c'VGC_ROOTDIAG_SZ')
+		if rds != unsafe { nil } {
+			vgc_rd_sz = u64(C.atoll(rds))
+		}
+		rdm := C.getenv(c'VGC_ROOTDIAG_MIN')
+		if rdm != unsafe { nil } {
+			vgc_rd_min = u64(C.atoll(rdm))
+		}
+	}
 	gogc_env := C.getenv(c'VGC_GOGC')
 	if gogc_env != unsafe { nil } {
 		gp := C.atoll(gogc_env)

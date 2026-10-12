@@ -2640,3 +2640,23 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
 #endif
 
 #endif // VGC_PLATFORM_H
+
+#if defined(__APPLE__)
+/* EXPERIMENT (gaps2, cx-private#1869): the frame-pointer chain of the calling
+   thread, each frame's offset below `hi` and its return address's symbol. */
+static inline void vgc_rd_bt(uintptr_t hi) {
+    void **fp = (void **)__builtin_frame_address(0);
+    for (int i = 0; i < 400 && fp; i++) {
+        void *lr = fp[1];
+        Dl_info info; memset(&info, 0, sizeof info);
+        dladdr(lr, &info);
+        fprintf(stderr, "[rd-bt] frame=%d fp_off=%lld lr=%p %s+%lld\n", i, (long long)((intptr_t)hi - (intptr_t)fp), lr,
+                info.dli_sname ? info.dli_sname : "?", info.dli_saddr ? (long long)((char *)lr - (char *)info.dli_saddr) : 0LL);
+        void **next = (void **)fp[0];
+        if (next <= fp) break;
+        fp = next;
+    }
+}
+#else
+static inline void vgc_rd_bt(uintptr_t hi) { (void)hi; }
+#endif
