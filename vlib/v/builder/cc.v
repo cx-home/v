@@ -723,6 +723,42 @@ fn cc_from_pref_ccompiler_type(cc_type pref.CompilerType) CC {
 	}
 }
 
+// vgc_auto_var_init_flag returns `-ftrivial-auto-var-init=zero` for a `-gc e`
+// build whose C compiler (clang or gcc) accepts it, none otherwise — see the
+// note at its use in setup_ccompiler_options (cx-private#1910 cut 1). The probe
+// compiles an empty program once per compiler path and keeps the answer in
+// the V temp dir.
+fn (mut v Builder) vgc_auto_var_init_flag(ccompiler string, cc CC) ?string {
+	if v.pref.gc_mode != .vgc || cc !in [.clang, .gcc] {
+		return none
+	}
+	if 'vgc_no_auto_var_init' in v.pref.compile_defines {
+		return none
+	}
+	flag := '-ftrivial-auto-var-init=zero'
+	mut key := ''
+	for ch in ccompiler {
+		key += if ch.is_alnum() { ch.ascii_str() } else { '_' }
+	}
+	if key.len > 80 {
+		key = key[key.len - 80..]
+	}
+	cache := os.join_path(os.vtmp_dir(), 'vgc_auto_var_init_${key}.txt')
+	if os.exists(cache) {
+		answer := os.read_file(cache) or { '' }
+		return if answer.trim_space() == 'yes' { flag } else { none }
+	}
+	src := os.join_path(os.vtmp_dir(), 'vgc_auto_var_init_probe_${os.getpid()}.c')
+	obj := src + '.o'
+	os.write_file(src, 'int main(void) { return 0; }\n') or { return none }
+	res := os.execute('${os.quoted_path(ccompiler)} ${flag} -c -o ${os.quoted_path(obj)} ${os.quoted_path(src)}')
+	os.rm(src) or {}
+	os.rm(obj) or {}
+	ok := res.exit_code == 0
+	os.write_file(cache, if ok { 'yes' } else { 'no' }) or {}
+	return if ok { flag } else { none }
+}
+
 fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 	mut ccoptions := CcompilerOptions{}
 
@@ -886,6 +922,20 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		optimization_options = ['-Ofast']
 	}
 
+	// cx-private#1910 cut 1: a `-gc e` build zero-initializes its automatic
+	// variables (clang/gcc -ftrivial-auto-var-init=zero). The collector scans
+	// the mutators' stacks conservatively, so a frame's never-written slots
+	// (padding holes, uninitialized locals) carry residue of deeper frames —
+	// heap pointers of objects long dropped — and every such word retains a
+	// subtree: json-codec 1 MB x100 read 72 MB peak RSS against 59 on the
+	// previous fork pin from the runtime's frame-layout shift alone (the root
+	// diag: 364 objects shaded from the stacks against 279, the data segments
+	// identical), 57 MB with the flag, time unchanged. Probed once per
+	// compiler (an older gcc or clang refuses the flag) and cached under the
+	// temp dir; -d vgc_no_auto_var_init leaves it out (an A/B knob).
+	if avi := v.vgc_auto_var_init_flag(ccompiler, ccoptions.cc) {
+		ccoptions.args << avi
+	}
 	if ccoptions.debug_mode {
 		ccoptions.args << debug_options
 	}
