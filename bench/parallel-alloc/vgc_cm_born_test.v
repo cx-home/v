@@ -11,14 +11,20 @@
 //
 // concurrent_born/born.v: main holds LIVE_MB of pointer-bearing records while
 // THREADS workers allocate 1 KB records into rolling windows for OPS steps each,
-// under VGC_CM=1 (every cycle concurrent).
+// under VGC_CM=1 (every cycle concurrent); the sizes are the consts below.
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_cm_born_test.v
 module main
 
 import os
 
-const live_mb = 48
+// 32 MB live, four churners, 150k steps each: the unbounded run's middles on a
+// loaded 4-vCPU runner stretch to seconds (CI vgc 38199673788, FreeBSD: 139-216
+// s for the 48 MB / eight-churner / 400k shape), and each one's births are
+// floating garbage the runner must hold
+const live_mb = 32
+const threads = 4
+const ops = 150000
 
 struct Cycle {
 	marked_mb u64
@@ -44,7 +50,7 @@ fn field(line string, key string) u64 {
 
 // the concurrent cycles of one run: the [gc N] line paired with its cm line
 fn run(exe string, env string) []Cycle {
-	r := os.execute('${env} VGC_CM=1 VGC_GCTRACE=2 LIVE_MB=${live_mb} THREADS=8 OPS=400000 ${os.quoted_path(exe)}')
+	r := os.execute('${env} VGC_CM=1 VGC_GCTRACE=2 LIVE_MB=${live_mb} THREADS=${threads} OPS=${ops} ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	assert r.output.contains('live_nodes=${live_mb * 1024 * 1024 / 64} '), r.output
 	mut out := []Cycle{}
@@ -129,7 +135,7 @@ fn test_the_middle_stops_at_the_born_bound() {
 		}
 		cuts += c.cut
 	}
-	assert cuts >= 1, 'no cut middle under eight hot allocators: ${bounded}'
+	assert cuts >= 1, 'no cut middle under ${threads} hot allocators: ${bounded}'
 	um := median(mut ub)
 	bm := median(mut bb)
 	assert um > 0 && bm > 0, 'no births seen: unbounded ${unbounded}, bounded ${bounded}'

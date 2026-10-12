@@ -775,12 +775,18 @@ fn vgc_stw_resume(self_idx int) {
 
 // cx-private#1910 cut 1: the births a concurrent middle would see, predicted
 // from the allocation since the last cycle over its interval (the rate) times
-// twice the last mark's wall (the middle runs beside the mutators, so it is
-// slower than the stop's mark), against the born bound (VGC_CM_BORN_PCT of the
-// live set, at least 4 MB; 0 = no bound, always fits). Read at the trigger,
-// before the stop: the per-thread deltas are a racy read, the rate an
-// estimate — the cut (vgc_cm_cut) is the bound's guarantee, this is its
-// forecast, so a probe known to lose on space is not run.
+// the last mark's wall, against twice the born bound (VGC_CM_BORN_PCT of the
+// live set, at least 4 MB; 0 = no bound, always fits): the cut's own
+// overshoot is about a bound (the stop's latency times the rate), so a probe
+// forecast past two bounds would be cut at once and leave that much floating
+// garbage for nothing. Read at the trigger, before the stop: the per-thread
+// deltas are a racy read, the rate an estimate — the cut (vgc_cm_cut) is the
+// bound's guarantee, this is its forecast, so a probe known to lose on space
+// is not run. The forecast is deliberately not stricter: a loaded box
+// stretches the stop-the-world mark (the door's 22 ms at load 40 against 5 ms
+// quiet), and a forecast of twice that mark against one bound sent the door
+// — the workload the concurrent cycle is for — to stop-the-world cycles,
+// pause p50 1.6 -> 25 ms.
 fn vgc_cm_born_fits() bool {
 	if vgc_cm_born_pct == 0 || vgc_gc_last_end == 0 {
 		return true
@@ -802,11 +808,11 @@ fn vgc_cm_born_fits() bool {
 	if bound < vgc_cm_born_min {
 		bound = vgc_cm_born_min
 	}
-	// since x (2 x mark) / interval, without overflow: the rate in bytes per
+	// since x mark / interval, without overflow: the rate in bytes per
 	// millisecond first
 	rate_per_ms := since / (interval / 1000000 + 1)
-	pred := rate_per_ms * (2 * vgc_mark_last_ns / 1000000 + 1)
-	return pred <= bound
+	pred := rate_per_ms * (vgc_mark_last_ns / 1000000 + 1)
+	return pred <= 2 * bound
 }
 
 // cx-private#1910: this cycle's stop-the-world time (the two windows), the
@@ -1114,9 +1120,11 @@ fn vgc_gc_start_concurrent() {
 	if vgc_cm_mode == 2 && vgc_stw_last_pause_ns > 0 {
 		// at least half the pause must be bought: the middle costs the mutators
 		// the markers' cores and the allocation that runs through it (RSS)
-		// (cut 1: a middle the births cut short is a loss too — its mark
-		// ran under the stop, and the probe cost its bound in floating garbage)
-		if vgc_cm_pause_ns * 2 >= vgc_stw_last_pause_ns || vgc_cm_cut_last {
+		// (cut 1: a middle the births cut short is judged by its stops like
+		// any other — the cut bounds what the probe cost in floating garbage,
+		// and a workload whose middles always cut still keeps the shorter
+		// stops it buys; the pacing is netted either way)
+		if vgc_cm_pause_ns * 2 >= vgc_stw_last_pause_ns {
 			vgc_cm_backoff = vgc_cm_backoff_len
 			if vgc_cm_backoff_len < 64 {
 				vgc_cm_backoff_len *= 2
