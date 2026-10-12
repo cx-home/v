@@ -110,6 +110,7 @@ fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the 
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
+fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -236,6 +237,22 @@ mut:
 	// object is born in this scan span during the concurrent mark; the span is
 	// re-scanned at termination (alloc-gray) and the flag cleared there.
 	born u32
+	// cx-home/v#15 (vgc_concurrent): the permanent generation. perm is set when
+	// this span holds objects promoted by vgc_perm_promote (the live set of the
+	// promotion cycle, the interpreter's start-up structures); perm_bits (one
+	// bit per slot, a 136-byte buffer from vgc_perm_bits_alloc) names them. The
+	// clear walk starts every cycle's mark bits from perm_bits instead of zero,
+	// so a permanent object is black from the start and is never traced; the
+	// pointers it holds into later generations are found by the dirty re-scan
+	// (vgc_wb_store dirties a permanent span on every store, in and out of a
+	// cycle, and vgc_rescan_dirty_spans runs in every cycle's stop). The 136
+	// bytes after perm_bits are the span's young_bits: the permanent objects
+	// that hold a pointer to a NON-permanent object as of the last re-scan —
+	// those are scanned again at every stop (a young object referenced only
+	// from a permanent one must be found at every cycle), the rest of the span
+	// only when a store dirtied it.
+	perm      u32
+	perm_bits &u8 = unsafe { nil }
 	// Linked list pointers — SHARED between the central partial/full lists and the
 	// free_spans recycle list (a span is on at most one at a time).
 	next &VGC_Span = unsafe { nil }
@@ -898,6 +915,65 @@ __global vgc_cm_born_pct = u64(25)
 __global vgc_cm_cut = u32(0)
 __global vgc_cm_born_last = u64(0)
 __global vgc_cm_cut_last = false
+// cx-home/v#15 lever 2: the permanent generation (vgc_concurrent only: it
+// rests on the codegen write barrier). VGC_PERM: 0 = off, 1 (default) = the
+// live set of the promotion cycle — VGC_PERM_CYCLE (default 1: the first
+// cycle, the interpreter's start-up structures) or the first stop-the-world
+// cycle after vgc_set_permanent — is promoted: pre-marked at every clear,
+// never traced again, never swept; the pointers it holds into later
+// generations are found by the dirty re-scan of its spans (every pointer
+// store into a permanent span dirties it, before and after the store —
+// vgc_wb_store; see vgc_perm_promote for the soundness argument). A later
+// vgc_set_permanent promotes the live set of that cycle on top.
+__global vgc_perm_mode = int(1)
+__global vgc_perm_cycle = u64(1)
+__global vgc_perm_on = u32(0)
+__global vgc_perm_request = false
+__global vgc_perm_spans = u64(0)
+__global vgc_perm_bytes = u64(0)
+__global vgc_perm_rescan_ns = u64(0)
+__global vgc_perm_promoted_cycle = u64(0)
+// the verifier's full re-mark clears to zero (every object traced)
+__global vgc_perm_clear_zero = false
+// the perm_bits slab: 272-byte buffers (perm_bits + young_bits), bump-carved,
+// never returned (a span keeps its buffer across recycling, zeroed by span_init)
+__global vgc_perm_slab_cur = usize(0)
+__global vgc_perm_slab_end = usize(0)
+__global vgc_perm_young_objs = u64(0)
+
+// vgc_perm_bits_alloc hands out one perm_bits + young_bits pair (STW, the collector).
+fn vgc_perm_bits_alloc() &u8 {
+	if vgc_perm_slab_cur + 272 > vgc_perm_slab_end {
+		chunk := usize(64) * 1024
+		p := C.vgc_os_alloc(chunk)
+		if p == unsafe { nil } {
+			return unsafe { nil }
+		}
+		vgc_perm_slab_cur = usize(p)
+		vgc_perm_slab_end = usize(p) + chunk
+	}
+	r := vgc_perm_slab_cur
+	vgc_perm_slab_cur += 272
+	return unsafe { &u8(voidptr(r)) }
+}
+
+@[inline]
+fn vgc_young_bits(span &VGC_Span) &u8 {
+	return unsafe { &u8(voidptr(usize(span.perm_bits) + 136)) }
+}
+
+// vgc_set_permanent asks the collector to promote the live set of its next
+// stop-the-world cycle to the permanent generation (cx-home/v#15): an
+// embedder calls it once its long-lived structures are built. Under VGC_PERM=0
+// or a build without the concurrent collector it does nothing.
+@[markused]
+pub fn vgc_set_permanent() {
+	$if vgc_concurrent ? {
+		if vgc_perm_mode != 0 {
+			vgc_perm_request = true
+		}
+	}
+}
 const vgc_cm_born_flush = u64(256) * 1024
 const vgc_cm_born_min = u64(4) << 20
 // the last cycle's root scan (suspended registers, data segments, stacks)
@@ -1689,7 +1765,9 @@ fn vgc_atfork_child() {
 	// bits are cleared by its first cycle, a span's dirty/born flags cost one
 	// re-scan at most.
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
+	// cx-home/v#15: the permanent generation survives the fork (the heap is
+	// the parent's copy), so its barrier regime stays on
+	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, if vgc_perm_on != 0 { u32(2) } else { u32(0) })
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
 	vgc_gc_owner = -1
 	// The peers did not survive the fork: their slots are unregistered (their
@@ -1866,6 +1944,23 @@ pub fn vgc_init() {
 				vgc_cm_born_pct = u64(cmb)
 			}
 		}
+		// cx-home/v#15 lever 2: the permanent generation and its promotion cycle
+		perm_env := C.getenv(c'VGC_PERM')
+		if perm_env != unsafe { nil } {
+			pv := C.atoll(perm_env)
+			if pv >= 0 && pv <= 1 {
+				vgc_perm_mode = int(pv)
+			}
+		}
+		pc_env := C.getenv(c'VGC_PERM_CYCLE')
+		if pc_env != unsafe { nil } {
+			pc := C.atoll(pc_env)
+			if pc >= 1 {
+				vgc_perm_cycle = u64(pc)
+			}
+		}
+	} $else {
+		vgc_perm_mode = 0
 	}
 	ww_env := C.getenv(c'VGC_WALK_WORKERS')
 	if ww_env != unsafe { nil } {
@@ -4033,6 +4128,11 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	span.is_tiny = false // reset on (re)use; set true only when the tiny allocator carves a packed block
 	span.dirty = 0 // concurrent mark: a recycled span starts clean
 	span.born = 0
+	// cx-home/v#15: a recycled span holds no permanent object (its buffer stays)
+	span.perm = 0
+	if span.perm_bits != unsafe { nil } {
+		unsafe { C.memset(span.perm_bits, 0, 272) }
+	}
 
 	// Bitmaps are inline in the span (alloc_buf/mark_buf); point the working pointers
 	// at them and zero the bytes in use. nobjs <= 1024 -> bitmap_size <= 128 <= 136,
@@ -4954,6 +5054,10 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		span.noscan = noscan
 		span.is_tiny = false // large spans are never tiny-packed (reset in case of a recycled span)
 		span.dirty = 0 // concurrent mark: recycled large span starts clean
+		span.perm = 0 // cx-home/v#15
+		if span.perm_bits != nil {
+			C.memset(span.perm_bits, 0, 272)
+		}
 		span.elem_size = u32(n)
 		span.nelems = 1
 		span.alloc_count = 1
@@ -5143,6 +5247,20 @@ fn vgc_free(ptr voidptr) {
 	// churn reproducer + TSan (the exact race the lock was added for).
 	mask := u8(1) << (obj_idx & 7)
 	byte_ptr := unsafe { &u8(voidptr(usize(span.alloc_bits) + usize(obj_idx >> 3))) }
+	$if vgc_concurrent ? {
+		// cx-home/v#15: a permanent object freed here leaves the permanent
+		// generation BEFORE its slot can be reused — the slot's next occupant is
+		// an ordinary young object (traced, swept), not a pre-marked one whose
+		// initializing stores no barrier covers. The clear walk takes the bit
+		// away at the next cycle; the stale mark bit until then only keeps the
+		// slot out of that cycle's garbage, which the free already accounted.
+		if span.perm != 0 && span.perm_bits != unsafe { nil } {
+			unsafe {
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + usize(obj_idx >> 3))), ~mask)
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + 136 + usize(obj_idx >> 3))), ~mask)
+			}
+		}
+	}
 	if span.on_central == 0 {
 		$if vgc_birthcheck ? {
 			vgc_bw_check(usize(byte_ptr), mask, 0xc1ea1)

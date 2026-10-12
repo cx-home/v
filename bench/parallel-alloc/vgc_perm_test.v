@@ -1,0 +1,80 @@
+// vgc_perm_test.v — the permanent generation (cx-home/v#15 lever 2, the
+// `-gc e` default): the live set of the first cycle is pre-marked at every
+// later cycle and never traced; a pointer stored into it afterwards is found
+// through the span's dirty bit (vgc_wb_store, called before and after every
+// pointer store) and the stop's re-scan. permanent/perm_gen.v stores the only
+// reference to a fresh record into permanent objects by every path (a field, a
+// nested value's field, an array buffer, a fixed array, a regrowing push, a
+// map, a store through a pointer, a statement whose right-hand side collects)
+// and reads every record back after cycles. The teeth: built with
+// -d vgc_cm_nobarrier (the re-scan skipped) the same program reclaims live
+// records. The verifier build (-d vgc_cm_verify) re-marks every cycle from
+// zero and must count no miss.
+//
+// Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_perm_test.v
+module main
+
+import os
+
+fn build(extra string) string {
+	src := os.join_path(@DIR, 'permanent', 'perm_gen.v')
+	exe := os.join_path(os.vtmp_dir(), 'vgc_perm_${os.getpid()}${extra.replace(' ', '_').replace('-', '')}')
+	r :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc ${extra} -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	assert r.exit_code == 0, r.output
+	return exe
+}
+
+fn test_every_store_path_into_a_permanent_object_keeps_the_record() {
+	exe := build('')
+	defer {
+		os.rm(exe) or {}
+	}
+	for cm in ['', 'VGC_CM=1 ', 'VGC_CM=0 '] {
+		for t in [1, 4] {
+			r := os.execute('${cm}VGC_GCTRACE=2 T=${t} STEPS=20000 ${os.quoted_path(exe)}')
+			assert r.exit_code == 0, '${cm}T=${t}: ${r.output}'
+			assert r.output.contains(' bad=0'), '${cm}T=${t}: ${r.output}'
+			// the generation is on: the first cycle promoted, and the later
+			// cycles re-scanned only the dirtied permanent spans
+			assert r.output.contains('promoted=1'), '${cm}T=${t}: no promotion in ${r.output}'
+			assert r.output.contains('] perm spans='), '${cm}T=${t}: ${r.output}'
+		}
+	}
+}
+
+fn test_the_verifier_counts_no_miss() {
+	exe := build('-d vgc_cm_verify')
+	defer {
+		os.rm(exe) or {}
+	}
+	for cm in ['', 'VGC_CM=1 '] {
+		r := os.execute('${cm}VGC_GCTRACE=2 T=4 STEPS=20000 ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, '${cm}: ${r.output}'
+		assert r.output.contains(' bad=0'), '${cm}: ${r.output}'
+		lines := r.output.split_into_lines().filter(it.contains('] perm spans='))
+		assert lines.len > 0, '${cm}: ${r.output}'
+		last := lines.last()
+		assert last.contains(' missed=0 '), '${cm}: ${last}'
+	}
+}
+
+fn test_without_the_rescan_the_records_are_reclaimed() {
+	exe := build('-d vgc_cm_nobarrier')
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('T=4 STEPS=20000 ${os.quoted_path(exe)}')
+	assert r.exit_code != 0 || !r.output.contains(' bad=0'), 'no teeth: ${r.output}'
+}
+
+fn test_vgc_perm_0_turns_the_generation_off() {
+	exe := build('')
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('VGC_PERM=0 VGC_GCTRACE=2 T=2 STEPS=10000 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert r.output.contains(' bad=0'), r.output
+	assert !r.output.contains('] perm spans='), r.output
+}

@@ -639,11 +639,18 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	match left {
 		ast.SelectorExpr {
 			// (*base).field = v : dirty *base's span, but only when base is a pointer
-			// (a heap object). A value-struct selector lives on the stack / inline in
-			// its owner, covered by the termination root re-scan or the owner's store.
-			if left.expr_type.is_ptr() && g.cm_is_pure_lvalue(left.expr) {
-				base := g.expr_string(left.expr)
-				g.writeln('vgc_wb_store((voidptr)(${base}));')
+			// (a heap object). A value-struct selector is inline in its owner: the
+			// store goes to whatever holds the owner (cx-home/v#15: `p.inner.f = v`
+			// writes p's object; `a[i].f = v` the array's buffer), so the owner's
+			// own store target is dirtied; a value struct in a local is the stack,
+			// covered by the root scan.
+			if left.expr_type.is_ptr() {
+				if g.cm_is_pure_lvalue(left.expr) {
+					base := g.expr_string(left.expr)
+					g.writeln('vgc_wb_store((voidptr)(${base}));')
+				}
+			} else if left.expr in [ast.SelectorExpr, ast.IndexExpr] {
+				g.gen_cm_write_barrier(left.expr, left.expr_type)
 			}
 		}
 		ast.PrefixExpr {
@@ -674,18 +681,37 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	}
 }
 
+// assign_stmt wraps the statement in the concurrent-mark write barrier
+// (-d vgc_concurrent): the span of each heap-targeted pointer-bearing store
+// target is dirtied BEFORE the statement (before the RHS evaluation and the
+// store: a mutator can be suspended mid-statement, so dirty-before-store is
+// what makes the termination re-scan see the store) and AGAIN AFTER it
+// (cx-home/v#15 lever 2: the permanent generation keeps a span's dirty bit
+// across cycles, and a cycle that ran during the RHS evaluation — or while the
+// mutator was suspended between the first call and its store — cleared the
+// bit before the store landed; the second call sets it again, so the next
+// cycle re-scans the span). Both calls are the same idempotent barrier on the
+// same pure lvalue base, which the store does not change. Declarations
+// (decl_assign) create a fresh var (alloc-black if heap) and need no barrier.
 fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
-	mut node := unsafe { node_ }
-	// Concurrent-mark write barrier (-d vgc_concurrent): dirty the span of each
-	// heap-targeted pointer-bearing store target BEFORE the store (and before RHS
-	// evaluation), so the collector re-scans it at mark-termination. Declarations
-	// (decl_assign) create a fresh var (alloc-black if heap) and need no barrier.
-	if node.op != .decl_assign && 'vgc_concurrent' in g.pref.compile_defines {
-		for i, lx in node.left {
-			lt := if i < node.left_types.len { node.left_types[i] } else { ast.void_type }
+	cm := node_.op != .decl_assign && 'vgc_concurrent' in g.pref.compile_defines
+	if cm {
+		for i, lx in node_.left {
+			lt := if i < node_.left_types.len { node_.left_types[i] } else { ast.void_type }
 			g.gen_cm_write_barrier(lx, lt)
 		}
 	}
+	g.assign_stmt_body(node_)
+	if cm {
+		for i, lx in node_.left {
+			lt := if i < node_.left_types.len { node_.left_types[i] } else { ast.void_type }
+			g.gen_cm_write_barrier(lx, lt)
+		}
+	}
+}
+
+fn (mut g Gen) assign_stmt_body(node_ ast.AssignStmt) {
+	mut node := unsafe { node_ }
 	if node.is_static {
 		is_defer_var := node.left[0] is ast.Ident && node.left[0].name in g.defer_vars
 		if is_defer_var && node.op == .decl_assign {

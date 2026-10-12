@@ -2334,6 +2334,26 @@ static void vgc_gctrace_cm(uint64_t cycle, uint64_t stop1_us, uint64_t middle_us
     vgc__ws("\n");
 }
 
+// VGC_GCTRACE=2 permanent-generation line (cx-home/v#15 lever 2): the
+// generation's spans and bytes, the permanent spans this cycle re-scanned
+// (dirtied since the last stop) with their objects and time, the verifier's
+// running miss count (-d vgc_cm_verify; 0 otherwise) and whether this was the
+// promotion cycle.
+static void vgc_gctrace_perm(uint64_t cycle, uint64_t spans, uint64_t kb, uint64_t dirty_spans,
+                             uint64_t dirty_objs, uint64_t young_objs, uint64_t rescan_us,
+                             uint64_t missed, uint64_t promoted) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] perm spans="); vgc__wdec(spans);
+    vgc__ws(" KB="); vgc__wdec(kb);
+    vgc__ws(" dirty_spans="); vgc__wdec(dirty_spans);
+    vgc__ws(" dirty_objs="); vgc__wdec(dirty_objs);
+    vgc__ws(" young_objs="); vgc__wdec(young_objs);
+    vgc__ws(" rescan="); vgc__wdec(rescan_us);
+    vgc__ws("us missed="); vgc__wdec(missed);
+    vgc__ws(" promoted="); vgc__wdec(promoted);
+    vgc__ws("\n");
+}
+
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
 // object holds a pointer to an ALLOCATED-but-UNMARKED object that sweep is about
 // to reclaim — i.e. the mark did not reach closure. `kind`: 0 = referrer is a

@@ -94,9 +94,14 @@ fn vgc_gc_start() {
 		// the born bound (vgc_cm_born_fits) — sixteen hot allocators at ~10
 		// GB/s put 300 MB through a 30 ms middle, a probe that lost before it
 		// ran; the bound's throttle (vgc_cm_throttle) is the guarantee.
-		if vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
+		// cx-home/v#15: the promotion cycle is stop-the-world under every VGC_CM
+		// (an object born in a concurrent middle is filled after the stop with
+		// no barrier, so it must not be promoted)
+		promote := vgc_perm_mode != 0
+			&& ((vgc_perm_on == 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
+		if !promote && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
-			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits()) {
+			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
 			vgc_gc_start_concurrent()
 			return
 		}
@@ -247,6 +252,15 @@ fn vgc_gc_start() {
 		}
 	}
 	vgc_watch_snapshot(3) // STAGE 3: post spawn-root shade
+	$if vgc_concurrent ? {
+		// cx-home/v#15: the permanent spans written since the last cycle (their
+		// objects are black from the clear; what they point to is found here)
+		if vgc_perm_on != 0 {
+			t_rescan := C.vgc_now_ns()
+			vgc_rescan_dirty_spans(false)
+			vgc_perm_rescan_ns = C.vgc_now_ns() - t_rescan
+		}
+	}
 
 	// FULL stop-the-world mark+sweep: the world stays stopped from here through
 	// the end of sweep. The previous design resumed mutators here and marked
@@ -282,9 +296,19 @@ fn vgc_gc_start() {
 		1
 	})
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
+	$if vgc_concurrent ? {
+		// cx-home/v#15: the promotion cycle, and the verifier's full re-mark
+		if vgc_perm_mode != 0
+			&& ((vgc_perm_on == 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
+			vgc_perm_promote()
+		}
+		if vgc_perm_on != 0 {
+			vgc_cm_verify(self_idx)
+		}
+	}
 
-	// Disable write barrier
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
+	// Disable write barrier (cx-home/v#15: the permanent regime stays)
+	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, vgc_perm_on * 2)
 
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
@@ -836,7 +860,7 @@ __global vgc_cm_verify_missed = u64(0)
 // into a black one, or filled into a black newborn, is found. Under the
 // termination stop; clears both flags.
 @[markused]
-fn vgc_rescan_dirty_spans() {
+fn vgc_rescan_dirty_spans(term bool) {
 	$if vgc_cm_nobarrier ? {
 		// TEETH KNOB (testing only): skip the re-scan, i.e. no barrier. The
 		// soundness gate (cm_stress) must reproduce live reclamation with it.
@@ -844,6 +868,7 @@ fn vgc_rescan_dirty_spans() {
 	}
 	vgc_cm_rescan_spans = 0
 	vgc_cm_rescan_objs = 0
+	vgc_perm_young_objs = 0
 	nb := (vgc_heap.nspans + 7) / 8
 	for wi in 0 .. nb {
 		mut bits := unsafe { vgc_heap.inuse_bits[wi] }
@@ -855,6 +880,24 @@ fn vgc_rescan_dirty_spans() {
 				continue
 			}
 			dirty := C.vgc_atomic_load_u32(&span.dirty) != 0 || C.vgc_atomic_load_u32(&span.born) != 0
+			if span.perm != 0 && span.perm_bits != unsafe { nil } && !span.noscan {
+				// cx-home/v#15: a permanent span. Dirtied since the last stop: its
+				// PERMANENT objects are scanned (every other object in it is traced
+				// or swept as usual — scanning a dead one would keep what it points
+				// to; at a concurrent termination every allocated object, as any
+				// dirty span: a black young object mutated in the middle) and
+				// young_bits re-taken; clean: only the permanent objects young_bits
+				// names (they hold a pointer to a non-permanent object, which only
+				// they keep alive).
+				vgc_rescan_perm_span(span, dirty, term)
+				if dirty {
+					unsafe {
+						C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+						C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 0)
+					}
+				}
+				continue
+			}
 			if !dirty {
 				continue
 			}
@@ -888,6 +931,89 @@ fn vgc_rescan_dirty_spans() {
 	}
 }
 
+// vgc_scan_perm_obj scans one object's words as vgc_scan_range does (every
+// heap pointer shaded) and reports whether any of them refers to an allocated
+// object outside the permanent generation (cx-home/v#15).
+fn vgc_scan_perm_obj(lo usize, hi usize) bool {
+	mut young := false
+	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+	mut addr := start
+	for addr + sizeof(usize) <= hi {
+		val := unsafe { *(&usize(voidptr(addr))) }
+		addr += sizeof(usize)
+		if val < vgc_arena_lo || val >= vgc_arena_hi {
+			continue
+		}
+		sp := vgc_find_span(voidptr(val))
+		if sp == unsafe { nil } || !sp.in_use || sp.elem_size == 0 {
+			continue
+		}
+		idx := u32((val - sp.base) / usize(sp.elem_size))
+		if idx >= sp.nelems || sp.alloc_bits == unsafe { nil }
+			|| C.vgc_bitmap_get(sp.alloc_bits, idx) == 0 {
+			continue
+		}
+		if sp.perm != 0 && sp.perm_bits != unsafe { nil } && C.vgc_bitmap_get(sp.perm_bits, idx) != 0 {
+			continue // a permanent object: black already
+		}
+		young = true
+		vgc_shade(val, 0)
+	}
+	return young
+}
+
+// One permanent span's re-scan (see vgc_rescan_dirty_spans). young_bits is a
+// subset of perm_bits: only a permanent object is a root for what it points to.
+fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool) {
+	if span.alloc_bits == unsafe { nil } {
+		return
+	}
+	yb := vgc_young_bits(span)
+	nbytes := (span.nelems + 7) / 8
+	mut counted := false
+	for b in 0 .. nbytes {
+		pbyte := unsafe { span.perm_bits[b] }
+		sel := if !dirty {
+			unsafe { yb[b] }
+		} else if term {
+			unsafe { span.alloc_bits[b] }
+		} else {
+			unsafe { span.alloc_bits[b] } & pbyte
+		}
+		if sel == 0 {
+			continue
+		}
+		if !counted {
+			vgc_cm_rescan_spans++
+			counted = true
+		}
+		mut nyb := u8(0)
+		for bit in 0 .. 8 {
+			idx := u32(b) * 8 + u32(bit)
+			if idx >= span.nelems {
+				break
+			}
+			m := u8(1) << u32(bit)
+			if (sel & m) == 0 {
+				continue
+			}
+			obj_addr := span.base + usize(idx) * usize(span.elem_size)
+			if vgc_scan_perm_obj(obj_addr, obj_addr + usize(span.elem_size)) && (pbyte & m) != 0 {
+				nyb |= m
+				vgc_perm_young_objs++
+			}
+			if dirty {
+				vgc_cm_rescan_objs++
+			}
+		}
+		if dirty {
+			unsafe {
+				yb[b] = nyb
+			}
+		}
+	}
+}
+
 // The roots, as both stops take them: the suspended threads' registers and
 // refreshed ranges, the data segments, the cache slots, every stack, the
 // spawn-argument structs and the pins.
@@ -914,6 +1040,82 @@ fn vgc_cm_drain() {
 	vgc_drain_mark_work(0)
 }
 
+// vgc_perm_promote (cx-home/v#15 lever 2): under the stop of a stop-the-world
+// cycle, after its mark reached closure, every marked object becomes
+// permanent: its span's perm_bits take the mark bits, and from now on the
+// clear walk starts the span's mark bits from them (the object is black at
+// the start of every cycle, never pushed, never traced, never swept) and the
+// barrier regime is on (wb_enabled bit 1): a pointer store into a permanent
+// span dirties it, and vgc_rescan_dirty_spans scans the span's objects at the
+// next stop, so a pointer from a permanent object into a later generation is
+// found there. Soundness: (1) every pointer a permanent object held at the
+// promotion was traced by this cycle, so its referents are permanent too;
+// (2) a pointer stored later goes through the barrier, called before and
+// after the store — the dirty bit is set when the store lands or is set
+// again after it (a cycle that cleared the bit between the two calls ran
+// with the store not yet visible; the call after the store sets it again),
+// so the next stop re-scans the span; (3) the only mutator-side store the
+// codegen barrier does not cover is the initialization of a fresh object
+// (decl_assign, memdup, the realloc copy), which is never a permanent
+// object's — a freed permanent slot leaves the generation in vgc_free before
+// it can be reused; (4) the span is dirtied by its address, so a store
+// through an interior pointer (an array header inside a permanent struct) is
+// covered as any other. -d vgc_cm_verify re-marks every cycle from zero and
+// counts what the permanent scheme would have missed (vgc_cm_verify).
+fn vgc_perm_promote() {
+	$if vgc_concurrent ? {
+		mut nsp := u64(0)
+		mut nbytes_total := u64(0)
+		for i in 0 .. vgc_heap.nspans {
+			span := unsafe { vgc_heap.allspans[i] }
+			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
+				continue
+			}
+			nb := (span.nelems + 7) / 8
+			mut any := u8(0)
+			for b in 0 .. nb {
+				any |= unsafe { span.mark_bits[b] }
+			}
+			if any == 0 {
+				continue
+			}
+			if span.perm_bits == unsafe { nil } {
+				pb := vgc_perm_bits_alloc()
+				if pb == unsafe { nil } {
+					continue
+				}
+				unsafe {
+					(&VGC_Span(span)).perm_bits = pb
+				}
+			}
+			unsafe {
+				C.memcpy(span.perm_bits, span.mark_bits, nb)
+				// every pointer the span holds was traced by this cycle: nothing
+				// young is referenced yet
+				C.memset(vgc_young_bits(span), 0, 136)
+				(&VGC_Span(span)).perm = 1
+				// the stores this cycle's mark saw are in; a mutator suspended
+				// between its barrier call and its store sets the bit again
+				C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+			}
+			mut count := u32(0)
+			for b in 0 .. nb {
+				count += u32(C.vgc_popcount8(unsafe { span.perm_bits[b] }))
+			}
+			if count > span.nelems {
+				count = span.nelems
+			}
+			nsp++
+			nbytes_total += u64(count) * u64(span.elem_size)
+		}
+		vgc_perm_spans = nsp
+		vgc_perm_bytes = nbytes_total
+		vgc_perm_promoted_cycle = vgc_heap.gc_cycle
+		vgc_perm_request = false
+		vgc_perm_on = 1
+	}
+}
+
 // -d vgc_cm_verify: under the termination stop, after the concurrent mark's
 // final drain, the heap is marked again from scratch — exactly the STW
 // collector's mark — and every object that mark reaches but the concurrent
@@ -934,7 +1136,11 @@ fn vgc_cm_verify(self_idx int) {
 			}
 			unsafe { C.memcpy(voidptr(usize(side) + usize(i) * 136), span.mark_bits, (span.nelems + 7) / 8) }
 		}
+		// cx-home/v#15: from zero — the permanent objects are traced too, so a
+		// pointer stored into one that no barrier dirtied shows as a miss
+		vgc_perm_clear_zero = true
 		vgc_walk_run(vgc_pool_phase_clear)
+		vgc_perm_clear_zero = false
 		saved_n := vgc_mark_nworkers_cur
 		vgc_mark_nworkers_cur = 1
 		vgc_cm_roots(self_idx)
@@ -1028,6 +1234,12 @@ fn vgc_gc_start_concurrent() {
 	for i in 0 .. vgc_nspawn_roots {
 		vgc_shade_spawn_root(usize(unsafe { vgc_spawn_roots[i] }))
 	}
+	// cx-home/v#15: the permanent spans written since the last cycle
+	if vgc_perm_on != 0 {
+		t_rescan1 := C.vgc_now_ns()
+		vgc_rescan_dirty_spans(false)
+		vgc_perm_rescan_ns = C.vgc_now_ns() - t_rescan1
+	}
 	t_resume1 := C.vgc_now_ns()
 	vgc_cm_stop1_ns = t_resume1 - vgc_gc_t0
 	vgc_stw_resume(self_idx)
@@ -1056,7 +1268,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_cm_born_last = born
 	vgc_cm_roots(self_idx)
 	t_rescan := C.vgc_now_ns()
-	vgc_rescan_dirty_spans()
+	vgc_rescan_dirty_spans(true)
 	vgc_cm_rescan_ns = C.vgc_now_ns() - t_rescan
 	vgc_cm_drain()
 	vgc_cm_verify(self_idx)
@@ -1069,7 +1281,7 @@ fn vgc_gc_start_concurrent() {
 	} else {
 		1
 	})
-	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, 0)
+	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, vgc_perm_on * 2) // cx-home/v#15: the permanent regime stays
 
 	marked := vgc_count_marked()
 	vgc_ph[6] = C.vgc_now_ns()
@@ -1188,6 +1400,12 @@ fn vgc_gctrace_emit() {
 			u64(vgc_mark_nworkers_cur), u64(vgc_walk_nworkers_cur), vgc_ph_swalk_ns / 1000,
 			vgc_ph_sapply_ns / 1000)
 		$if vgc_concurrent ? {
+			// cx-home/v#15: the permanent generation's share of the cycle
+			if vgc_perm_on != 0 {
+				C.vgc_gctrace_perm(u64(vgc_heap.gc_cycle), vgc_perm_spans, vgc_perm_bytes / 1024,
+					vgc_cm_rescan_spans, vgc_cm_rescan_objs, vgc_perm_young_objs, vgc_perm_rescan_ns / 1000,
+					vgc_cm_verify_missed, u64(if vgc_perm_promoted_cycle == vgc_heap.gc_cycle { 1 } else { 0 }))
+			}
 			// cx-private#1910: the concurrent cycle's shape — the two stops, the
 			// middle, the termination re-scan's spans/objects and time
 			if vgc_cm_this_cycle {
@@ -1299,7 +1517,13 @@ fn vgc_walk_clear(w int, n int) {
 				}
 				if span.mark_bits != unsafe { nil } {
 					bitmap_size := (span.nelems + 7) / 8
-					unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+					// cx-home/v#15: a permanent span's objects start the cycle
+					// marked (the verifier's full re-mark starts from zero)
+					if span.perm != 0 && span.perm_bits != unsafe { nil } && !vgc_perm_clear_zero {
+						unsafe { C.memcpy(span.mark_bits, span.perm_bits, bitmap_size) }
+					} else {
+						unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+					}
 				}
 			}
 		}
@@ -2359,10 +2583,22 @@ fn vgc_write_barrier(new_val voidptr) {
 // would otherwise prune it (it is unreferenced in the V call graph) — leaving the
 // emitted `vgc_wb_store(...)` calls undeclared. Export forces retention and emits
 // an early prototype under the exact C name codegen uses.
+// cx-home/v#15 lever 2: wb_enabled is a mode word. Bit 0 is the concurrent
+// middle (every scan span a store targets is dirtied, as above); bit 1 is the
+// permanent generation's regime (vgc_perm_on, from the promotion cycle on):
+// a store into a PERMANENT span dirties it in and out of a cycle, and codegen
+// calls this barrier before AND after the store (assign.v
+// gen_cm_write_barrier), so a dirty bit the collector cleared between the two
+// calls — a cycle that ran while the right-hand side was evaluated, or a
+// mutator suspended between the call and its store — is set again after the
+// store landed and the next cycle re-scans the span. Off-cycle and before the
+// promotion it is a single atomic load + return; the dirty bit is read before
+// it is written, so a span already dirty costs no store.
 @[export: 'vgc_wb_store']
 pub fn vgc_wb_store(obj voidptr) {
 	$if vgc_concurrent ? {
-		if C.vgc_atomic_load_u32(&vgc_heap.wb_enabled) == 0 {
+		mode := C.vgc_atomic_load_u32(&vgc_heap.wb_enabled)
+		if mode == 0 {
 			return
 		}
 		if obj == unsafe { nil } {
@@ -2370,8 +2606,12 @@ pub fn vgc_wb_store(obj voidptr) {
 		}
 		span := vgc_find_span(obj)
 		if span != unsafe { nil } && span.in_use && !span.noscan {
-			unsafe {
-				C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 1)
+			if (mode & 1) != 0 || span.perm != 0 {
+				if C.vgc_atomic_load_u32(&span.dirty) == 0 {
+					unsafe {
+						C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 1)
+					}
+				}
 			}
 		}
 	}
