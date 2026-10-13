@@ -1456,6 +1456,14 @@ const vgc_idle_defrag_age = u32(1)
 // trigger recompute — never touched on the allocation path).
 __global vgc_gc_t0 = u64(0)
 __global vgc_gc_last_end = u64(0)
+// cx-home/v#42: the collecting thread's CPU clock at t0 (0: no CPU clock, the
+// pacer judges by wall time). VGC_PACER_WALL=1 restores the wall-time pacer.
+// VGC_TEST_COLLECTOR_STALL_US: the collector sleeps that long inside each
+// cycle — a test's stand-in for a busy box keeping it off its core (off-CPU
+// time in the pause, none in the work).
+__global vgc_gc_cpu_t0 = u64(0)
+__global vgc_pacer_wall = u64(0)
+__global vgc_test_stall_us = u64(0)
 
 // ── #58 SCANNED-WINDOW SHADOW (-d vgc_spcheck) ──────────────────────────────
 // Per-thread snapshot of the [stack_lo, stack_hi] range the collector actually
@@ -1826,6 +1834,7 @@ fn vgc_spchk_report(pkey voidptr, myframe usize) {
 fn C.atoll(&char) i64
 fn C.getenv(&char) &char
 fn C.vgc_now_ns() u64
+fn C.vgc_thread_cpu_ns() u64
 
 // vgc_init initializes the vgc heap: it fills the size-class tables, enables the
 // collector and reads the `VGC_NEXT_GC_MB` environment override for the initial
@@ -1993,6 +2002,11 @@ pub fn vgc_init() {
 	vgc_grow_gate_growth_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWTH_PCT', vgc_grow_gate_growth_pct)
 	vgc_grow_gate_growing_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWING_PCT', vgc_grow_gate_growing_pct)
 	vgc_grow_gate_rate_pct = vgc_env_pct(c'VGC_GROW_GATE_RATE_PCT', vgc_grow_gate_rate_pct)
+	vgc_pacer_wall = vgc_env_pct(c'VGC_PACER_WALL', vgc_pacer_wall)
+	stall_env := C.getenv(c'VGC_TEST_COLLECTOR_STALL_US')
+	if stall_env != unsafe { nil } && C.atoll(stall_env) > 0 && C.atoll(stall_env) <= 1000000 {
+		vgc_test_stall_us = u64(C.atoll(stall_env))
+	}
 	vgc_frag_gate_on = vgc_env_pct(c'VGC_FRAG_GATE', vgc_frag_gate_on)
 	vgc_frag_gate_late_pct = vgc_env_pct(c'VGC_FRAG_GATE_LATE_PCT', vgc_frag_gate_late_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')

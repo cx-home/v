@@ -885,6 +885,23 @@ static inline uint64_t vgc_now_ns(void) {
 }
 #endif
 
+// cx-home/v#42: the calling thread's CPU time, the pacer's measure of what a
+// collection cost. Wall time counts the cycles a busy box keeps the collector
+// off its core (a 4.5 ms pause read 65-70 ms with no extra work), so the
+// headroom grew and the gates stood down for load the program did not make.
+// Read twice per cycle by the collecting thread. Windows' thread times tick at
+// the scheduler's 15.6 ms, coarser than most pauses: 0 there, and the pacer
+// keeps the wall clock.
+#ifdef _WIN32
+static inline uint64_t vgc_thread_cpu_ns(void) { return 0; }
+#else
+static inline uint64_t vgc_thread_cpu_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
 // ============================================================
 // Simple mutex (adaptive spinlock with backoff)
 // ============================================================

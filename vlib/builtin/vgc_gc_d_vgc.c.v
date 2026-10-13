@@ -124,6 +124,7 @@ fn vgc_gc_start() {
 		vgc_cm_this_cycle = false
 	}
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
+	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
 	vgc_mark_nworkers_cur = vgc_mark_plan()
@@ -1304,6 +1305,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_gc_owner = C.vgc_get_cache_idx()
 	vgc_cm_this_cycle = true
 	vgc_gc_t0 = C.vgc_now_ns() // the pacer's cycle cost (#71): the whole cycle, middle included
+	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
 	vgc_mark_nworkers_cur = vgc_mark_plan()
 	vgc_walk_nworkers_cur = vgc_walk_plan()
 	self_idx := C.vgc_get_cache_idx()
@@ -3388,6 +3390,11 @@ fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
 
+	$if !windows {
+		if vgc_test_stall_us > 0 {
+			C.usleep(u32(vgc_test_stall_us))
+		}
+	}
 	now := C.vgc_now_ns()
 	// The adaptive floor (cx-home/v#14; vgc_headroom_adaptive_floor doc):
 	// clamp(2 x marked, lo, live_floor). hr_min follows it below 8 MB.
@@ -3440,6 +3447,22 @@ fn vgc_update_trigger() {
 		mut interval := u64(0)
 		if vgc_gc_t0 > vgc_gc_last_end {
 			interval = vgc_gc_t0 - vgc_gc_last_end
+		}
+		// cx-home/v#42: the cost is the collecting thread's CPU time over the
+		// cycle (it runs every phase and marks as slot 0 of the pool), not its
+		// wall time: on a busy box the stop, the wakes and the collector's own
+		// slices wait for a core, and a 4.5 ms pause read 65-70 ms with no
+		// extra work — the band then bought headroom (RSS) and the gates stood
+		// down for load the program did not make. The interval stays the
+		// mutators' wall time (an idle server's interval is idle, and GC that
+		// is cheap against it is cheap). Go's GC CPU limiter has this shape:
+		// the collector's CPU, not its wall time. No CPU clock (Windows) or
+		// VGC_PACER_WALL=1: the wall pause, as before.
+		if vgc_pacer_wall == 0 && vgc_gc_cpu_t0 != 0 {
+			cpu_now := C.vgc_thread_cpu_ns()
+			if cpu_now > vgc_gc_cpu_t0 && cpu_now - vgc_gc_cpu_t0 < pause {
+				pause = cpu_now - vgc_gc_cpu_t0
+			}
 		}
 		vgc_gate_last_pause = pause
 		vgc_gate_last_interval = interval
