@@ -19,7 +19,10 @@
 
 #include "common.h"
 
-#if !defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED)
+/* not under tcc: kremlin's legacy (no-int128) path uses _Pragma in a macro
+ * tcc cannot parse; psa_crypto_ecp.c keeps the generic ladder there
+ * (CX_X25519_HACL) */
+#if !defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED) && !defined(__TINYC__)
 
 #if defined(__SIZEOF_INT128__) && (__SIZEOF_INT128__ == 16)
 #define MBEDTLS_HAVE_INT128
@@ -35,4 +38,4 @@
 
 #include "../3rdparty/everest/library/kremlib/FStar_UInt64_FStar_UInt32_FStar_UInt16_FStar_UInt8.c"
 
-#endif /* !MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED */
+#endif /* !MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED && !__TINYC__ */

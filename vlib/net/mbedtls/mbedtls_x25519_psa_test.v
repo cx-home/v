@@ -17,6 +17,10 @@ fn test_x25519_psa_matches_rfc7748() {
 }
 
 fn test_x25519_psa_is_faster_than_the_generic_ladder() {
+	$if tinyc {
+		// tcc cannot compile kremlin's code: the PSA path keeps the ladder there
+		return
+	}
 	mut p := 0.0
 	mut l := 0.0
 	ratio := C.cx_x25519_speed_ratio(5, 200, &p, &l)

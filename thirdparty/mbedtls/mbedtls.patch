@@ -349,7 +349,7 @@ diff -ur mbedtls.orig/library/ssl_tls12_client.c mbedtls/library/ssl_tls12_clien
 diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 --- mbedtls.orig/library/psa_crypto_ecp.c
 +++ mbedtls/library/psa_crypto_ecp.c
-@@ -24,6 +24,56 @@
+@@ -24,6 +24,66 @@
  #include <mbedtls/ecdh.h>
  #include <mbedtls/ecp.h>
  #include <mbedtls/error.h>
@@ -362,12 +362,18 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 + * u-coordinate's top bit as RFC 7748 does. An all-zero shared secret (a
 + * small-order peer point) is refused, as mbedtls_ecdh_calc_secret refuses
 + * the zero point (RFC 8446 section 7.4.2). */
++#if !defined(__TINYC__) || defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED)
++#define CX_X25519_HACL 1
++#else
++#define CX_X25519_HACL 0 /* library/cx_x25519_hacl.c is empty under tcc */
++#endif
 +void Hacl_Curve25519_crypto_scalarmult(uint8_t *mypublic, uint8_t *secret,
 +                                       uint8_t *basepoint);
 +
 +static int cx_psa_is_x25519(const psa_key_attributes_t *attributes)
 +{
-+    return PSA_KEY_TYPE_ECC_GET_FAMILY(attributes->type) ==
++    return CX_X25519_HACL &&
++           PSA_KEY_TYPE_ECC_GET_FAMILY(attributes->type) ==
 +           PSA_ECC_FAMILY_MONTGOMERY && attributes->bits == 255;
 +}
 +
@@ -389,7 +395,11 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 +    }
 +    memcpy(k, scalar, 32);
 +    memcpy(u, point, 32);
++#if CX_X25519_HACL
 +    Hacl_Curve25519_crypto_scalarmult(r, k, u);
++#else
++    memset(r, 0, sizeof(r));
++#endif
 +    for (i = 0; i < 32; i++) {
 +        acc |= r[i];
 +    }
@@ -406,7 +416,7 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
  
  #if defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_BASIC) || \
      defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_IMPORT) || \
-@@ -295,6 +345,14 @@ psa_status_t mbedtls_psa_ecp_export_public_key(
+@@ -295,6 +355,14 @@ psa_status_t mbedtls_psa_ecp_export_public_key(
      psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
      mbedtls_ecp_keypair *ecp = NULL;
  
@@ -421,7 +431,7 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
      status = mbedtls_psa_ecp_load_representation(
          attributes->type, attributes->bits,
          key_buffer, key_buffer_size, &ecp);
-@@ -528,6 +586,12 @@ psa_status_t mbedtls_psa_key_agreement_ecdh(
+@@ -528,6 +596,12 @@ psa_status_t mbedtls_psa_key_agreement_ecdh(
          !PSA_ALG_IS_ECDH(alg)) {
          return PSA_ERROR_INVALID_ARGUMENT;
      }

@@ -33,12 +33,18 @@
  * u-coordinate's top bit as RFC 7748 does. An all-zero shared secret (a
  * small-order peer point) is refused, as mbedtls_ecdh_calc_secret refuses
  * the zero point (RFC 8446 section 7.4.2). */
+#if !defined(__TINYC__) || defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED)
+#define CX_X25519_HACL 1
+#else
+#define CX_X25519_HACL 0 /* library/cx_x25519_hacl.c is empty under tcc */
+#endif
 void Hacl_Curve25519_crypto_scalarmult(uint8_t *mypublic, uint8_t *secret,
                                        uint8_t *basepoint);
 
 static int cx_psa_is_x25519(const psa_key_attributes_t *attributes)
 {
-    return PSA_KEY_TYPE_ECC_GET_FAMILY(attributes->type) ==
+    return CX_X25519_HACL &&
+           PSA_KEY_TYPE_ECC_GET_FAMILY(attributes->type) ==
            PSA_ECC_FAMILY_MONTGOMERY && attributes->bits == 255;
 }
 
@@ -60,7 +66,11 @@ static psa_status_t cx_psa_x25519(const uint8_t *scalar, size_t scalar_len,
     }
     memcpy(k, scalar, 32);
     memcpy(u, point, 32);
+#if CX_X25519_HACL
     Hacl_Curve25519_crypto_scalarmult(r, k, u);
+#else
+    memset(r, 0, sizeof(r));
+#endif
     for (i = 0; i < 32; i++) {
         acc |= r[i];
     }
