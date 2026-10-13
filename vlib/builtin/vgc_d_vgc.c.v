@@ -4499,6 +4499,32 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 		return unsafe { nil }
 	}
 	start_idx := span.free_index
+	// The fast path (cx-home/v#15 lever 3): a span the cache hands out is
+	// carved fresh or swept, and its slots above the hint are free in nearly
+	// every allocation — the hint's own slot is claimed with one load and one
+	// atomic OR, no byte scan, no pass bookkeeping. A taken slot (a stale
+	// hint, a racing claim) falls through to the scan below, which is the
+	// same claim over every slot. The slow path's forensics (vgc_birthcheck)
+	// stay on the scan: a -d vgc_birthcheck build takes the scan for every
+	// slot, so its checks see every birth.
+	$if !vgc_birthcheck ? {
+		if start_idx < span.nelems {
+			fast_byte := start_idx >> 3
+			fast_mask := u8(1) << (start_idx & 7)
+			if (unsafe { span.alloc_bits[fast_byte] } & fast_mask) == 0 {
+				old := unsafe {
+					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.alloc_bits) + usize(fast_byte))),
+						fast_mask)
+				}
+				if (old & fast_mask) == 0 {
+					unsafe { C.vgc_atomic_add_u32(&u32(voidptr(&span.alloc_count)), 1) }
+					span.free_index = start_idx + 1
+					vgc_alloc_black_hook(span, start_idx)
+					return unsafe { voidptr(span.base + usize(start_idx) * usize(span.elem_size)) }
+				}
+			}
+		}
+	}
 	nbytes := (span.nelems + 7) >> 3
 	start_byte := start_idx >> 3
 	end_byte := (start_idx + 7) >> 3
