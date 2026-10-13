@@ -2589,6 +2589,54 @@ cleanup:
     return ret;
 }
 
+#if defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED) && defined(MBEDTLS_ECP_DP_CURVE25519_ENABLED)
+/*
+ * cx-home/v#39: R = m * P on Curve25519 by HACL* (Project Everest's verified,
+ * constant-time X25519) instead of the generic ladder over mbedtls_mpi — the
+ * same function for every key the library makes or agrees on (PSA key
+ * generation's public half, ECDH, TLS 1.3 key shares). HACL* applies the RFC
+ * 7748 clamp itself, so only an already-clamped scalar (every Curve25519
+ * private key mbedtls generates or loads is) takes this path, and a result of
+ * zero (a low-order point) goes back to the ladder: both give exactly the
+ * ladder's answer or its error. Returns 0 on success, -1 to fall back.
+ */
+#include "everest/Hacl_Curve25519.h"
+
+static int ecp_mul_x25519_hacl(mbedtls_ecp_point *R, const mbedtls_mpi *m,
+                               const mbedtls_ecp_point *P)
+{
+    unsigned char k[32], u[32], out[32];
+    unsigned char acc = 0;
+    size_t i;
+    int ret = -1;
+
+    if (mbedtls_mpi_write_binary_le(m, k, sizeof(k)) != 0 ||
+        mbedtls_mpi_write_binary_le(&P->X, u, sizeof(u)) != 0) {
+        goto exit;
+    }
+    if ((k[0] & 7) != 0 || (k[31] & 0xC0) != 0x40) {
+        goto exit; /* not a clamped X25519 scalar: the ladder's arithmetic */
+    }
+    Hacl_Curve25519_crypto_scalarmult(out, k, u);
+    for (i = 0; i < sizeof(out); i++) {
+        acc |= out[i];
+    }
+    if (acc == 0) {
+        goto exit; /* low-order input: the ladder reports it */
+    }
+    if (mbedtls_mpi_read_binary_le(&R->X, out, sizeof(out)) != 0 ||
+        mbedtls_mpi_lset(&R->Z, 1) != 0) {
+        goto exit;
+    }
+    mbedtls_mpi_free(&R->Y);
+    ret = 0;
+exit:
+    mbedtls_platform_zeroize(k, sizeof(k));
+    mbedtls_platform_zeroize(out, sizeof(out));
+    return ret;
+}
+#endif
+
 #endif /* MBEDTLS_ECP_MONTGOMERY_ENABLED */
 
 /*
@@ -2639,6 +2687,12 @@ static int ecp_mul_restartable_internal(mbedtls_ecp_group *grp, mbedtls_ecp_poin
     ret = MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
 #if defined(MBEDTLS_ECP_MONTGOMERY_ENABLED)
     if (mbedtls_ecp_get_type(grp) == MBEDTLS_ECP_TYPE_MONTGOMERY) {
+#if defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED) && defined(MBEDTLS_ECP_DP_CURVE25519_ENABLED)
+        if (grp->id == MBEDTLS_ECP_DP_CURVE25519 && ecp_mul_x25519_hacl(R, m, P) == 0) {
+            ret = 0;
+            goto cleanup;
+        }
+#endif
         MBEDTLS_MPI_CHK(ecp_mul_mxz(grp, R, m, P, f_rng, p_rng));
     }
 #endif

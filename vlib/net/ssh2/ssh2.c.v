@@ -26,6 +26,11 @@ import crypto.ed25519
 // flags only — so the plain spelling would leave libssh2's objects without the
 // backend's headers.
 #flag -I @VEXEROOT/thirdparty/./mbedtls/include
+// cx-home/v#39: with MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED mbedtls's ecdh.h
+// includes everest/everest.h — the same `./` spelling, for the same reason.
+#flag -I @VEXEROOT/thirdparty/./mbedtls/3rdparty/everest/include
+#flag -I @VEXEROOT/thirdparty/./mbedtls/3rdparty/everest/include/everest
+#flag -I @VEXEROOT/thirdparty/./mbedtls/3rdparty/everest/include/everest/kremlib
 #flag -DHAVE_CONFIG_H
 #flag -DLIBSSH2_MBEDTLS
 

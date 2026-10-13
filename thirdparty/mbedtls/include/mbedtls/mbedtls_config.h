@@ -746,7 +746,10 @@
  * The Everest code is provided under the Apache 2.0 license only; therefore enabling this
  * option is not compatible with taking the library under the GPL v2.0-or-later license.
  */
-//#define MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED
+// cx-home/v#39: ON — HACL* Curve25519 (Project Everest, Apache-2.0 only) does
+// X25519; mbedtls's generic Montgomery ladder over mbedtls_mpi was 75 % of a
+// TLS 1.3 handshake's CPU (library/ecp.c routes Curve25519 here too).
+#define MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED
 
 /**
  * \def MBEDTLS_ECP_DP_SECP192R1_ENABLED
