@@ -725,22 +725,9 @@ fn cc_from_pref_ccompiler_type(cc_type pref.CompilerType) CC {
 
 // vgc_auto_var_init_flag returns `-ftrivial-auto-var-init=zero` for a `-gc e`
 // build whose C compiler (clang or gcc) accepts it, none otherwise — see the
-// note at its use in setup_ccompiler_options (cx-private#1910 cut 1). On a
-// compiler that also accepts `-ftrivial-auto-var-init-max-size=` (clang) the
-// clearing is capped at vgc_auto_var_init_max_size bytes (cx-private#1922):
-// cx's generated C has no large automatic buffers, but ~28k declared-then-
-// assigned struct temporaries (`T _tN; ... _tN = f(...)`, ~11k of them
-// _option_/_result_ wrappers) each took a zero-store at their declaration
-// that dead-store elimination cannot drop before an sret call — template-
-// render paid 3-4 % user time for it. The residue the flag exists for sits
-// in small slots (json-codec 1 MB x100: 49.3 MB peak with the flag, 59.6
-// without, 49.0 capped at 32 B, 59.5 capped at 16 B), so the cap keeps the
-// memory and drops the time (template-render 1.010 -> 0.987 s user, the
-// flagless build 0.983). -d vgc_auto_var_init_nocap clears every size (A/B).
-// The probe compiles an empty program once per compiler path and keeps the
-// accepted flags in the V temp dir.
-const vgc_auto_var_init_max_size = 32
-
+// note at its use in setup_ccompiler_options (cx-private#1910 cut 1). The probe
+// compiles an empty program once per compiler path and keeps the answer in
+// the V temp dir.
 fn (mut v Builder) vgc_auto_var_init_flag(ccompiler string, cc CC) ?string {
 	if v.pref.gc_mode != .vgc || cc !in [.clang, .gcc] {
 		return none
@@ -749,8 +736,6 @@ fn (mut v Builder) vgc_auto_var_init_flag(ccompiler string, cc CC) ?string {
 		return none
 	}
 	flag := '-ftrivial-auto-var-init=zero'
-	capped := '${flag} -ftrivial-auto-var-init-max-size=${vgc_auto_var_init_max_size}'
-	nocap := 'vgc_auto_var_init_nocap' in v.pref.compile_defines
 	mut key := ''
 	for ch in ccompiler {
 		key += if ch.is_alnum() { ch.ascii_str() } else { '_' }
@@ -758,36 +743,20 @@ fn (mut v Builder) vgc_auto_var_init_flag(ccompiler string, cc CC) ?string {
 	if key.len > 80 {
 		key = key[key.len - 80..]
 	}
-	// v2: the cache holds the accepted flags themselves ('-' when none), so an
-	// answer cached before the cap (a bare 'yes') is never misread.
-	cache := os.join_path(os.vtmp_dir(), 'vgc_auto_var_init_v2_${key}.txt')
-	mut accepted := ''
+	cache := os.join_path(os.vtmp_dir(), 'vgc_auto_var_init_${key}.txt')
 	if os.exists(cache) {
-		accepted = (os.read_file(cache) or { '' }).trim_space()
+		answer := os.read_file(cache) or { '' }
+		return if answer.trim_space() == 'yes' { flag } else { none }
 	}
-	if accepted == '' {
-		src := os.join_path(os.vtmp_dir(), 'vgc_auto_var_init_probe_${os.getpid()}.c')
-		obj := src + '.o'
-		os.write_file(src, 'int main(void) { return 0; }\n') or { return none }
-		accepted = '-'
-		for cand in [capped, flag] {
-			res := os.execute('${os.quoted_path(ccompiler)} ${cand} -Werror -c -o ${os.quoted_path(obj)} ${os.quoted_path(src)}')
-			if res.exit_code == 0 {
-				accepted = cand
-				break
-			}
-		}
-		os.rm(src) or {}
-		os.rm(obj) or {}
-		os.write_file(cache, accepted) or {}
-	}
-	if accepted == '-' {
-		return none
-	}
-	if nocap {
-		return flag
-	}
-	return accepted
+	src := os.join_path(os.vtmp_dir(), 'vgc_auto_var_init_probe_${os.getpid()}.c')
+	obj := src + '.o'
+	os.write_file(src, 'int main(void) { return 0; }\n') or { return none }
+	res := os.execute('${os.quoted_path(ccompiler)} ${flag} -c -o ${os.quoted_path(obj)} ${os.quoted_path(src)}')
+	os.rm(src) or {}
+	os.rm(obj) or {}
+	ok := res.exit_code == 0
+	os.write_file(cache, if ok { 'yes' } else { 'no' }) or {}
+	return if ok { flag } else { none }
 }
 
 fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
