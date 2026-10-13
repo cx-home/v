@@ -46,11 +46,17 @@ struct _result {
 	// derived Result_xxx types
 }
 
+// cx-private#1924: inlined at every site, so clang sees the zero-init of the
+// caller's declared temporary overwritten whole (header store + a copy of the
+// payload's constant size) and drops it — ~11,000 sites in cx (7,381 option,
+// 3,304 result), each a full zero-store of the wrapper before an opaque call.
+@[_always_inline]
 fn _result_ok(data voidptr, mut res _result, size int) {
 	unsafe {
 		*res = _result{}
-		// use err to get the end of ResultBase and then memcpy into it
-		vmemcpy(&u8(&res.err) + sizeof(IError), data, size)
+		// use err to get the end of ResultBase and then memcpy into it (C's own
+		// memcpy, so the inlined copy has the call site's constant size)
+		C.memcpy(&u8(&res.err) + sizeof(IError), data, size)
 	}
 }
 
@@ -183,11 +189,14 @@ fn _option_none(data voidptr, mut option _option, size int) {
 	}
 }
 
+// cx-private#1924: see _result_ok.
+@[_always_inline]
 fn _option_ok(data voidptr, mut option _option, size int) {
 	unsafe {
 		*option = _option{}
-		// use err to get the end of OptionBase and then memcpy into it
-		vmemcpy(&u8(&option.err) + sizeof(IError), data, size)
+		// use err to get the end of OptionBase and then memcpy into it (C's own
+		// memcpy, so the inlined copy has the call site's constant size)
+		C.memcpy(&u8(&option.err) + sizeof(IError), data, size)
 	}
 }
 

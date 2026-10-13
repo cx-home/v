@@ -1,0 +1,27 @@
+// vtest vflags: -gc e
+// cx-private#1924: _option_ok/_result_ok are inlined at every site whatever the
+// optimisation level, so clang drops the zero-init of the temporary they fill.
+struct Pair {
+	a int
+	b string
+}
+
+fn opt(i int) ?Pair {
+	if i < 0 {
+		return none
+	}
+	return Pair{i, 'x'}
+}
+
+fn res(i int) !Pair {
+	if i < 0 {
+		return error('neg')
+	}
+	return Pair{i, 'y'}
+}
+
+fn main() {
+	p := opt(1) or { Pair{} }
+	q := res(2) or { Pair{} }
+	println(p.a + q.a)
+}

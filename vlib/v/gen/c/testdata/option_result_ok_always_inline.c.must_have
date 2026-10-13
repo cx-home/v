@@ -1,0 +1,2 @@
+inline __attribute__((always_inline)) VV_LOC void builtin___option_ok(voidptr data, _option* option, int size) {
+inline __attribute__((always_inline)) VV_LOC void builtin___result_ok(voidptr data, _result* res, int size) {

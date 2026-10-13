@@ -7697,6 +7697,13 @@ fn (mut g Gen) write_fn_attrs(attrs []ast.Attr) string {
 			'inline' {
 				g.write('inline ')
 			}
+			'_always_inline' {
+				// cx-private#1924: inlined at every call site whatever the
+				// optimisation level (-Os included), so the caller's dead stores
+				// before it — the zero-init of the temporary it fills — are seen
+				// and dropped
+				g.write('inline __attribute__((always_inline)) ')
+			}
 			'noinline' {
 				// since these are supported by GCC, clang and MSVC, we can consider them officially supported.
 				g.write('__NOINLINE ')
