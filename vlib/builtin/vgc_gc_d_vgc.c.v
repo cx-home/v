@@ -125,6 +125,8 @@ fn vgc_gc_start() {
 	}
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
 	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
+	vgc_dg_idx0 = u64(C.vgc_get_cache_idx())
+	vgc_dg_cpu0 = vgc_gc_cpu_t0
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
 	vgc_mark_nworkers_cur = vgc_mark_plan()
@@ -1306,6 +1308,8 @@ fn vgc_gc_start_concurrent() {
 	vgc_cm_this_cycle = true
 	vgc_gc_t0 = C.vgc_now_ns() // the pacer's cycle cost (#71): the whole cycle, middle included
 	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
+	vgc_dg_idx0 = u64(C.vgc_get_cache_idx())
+	vgc_dg_cpu0 = vgc_gc_cpu_t0
 	vgc_mark_nworkers_cur = vgc_mark_plan()
 	vgc_walk_nworkers_cur = vgc_walk_plan()
 	self_idx := C.vgc_get_cache_idx()
@@ -1490,6 +1494,14 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024, vgc_idle_defrag_merged_kb)
+	if vgc_gctrace >= 1 {
+		C.vgc_say(0x4200, vgc_dg_wall / 1000)
+		C.vgc_say(0x4201, vgc_dg_cpu / 1000)
+		C.vgc_say(0x4202, vgc_dg_int / 1000)
+		C.vgc_say(0x4203, vgc_dg_stallcpu / 1000)
+		C.vgc_say(0x4204, vgc_dg_idx0 * 1000 + vgc_dg_idx1)
+		C.vgc_say(0x4205, vgc_gate_last_pause / 1000)
+	}
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
 		// bytes the root scan walked and the spans the clear/sweep walks visited.
@@ -3392,7 +3404,9 @@ fn vgc_update_trigger() {
 
 	$if !windows {
 		if vgc_test_stall_us > 0 {
+			sc0 := C.vgc_thread_cpu_ns()
 			C.usleep(u32(vgc_test_stall_us))
+			vgc_dg_stallcpu = C.vgc_thread_cpu_ns() - sc0
 		}
 	}
 	now := C.vgc_now_ns()
@@ -3464,6 +3478,10 @@ fn vgc_update_trigger() {
 				pause = cpu_now - vgc_gc_cpu_t0
 			}
 		}
+		vgc_dg_wall = if vgc_gc_t0 != 0 && now > vgc_gc_t0 { now - vgc_gc_t0 } else { u64(0) }
+		vgc_dg_cpu = C.vgc_thread_cpu_ns() - vgc_dg_cpu0
+		vgc_dg_int = interval
+		vgc_dg_idx1 = u64(C.vgc_get_cache_idx())
 		vgc_gate_last_pause = pause
 		vgc_gate_last_interval = interval
 		mut hr := vgc_headroom

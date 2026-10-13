@@ -14,6 +14,7 @@ on:
 
 jobs:
   vgc-linux:
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -59,21 +60,23 @@ jobs:
           sudo hostname -s freebsd-ci
           git config --global --add safe.directory .
           gmake
-          sysctl kern.threads.max_threads_per_proc hw.ncpu
-          # cx-home/v#24: the idle-run coalesce row, traced, before the suite
-          VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_idle_defrag_test.v 2>&1 | tail -80 || true
-          # every mode reports, then the job fails if any did
-          rc=0
-          ./v test bench/parallel-alloc || rc=1
-          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc || rc=1
-          VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc || rc=1
-          exit $rc
+          sysctl kern.threads.max_threads_per_proc hw.ncpu kern.timecounter.hardware kern.sched.name kern.sched.slice || true
+          cc -O1 -o /tmp/cpuclk bench/parallel-alloc/diag/cpuclk.c && /tmp/cpuclk
+          echo "== DIAG alone, MPM=0"
+          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc/vgc_pacer_cpu_clock_test.v || true
+          for f in /tmp/pacer_diag_*.txt; do echo "## $f"; grep -E "^ENV|^\[gc [0-9]+\] marked|tag=0x00000000000042" "$f" | tail -120; done
+          rm -f /tmp/pacer_diag_*.txt
+          echo "== DIAG suite mode 2"
+          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc || true
+          for f in /tmp/pacer_diag_*.txt; do echo "## $f"; grep -E "^ENV|^\[gc [0-9]+\] marked|tag=0x00000000000042" "$f" | tail -120; done
+          exit 0
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's
   # drivers spawn children through `ENV=v cmd`, which cmd.exe does not read,
   # so this job runs the port test and the soundness driver directly.
   vgc-windows:
+    if: false
     strategy:
       fail-fast: false
       matrix:

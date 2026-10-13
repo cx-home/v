@@ -67,6 +67,8 @@ fn headroom_kb(env string) (u64, int, i64) {
 	sw := time.new_stopwatch()
 	r := os.execute('VGC_PACER_CHILD=1 VGC_GCTRACE=1 VGC_HEADROOM_LIVE_PCT=0 ${env}${os.quoted_path(os.executable())}')
 	assert r.exit_code == 0, r.output
+	dpath := '/tmp/pacer_diag_${os.getpid()}_${time.now().unix_micro()}.txt'
+	os.write_file(dpath, 'ENV=${env} MPM=${os.getenv('VGC_MARK_PAR_MIN_US')}\n' + r.output) or {}
 	mut hs := []u64{}
 	for l in r.output.split_into_lines() {
 		if l.starts_with('[gc ') && l.contains(' headroom=') {

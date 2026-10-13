@@ -1464,6 +1464,14 @@ __global vgc_gc_last_end = u64(0)
 __global vgc_gc_cpu_t0 = u64(0)
 __global vgc_pacer_wall = u64(0)
 __global vgc_test_stall_us = u64(0)
+// DIAG v#42 (never landed)
+__global vgc_dg_wall = u64(0)
+__global vgc_dg_cpu = u64(0)
+__global vgc_dg_int = u64(0)
+__global vgc_dg_stallcpu = u64(0)
+__global vgc_dg_idx0 = u64(0)
+__global vgc_dg_idx1 = u64(0)
+__global vgc_dg_cpu0 = u64(0)
 
 // ── #58 SCANNED-WINDOW SHADOW (-d vgc_spcheck) ──────────────────────────────
 // Per-thread snapshot of the [stack_lo, stack_hi] range the collector actually
