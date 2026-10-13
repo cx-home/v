@@ -1,0 +1,27 @@
+module main
+
+@[heap]
+struct Node {
+mut:
+	a &Node = unsafe { nil }
+	b &Node = unsafe { nil }
+	c []int
+}
+
+@[noinline]
+fn link(mut p Node, q &Node, r &Node) {
+	p.a = q
+	p.b = r
+	p.c = [1, 2]
+	if q != unsafe { nil } {
+		p.a = r
+	}
+	p.b = q
+}
+
+fn main() {
+	mut n := &Node{}
+	m := &Node{}
+	link(mut n, m, n)
+	println(n.a == n)
+}

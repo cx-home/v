@@ -624,6 +624,26 @@ fn (g &Gen) cm_is_pure_lvalue(e ast.Expr) bool {
 // sound: dirtying an extra/imprecise-but-valid span only costs a harmless re-scan;
 // only a MISSED heap store is unsound. Side-effecting bases are skipped (the bulk
 // mutators array_push/map_set/memdup/realloc carry their own barrier).
+// wb_gate emits one `vgc_wb_gate(<base>);` statement — unless the statement
+// just emitted is that same call (cx-private#1924 cut 3). A statement's after
+// barrier and the next statement's before barrier on the same base meet at one
+// program point with nothing between them in the text, so no code runs between
+// the two calls, the base evaluates to the same object, and the gate is
+// idempotent: the second call adds nothing the first did not. The common case
+// is a run of field stores through one pointer (`p.a = x` `p.b = y` ...): 2n
+// gates become n + 1. Text adjacency is the proof: a label, a brace, a
+// declaration or any other statement between them keeps both calls.
+fn (mut g Gen) wb_gate(base string) {
+	line := 'vgc_wb_gate((voidptr)(${base}));\n'
+	if g.out.len >= line.len && g.out.last_n(line.len) == line {
+		at := g.out.len - line.len
+		if at == 0 || g.out.byte_at(at - 1) in [`\t`, `\n`] {
+			return
+		}
+	}
+	g.writeln(line[..line.len - 1])
+}
+
 fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	if left_type == 0 || !g.contains_ptr(left_type) {
 		return
@@ -635,7 +655,7 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	if left_type.has_flag(.shared_f) && left in [ast.Ident, ast.SelectorExpr]
 		&& g.cm_is_pure_lvalue(left) {
 		wrapper := g.expr_string(left)
-		g.writeln('vgc_wb_gate((voidptr)(${wrapper}));')
+		g.wb_gate(wrapper)
 		return
 	}
 	match left {
@@ -649,7 +669,7 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			if left.expr_type.is_ptr() {
 				if g.cm_is_pure_lvalue(left.expr) {
 					base := g.expr_string(left.expr)
-					g.writeln('vgc_wb_gate((voidptr)(${base}));')
+					g.wb_gate(base)
 				}
 			} else if left.expr in [ast.SelectorExpr, ast.IndexExpr] {
 				g.gen_cm_write_barrier(left.expr, left.expr_type)
@@ -659,7 +679,7 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			// *p = v
 			if left.op == .mul && g.cm_is_pure_lvalue(left.right) {
 				base := g.expr_string(left.right)
-				g.writeln('vgc_wb_gate((voidptr)(${base}));')
+				g.wb_gate(base)
 			}
 		}
 		ast.IndexExpr {
@@ -670,10 +690,10 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 					// array's is behind its wrapper (`a->val.data`, as index.v emits).
 					arrow := if left.left_type.is_ptr() { '->' } else { '.' }
 					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
-					g.writeln('vgc_wb_gate((voidptr)((${base})${arrow}${val}data));')
+					g.wb_gate('(${base})${arrow}${val}data')
 				} else if left.is_farray {
 					// fixed array element: its address is interior to the owning object.
-					g.writeln('vgc_wb_gate((voidptr)(&(${base})));')
+					g.wb_gate('&(${base})')
 				}
 				// maps: handled by map_set's own barrier (the key/value buffers move
 				// in bulk inside the builtin, where codegen has no per-store hook).
