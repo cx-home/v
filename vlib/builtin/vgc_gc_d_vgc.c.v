@@ -3065,6 +3065,12 @@ fn vgc_sweep_span_bits(span &VGC_Span) u8 {
 	if span.sweep_gen == u32(vgc_heap.gc_cycle) {
 		return vgc_walk_tag_none
 	}
+	// cx-home/v#37: a span in flight to its owner — popped from a list, not yet
+	// in the owner's slot — however many cycles the owner is off-CPU. (The
+	// stamp above covered that window for one sweep only.)
+	if C.vgc_atomic_load_u32(&span.inflight) != 0 {
+		return vgc_walk_tag_none
+	}
 
 	// Sweep using byte-level operations for speed
 	nbytes := (span.nelems + 7) / 8
