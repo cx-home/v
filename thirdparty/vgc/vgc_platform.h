@@ -1403,7 +1403,7 @@ typedef struct {
     volatile int nregs;
     uintptr_t regs[VGC_SUSP_MAXREG];
 #if defined(__APPLE__) && defined(VGC_SIGNAL_SUSPEND)
-    pthread_t pt;              // target pthread (in-handler self-check)
+    pthread_t pt;              // unused since cx-home/v#43 (the port is the key; kept for layout)
     semaphore_t sem;           // park semaphore (created once per slot, reused)
     volatile uint32_t sem_init;
 #endif
@@ -1707,12 +1707,15 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
     #define VGC_SUSPEND_SIGNAL SIGXCPU
   #endif
   #define VGC_MAC_MAXREG VGC_SUSP_MAXREG
-  // Async-signal-safe: pthread_self/pthread_equal, the TLS slot index, volatile
-  // atomics, register copy, sched_yield. No malloc/locks/stdio.
+  // Async-signal-safe: pthread_self, pthread_mach_thread_np on SELF (no list
+  // lock: libpthread's fast path for the calling thread), the TLS slot index,
+  // volatile atomics, register copy, sched_yield. No malloc/locks/stdio.
   static void vgc_suspend_handler(int sig, siginfo_t* si, void* uctx) {
       (void)sig; (void)si;
+      // the record armed with this thread's own port (a live thread's port is
+      // unique), so no pthread_t compare is needed (cx-home/v#43)
       vgc_susp* s = vgc_susp_self(vgc_get_cache_idx(), (uint32_t)pthread_mach_thread_np(pthread_self()));
-      if (s == 0 || !pthread_equal(pthread_self(), s->pt)) return; // spurious / not a target this cycle
+      if (s == 0) return; // spurious / not a target this cycle
       ucontext_t* uc = (ucontext_t*)uctx;
       int c = 0;
     #if defined(__arm64__) || defined(__aarch64__)
@@ -1774,10 +1777,22 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   // scheduler has not run since the last resume is still inside the handler
   // reading `release`; re-arming under it would park it on a reset flag and its
   // ack for THIS cycle would never come (cx-home/v#17 shape).
+  // cx-home/v#43: delivery and the existence probe go to the kernel by mach
+  // port (__pthread_kill, the syscall pthread_kill wraps), never through
+  // libpthread's pthread_from_mach_thread_np / pthread_kill: those take the
+  // process-wide _pthread_list_lock, which a thread this collector parked may
+  // hold (inside pthread_join, or _pthread_terminate unlinking an exiting
+  // thread) — the forcer then waits on that lock for ever with the holder
+  // parked by the previous cycle's signal (vgc_exit_churn_stw_test's
+  // tls-by-key child, 4 h at ~3 cores). The syscall returns ESRCH for a dead
+  // port like pthread_kill does.
+  extern int __pthread_kill(mach_port_t, int);
+  static inline int vgc_port_kill(uint32_t t, int sig) {
+      int r = __pthread_kill((mach_port_t)t, sig);
+      return r == -1 ? errno : r;
+  }
   static inline int vgc_suspend_request(int idx, uint32_t t) {
       if (t == 0) return 0;
-      pthread_t pt = pthread_from_mach_thread_np((mach_port_t)t);
-      if (pt == 0) { vgc_say(0xdead1, (uint64_t)t); return 0; } // target gone (port unresolvable)
       vgc_susp* s = vgc_susp_at(idx);
       if (s == 0) { vgc_say(0xdead3, (uint64_t)t); return 0; }
       for (uint64_t spins = 1; __atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0; spins++) {
@@ -1794,9 +1809,9 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
               return 0; // cannot park this target safely without a semaphore: skip (backstop path)
           }
       }
-      s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0; s->pt = pt;
+      s->acked = 0; s->release = 0; s->sp = 0; s->nregs = 0;
       __atomic_store_n(&s->port, t, __ATOMIC_RELEASE); // arm before signaling
-      int kr = pthread_kill(pt, VGC_SUSPEND_SIGNAL);
+      int kr = vgc_port_kill(t, VGC_SUSPEND_SIGNAL);
       if (kr == ESRCH) {
           vgc_say(0xdea52, (uint64_t)t); // target genuinely gone (ESRCH)
           __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
@@ -1804,14 +1819,14 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
       }
       for (uint64_t kspin = 1; kr != 0; kspin++) {
           // transient failure for a live thread: re-verify existence, retry.
-          if (pthread_kill(pt, 0) == ESRCH) {
+          if (vgc_port_kill(t, 0) == ESRCH) {
               vgc_say(0xdea52, (uint64_t)t);
               __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
               return 0;
           }
           if ((kspin & 0xfffff) == 0) vgc_say(0xdead2, (uint64_t)t); // abnormal retry (visible)
           sched_yield();
-          kr = pthread_kill(pt, VGC_SUSPEND_SIGNAL);
+          kr = vgc_port_kill(t, VGC_SUSPEND_SIGNAL);
       }
       return 1;
   }
@@ -1821,7 +1836,6 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   static inline int vgc_suspend_settle(int idx, uint32_t t) {
       vgc_susp* s = vgc_susp_at(idx);
       if (s == 0 || __atomic_load_n(&s->port, __ATOMIC_ACQUIRE) != t) return 0;
-      pthread_t pt = s->pt;
       for (int i = 0; i < 200000; i++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1; // settled
           sched_yield();
@@ -1833,13 +1847,13 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   #else
       for (uint64_t spins = 1;; spins++) {
           if (__atomic_load_n(&s->acked, __ATOMIC_ACQUIRE) != 0) return 1;
-          if (pthread_kill(pt, 0) == ESRCH) { // target genuinely exited: no ack will ever come
+          if (vgc_port_kill(t, 0) == ESRCH) { // target genuinely exited: no ack will ever come
               vgc_say(0xdead5, (uint64_t)t);
               __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
               return 0;
           }
           if ((spins & 0xffff) == 0) {
-              (void)pthread_kill(pt, VGC_SUSPEND_SIGNAL); // re-signal a lost/consumed delivery
+              (void)vgc_port_kill(t, VGC_SUSPEND_SIGNAL); // re-signal a lost/consumed delivery
           }
           if ((spins & 0xfffff) == 0) {
               vgc_say(0x0acd, (uint64_t)t); // abnormal: still waiting for ack (visible, not silent)

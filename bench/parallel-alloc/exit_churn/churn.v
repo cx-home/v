@@ -44,7 +44,9 @@ fn main() {
 	spawn fn (s int) {
 		time.sleep(s * time.second)
 		eprintln('churn: no progress in ${s} s')
-		exit(3)
+		// _exit: exit() runs the collector's exit path, which a wedged stop
+		// blocks — the cx-home/v#43 hang outlived this watchdog for 4 h
+		C._exit(3)
 	}(watchdog)
 	mut stop := false
 	f := spawn forcer(&stop)
