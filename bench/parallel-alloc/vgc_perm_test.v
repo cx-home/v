@@ -1,6 +1,7 @@
-// vgc_perm_test.v — the permanent generation (cx-home/v#15 lever 2, the
-// `-gc e` default): the live set of the first cycle is pre-marked at every
-// later cycle and never traced; a pointer stored into it afterwards is found
+// vgc_perm_test.v — the permanent generation (cx-home/v#15 lever 2, `-gc e`):
+// the live set of the first cycle after the embedder's vgc_set_permanent is
+// pre-marked at every later cycle and never traced (there is no automatic
+// promotion: permanent/perm_transient.v); a pointer stored into it afterwards is found
 // through the span's dirty bit (vgc_wb_store, called before and after every
 // pointer store) and the stop's re-scan. permanent/perm_gen.v stores the only
 // reference to a fresh record into permanent objects by every path (a field, a
@@ -22,9 +23,13 @@ module main
 import os
 
 fn build(extra string) string {
-	src := os.join_path(@DIR, 'permanent', 'perm_gen.v')
+	return build_src('perm_gen.v', extra)
+}
+
+fn build_src(name string, extra string) string {
+	src := os.join_path(@DIR, 'permanent', name)
 	exe := os.join_path(os.vtmp_dir(),
-		'vgc_perm_${os.getpid()}${extra.replace(' ', '_').replace('-', '')}')
+		'vgc_perm_${os.getpid()}_${name.all_before('.')}${extra.replace(' ', '_').replace('-', '')}')
 	r :=
 		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc ${extra} -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert r.exit_code == 0, r.output
@@ -81,4 +86,25 @@ fn test_vgc_perm_0_turns_the_generation_off() {
 	assert r.exit_code == 0, r.output
 	assert r.output.contains(' bad=0'), r.output
 	assert !r.output.contains('] perm spans='), r.output
+}
+
+// cx-home/v#15 / cx-private's repr-guard red on fe3095ab6: the first cycle
+// promotes nothing unless the program asked (vgc_set_permanent), so ~8 MB held
+// across it and dropped after is reclaimed by the next collections. The teeth:
+// VGC_PERM_CYCLE=1 (the old automatic promotion) keeps it for the life of the
+// process.
+fn test_no_automatic_promotion_of_the_first_cycles_live_set() {
+	exe := build_src('perm_transient.v', '')
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('VGC_GCTRACE=2 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert !r.output.contains('] perm spans='), 'promoted without a request: ${r.output}'
+	held := r.output.all_after('held_kb=').int()
+	assert held < 2048, 'the dropped transient stayed live: ${held} KB\n${r.output}'
+	t := os.execute('VGC_PERM_CYCLE=1 ${os.quoted_path(exe)}')
+	assert t.exit_code == 0, t.output
+	theld := t.output.all_after('held_kb=').int()
+	assert theld > 6144, 'no teeth: VGC_PERM_CYCLE=1 held only ${theld} KB\n${t.output}'
 }

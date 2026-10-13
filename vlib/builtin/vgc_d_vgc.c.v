@@ -918,16 +918,22 @@ __global vgc_cm_born_last = u64(0)
 __global vgc_cm_cut_last = false
 // cx-home/v#15 lever 2: the permanent generation (vgc_concurrent only: it
 // rests on the codegen write barrier). VGC_PERM: 0 = off, 1 (default) = the
-// live set of the promotion cycle — VGC_PERM_CYCLE (default 1: the first
-// cycle, the interpreter's start-up structures) or the first stop-the-world
-// cycle after vgc_set_permanent — is promoted: pre-marked at every clear,
+// live set of the promotion cycle — the first stop-the-world cycle after
+// vgc_set_permanent, or VGC_PERM_CYCLE=N's N-th cycle when that is set — is
+// promoted. There is no automatic promotion by default (VGC_PERM_CYCLE
+// unset or 0): a permanent object is never swept, so whatever the program
+// happened to hold at an arbitrary first cycle became immortal — the input
+// string of cx-private's bench/repr (+1.0 on the xml/cx/cxel multipliers, the
+// loop's fe3095ab6 repr-guard red). Only the embedder knows when its
+// long-lived structures are built and nothing else is held; it says so with
+// vgc_set_permanent. The promoted set is pre-marked at every clear,
 // never traced again, never swept; the pointers it holds into later
 // generations are found by the dirty re-scan of its spans (every pointer
 // store into a permanent span dirties it, before and after the store —
 // vgc_wb_store; see vgc_perm_promote for the soundness argument). A later
 // vgc_set_permanent promotes the live set of that cycle on top.
 __global vgc_perm_mode = int(1)
-__global vgc_perm_cycle = u64(1)
+__global vgc_perm_cycle = u64(0) // 0: no automatic promotion (vgc_set_permanent only)
 __global vgc_perm_on = u32(0)
 __global vgc_perm_request = false
 __global vgc_perm_spans = u64(0)
@@ -2001,7 +2007,7 @@ pub fn vgc_init() {
 		pc_env := C.getenv(c'VGC_PERM_CYCLE')
 		if pc_env != unsafe { nil } {
 			pc := C.atoll(pc_env)
-			if pc >= 1 {
+			if pc >= 0 {
 				vgc_perm_cycle = u64(pc)
 			}
 		}

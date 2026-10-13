@@ -98,7 +98,7 @@ fn vgc_gc_start() {
 		// (an object born in a concurrent middle is filled after the stop with
 		// no barrier, so it must not be promoted)
 		promote := vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
+			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
 		if !promote && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
@@ -299,7 +299,7 @@ fn vgc_gc_start() {
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the promotion cycle, and the verifier's full re-mark
 		if vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
+			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
 			vgc_perm_promote()
 		}
 		if vgc_perm_on != 0 {

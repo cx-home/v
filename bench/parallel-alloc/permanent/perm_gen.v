@@ -185,7 +185,10 @@ fn main() {
 	for _ in 0 .. workers {
 		olds << new_old()
 	}
-	gc_collect() // the promotion cycle (VGC_PERM_CYCLE=1)
+	// the embedder's word: the long-lived structures are built (there is no
+	// automatic promotion — cx-home/v#15, the repr-guard red on fe3095ab6)
+	vgc_set_permanent()
+	gc_collect() // the promotion cycle
 	gc_collect()
 	mut ts := []thread u64{}
 	for w in 0 .. workers {
