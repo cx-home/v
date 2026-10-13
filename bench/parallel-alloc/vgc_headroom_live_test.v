@@ -94,19 +94,21 @@ fn test_the_headroom_is_bounded_by_the_live_set() {
 	if which != '' {
 		return
 	}
-	on := ratio('', 'big')
-	off := ratio('VGC_HEADROOM_LIVE_PCT=0 ', 'big')
-	println('vgc_headroom_live: bound default ${on:.3f}x, bound off ${off:.3f}x (carved high / live, 40 MB live)')
-	// The bound binds only when the unbounded pacer carves past it: the time
-	// band doubles the headroom when marking costs more than a tenth of the
-	// interval, which a fast runner's mark may not (GitHub's ubuntu-24.04 runner:
-	// 1.6x bound off, 1.6x on — the headroom never left its floor). So the bound
-	// must never carve MORE, and must carve less wherever bound-off went past
-	// 2x + the floor's margin; the 2.3x bar holds on every box.
-	assert on <= off + 0.05, 'the live-set bound raised the carve: ${on:.3f}x against bound off ${off:.3f}x'
-	if off > 2.3 {
-		assert on < off, 'the live-set bound does not lower the carve: ${on:.3f}x against bound off ${off:.3f}x'
-	}
+	// The bound binds only when the unbounded pacer carves past it, and left to
+	// itself the time band is the runner's: since cx-home/v#42 it reads the
+	// collector's work CPU, so one run of a pair can ride the band to the 64 MB
+	// cap while the other keeps its base (Linux CI, the same build: bound default
+	// 1.600x / bound off 2.626x, then 2.026x / 2.626x, then 2.026x / 1.600x — a
+	// comparison of two band draws, not of the bound). The band is held up here
+	// as in test_the_bound_has_a_floor (the wall-time pacer and a 50 ms collector
+	// stall per cycle), so bound off carves marked + the 64 MB cap (~2.6x) on
+	// every runner and the pair reads the bound alone.
+	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
+	on := ratio(band, 'big')
+	off := ratio(band + 'VGC_HEADROOM_LIVE_PCT=0 ', 'big')
+	println('vgc_headroom_live: band held up — bound default ${on:.3f}x, bound off ${off:.3f}x (carved high / live, 40 MB live)')
+	assert off > 2.3, 'the band held up did not carve past the bound with the bound off: ${off:.3f}x (expected marked + 64 MB, ~2.6x)'
+	assert on < off, 'the live-set bound does not lower the carve: ${on:.3f}x against bound off ${off:.3f}x'
 	assert on <= 2.3, 'the bounded pacer carved ${on:.3f}x the live set (bar 2.3x)'
 }
 
