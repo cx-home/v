@@ -11,6 +11,7 @@
 module main
 
 import time
+import sync.stdatomic
 
 @[heap]
 struct Rec {
@@ -35,7 +36,7 @@ fn mk(i u64, prev &Rec) &Rec {
 	return r
 }
 
-fn worker(id u64) u64 {
+fn worker(id u64, done &Done) u64 {
 	mut ring := []&Rec{len: window}
 	mut bad := u64(0)
 	mut prev := &Rec(unsafe { nil })
@@ -61,6 +62,7 @@ fn worker(id u64) u64 {
 			prev = unsafe { nil }
 		}
 	}
+	stdatomic.add_u64(&done.n, 1)
 	return bad
 }
 
@@ -70,16 +72,31 @@ fn worker(id u64) u64 {
 // clock gave ~15 per thread per cycle on a loaded 4-vCPU runner (FreeBSD CI
 // 38184127117: 68 %) against hundreds on a quiet box; a cycle now waits for
 // cycle_refills refills across the workers (at most cycle_wait).
+//
+// cx-home/v#40: the 20 ms cap on that wait still made the cadence a clock on a
+// slow runner — FreeBSD's 4-vCPU runner under VJOBS=1 with eight walkers made
+// ~125 refills per cycle (12,461 over 100 stops, share 71-73 %). The wait is
+// now on the refills alone; it ends early only when every worker has finished
+// (Done), so no stop lands between two of a thread's refills because
+// a clock ran out.
 const cycle_refills = u64(400)
-const cycle_wait = 20 * time.millisecond
 
-fn collector(n int) u64 {
+// how many workers of the running phase have finished
+@[heap]
+struct Done {
+mut:
+	n u64
+}
+
+fn collector(n int, done &Done) u64 {
 	for _ in 0 .. n {
+		if stdatomic.load_u64(&done.n) >= u64(threads) {
+			break
+		}
 		gc_collect()
 		$if vgc ? {
 			base, _ := vgc_pool_refill_stats()
-			sw := time.new_stopwatch()
-			for sw.elapsed() < cycle_wait {
+			for stdatomic.load_u64(&done.n) < u64(threads) {
 				time.sleep(time.millisecond)
 				r, _ := vgc_pool_refill_stats()
 				if r - base >= cycle_refills {
@@ -94,11 +111,12 @@ fn collector(n int) u64 {
 }
 
 fn run_phase() u64 {
+	done := &Done{}
 	mut ts := []thread u64{}
 	for t in 0 .. threads {
-		ts << spawn worker(u64(t) + 1)
+		ts << spawn worker(u64(t) + 1, done)
 	}
-	ts << spawn collector(100)
+	ts << spawn collector(100, done)
 	mut bad := u64(0)
 	for t in ts {
 		bad += t.wait()

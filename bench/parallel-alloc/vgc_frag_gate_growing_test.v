@@ -29,6 +29,23 @@
 module main
 
 import os
+import runtime
+
+fn C.getloadavg(loadavg &f64, nelem int) int
+
+// load1 is the one-minute load average, or -1 where getloadavg answers nothing
+// (and on Windows, which has none).
+fn load1() f64 {
+	$if windows {
+		return -1
+	} $else {
+		mut la := [3]f64{}
+		if C.getloadavg(&la[0], 1) != 1 {
+			return -1
+		}
+		return la[0]
+	}
+}
 
 const rec = 2048
 const live_bytes = 192 * 1024 * 1024
@@ -103,6 +120,7 @@ fn test_a_growing_heap_takes_no_extra_frag_gate_collections() {
 		println('FRAG-DONE=${grow()}')
 		return
 	}
+	load_start := load1()
 	mut off := run_child('0')
 	mut off_most := off
 	mut on := run_child('')
@@ -118,5 +136,16 @@ fn test_a_growing_heap_takes_no_extra_frag_gate_collections() {
 	// collection in eight more than the gate off (measured: 17-18 against 17;
 	// 65 against 18 before the guard)
 	assert on.cycles <= off_most.cycles + off_most.cycles / 8, 'the frag gate added collections on a growing heap: ${on.cycles} against ${off.cycles}-${off_most.cycles} with the gate off'
+	// the pause sum is wall time: judged only on a runner that is not
+	// oversubscribed (cx-home/v#40: FreeBSD's 4-vCPU runner with four test
+	// binaries in parallel read 739 ms against an off arm of 179-436 ms at the
+	// same collection count); the collection count above is the regression's
+	// own measure and is judged on every runner
+	load_end := load1()
+	ncpu := f64(runtime.nr_cpus())
+	if load_start > ncpu || load_end > ncpu {
+		println('vgc_frag_gate_growing: pause time not judged on an oversubscribed runner (load ${load_start:.1f} -> ${load_end:.1f} on ${ncpu} CPUs)')
+		return
+	}
 	assert on.pause_us <= off_most.pause_us * 5 / 4 + 10000, 'the frag gate added pause time on a growing heap: ${on.pause_us} us against ${off.pause_us}-${off_most.pause_us} us'
 }
