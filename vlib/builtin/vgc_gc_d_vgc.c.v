@@ -125,6 +125,7 @@ fn vgc_gc_start() {
 	}
 	vgc_gc_t0 = C.vgc_now_ns() // cycle-cost measurement for the adaptive pacer (#71)
 	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
+	vgc_gc_wait_cpu = 0
 	// cx-home/v#16: this cycle's marker count, and the pool threads created
 	// BEFORE the world stops (see vgc_mark_workers_cfg).
 	vgc_mark_nworkers_cur = vgc_mark_plan()
@@ -423,6 +424,27 @@ fn vgc_gc_start() {
 // probe, the work-queue reset and the span-stash drain. On return every other
 // mutator is parked, safe or suspended, and this thread holds cache_lock,
 // free_spans_lock, vgc_heap.lock, every central lock and the spawn-root lock.
+// vgc_wait_cpu_begin / _end bracket one of the collecting thread's waits
+// (cx-home/v#42): the CPU the wait spun is added to vgc_gc_wait_cpu, which the
+// pacer takes off the cycle's cost. Only the collecting thread calls them.
+@[inline]
+fn vgc_wait_cpu_begin() u64 {
+	if vgc_pacer_wall != 0 || vgc_gc_cpu_t0 == 0 {
+		return 0
+	}
+	return C.vgc_thread_cpu_ns()
+}
+
+@[inline]
+fn vgc_wait_cpu_end(t0 u64) {
+	if t0 != 0 {
+		t1 := C.vgc_thread_cpu_ns()
+		if t1 > t0 {
+			vgc_gc_wait_cpu += t1 - t0
+		}
+	}
+}
+
 fn vgc_stw_stop(self_idx int) {
 	$if !vgc_legacy_stw ? {
 		// #63 COOPERATIVE STW (DEFAULT; -d vgc_legacy_stw reverts to legacy mach-suspend-all):
@@ -523,6 +545,11 @@ fn vgc_stw_stop(self_idx int) {
 			mut spins := 0
 			mut stable := 0
 			mut last_stopped := u32(0xffffffff)
+			wcpu := if C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want {
+				vgc_wait_cpu_begin()
+			} else {
+				u64(0)
+			}
 			for C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count) < want && spins < 200000 {
 				cur := C.vgc_atomic_load_u32(&vgc_heap.gc_stopped_count)
 				if cur != last_stopped {
@@ -537,6 +564,7 @@ fn vgc_stw_stop(self_idx int) {
 				C.vgc_cpu_pause()
 				spins++
 			}
+			vgc_wait_cpu_end(wcpu)
 		}
 		// Now safe to take allocator locks (parkers hold none at the poll site) + finish
 		// any lazy sweep from the previous cycle.
@@ -604,7 +632,9 @@ fn vgc_stw_stop(self_idx int) {
 				}
 			}
 		}
-		// Pass 2: settle every requested suspend (ack / register capture).
+		// Pass 2: settle every requested suspend (ack / register capture). The
+		// settle spins for the acks: its CPU is a wait (cx-home/v#42).
+		wcpu2 := vgc_wait_cpu_begin()
 		for i in 0 .. vgc_heap.ncaches {
 			mut c := unsafe { vgc_cache(i) }
 			if c.cov_req {
@@ -615,6 +645,7 @@ fn vgc_stw_stop(self_idx int) {
 				C.vgc_trace(7, i, u64(c.mach_port), 0)
 			}
 		}
+		vgc_wait_cpu_end(wcpu2)
 	} $else {
 		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 0) // OS-suspend, not cooperative
 
@@ -649,6 +680,7 @@ fn vgc_stw_stop(self_idx int) {
 				c.cov_req = C.vgc_suspend_request(i, c.mach_port) != 0
 			}
 		}
+		wcpu2 := vgc_wait_cpu_begin()
 		for i in 0 .. vgc_heap.ncaches {
 			mut c := unsafe { vgc_cache(i) }
 			if c.cov_req {
@@ -660,6 +692,7 @@ fn vgc_stw_stop(self_idx int) {
 				C.vgc_trace(7, i, u64(c.mach_port), 0) // SUSP! (actually suspended)
 			}
 		}
+		vgc_wait_cpu_end(wcpu2)
 	}
 	$if vgc_passive ? {
 		// #145 LIGHT non-masking STW-completeness probe: at mark time every registered
@@ -1306,6 +1339,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_cm_this_cycle = true
 	vgc_gc_t0 = C.vgc_now_ns() // the pacer's cycle cost (#71): the whole cycle, middle included
 	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
+	vgc_gc_wait_cpu = 0
 	vgc_mark_nworkers_cur = vgc_mark_plan()
 	vgc_walk_nworkers_cur = vgc_walk_plan()
 	self_idx := C.vgc_get_cache_idx()
@@ -2344,6 +2378,11 @@ fn vgc_pool_run(phase u32, n int) {
 	_ = C.vgc_atomic_add_u32(&vgc_mark_go, 1)
 	C.vgc_mark_wake(&vgc_mark_go)
 	vgc_pool_phase_run(phase, 0, n)
+	if C.vgc_atomic_load_u32(&vgc_mark_done) >= u32(vgc_mark_pool_n) {
+		return
+	}
+	// the join: slot 0 waits for the pool threads (a wait — cx-home/v#42)
+	wcpu := vgc_wait_cpu_begin()
 	mut spins := 0
 	for C.vgc_atomic_load_u32(&vgc_mark_done) < u32(vgc_mark_pool_n) {
 		spins++
@@ -2353,6 +2392,7 @@ fn vgc_pool_run(phase u32, n int) {
 			C.vgc_cpu_pause()
 		}
 	}
+	vgc_wait_cpu_end(wcpu)
 }
 
 // One thread's share of a phase.
@@ -2451,9 +2491,13 @@ fn vgc_drain_mark_parallel(w int, n int) {
 			continue
 		}
 		_ = C.vgc_atomic_add_u32(&vgc_mark_idle, 1)
+		// slot 0 (the collecting thread) waiting for the other markers is a
+		// wait (cx-home/v#42); the pool threads' clocks are not the pacer's
+		wcpu := if w == 0 { vgc_wait_cpu_begin() } else { u64(0) }
 		mut spins := 0
 		for {
 			if C.vgc_atomic_load_u32(&vgc_mark_idle) >= u32(n) {
+				vgc_wait_cpu_end(wcpu)
 				return
 			}
 			if unsafe { voidptr(vgc_heap.work_full) } != unsafe { nil } {
@@ -2467,6 +2511,7 @@ fn vgc_drain_mark_parallel(w int, n int) {
 				C.vgc_cpu_pause()
 			}
 		}
+		vgc_wait_cpu_end(wcpu)
 	}
 }
 
@@ -3460,8 +3505,19 @@ fn vgc_update_trigger() {
 		// VGC_PACER_WALL=1: the wall pause, as before.
 		if vgc_pacer_wall == 0 && vgc_gc_cpu_t0 != 0 {
 			cpu_now := C.vgc_thread_cpu_ns()
-			if cpu_now > vgc_gc_cpu_t0 && cpu_now - vgc_gc_cpu_t0 < pause {
-				pause = cpu_now - vgc_gc_cpu_t0
+			if cpu_now > vgc_gc_cpu_t0 {
+				// the waits' spin is the box's contention, not the cycle's work
+				// (FreeBSD CI: 179-790 ms of CPU spun waiting for descheduled
+				// markers and parkers in cycles whose work is ~3 ms)
+				mut cpu := cpu_now - vgc_gc_cpu_t0
+				if vgc_gc_wait_cpu < cpu {
+					cpu -= vgc_gc_wait_cpu
+				} else {
+					cpu = 0
+				}
+				if cpu < pause {
+					pause = cpu
+				}
 			}
 		}
 		vgc_gate_last_pause = pause

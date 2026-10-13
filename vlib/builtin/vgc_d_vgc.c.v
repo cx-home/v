@@ -1464,6 +1464,14 @@ __global vgc_gc_last_end = u64(0)
 __global vgc_gc_cpu_t0 = u64(0)
 __global vgc_pacer_wall = u64(0)
 __global vgc_test_stall_us = u64(0)
+// cx-home/v#42 (FreeBSD CI): the collecting thread's CPU time inside its waits
+// this cycle — the park and ack waits of the stop, the pool's join, slot 0's
+// idle wait for the markers. They spin (cpu_pause, sched_yield), so on a busy
+// box a collector waiting for descheduled threads bills CPU for the box's
+// contention, not for the collection's work (FreeBSD's 4-vCPU runner at 4
+// jobs: 179-790 ms of CPU in a cycle whose work is ~3 ms). The pacer's pause is
+// the cycle's CPU less this.
+__global vgc_gc_wait_cpu = u64(0)
 
 // ── #58 SCANNED-WINDOW SHADOW (-d vgc_spcheck) ──────────────────────────────
 // Per-thread snapshot of the [stack_lo, stack_hi] range the collector actually
