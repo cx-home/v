@@ -119,6 +119,7 @@ fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u
 fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
+fn C.vgc_addr_to_arena2(addr usize) int
 fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_touched_ranges(lo usize, hi usize, los &usize, his &usize, max int) int // cx-home/v#15
 fn C.vgc_addr_to_arena(addr usize) int
@@ -6017,6 +6018,13 @@ fn vgc_find_span(ptr voidptr) &VGC_Span {
 	mut arena_idx := C.vgc_addr_to_arena(addr)
 	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
+		// the chunk's second arena (cx-home/v#15 lever 3: an arena straddles
+		// two chunks, so the one entry missed for the older arena's part of a
+		// shared chunk and every such lookup scanned the arenas linearly)
+		arena_idx = C.vgc_addr_to_arena2(addr)
+	}
+	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
+		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		arena_idx = -1
 		for i in 0 .. nar {
 			a := unsafe { &vgc_heap.arenas[i] }
@@ -6062,13 +6070,22 @@ fn vgc_is_heap_ptr(addr usize) bool {
 	if addr < vgc_arena_lo || addr >= vgc_arena_hi {
 		return false
 	}
-	arena_idx := C.vgc_addr_to_arena(addr)
 	// ACQUIRE-load narenas (paired with vgc_span_alloc's RELEASE store).
-	if arena_idx < 0 || arena_idx >= int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas)))) {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	arena_idx := C.vgc_addr_to_arena(addr)
+	if arena_idx >= 0 && arena_idx < nar {
+		a := unsafe { &vgc_heap.arenas[arena_idx] }
+		if addr >= a.base && addr < a.base + a.used {
+			return true
+		}
+	}
+	// the chunk's second arena (see vgc_find_span)
+	arena2 := C.vgc_addr_to_arena2(addr)
+	if arena2 < 0 || arena2 >= nar {
 		return false
 	}
-	a := unsafe { &vgc_heap.arenas[arena_idx] }
-	return addr >= a.base && addr < a.base + a.used
+	a2 := unsafe { &vgc_heap.arenas[arena2] }
+	return addr >= a2.base && addr < a2.base + a2.used
 }
 
 // Safepoint: called when GC needs threads to stop. Spills callee-saved

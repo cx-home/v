@@ -939,12 +939,26 @@ static inline void vgc_mutex_unlock(volatile uint32_t* lock) {
 #define VGC_ADDR_SHIFT 26  // 64MB chunks (== vgc_arena_size)
 #define VGC_ADDR_MAP_SIZE 65536 // 65536 * 64MB = 4TB address coverage (same as old 4096*1GB)
 
-// Maps (address >> 30) -> arena_index+1 (0 = not mapped)
+// Maps (address >> VGC_ADDR_SHIFT) -> arena_index+1 (0 = not mapped), TWICE:
+// an arena is an mmap of vgc_arena_size at whatever address the OS hands out,
+// so it is not aligned to the map's chunks and every arena straddles two of
+// them; with one entry per chunk the newer arena's registration overwrote the
+// older one's in the chunk they share, the hint missed for the older arena's
+// part of that chunk — the fraction of every arena below its first chunk
+// boundary, up to the whole arena — and vgc_find_span fell back to the linear
+// scan over every arena for each such address (cx-home/v#15 lever 3: 38 % of
+// the mark workers' cycles on a 2.4 GB heap, vgc_find_span's own loop). A
+// chunk holds the parts of at most two 64 MB arenas (an oversized
+// single-object arena is larger, never smaller), so the second entry makes
+// the lookup exact: the hint names one arena, vgc_addr_map2 the other, and
+// the linear scan is left for a chunk that somehow holds a third.
 static uint16_t vgc_addr_map[VGC_ADDR_MAP_SIZE];
+static uint16_t vgc_addr_map2[VGC_ADDR_MAP_SIZE];
 
 static inline void vgc_addr_map_register(uintptr_t base, size_t size, int arena_idx) {
     uintptr_t lo = base >> VGC_ADDR_SHIFT;
     uintptr_t hi = (base + size - 1) >> VGC_ADDR_SHIFT;
+    uint16_t me = (uint16_t)(arena_idx + 1);
     for (uintptr_t i = lo; i <= hi && i < VGC_ADDR_MAP_SIZE; i++) {
         // RELEASE store: vgc_span_alloc (writer, under heap lock) publishes the chunk
         // hint; vgc_addr_to_arena reads it LOCK-FREE from vgc_find_span in the
@@ -952,7 +966,15 @@ static inline void vgc_addr_map_register(uintptr_t base, size_t size, int arena_
         // (ThreadSanitizer: data race on global vgc_addr_map between vgc_span_alloc and
         // vgc_find_span under concurrent HTTP load) — the last unsynchronized
         // lock-free-reader/writer in the allocator after the narenas/page_span fixes.
-        vgc_atomic_store_u16(&vgc_addr_map[i], (uint16_t)(arena_idx + 1));
+        // The writer runs under vgc_heap.lock, so the two reads below are its own.
+        uint16_t first = vgc_atomic_load_u16(&vgc_addr_map[i]);
+        if (first == 0 || first == me) {
+            vgc_atomic_store_u16(&vgc_addr_map[i], me);
+        } else {
+            // the chunk's first arena stays; this one is its second (a third
+            // overwrites the second: the linear fallback still covers it)
+            vgc_atomic_store_u16(&vgc_addr_map2[i], me);
+        }
     }
 }
 
@@ -961,6 +983,15 @@ static inline int vgc_addr_to_arena(uintptr_t addr) {
     uintptr_t idx = addr >> VGC_ADDR_SHIFT;
     if (idx >= VGC_ADDR_MAP_SIZE) return -1;
     int v = (int)vgc_atomic_load_u16(&vgc_addr_map[idx]); // ACQUIRE (pairs with register's RELEASE)
+    return v ? v - 1 : -1;
+}
+
+// The chunk's second arena (see vgc_addr_map2), or -1: tried when the first
+// does not contain addr, before the linear scan.
+static inline int vgc_addr_to_arena2(uintptr_t addr) {
+    uintptr_t idx = addr >> VGC_ADDR_SHIFT;
+    if (idx >= VGC_ADDR_MAP_SIZE) return -1;
+    int v = (int)vgc_atomic_load_u16(&vgc_addr_map2[idx]);
     return v ? v - 1 : -1;
 }
 
