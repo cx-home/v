@@ -419,6 +419,13 @@ mut:
 	// refill statistics (cx-private#1910 evidence; slow path only)
 	pool_refills    u64 // vgc_get_free_span_cached calls
 	pool_lock_takes u64 // of which took free_spans_lock
+	// DIAG v#40 (never landed)
+	dg_take_empty   u64
+	dg_take_short   u64
+	dg_take_full    u64
+	dg_take_drained u64
+	dg_take_big     u64
+	dg_drained      bool
 }
 
 // cx-private#1910: the stash covers the size classes' span sizes (vgc_class_npages
@@ -3029,6 +3036,13 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 		return s, cold
 	}
 	c.pool_lock_takes++
+	if c.dg_drained {
+		c.dg_take_drained++
+		c.dg_drained = false
+	}
+	if npages > 2 {
+		c.dg_take_big++
+	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
 	// Exact fit, hot first then cold, up to the batch; the recommits of cold
 	// spans are left to the pops above (the trim files a pooled span cold after
@@ -3060,9 +3074,15 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 			got++
 		}
 		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+		if got < want {
+			c.dg_take_short++
+		} else {
+			c.dg_take_full++
+		}
 		vgc_pool_unlink_finish(mut first)
 		return first, cold
 	}
+	c.dg_take_empty++
 	span, cold := vgc_get_free_span_locked(npages)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	return span, cold
@@ -3096,6 +3116,7 @@ fn vgc_tpool_drain_slot(mut c VGC_Cache) {
 		}
 	}
 	c.tpool_n = 0
+	c.dg_drained = true
 }
 
 // vgc_tpool_drain_stw runs under the stop with free_spans_lock held: every
@@ -3132,6 +3153,25 @@ pub fn vgc_pool_refill_stats() (u64, u64) {
 		takes += c.pool_lock_takes
 	}
 	return refills, takes
+}
+
+// DIAG v#40: (empty, short, full, drained, big) lock takes summed over slots
+@[markused]
+pub fn vgc_pool_take_diag() (u64, u64, u64, u64, u64) {
+	mut a := u64(0)
+	mut b := u64(0)
+	mut d := u64(0)
+	mut e := u64(0)
+	mut f := u64(0)
+	for i in 0 .. vgc_heap.ncaches {
+		c := unsafe { vgc_cache(i) }
+		a += c.dg_take_empty
+		b += c.dg_take_short
+		d += c.dg_take_full
+		e += c.dg_take_drained
+		f += c.dg_take_big
+	}
+	return a, b, d, e, f
 }
 
 // vgc_span_pop_finish restores a just-popped span's data pages if a pool trim

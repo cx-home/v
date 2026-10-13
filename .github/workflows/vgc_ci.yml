@@ -69,6 +69,17 @@ jobs:
           echo "== DIAG suite mode 2"
           VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc || true
           for f in /tmp/pacer_diag_*.txt; do echo "## $f"; grep -E "^ENV|^\[gc [0-9]+\] marked|tag=0x00000000000042" "$f" | tail -120; done
+          cat /tmp/stash_diag_*.txt; rm -f /tmp/stash_diag_*.txt; echo
+          echo "== DIAG40 stash x6 alone, MPM=0"
+          for i in 1 2 3 4 5 6; do VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc/vgc_span_stash_test.v >/dev/null 2>&1; done
+          cat /tmp/stash_diag_*.txt; rm -f /tmp/stash_diag_*.txt; echo
+          echo "== DIAG40 stash x6 alone, MPM=0, beside 3 busy loops"
+          for k in 1 2 3; do (sh -c 'while :; do :; done' &) ; done
+          for i in 1 2 3 4 5 6; do VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc/vgc_span_stash_test.v 2>&1 | grep -E "steady|OK|FAIL" ; done
+          cat /tmp/stash_diag_*.txt; rm -f /tmp/stash_diag_*.txt; echo
+          echo "== DIAG42 pacer alone, MPM=0, beside 3 busy loops"
+          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc/vgc_pacer_cpu_clock_test.v 2>&1 | grep -E "vgc_pacer_cpu_clock|OK|FAIL"
+          for f in /tmp/pacer_diag_*.txt; do echo "## $f"; grep -E "^ENV|^\[gc [0-9]+\] marked|tag=0x00000000000042" "$f" | tail -120; done
           exit 0
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),

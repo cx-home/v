@@ -11,6 +11,7 @@
 module main
 
 import time
+import os
 import sync.stdatomic
 
 @[heap]
@@ -130,7 +131,12 @@ fn test_span_stash_refills_without_the_pool_lock() {
 	assert run_phase() == 0
 	$if vgc ? {
 		refills0, takes0 := vgc_pool_refill_stats()
+		e0, s0, f0, d0, b0 := vgc_pool_take_diag()
 		bad := run_phase()
+		e1, s1, f1, d1, b1 := vgc_pool_take_diag()
+		dl := 'DIAG40 empty=${e1 - e0} short=${s1 - s0} full=${f1 - f0} drained=${d1 - d0} big=${b1 - b0}'
+		println(dl)
+		os.write_file('/tmp/stash_diag_${os.getpid()}.txt', dl) or {}
 		assert bad == 0, 'corrupted records: ${bad}'
 		refills1, takes1 := vgc_pool_refill_stats()
 		refills := refills1 - refills0
