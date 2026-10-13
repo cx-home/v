@@ -228,6 +228,22 @@ mut:
 	free_index  u32 // hint: scan from here for free slot
 	// Sweep generation (translated from Go's sweepgen)
 	sweep_gen u32
+	// cx-home/v#37: the in-flight claim. Set (atomic) where a span leaves a
+	// list for a mutator — the central pop (vgc_central_get_span, under the
+	// class lock), the pool or stash pop and the carve (vgc_span_alloc_once) —
+	// and cleared by the owner once the span is somewhere the collector reads:
+	// after the mcache slot store (vgc_span_release_acquisition, a release
+	// store) or, for a large span, once its object is set up
+	// (vgc_alloc_large). The sweep skips a span with the bit set
+	// (vgc_sweep_span_bits), so the window between the pop and the slot store
+	// is covered however long the owner is off-CPU; the one-cycle stamp
+	// (sweep_gen = gc_cycle, kept beside it) covered that window for exactly
+	// one sweep, and an owner preempted across a whole cycle — a 4-vCPU runner
+	// with 25 runnable threads and a forced cycle every 2 ms — came back to a
+	// span the next sweep had relinked onto central.partial (a second thread
+	// then popped it, the owner filled it, vgc_span_alloc_obj answered nil)
+	// or recycled to the pool (its pages handed out twice).
+	inflight u32
 	// Concurrent mark (vgc_concurrent): set to 1 by the write barrier
 	// (vgc_wb_store) when any object in this span is mutated during the
 	// concurrent mark; the collector conservatively re-scans every dirty span at
@@ -694,6 +710,8 @@ const vgc_spawn_roots_initial = 1024
 __global vgc_spawn_roots = &voidptr(unsafe { nil })
 __global vgc_spawn_roots_cap = int(0)
 __global vgc_nspawn_roots = int(0)
+// cx-home/v#37: vgc_inflight_selftest's root for the object it keeps live
+__global vgc_inflight_keep = usize(0)
 __global vgc_spawn_root_lock = u32(0)
 
 // ============================================================
@@ -3530,6 +3548,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 	// by the STW pool trim (vgc_pool_trim, cx #360) — once per pool residence, so
 	// the syscall churn cannot return.
 	span.in_use = false
+	C.vgc_atomic_store_u32(&span.inflight, 0) // cx-home/v#37: pooled, in nobody's flight
 	C.vgc_atomic_fetch_and_u8(unsafe { &vgc_heap.inuse_bits[span.slot >> 3] },
 		~u8(1 << (span.slot & 7)))
 	span.class_idx = 0
@@ -4113,6 +4132,7 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 		// See vgc_sweep_span's sweep_gen guard.
 		unsafe {
 			recycled.sweep_gen = u32(vgc_heap.gc_cycle)
+			C.vgc_atomic_store_u32(&recycled.inflight, 1) // cx-home/v#37: in flight until the owner holds it
 		}
 		if cold && (npages >= u32(vgc_pool_merge_min) || vgc_committed_above_goal()) {
 			// A large request served from a COLD run commits as many pages as a
@@ -4249,6 +4269,7 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 		// the same cycle won't reclaim it as empty before its first object is
 		// allocated (alloc_count 0). See vgc_sweep_span's sweep_gen guard.
 		span.sweep_gen = u32(vgc_heap.gc_cycle)
+		C.vgc_atomic_store_u32(&span.inflight, 1) // cx-home/v#37: in flight until the owner holds it
 	}
 	// Register span in arena's page map (out-of-line — see VGC_Arena.page_span;
 	// sized size/vgc_page_size, so the bound is the arena's own page count, not
@@ -4599,8 +4620,10 @@ fn vgc_central_get_span(span_class int) &VGC_Span {
 			span.prev = nil
 			span.on_central = 0 // popped off the central list; now owned by a mcache
 			// Mark as acquired THIS cycle so a concurrent sweep won't reclaim it as
-			// empty while it is in-flight to the mutator (see vgc_sweep_span guard).
+			// empty while it is in-flight to the mutator (see vgc_sweep_span guard),
+			// and claim it in flight until the owner's slot holds it (cx-home/v#37).
 			span.sweep_gen = u32(vgc_heap.gc_cycle)
+			C.vgc_atomic_store_u32(&span.inflight, 1)
 		}
 		C.vgc_mutex_unlock(&central.lock)
 		return span
@@ -4664,6 +4687,10 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 fn vgc_span_release_acquisition(span &VGC_Span) {
 	unsafe {
 		C.vgc_atomic_store_u32(&span.sweep_gen, u32(vgc_heap.gc_cycle) - 1)
+		// cx-home/v#37: the slot store before this call is visible before the
+		// claim drops (release), so the collector reads the span in the slot
+		// (vgc_protect_cached_spans) or the claim, never neither.
+		C.vgc_atomic_store_u32(&span.inflight, 0)
 	}
 }
 
@@ -4677,8 +4704,14 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 		// collector. Slower for these overflow threads, but SAFE — previously this
 		// indexed caches[-1] -> "fixed array index out of range (index: -1, len: 64)"
 		// -> panic, and the panic's own message formatting re-entered malloc -> the
-		// same crash (infinite recursion).
-		return vgc_central_get_span(span_class)
+		// same crash (infinite recursion). No slot will ever hold the span, so
+		// the in-flight claim is dropped at once: the one-cycle stamp is its cover,
+		// as before cx-home/v#37.
+		orphan := vgc_central_get_span(span_class)
+		if orphan != unsafe { nil } {
+			C.vgc_atomic_store_u32(&orphan.inflight, 0)
+		}
+		return orphan
 	}
 	span := unsafe { vgc_cache(cache_idx).alloc[span_class] }
 	if span != unsafe { nil } {
@@ -4700,7 +4733,16 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	}
 	// Get fresh span from central (reuses central.partial if a sweep populated it, else
 	// carves a new span under vgc_heap.lock).
-	new_span := vgc_central_get_span(span_class)
+	mut new_span := vgc_central_get_span(span_class)
+	for tries := 0; new_span != unsafe { nil } && new_span.alloc_count >= new_span.nelems
+		&& tries < 8; tries++ {
+		// cx-home/v#37: a span popped full was filled while it was listed — two
+		// owners. Loud, and not handed out: dropped like a filled span (B18),
+		// and the next pop tried. The in-flight claim makes this unreachable.
+		C.vgc_say(0x37f0, u64(new_span.slot))
+		C.vgc_atomic_store_u32(&new_span.inflight, 0)
+		new_span = vgc_central_get_span(span_class)
+	}
 	unsafe {
 		vgc_cache(cache_idx).alloc[span_class] = new_span
 	}
@@ -4802,7 +4844,9 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 	_ = ptr_words
 
 	ptr := unsafe { vgc_span_alloc_obj(mut span) }
-	if ptr != unsafe { nil } {
+	if ptr == unsafe { nil } {
+		vgc_span_handout_report(span, n) // cx-home/v#37: a handed-out span answered nil — say which
+	} else {
 		// Track actual object bytes, not page bytes (per-thread; see vgc_acct_alloc)
 		vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
 		// A SCAN slot is handed out holding no word its new occupant did not
@@ -4886,6 +4930,18 @@ fn vgc_force_collect_release_os() {
 // the arena-count ceiling (RAM-derived default or VGC_MAX_ARENAS — cx #282)
 // from RAM exhaustion (vgc_os_alloc failure prints the same shape with arenas
 // below the cap).
+// cx-home/v#37: vgc_cache_get_span handed out a span and vgc_span_alloc_obj
+// found no free slot in it. Before this the caller returned nil into builtin's
+// 'memory allocation failure' panic with no line of its own — the runner's
+// walks-forced red was read from a bisect's dumps. One line, no allocation.
+fn vgc_span_handout_report(span &VGC_Span, n usize) {
+	C.fprintf(C.stderr,
+		c'vgc: span handed out full: %llu bytes requested; slot %u class %u elem %u alloc_count %u of %u, on_central %u, inflight %u, sweep_gen %u at cycle %llu\n',
+		C.vgc_ull(u64(n)), span.slot, u32(span.class_idx), span.elem_size, span.alloc_count,
+		span.nelems, u32(span.on_central), C.vgc_atomic_load_u32(&span.inflight), span.sweep_gen,
+		C.vgc_ull(vgc_heap.gc_cycle))
+}
+
 fn vgc_oom_report(n usize) {
 	mut max_arenas := vgc_max_arenas_eff
 	if max_arenas <= 0 {
@@ -5175,7 +5231,9 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 	}
 
 	ptr := unsafe { vgc_span_alloc_obj(mut span) }
-	if ptr != unsafe { nil } {
+	if ptr == unsafe { nil } {
+		vgc_span_handout_report(span, n) // cx-home/v#37: a handed-out span answered nil — say which
+	} else {
 		vgc_acct_alloc(cache_idx, u64(span.elem_size), u64(n))
 		if zero_fill {
 			unsafe { C.memset(ptr, 0, n) }
@@ -5283,6 +5341,11 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 	if zero_fill {
 		unsafe { C.memset(ptr, 0, n) }
 	}
+	// cx-home/v#37: the object is set up and its address is in this frame
+	// (scanned at a park, captured by a suspend): the in-flight claim drops
+	// here; the acquisition stamp stays, so the one sweep after this skips the
+	// span as before.
+	C.vgc_atomic_store_u32(&span.inflight, 0)
 	return ptr
 }
 
