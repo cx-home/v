@@ -24,6 +24,56 @@
 #include <mbedtls/ecdh.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/error.h>
+#include "mbedtls/platform_util.h"
+
+/* cx-home/v#39: X25519 (PSA_ECC_FAMILY_MONTGOMERY, 255 bits) runs on HACL*
+ * Curve25519 (library/cx_x25519_hacl.c) instead of the generic ladder: the
+ * 32-byte little-endian scalar and u-coordinate of RFC 7748 are PSA's key
+ * formats for this curve, and the function clamps the scalar and masks the
+ * u-coordinate's top bit as RFC 7748 does. An all-zero shared secret (a
+ * small-order peer point) is refused, as mbedtls_ecdh_calc_secret refuses
+ * the zero point (RFC 8446 section 7.4.2). */
+void Hacl_Curve25519_crypto_scalarmult(uint8_t *mypublic, uint8_t *secret,
+                                       uint8_t *basepoint);
+
+static int cx_psa_is_x25519(const psa_key_attributes_t *attributes)
+{
+    return PSA_KEY_TYPE_ECC_GET_FAMILY(attributes->type) ==
+           PSA_ECC_FAMILY_MONTGOMERY && attributes->bits == 255;
+}
+
+static psa_status_t cx_psa_x25519(const uint8_t *scalar, size_t scalar_len,
+                                  const uint8_t *point, size_t point_len,
+                                  uint8_t *out, size_t out_size,
+                                  size_t *out_len)
+{
+    uint8_t k[32];
+    uint8_t u[32];
+    uint8_t r[32];
+    uint8_t acc = 0;
+    size_t i;
+    if (scalar_len != 32 || point_len != 32) {
+        return PSA_ERROR_INVALID_ARGUMENT;
+    }
+    if (out_size < 32) {
+        return PSA_ERROR_BUFFER_TOO_SMALL;
+    }
+    memcpy(k, scalar, 32);
+    memcpy(u, point, 32);
+    Hacl_Curve25519_crypto_scalarmult(r, k, u);
+    for (i = 0; i < 32; i++) {
+        acc |= r[i];
+    }
+    mbedtls_platform_zeroize(k, sizeof(k));
+    if (acc == 0) {
+        mbedtls_platform_zeroize(r, sizeof(r));
+        return PSA_ERROR_INVALID_ARGUMENT;
+    }
+    memcpy(out, r, 32);
+    mbedtls_platform_zeroize(r, sizeof(r));
+    *out_len = 32;
+    return PSA_SUCCESS;
+}
 
 #if defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_BASIC) || \
     defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_IMPORT) || \
@@ -295,6 +345,14 @@ psa_status_t mbedtls_psa_ecp_export_public_key(
     psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
     mbedtls_ecp_keypair *ecp = NULL;
 
+    /* cx-home/v#39: an X25519 key pair's public key is X25519(k, 9) */
+    if (PSA_KEY_TYPE_IS_ECC_KEY_PAIR(attributes->type) &&
+        cx_psa_is_x25519(attributes)) {
+        static const uint8_t base[32] = { 9 };
+        return cx_psa_x25519(key_buffer, key_buffer_size, base, 32,
+                             data, data_size, data_length);
+    }
+
     status = mbedtls_psa_ecp_load_representation(
         attributes->type, attributes->bits,
         key_buffer, key_buffer_size, &ecp);
@@ -527,6 +585,12 @@ psa_status_t mbedtls_psa_key_agreement_ecdh(
     if (!PSA_KEY_TYPE_IS_ECC_KEY_PAIR(attributes->type) ||
         !PSA_ALG_IS_ECDH(alg)) {
         return PSA_ERROR_INVALID_ARGUMENT;
+    }
+    /* cx-home/v#39 */
+    if (cx_psa_is_x25519(attributes)) {
+        return cx_psa_x25519(key_buffer, key_buffer_size, peer_key,
+                             peer_key_length, shared_secret,
+                             shared_secret_size, shared_secret_length);
     }
     mbedtls_ecp_keypair *ecp = NULL;
     status = mbedtls_psa_ecp_load_representation(
