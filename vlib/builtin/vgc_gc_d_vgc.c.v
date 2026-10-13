@@ -1094,15 +1094,26 @@ fn vgc_perm_promote() {
 		mut nbytes_total := u64(0)
 		mut lo := vgc_perm_lo
 		mut hi := vgc_perm_hi
+		// vgc_set_permanent's epoch: only the marked candidates (allocated
+		// before the call) are promoted; without one (VGC_PERM_CYCLE=N) the
+		// whole marked set is, as before
+		epoch := vgc_perm_epoch
 		for i in 0 .. vgc_heap.nspans {
 			span := unsafe { vgc_heap.allspans[i] }
 			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
 				continue
 			}
+			if epoch && span.perm_cand == unsafe { nil } {
+				continue
+			}
 			nb := (span.nelems + 7) / 8
 			mut any := u8(0)
 			for b in 0 .. nb {
-				any |= unsafe { span.mark_bits[b] }
+				any |= unsafe { span.mark_bits[b] } & (if epoch {
+					unsafe { span.perm_cand[b] }
+				} else {
+					u8(0xff)
+				})
 			}
 			if any == 0 {
 				continue
@@ -1116,15 +1127,31 @@ fn vgc_perm_promote() {
 					(&VGC_Span(span)).perm_bits = pb
 				}
 			}
+			was := span.perm != 0
 			unsafe {
-				C.memcpy(span.perm_bits, span.mark_bits, nb)
-				// every pointer the span holds was traced by this cycle: nothing
-				// young is referenced yet
+				if epoch {
+					for b in 0 .. nb {
+						v := span.mark_bits[b] & span.perm_cand[b]
+						pp := &u8(voidptr(usize(span.perm_bits) + usize(b)))
+						*pp = if was { *pp | v } else { v }
+					}
+				} else {
+					C.memcpy(span.perm_bits, span.mark_bits, nb)
+				}
 				C.memset(vgc_young_bits(span), 0, 136)
 				(&VGC_Span(span)).perm = 1
-				// the stores this cycle's mark saw are in; a mutator suspended
-				// between its barrier call and its store sets the bit again
-				C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+				if epoch {
+					// a marked object born after the epoch stays young, and a
+					// promoted one may point at it: the next stop re-scans the
+					// span's permanent objects and takes young_bits from them
+					C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 1)
+				} else {
+					// every pointer the span holds was traced by this cycle and
+					// every marked object is promoted: nothing young is
+					// referenced yet; a mutator suspended between its barrier
+					// call and its store sets the bit again
+					C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+				}
 			}
 			mut count := u32(0)
 			for b in 0 .. nb {
@@ -1193,6 +1220,7 @@ fn vgc_perm_promote() {
 		vgc_perm_promoted_cycle = vgc_heap.gc_cycle
 		vgc_perm_request = false
 		vgc_perm_on = 1
+		vgc_perm_cand_drop()
 	}
 }
 
@@ -1942,10 +1970,18 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	heap_lo := usize(voidptr(&vgc_heap))
 	heap_hi := heap_lo + usize(sizeof(VGC_Heap))
 	w := usize(sizeof(usize))
+	// cx-home/v#15: the permanent range's bounds and the barrier gate's base are
+	// span addresses too — vgc_perm_hi is the END of the highest permanent span,
+	// which is the base of whatever span follows it, and vgc_perm_lo / vgc_wb_lo
+	// the base of the lowest, whose first slot may hold a young object: scanned,
+	// they rooted that object for the life of the process (a dropped 1.9 MB
+	// array and the 7.5 MB of strings it held, permanent/perm_transient.v)
 	mut ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
-		usize(voidptr(&vgc_workbuf_end)), 0, 0, 0]!
+		usize(voidptr(&vgc_workbuf_end)), 0, 0, 0, usize(voidptr(&vgc_perm_lo)),
+		usize(voidptr(&vgc_perm_hi)), usize(voidptr(&vgc_wb_lo))]!
 	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
-		usize(voidptr(&vgc_workbuf_end)) + w, 0, 0, 0]!
+		usize(voidptr(&vgc_workbuf_end)) + w, 0, 0, 0, usize(voidptr(&vgc_perm_lo)) + w,
+		usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w]!
 	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
 	// vgc_platform.h): the arena address map and the chunk tables.
 	C.vgc_static_tables(&ex_los[4], &ex_his[4])
@@ -3050,6 +3086,16 @@ fn vgc_sweep_span_bits(span &VGC_Span) u8 {
 		mark_byte := unsafe { span.mark_bits[b] }
 		// allocated but not marked = garbage
 		garbage := alloc_byte & ~mark_byte
+		$if vgc_concurrent ? {
+			// cx-home/v#15: a swept candidate leaves the epoch (its slot's next
+			// occupant is born after vgc_set_permanent)
+			if garbage != 0 && span.perm_cand != unsafe { nil } {
+				unsafe {
+					cp := &u8(voidptr(usize(span.perm_cand) + usize(b)))
+					*cp = *cp & ~garbage
+				}
+			}
+		}
 		if b == watch_byte {
 			// DIAGNOSTIC (per-span, cheap): record this cycle's mark/sweep verdict
 			// for the watched object. marked = its mark bit is set at sweep time;

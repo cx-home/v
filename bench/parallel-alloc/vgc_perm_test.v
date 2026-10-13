@@ -108,3 +108,29 @@ fn test_no_automatic_promotion_of_the_first_cycles_live_set() {
 	theld := t.output.all_after('held_kb=').int()
 	assert theld > 6144, 'no teeth: VGC_PERM_CYCLE=1 held only ${theld} KB\n${t.output}'
 }
+
+// cx-home/v#15: vgc_set_permanent's epoch — the promotion cycle runs while
+// ~6 MB of strings allocated AFTER the call is live; only the records built
+// before it become permanent, the strings are reclaimed once dropped, and a
+// young record stored into each permanent one survives. Also the data-segment
+// root scan leaves the permanent range's bounds out: vgc_perm_hi (the end of
+// the highest permanent span = the base of the next) rooted the dropped array
+// and everything it held (after_kb 10,468 against 1,093 here).
+fn test_the_epoch_promotes_only_what_was_allocated_before_the_call() {
+	exe := build_src('perm_epoch.v', '')
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('VGC_GCTRACE=2 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert r.output.contains(' bad=0 '), r.output
+	assert r.output.contains('promoted=1'), 'no promotion: ${r.output}'
+	ref := os.execute('VGC_PERM=0 ${os.quoted_path(exe)}')
+	assert ref.exit_code == 0, ref.output
+	after := r.output.all_after('after_kb=').int()
+	ref_after := ref.output.all_after('after_kb=').int()
+	assert after <= ref_after + 1024, 'the epoch kept ${after} KB live against ${ref_after} KB without the generation\n${r.output}'
+	// the generation holds the records (~1 MB), not the strings (~9 MB)
+	perm_kb := r.output.all_after('] perm spans=').all_after('KB=').int()
+	assert perm_kb > 512 && perm_kb < 4096, 'perm KB=${perm_kb}\n${r.output}'
+}

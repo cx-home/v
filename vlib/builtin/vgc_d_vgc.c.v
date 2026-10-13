@@ -254,6 +254,13 @@ mut:
 	// only when a store dirtied it.
 	perm      u32
 	perm_bits &u8 = unsafe { nil }
+	// cx-home/v#15: the epoch's candidates — the span's alloc_bits as
+	// vgc_set_permanent found them (one bit per slot: allocated before the
+	// embedder's call). The promotion cycle promotes the MARKED candidates
+	// only, so what the program allocates after the call is never made
+	// permanent. A slot the sweep or vgc_free reclaims leaves the set (its next
+	// occupant is not a candidate); a recycled span has none.
+	perm_cand &u8 = unsafe { nil }
 	// Linked list pointers — SHARED between the central partial/full lists and the
 	// free_spans recycle list (a span is on at most one at a time).
 	next &VGC_Span = unsafe { nil }
@@ -940,6 +947,12 @@ __global vgc_perm_spans = u64(0)
 __global vgc_perm_bytes = u64(0)
 __global vgc_perm_rescan_ns = u64(0)
 __global vgc_perm_promoted_cycle = u64(0)
+// the epoch (vgc_set_permanent): the candidate bits of every span in use at
+// the call, one 136-byte row per span in one vgc_os_alloc'd block, released
+// by the promotion
+__global vgc_perm_epoch = false
+__global vgc_perm_cand_slab = usize(0)
+__global vgc_perm_cand_slab_len = usize(0)
 // the address range the permanent spans lie in (vgc_perm_promote): a store
 // outside it cannot target a permanent object, so the barrier returns before
 // the span lookup — nearly every store of a program whose heap grew past its
@@ -1014,16 +1027,86 @@ fn vgc_young_bits(span &VGC_Span) &u8 {
 	return unsafe { &u8(voidptr(usize(span.perm_bits) + 136)) }
 }
 
-// vgc_set_permanent asks the collector to promote the live set of its next
-// stop-the-world cycle to the permanent generation (cx-home/v#15): an
-// embedder calls it once its long-lived structures are built. Under VGC_PERM=0
-// or a build without the concurrent collector it does nothing.
+// vgc_set_permanent asks the collector to promote, at its next
+// stop-the-world cycle, what the program allocated BEFORE this call and still
+// holds then (cx-home/v#15): an embedder calls it once its long-lived
+// structures are built — the interpreter at the end of its start-up. The call
+// takes the epoch: a copy of every span's allocation bits (vgc_perm_snapshot),
+// so an object born after it — the program's own data, live at the
+// promotion cycle or not — is never made permanent (a permanent object is
+// never swept). Call it while no collection is in flight and no other thread
+// allocates (a racing allocation is at worst left young, or, in a slot the
+// lazy sweep of an earlier cycle hands out under the copy, promoted). Under
+// VGC_PERM=0 or a build without the concurrent collector it does nothing.
 @[markused]
 pub fn vgc_set_permanent() {
 	$if vgc_concurrent ? {
-		if vgc_perm_mode != 0 {
+		if vgc_perm_mode != 0 && vgc_perm_snapshot() {
 			vgc_perm_request = true
 		}
+	}
+}
+
+// vgc_perm_snapshot takes the epoch's candidate bits (vgc_set_permanent);
+// false when there is nothing to take or no memory for it. A second call
+// before the promotion replaces the first epoch.
+fn vgc_perm_snapshot() bool {
+	$if vgc_concurrent ? {
+		if vgc_heap.allspans == unsafe { nil } {
+			return false
+		}
+		vgc_perm_cand_drop()
+		n := vgc_heap.nspans
+		if n <= 0 {
+			return false
+		}
+		size := usize(n) * 136
+		p := C.vgc_os_alloc(size)
+		if p == unsafe { nil } {
+			return false
+		}
+		mut off := usize(0)
+		for i in 0 .. n {
+			span := unsafe { vgc_heap.allspans[i] }
+			if span == unsafe { nil } || !span.in_use || span.alloc_bits == unsafe { nil }
+				|| span.nelems == 0 || span.nelems > 1088 || off + 136 > size {
+				continue
+			}
+			dst := unsafe { &u8(voidptr(usize(p) + off)) }
+			off += 136
+			unsafe {
+				C.memcpy(dst, span.alloc_bits, (span.nelems + 7) / 8)
+				(&VGC_Span(span)).perm_cand = dst
+			}
+		}
+		vgc_perm_cand_slab = usize(p)
+		vgc_perm_cand_slab_len = size
+		vgc_perm_epoch = true
+		return true
+	} $else {
+		return false
+	}
+}
+
+// vgc_perm_cand_drop ends the epoch: no span names a candidate row, and the
+// rows go back to the OS.
+fn vgc_perm_cand_drop() {
+	$if vgc_concurrent ? {
+		if vgc_perm_cand_slab == 0 {
+			return
+		}
+		for i in 0 .. vgc_heap.nspans {
+			span := unsafe { vgc_heap.allspans[i] }
+			if span != unsafe { nil } && span.perm_cand != unsafe { nil } {
+				unsafe {
+					(&VGC_Span(span)).perm_cand = nil
+				}
+			}
+		}
+		C.vgc_os_free(voidptr(vgc_perm_cand_slab), vgc_perm_cand_slab_len)
+		vgc_perm_cand_slab = 0
+		vgc_perm_cand_slab_len = 0
+		vgc_perm_epoch = false
 	}
 }
 const vgc_cm_born_flush = u64(256) * 1024
@@ -4245,6 +4328,7 @@ fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	if span.perm_bits != unsafe { nil } {
 		unsafe { C.memset(span.perm_bits, 0, 272) }
 	}
+	span.perm_cand = unsafe { nil } // born after the epoch: no candidate
 
 	// Bitmaps are inline in the span (alloc_buf/mark_buf); point the working pointers
 	// at them and zero the bytes in use. nobjs <= 1024 -> bitmap_size <= 128 <= 136,
@@ -5170,6 +5254,7 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 		if span.perm_bits != nil {
 			C.memset(span.perm_bits, 0, 272)
 		}
+		span.perm_cand = nil // born after the epoch: no candidate
 		span.elem_size = u32(n)
 		span.nelems = 1
 		span.alloc_count = 1
@@ -5370,6 +5455,12 @@ fn vgc_free(ptr voidptr) {
 			unsafe {
 				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + usize(obj_idx >> 3))), ~mask)
 				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + 136 + usize(obj_idx >> 3))), ~mask)
+			}
+		}
+		// a freed candidate leaves the epoch: the slot's next occupant is born after it
+		if span.perm_cand != unsafe { nil } {
+			unsafe {
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_cand) + usize(obj_idx >> 3))), ~mask)
 			}
 		}
 	}
