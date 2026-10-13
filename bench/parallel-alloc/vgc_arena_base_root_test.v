@@ -28,7 +28,7 @@ module main
 struct Node {
 	prev &Node = unsafe { nil }
 mut:
-	pad  [1016]u64
+	pad [1016]u64
 }
 
 const chain_bytes = 160 * 1024 * 1024 // more than two 64 MB arenas of nodes
@@ -67,13 +67,37 @@ fn scrub_stack() u64 {
 	return buf[4095]
 }
 
+struct Reading {
+	retained usize
+	carved   usize
+}
+
+// The collections and the reading run on a thread of their own, as the chain
+// does: no stack the collector scans ever held a chain pointer.
+fn collect_and_read() Reading {
+	gc_collect()
+	gc_collect()
+	return Reading{
+		retained: gc_heap_usage().total_bytes
+		carved:   gc_memory_use()
+	}
+}
+
 fn test_an_arena_base_does_not_root_the_object_carved_there() {
-	len := build_and_drop_chain()
-	_ := scrub_stack()
-	gc_collect()
-	gc_collect()
-	retained := gc_heap_usage().total_bytes
-	carved := gc_memory_use()
+	// cx-home/v#41: built, dropped and collected on the test's own thread, a
+	// stale chain pointer in a stack slot that a later frame reserves but does
+	// not write rooted part of the chain in ~1 run of 12 (VGC_ROOTDIAG: the
+	// test thread's stack, in gc_collect's frame, an interior pointer reaching
+	// 3,815-15,525 nodes — never the 8,182 of the arena-base root this test is
+	// for). The chain is now built and dropped on one thread, and the heap
+	// collected and read on another, each exited before the next starts; the
+	// test thread only joins them.
+	tb := spawn build_and_drop_chain()
+	len := tb.wait()
+	tr := spawn collect_and_read()
+	r := tr.wait()
+	retained := r.retained
+	carved := r.carved
 	println('vgc_arena_base_root: chain=${len} nodes (${chain_bytes} bytes) carved=${carved} retained_after_drop=${retained} bound=${retained_bound}')
 	assert len == chain_bytes / int(sizeof(Node))
 	assert carved > u64(chain_bytes), 'the chain did not span a second arena (carved ${carved})'
