@@ -46,6 +46,10 @@ struct _result {
 	// derived Result_xxx types
 }
 
+// cx-private#1924 cut 3: no barrier on the header store (vgc_no_wb, honoured by
+// gen_cm_write_barrier): its one pointer is none__'s object, which the const's
+// global roots, so the store records no edge the collector needs.
+@[vgc_no_wb]
 fn _result_ok(data voidptr, mut res _result, size int) {
 	unsafe {
 		*res = _result{}
@@ -173,6 +177,10 @@ struct _option {
 	// derived _option_xxx types
 }
 
+// cx-private#1924 cut 3: no barrier on the header store (vgc_no_wb, honoured by
+// gen_cm_write_barrier): its one pointer is none__'s object, which the const's
+// global roots, so the store records no edge the collector needs.
+@[vgc_no_wb]
 fn _option_none(data voidptr, mut option _option, size int) {
 	unsafe {
 		*option = _option{
@@ -183,6 +191,10 @@ fn _option_none(data voidptr, mut option _option, size int) {
 	}
 }
 
+// cx-private#1924 cut 3: no barrier on the header store (vgc_no_wb, honoured by
+// gen_cm_write_barrier): its one pointer is none__'s object, which the const's
+// global roots, so the store records no edge the collector needs.
+@[vgc_no_wb]
 fn _option_ok(data voidptr, mut option _option, size int) {
 	unsafe {
 		*option = _option{}
