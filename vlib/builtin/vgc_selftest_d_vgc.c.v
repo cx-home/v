@@ -204,3 +204,99 @@ pub fn vgc_pool_aged_selftest(n int) (u32, u64) {
 	unsafe { C.free(descs) }
 	return rc, elapsed
 }
+
+// vgc_inflight_selftest — cx-home/v#37: a span IN FLIGHT to its owner — popped
+// from central.partial, or fresh from the pool, and not yet stored into the
+// owner's mcache slot (the line after vgc_central_get_span returns in
+// vgc_cache_get_span) — is referenced by nothing the collector reads. The
+// acquisition stamp (sweep_gen = gc_cycle) covered exactly one sweep, so an
+// owner off-CPU across a whole cycle (a 4-vCPU runner, 25 runnable threads, a
+// forced cycle every 2 ms) came back to a span the next sweep had RELINKED
+// onto central.partial (a partial span: a second thread popped it, the owner
+// filled it, the second thread's vgc_span_alloc_obj answered nil — the
+// walks-forced 'malloc_noscan(0x10) V panic: memory allocation failure') or
+// RECYCLED to the pool (a fresh span: its pages handed out twice — the bad=1
+// checksum mismatches). This drives exactly that window on the calling
+// thread, with no load lottery: the span is held in a local across two
+// collections and must still be off every list and in use afterwards. The
+// in-flight claim bit (VGC_Span.inflight) is what keeps it so. Driven by
+// bench/parallel-alloc/vgc_inflight_span_test.v. Returns 0, else the id of the
+// first failed check (1-4, 7 = setup preconditions).
+pub fn vgc_inflight_selftest() u32 {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 {
+		return 1 // the calling thread must be vgc-registered
+	}
+	class_idx := u8(C.vgc_size_class(u32(24)))
+	sc := int(class_idx) * 2 + 1 // noscan variant: the fixture's dying class
+	np := u32(C.vgc_get_class_npages(int(class_idx)))
+	mut rc := u32(0)
+	// (a) a PARTIAL span: one object carved, listed on central.partial the way
+	// the sweep lists it, popped as vgc_cache_get_span pops it, and held here
+	// — not in any mcache slot — across two collections.
+	mut s := vgc_span_alloc(np)
+	if s == unsafe { nil } {
+		return 2
+	}
+	unsafe { vgc_span_init(mut s, class_idx, true) }
+	p := unsafe { vgc_span_alloc_obj(mut s) }
+	if p == unsafe { nil } {
+		return 3
+	}
+	vgc_inflight_keep = usize(p) // a data-segment root: the object stays live
+	central := unsafe { &vgc_heap.central[sc] }
+	C.vgc_mutex_lock(&central.lock)
+	unsafe {
+		s.next = central.partial
+		s.prev = nil
+		if s.next != nil {
+			s.next.prev = s
+		}
+		vgc_heap.central[sc].partial = s
+		s.on_central = 1
+	}
+	C.vgc_mutex_unlock(&central.lock)
+	got := vgc_central_get_span(sc)
+	if unsafe { voidptr(got) } != unsafe { voidptr(s) } {
+		return 4 // another thread took it: no verdict
+	}
+	gc_collect()
+	gc_collect()
+	if s.on_central != 0 {
+		rc = 5 // relinked while in flight (3b3fd54ba1: the second sweep)
+	} else if !s.in_use {
+		rc = 6 // recycled while in flight
+	}
+	if rc == 0 {
+		// the owner's side of the hand-over, as vgc_cache_get_span does it:
+		// the slot store, then the stamp and the claim bit released
+		saved := unsafe { vgc_cache(idx).alloc[sc] }
+		unsafe {
+			vgc_cache(idx).alloc[sc] = s
+		}
+		vgc_span_release_acquisition(s)
+		unsafe {
+			vgc_cache(idx).alloc[sc] = saved
+		}
+	}
+	vgc_inflight_keep = 0
+	// (b) a FRESH span (alloc_count 0) held across two collections.
+	mut f := vgc_span_alloc(np)
+	if f == unsafe { nil } {
+		return 7
+	}
+	unsafe { vgc_span_init(mut f, class_idx, true) }
+	gc_collect()
+	gc_collect()
+	if !f.in_use {
+		if rc == 0 {
+			rc = 8 // recycled while in flight (3b3fd54ba1: the second sweep)
+		}
+	} else {
+		vgc_span_release_acquisition(f)
+		C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+		unsafe { vgc_put_free_span(mut f) }
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	}
+	return rc
+}
