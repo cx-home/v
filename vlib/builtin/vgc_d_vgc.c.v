@@ -3064,6 +3064,38 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 		return first, cold
 	}
 	span, cold := vgc_get_free_span_locked(npages)
+	// cx-home/v#40: no exact-fit span pooled — the pool holds larger runs (the
+	// sweep's defrag merges adjacent free spans), so the take above split one.
+	// Split the batch's other pieces off pooled runs too, under this one lock
+	// take, into the stash: without them every refill of this size split again
+	// and took the lock (FreeBSD CI at 4 jobs: 3,226 of 5,571 takes found no
+	// exact fit, 12 a short batch, 12 a stash the stop had drained). Only
+	// pooled runs are split; nothing is carved for the stash.
+	if span != unsafe { nil } {
+		want := vgc_tpool_batch(npages) - 1
+		mut got := 0
+		for got < want {
+			n := vgc_pool_first_at_least(npages + 1)
+			if n == 0 || n > u32(vgc_max_pooled_pages) {
+				break
+			}
+			mut cand := vgc_heap.free_spans[n]
+			if cand == unsafe { nil } {
+				cand = vgc_heap.free_spans_cold[n]
+			}
+			if cand == unsafe { nil } {
+				break
+			}
+			vgc_pool_unlink(mut cand)
+			vgc_span_split(mut cand, npages)
+			unsafe {
+				cand.next = c.tpool[npages]
+				c.tpool[npages] = cand
+			}
+			c.tpool_n++
+			got++
+		}
+	}
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	return span, cold
 }
