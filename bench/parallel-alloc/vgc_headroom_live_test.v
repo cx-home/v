@@ -143,7 +143,13 @@ fn test_the_adaptive_floor_follows_a_tiny_live_set() {
 	fixed := ratio('VGC_HEADROOM_ADAPTIVE_FLOOR=0 ', 'tiny') * f64(tiny_live_bytes) / 1048576.0
 	adaptive := ratio('', 'tiny') * f64(tiny_live_bytes) / 1048576.0
 	println('vgc_headroom_live: 2 MB live — carved high fixed floor ${fixed:.1f} MB, adaptive floor ${adaptive:.1f} MB')
-	assert fixed >= 20.0, 'the fixed floor carved only ${fixed:.1f} MB over 2 MB live (expected ~34 MB)'
+	// the control: the fixed floor carves its first 16 MB of headroom whatever the
+	// band says (~34 MB once the band doubles it; since cx-home/v#42 the band reads
+	// the collector's CPU time, and a contended runner's mutator interval can keep
+	// it at 16 MB: Linux CI at 4 jobs carved 18.9 MB); the adaptive floor's bar is
+	// the one this test exists for
+	assert fixed >= 16.0, 'the fixed floor carved only ${fixed:.1f} MB over 2 MB live (expected 18-34 MB)'
+	assert fixed >= adaptive * 2.0, 'the adaptive floor carved ${adaptive:.1f} MB, not under half the fixed floor ${fixed:.1f} MB'
 	assert adaptive <= 14.0, 'the adaptive floor carved ${adaptive:.1f} MB over 2 MB live (expected ~6-10 MB)'
 }
 

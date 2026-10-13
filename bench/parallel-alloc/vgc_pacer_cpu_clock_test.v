@@ -24,6 +24,7 @@
 module main
 
 import os
+import time
 
 struct Node {
 mut:
@@ -62,7 +63,8 @@ fn child() {
 }
 
 // the headroom (KB) of the last quarter of the run's collections, at most
-fn headroom_kb(env string) (u64, int) {
+fn headroom_kb(env string) (u64, int, i64) {
+	sw := time.new_stopwatch()
 	r := os.execute('VGC_PACER_CHILD=1 VGC_GCTRACE=1 VGC_HEADROOM_LIVE_PCT=0 ${env}${os.quoted_path(os.executable())}')
 	assert r.exit_code == 0, r.output
 	mut hs := []u64{}
@@ -78,7 +80,7 @@ fn headroom_kb(env string) (u64, int) {
 			m = h
 		}
 	}
-	return m, hs.len
+	return m, hs.len, sw.elapsed().microseconds()
 }
 
 fn test_a_descheduled_collector_does_not_grow_the_headroom() {
@@ -90,10 +92,22 @@ fn test_a_descheduled_collector_does_not_grow_the_headroom() {
 		// no per-thread CPU clock fine enough: the pacer keeps the wall clock there
 		return
 	}
-	quiet, nq := headroom_kb('')
-	stalled, ns := headroom_kb('VGC_TEST_COLLECTOR_STALL_US=40000 ')
-	wall, nw := headroom_kb('VGC_TEST_COLLECTOR_STALL_US=40000 VGC_PACER_WALL=1 ')
-	println('vgc_pacer_cpu_clock: headroom of the last collections — quiet ${quiet} KB (${nq} cycles), 40 ms stall per cycle ${stalled} KB (${ns}), the same stall on the wall-time pacer ${wall} KB (${nw})')
+	quiet, nq, us := headroom_kb('')
+	// the stall is one quiet mutator interval (at least 40 ms, at most 1 s): the
+	// wall-time band grows the headroom while the stall exceeds a tenth of the
+	// interval, so a stall sized to the host keeps the control at >= 4x on a slow
+	// or shared runner too (FreeBSD CI at 4 jobs: a fixed 40 ms was under a tenth
+	// of its interval after one doubling — 16 MB against quiet 8 MB)
+	mut stall := us / i64(nq)
+	if stall < 40000 {
+		stall = 40000
+	}
+	if stall > 1000000 {
+		stall = 1000000
+	}
+	stalled, ns, _ := headroom_kb('VGC_TEST_COLLECTOR_STALL_US=${stall} ')
+	wall, nw, _ := headroom_kb('VGC_TEST_COLLECTOR_STALL_US=${stall} VGC_PACER_WALL=1 ')
+	println('vgc_pacer_cpu_clock: headroom of the last collections — quiet ${quiet} KB (${nq} cycles, ${us / 1000} ms), ${stall / 1000} ms stall per cycle ${stalled} KB (${ns}), the same stall on the wall-time pacer ${wall} KB (${nw})')
 	// the old clock reads the stall as cost: the band doubles the headroom
 	assert wall >= quiet * 4, 'the stall did not move the wall-time pacer (${wall} KB against quiet ${quiet} KB): the injection is not contention'
 	// the CPU clock does not: the same verdict as the quiet run (one doubling of slack)
