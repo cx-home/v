@@ -1507,6 +1507,9 @@ fn vgc_gctrace_emit() {
 			vgc_ph[7]), vgc_ph_us(vgc_ph[7], vgc_gc_last_end), seg / 1024, in_use,
 			u64(vgc_mark_nworkers_cur), u64(vgc_walk_nworkers_cur), vgc_ph_swalk_ns / 1000,
 			vgc_ph_sapply_ns / 1000)
+		if vgc_gctrace >= 3 {
+			vgc_gctrace_occupancy()
+		}
 		$if vgc_concurrent ? {
 			// cx-home/v#15: the permanent generation's share of the cycle
 			if vgc_perm_on != 0 {
@@ -1523,6 +1526,94 @@ fn vgc_gctrace_emit() {
 			}
 		}
 	}
+}
+
+// cx-private#1886: VGC_GCTRACE=3 — per span class, what the sweep left:
+// spans, pages, objects in use against slots, and the central partial list.
+// Large spans (class 0) are one line. Runs under the stop, reads only.
+__global vgc_occ_recycled = [137]u64{}
+__global vgc_occ_free = [6]u64{}
+__global vgc_occ_freen = [3]u64{}
+
+fn vgc_gctrace_occupancy() {
+	mut nsp := [137]u64{}
+	mut npg := [137]u64{}
+	mut used := [137]u64{}
+	mut slots := [137]u64{}
+	mut elem := [137]u64{}
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use {
+			continue
+		}
+		sc := if span.class_idx == 0 { 136 } else { int(span.class_idx) * 2 + if span.noscan { 1 } else { 0 } }
+		nsp[sc]++
+		npg[sc] += u64(span.npages)
+		used[sc] += u64(span.alloc_count)
+		slots[sc] += u64(span.nelems)
+		elem[sc] = u64(span.elem_size)
+		if sc < 136 {
+			fb := u64(span.nelems - span.alloc_count) * u64(span.elem_size)
+			k := if span.on_central == 1 { 0 } else if span.perm != 0 { 1 } else { 2 }
+			vgc_occ_free[k] += fb
+			vgc_occ_freen[k]++
+			vgc_occ_free[3 + k] += u64(span.npages) * vgc_page_size
+			if k == 1 && span.alloc_count < span.nelems {
+				C.vgc_gctrace_occ(u64(vgc_heap.gc_cycle), 996, u64(span.on_central), u64(span.sweep_gen),
+					u64(span.alloc_count), u64(span.nelems), u64(span.dirty), u64(span.free_index), 0, 0)
+			}
+		}
+	}
+	// sc=997: free slot bytes after the sweep (used=) and span count (slots=)
+	// and span bytes (partial=) by state: elem=0 on a central partial list,
+	// 1 permanent and off the lists, 2 any other (mcache-resident, full)
+	for k in 0 .. 3 {
+		C.vgc_gctrace_occ(u64(vgc_heap.gc_cycle), 997, u64(k), 0, 0, vgc_occ_free[k], vgc_occ_freen[k],
+			vgc_occ_free[3 + k], 0, 0)
+		vgc_occ_freen[k] = 0
+		vgc_occ_free[k] = 0
+		vgc_occ_free[3 + k] = 0
+	}
+	for sc in 0 .. 137 {
+		if nsp[sc] == 0 {
+			continue
+		}
+		mut np := u64(0)
+		mut pf := u64(0)
+		if sc < 136 {
+			mut s := vgc_heap.central[sc].partial
+			for s != unsafe { nil } {
+				np++
+				pf += u64(s.nelems - s.alloc_count)
+				s = s.next
+			}
+		}
+		C.vgc_gctrace_occ(u64(vgc_heap.gc_cycle), u64(sc), elem[sc], nsp[sc], npg[sc], used[sc],
+			slots[sc], np, pf, vgc_occ_recycled[sc])
+	}
+	for sc in 0 .. 137 {
+		vgc_occ_recycled[sc] = 0
+	}
+	// the hot pool by age (cycles since pooled): 0, 1, >= vgc_pool_trim_age;
+	// reported as sc=999 elem=age spans pages
+	mut ap := [3]u64{}
+	mut an := [3]u64{}
+	cyc := u32(vgc_heap.gc_cycle)
+	for idx in 1 .. vgc_max_pooled_pages + 1 {
+		mut s := vgc_heap.free_spans[idx]
+		for s != unsafe { nil } {
+			age := cyc - s.pool_gen
+			k := if age >= 2 { 2 } else { int(age) }
+			an[k]++
+			ap[k] += u64(s.npages)
+			s = s.next
+		}
+	}
+	for k in 0 .. 3 {
+		C.vgc_gctrace_occ(u64(vgc_heap.gc_cycle), 999, u64(k), an[k], ap[k], 0, 0, 0, 0, 0)
+	}
+	// sc=998: resident KB now (used=) and the process peak so far (slots=)
+	C.vgc_gctrace_occ(u64(vgc_heap.gc_cycle), 998, 0, 0, 0, C.vgc_rss_now_kb(), C.vgc_rss_peak_kb(), C.vgc_resident_kb(vgc_arena_lo, vgc_arena_hi), u64(vgc_arena_hi - vgc_arena_lo) / 1024, 0)
 }
 
 // Scan the roots of every suspended mutator: refresh its stack range from its
@@ -3268,6 +3359,14 @@ fn vgc_sweep_span_apply(span &VGC_Span, tag u8) {
 				mspan.next = nil
 				mspan.prev = nil
 			}
+		}
+		if vgc_gctrace >= 3 {
+			rsc := if mspan.class_idx == 0 {
+				136
+			} else {
+				int(mspan.class_idx) * 2 + if mspan.noscan { 1 } else { 0 }
+			}
+			vgc_occ_recycled[rsc]++
 		}
 		vgc_put_free_span(mut mspan)
 		return

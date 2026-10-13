@@ -608,7 +608,7 @@ fn (mut g Gen) create_waiter_handler(call_ret_type ast.Type, s_ret_typ string, g
 		}
 	} else {
 		g.gowrappers.writeln('\tif ((unsigned long int)thread == 0) { builtin___v_panic(_S("unable to join thread")); }')
-		g.gowrappers.writeln('\tint stat = pthread_join(thread, (void **)${c_ret_ptr_ptr});')
+		g.write_vgc_join('\tint stat = pthread_join(thread, (void **)${c_ret_ptr_ptr});')
 	}
 	g.gowrappers.writeln('\tif (stat != 0) { builtin___v_panic(_S("unable to join thread")); }')
 	if g.pref.os == .windows {

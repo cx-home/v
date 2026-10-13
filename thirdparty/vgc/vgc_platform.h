@@ -2359,6 +2359,54 @@ static void vgc_gctrace_perm(uint64_t cycle, uint64_t spans, uint64_t kb, uint64
     vgc__ws("\n");
 }
 
+// VGC_GCTRACE=3 (cx-private#1886): the process's resident KB now and at its peak.
+#include <sys/resource.h>
+static uint64_t vgc_rss_now_kb(void) {
+#if defined(__APPLE__)
+    struct mach_task_basic_info info; mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &cnt) == KERN_SUCCESS)
+        return (uint64_t)info.resident_size / 1024;
+#endif
+    return 0;
+}
+#include <sys/mman.h>
+static uint64_t vgc_resident_kb(uintptr_t lo, uintptr_t hi) {
+    long pg = sysconf(_SC_PAGESIZE); uint64_t n = 0; char vec[256];
+    lo &= ~(uintptr_t)(pg - 1);
+    while (lo < hi) {
+        uintptr_t len = (uintptr_t)pg * 256; if (hi - lo < len) len = ((hi - lo + pg - 1) / pg) * pg;
+        if (mincore((void *)lo, len, (void *)vec) == 0) { for (uintptr_t i = 0; i < len / pg; i++) if (vec[i] & 1) n++; }
+        lo += len;
+    }
+    return n * (uint64_t)pg / 1024;
+}
+static uint64_t vgc_rss_peak_kb(void) {
+    struct rusage ru; if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#if defined(__APPLE__)
+    return (uint64_t)ru.ru_maxrss / 1024;
+#else
+    return (uint64_t)ru.ru_maxrss;
+#endif
+}
+// VGC_GCTRACE=3 occupancy line (cx-private#1886): per span class, after the
+// sweep — spans, pages, objects in use / slots, the spans on the central
+// partial list and their free slots.
+static void vgc_gctrace_occ(uint64_t cycle, uint64_t sc, uint64_t elem, uint64_t spans,
+                            uint64_t pages, uint64_t used, uint64_t slots, uint64_t partial,
+                            uint64_t partial_free, uint64_t recycled) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] occ sc="); vgc__wdec(sc);
+    vgc__ws(" elem="); vgc__wdec(elem);
+    vgc__ws(" spans="); vgc__wdec(spans);
+    vgc__ws(" pages="); vgc__wdec(pages);
+    vgc__ws(" used="); vgc__wdec(used);
+    vgc__ws(" slots="); vgc__wdec(slots);
+    vgc__ws(" partial="); vgc__wdec(partial);
+    vgc__ws(" partial_free="); vgc__wdec(partial_free);
+    vgc__ws(" recycled="); vgc__wdec(recycled);
+    vgc__ws("\n");
+}
+
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
 // object holds a pointer to an ALLOCATED-but-UNMARKED object that sweep is about
 // to reclaim — i.e. the mark did not reach closure. `kind`: 0 = referrer is a

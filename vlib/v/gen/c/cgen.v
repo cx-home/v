@@ -2192,6 +2192,26 @@ fn (mut g Gen) write_shareds() {
 	}
 }
 
+// write_vgc_join writes a thread join into the wait wrapper. Under -gc vgc the
+// join is a GC-safe region (cx-private#1886): a thread blocked joining another
+// allocates nothing and stores no heap pointer until the join returns, so the
+// collector neither parks nor suspends it at a stop, and on entry it hands its
+// cached spans to the other threads (vgc_safe_cache_flush, cx-home/v#36). cx's
+// main thread spends the whole run joining the evaluator's thread; its span
+// cache, one span per size class its start-up touched, a few objects in, was
+// stamped as cache-resident at every cycle and never swept or relinked
+// (fasta: 98 spans, 5,228 free slots, the same counts at cycle 0 and 300). A
+// returned value is pinned by the spawn wrapper until the wait releases it.
+fn (mut g Gen) write_vgc_join(join string) {
+	if g.pref.gc_mode == .vgc {
+		g.gowrappers.writeln('\tbuiltin__gc_safe_region_enter();')
+		g.gowrappers.writeln(join)
+		g.gowrappers.writeln('\tbuiltin__gc_safe_region_exit();')
+	} else {
+		g.gowrappers.writeln(join)
+	}
+}
+
 fn (mut g Gen) register_thread_void_wait_call() {
 	lock g.waiter_fns {
 		if '__v_thread_wait' in g.waiter_fns {
@@ -2205,7 +2225,7 @@ fn (mut g Gen) register_thread_void_wait_call() {
 		g.gowrappers.writeln('\tu32 stat = WaitForSingleObject(thread, INFINITE);')
 		g.gowrappers.writeln('\tif (stat != WAIT_OBJECT_0) { builtin___v_panic(_S("error waiting thread")); }')
 	} else {
-		g.gowrappers.writeln('\tint stat = pthread_join(thread, (void **)NULL);')
+		g.write_vgc_join('\tint stat = pthread_join(thread, (void **)NULL);')
 		g.gowrappers.writeln('\tif (stat != 0) { builtin___v_panic(_S("error waiting thread")); }')
 	}
 	g.gowrappers.writeln('}')
@@ -2235,7 +2255,7 @@ fn (mut g Gen) register_thread_wait_call(eltyp string) {
 		}
 	} else {
 		g.gowrappers.writeln('\tvoid* ret_val;')
-		g.gowrappers.writeln('\tint stat = pthread_join(thread, &ret_val);')
+		g.write_vgc_join('\tint stat = pthread_join(thread, &ret_val);')
 		g.gowrappers.writeln('\tif (stat != 0) { builtin___v_panic(_S("error waiting thread")); }')
 		g.gowrappers.writeln('\tres = *(${eltyp}*)ret_val;')
 		if g.pref.prealloc {
