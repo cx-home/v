@@ -628,6 +628,15 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	if left_type == 0 || !g.contains_ptr(left_type) {
 		return
 	}
+	// cx-private#1924 cut 3: @[vgc_no_wb] marks a builtin whose every pointer
+	// store writes only a pointer the collector reaches from a root anyway
+	// (_option_ok/_result_ok/_option_none store the wrapper header, whose one
+	// pointer is the `none__` const's object, a global's referent), so the
+	// store can create no edge the barrier must record. Those two ok-wraps are
+	// 31.5 M of template-render 5000's 43 M executed gates (73 %).
+	if g.fn_decl != unsafe { nil } && g.fn_decl.attrs.any(it.name == 'vgc_no_wb') {
+		return
+	}
 	// A `shared` target is stored through its heap wrapper (`x->val = v`, the
 	// wrapper allocated by __dup__shared_*), a separate object from the owner:
 	// dirty the wrapper. `x` is a shared local or a shared field (`h.f = v` writes
