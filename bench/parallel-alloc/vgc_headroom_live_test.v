@@ -117,14 +117,27 @@ fn test_the_bound_has_a_floor() {
 	fixed32 := ratio('VGC_HEADROOM_ADAPTIVE_FLOOR=0 ', 'small')
 	fixed16 := ratio('VGC_HEADROOM_ADAPTIVE_FLOOR=0 VGC_HEADROOM_LIVE_FLOOR_MB=16 ', 'small')
 	adaptive := ratio('', 'small')
-	println('vgc_headroom_live: 8 MB live — fixed 32 MB floor ${fixed32:.3f}x, fixed 16 MB floor ${fixed16:.3f}x, adaptive floor ${adaptive:.3f}x')
-	// 8 MB live under the fixed 32 MB floor: the carve is live + floor (+ slack), 5x,
-	// not the 2x the bare bound would force; a 16 MB floor carves measurably less.
-	assert fixed32 >= 4.0, 'the fixed floor did not hold: ${fixed32:.3f}x (expected live + 32 MB, ~5x)'
-	assert fixed16 < fixed32, 'a 16 MB floor carved ${fixed16:.3f}x, not less than the fixed 32 MB floor ${fixed32:.3f}x'
-	// The adaptive floor (cx-home/v#14) is clamp(2 x marked, 4 MB, 32 MB): 16 MB
-	// over 8 MB live, so the carve is ~3x, below the fixed floor's.
-	assert adaptive < fixed32, 'the adaptive floor carved ${adaptive:.3f}x, not less than the fixed floor ${fixed32:.3f}x'
+	// the band's own carve, no bound: the floor can only show where the band
+	// asked for more than it (cx-home/v#42: the band reads the collector's work
+	// CPU, so a runner where marking 8 MB is cheap against the interval keeps the
+	// headroom at its base — Linux CI's walks-forced mode carved 2.07x with the
+	// fixed floor, the band never past 8 MB)
+	free := ratio('VGC_HEADROOM_ADAPTIVE_FLOOR=0 VGC_HEADROOM_LIVE_PCT=0 ', 'small')
+	println('vgc_headroom_live: 8 MB live — fixed 32 MB floor ${fixed32:.3f}x, fixed 16 MB floor ${fixed16:.3f}x, adaptive floor ${adaptive:.3f}x, bound off ${free:.3f}x')
+	// The floor never carves under the band: up to live + 32 MB the bounded carve
+	// is the unbounded one.
+	want := if free < 4.0 { free } else { 4.0 }
+	assert fixed32 >= want - 0.15, 'the fixed floor cut the carve: ${fixed32:.3f}x against the band\'s ${free:.3f}x'
+	if free >= 4.0 {
+		// 8 MB live under the fixed 32 MB floor, the band past it: the carve is
+		// live + floor (+ slack), 5x, not the 2x the bare bound would force; a
+		// 16 MB floor carves measurably less.
+		assert fixed32 >= 4.0, 'the fixed floor did not hold: ${fixed32:.3f}x (expected live + 32 MB, ~5x; bound off ${free:.3f}x)'
+		assert fixed16 < fixed32, 'a 16 MB floor carved ${fixed16:.3f}x, not less than the fixed 32 MB floor ${fixed32:.3f}x'
+		// The adaptive floor (cx-home/v#14) is clamp(2 x marked, 4 MB, 32 MB): 16 MB
+		// over 8 MB live, so the carve is ~3x, below the fixed floor's.
+		assert adaptive < fixed32, 'the adaptive floor carved ${adaptive:.3f}x, not less than the fixed floor ${fixed32:.3f}x'
+	}
 	assert adaptive <= 3.6, 'the adaptive floor carved ${adaptive:.3f}x over 8 MB live (expected live + 16 MB, ~3x)'
 }
 
