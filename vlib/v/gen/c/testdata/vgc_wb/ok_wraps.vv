@@ -1,0 +1,39 @@
+module main
+
+@[heap]
+struct Rec {
+	n int
+}
+
+struct Box {
+mut:
+	p &Rec = unsafe { nil }
+}
+
+fn find(n int) ?&Rec {
+	if n > 0 {
+		return &Rec{n}
+	}
+	return none
+}
+
+fn parse(n int) !&Rec {
+	if n < 0 {
+		return error('negative')
+	}
+	return &Rec{n}
+}
+
+@[noinline]
+fn store(mut b Box, q &Rec) {
+	b.p = q
+}
+
+fn main() {
+	mut b := &Box{}
+	x := find(3) or { return }
+	y := parse(4) or { return }
+	store(mut b, x)
+	store(mut b, y)
+	println(b.p.n)
+}

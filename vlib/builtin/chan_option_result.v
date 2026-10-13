@@ -46,11 +46,12 @@ struct _result {
 	// derived Result_xxx types
 }
 
-// cx-private#1924: inlined at every site, so clang sees the zero-init of the
+// cx-private#1924: no barrier on the header store (vgc_no_wb: its one pointer is
+// none__'s object, reached from the const's root). Inlined at every site, so clang sees the zero-init of the
 // caller's declared temporary overwritten whole (header store + a copy of the
 // payload's constant size) and drops it — ~11,000 sites in cx (7,381 option,
 // 3,304 result), each a full zero-store of the wrapper before an opaque call.
-@[_always_inline]
+@[_always_inline; vgc_no_wb]
 fn _result_ok(data voidptr, mut res _result, size int) {
 	unsafe {
 		*res = _result{}
@@ -179,6 +180,8 @@ struct _option {
 	// derived _option_xxx types
 }
 
+// cx-private#1924 cut 3: the header's one pointer is none__'s object (see gen_cm_write_barrier)
+@[vgc_no_wb]
 fn _option_none(data voidptr, mut option _option, size int) {
 	unsafe {
 		*option = _option{
@@ -190,7 +193,7 @@ fn _option_none(data voidptr, mut option _option, size int) {
 }
 
 // cx-private#1924: see _result_ok.
-@[_always_inline]
+@[_always_inline; vgc_no_wb]
 fn _option_ok(data voidptr, mut option _option, size int) {
 	unsafe {
 		*option = _option{}
