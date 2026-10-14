@@ -74,6 +74,7 @@ fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
 fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping on gc_stop_flag
+fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
@@ -6185,6 +6186,7 @@ fn vgc_safe_cache_flush(cache_idx int) {
 		return
 	}
 	c.flush_gen = gen
+	vgc_safe_cache_quarantine(cache_idx)
 	for sc in 0 .. 136 {
 		if unsafe { c.alloc[sc] } == unsafe { nil } {
 			continue
@@ -6210,6 +6212,84 @@ fn vgc_safe_cache_flush(cache_idx int) {
 		}
 		C.vgc_mutex_unlock(&central.lock)
 	}
+}
+
+// vgc_safe_cache_quarantine claims, before vgc_safe_cache_flush hands this
+// thread's cached spans to the other threads, every FREE slot of those spans
+// that a word on this thread's own stack or in its registers points into, and
+// zeroes it (cx-private#1886). A thread entering a safe region keeps its live
+// frames, and their stale words (an uninitialised slot, a dead temporary) are
+// roots for the whole region: while the span was this thread's, a stale word
+// at a free slot was harmless — only this thread, blocked, could fill it. Once
+// the span is on central.partial another thread fills that slot, and the stale
+// word roots the new object and everything it reaches: a thread joining a
+// list-builder kept a 240 MB doubly-linked list alive through one main-stack
+// word (vgc_metadata_roots_test with the join a safe region: 245,760,xxx B
+// retained, the word 0xC8 below the test's local, an early list node's slot).
+// A claimed slot is an allocated, zeroed object: the stale word keeps it
+// (it reaches nothing), the other threads never get it, and the first sweep
+// after the word is gone frees it. Only the owner writes a cached span's
+// alloc bits outside a stop (the atomic OR pairs with vgc_free's atomic AND).
+fn vgc_safe_cache_quarantine(cache_idx int) {
+	mut c := unsafe { vgc_cache(cache_idx) }
+	mut any := false
+	for sc in 0 .. 136 {
+		s := unsafe { c.alloc[sc] }
+		if s != unsafe { nil } && s.in_use && s.alloc_count < s.nelems && s.class_idx != 0 {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return
+	}
+	mut regs := [vgc_safe_spill_words]usize{}
+	sp := C.vgc_spill_regs(&regs[0], vgc_safe_spill_words)
+	for k in 0 .. vgc_safe_spill_words {
+		vgc_quarantine_word(mut c, regs[k])
+	}
+	hi := c.stack_base
+	if hi > sp {
+		w := usize(sizeof(usize))
+		mut a := (sp + w - 1) & ~(w - 1)
+		for a + w <= hi {
+			vgc_quarantine_word(mut c, unsafe { *(&usize(voidptr(a))) })
+			a += w
+		}
+	}
+}
+
+// vgc_quarantine_word claims the free slot `v` points into when that slot is in
+// one of this cache's partly-free spans (vgc_safe_cache_quarantine).
+@[inline]
+fn vgc_quarantine_word(mut c VGC_Cache, v usize) {
+	if v < vgc_arena_lo || v >= vgc_arena_hi {
+		return
+	}
+	mut span := vgc_find_span(voidptr(v))
+	if span == unsafe { nil } || !span.in_use || span.class_idx == 0 || span.elem_size == 0
+		|| span.alloc_bits == unsafe { nil } {
+		return
+	}
+	spc := int(span.class_idx) * 2 + if span.noscan { 1 } else { 0 } // the span class (vgc_central_get_fresh)
+	if unsafe { c.alloc[spc] } != span {
+		return
+	}
+	idx := u32((v - span.base) / usize(span.elem_size))
+	if idx >= span.nelems {
+		return
+	}
+	byte_i := idx >> 3
+	mask := u8(1) << (idx & 7)
+	old := unsafe { C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.alloc_bits) + usize(byte_i))), mask) }
+	if (old & mask) != 0 {
+		return
+	}
+	unsafe {
+		C.vgc_atomic_add_u32(&u32(voidptr(&span.alloc_count)), 1)
+		C.memset(voidptr(span.base + usize(idx) * usize(span.elem_size)), 0, span.elem_size)
+	}
+	vgc_alloc_black_hook(span, idx)
 }
 
 // vgc_safe_region_exit leaves the safe region via the Dekker handshake

@@ -1273,6 +1273,24 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
 #else
   #define VGC_SPILL_SETJMP(b) setjmp(b) // glibc/musl setjmp does not save the mask
 #endif
+// vgc_spill_regs (cx-private#1886): the calling thread's callee-saved
+// registers into `regs` (setjmp's buffer, word by word) and its real SP, for a
+// thread that scans its OWN stack (vgc_safe_cache_quarantine).
+static inline uintptr_t vgc_spill_regs(uintptr_t* regs, int reg_max) {
+    jmp_buf buf;
+    memset(&buf, 0, sizeof(buf));
+    VGC_SPILL_SETJMP(buf);
+    uintptr_t sp = vgc_real_sp();
+    if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
+    size_t buf_bytes = sizeof(buf);
+    int n = (int)(buf_bytes / sizeof(uintptr_t));
+    if (n > reg_max) { n = reg_max; }
+    const uintptr_t* w = (const uintptr_t*)&buf;
+    for (int i = 0; i < n; i++) { regs[i] = w[i]; }
+    for (int i = n; i < reg_max; i++) { regs[i] = 0; }
+    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    return sp;
+}
 static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
                                         uintptr_t* range_hi, uintptr_t stack_base,
                                         uintptr_t* reg_save, int reg_max) {
