@@ -60,9 +60,8 @@ jobs:
           git config --global --add safe.directory .
           gmake
           sysctl kern.threads.max_threads_per_proc hw.ncpu
-          # DIAG cx-home/v#44 (never land): spans_in_use vs in-range integers, x15 per mode
-          ./v -stats test bench/parallel-alloc/vgc_ps_diag_test.v 2>&1 | grep -E "DIAG|FAIL|error|HITS" || true
-          for k in 1 2 3 4 5 6; do ./v -stats test bench/parallel-alloc/vgc_parallel_sweep_test.v 2>&1 | grep 'vgc_parallel_sweep:' ; done
+          # DIAG 2 cx-home/v#44 (never land): the loop test inside the suite (default mode, concurrent tests = CI load), x3
+          for k in 1 2 3; do ./v test bench/parallel-alloc 2>&1 | grep -E "LOOPDIAG|spans_in_use|vgc_parallel_sweep" | grep -v "^ *[0-9]* *|" | head -400; done
           exit 0
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
