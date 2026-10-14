@@ -222,12 +222,21 @@ fn test_one_allocating_thread_paces_to_twice_the_live_set() {
 	if which != '' {
 		return
 	}
-	one := ratio('', 'small')
-	one_old := ratio('VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
-	println('vgc_headroom_live: 8 MB live, one allocating thread — ${one:.3f}x (GOGC=100 floor), ${one_old:.3f}x (2 x marked)')
+	// The floors show only where the band asks for more than them, and left to
+	// itself the band is the runner's (cx-home/v#42): Linux CI's walks-forced
+	// mode read 2.066x for both floors on c44b0e0049 (CI 38488246197), the
+	// band at its base. Held up as in test_the_bound_has_a_floor, the pair
+	// reads the floors alone (macOS: 2.066x / 3.115x).
+	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
+	one := ratio(band, 'small')
+	one_old := ratio(band + 'VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
+	println('vgc_headroom_live: 8 MB live, one allocating thread, band held up — ${one:.3f}x (GOGC=100 floor), ${one_old:.3f}x (2 x marked)')
 	assert one <= 2.5, 'one allocating thread carved ${one:.3f}x over 8 MB live (expected ~2x: live + 1 x marked)'
 	assert one < one_old, 'the 1 x marked floor carved ${one:.3f}x, not less than ${one_old:.3f}x'
+	// four threads against one, both left to the band as before (the stall would
+	// let four allocating threads run ahead of any floor)
+	one_free := ratio('', 'small')
 	four := ratio('', 'small4')
-	println('vgc_headroom_live: 8 MB live, four allocating threads — ${four:.3f}x')
-	assert four > one, 'four allocating threads carved ${four:.3f}x, not more than one thread ${one:.3f}x: the per-thread floor lost its 2 x marked base'
+	println('vgc_headroom_live: 8 MB live, four allocating threads — ${four:.3f}x (one thread ${one_free:.3f}x)')
+	assert four > one_free, 'four allocating threads carved ${four:.3f}x, not more than one thread ${one_free:.3f}x: the per-thread floor lost its 2 x marked base'
 }
