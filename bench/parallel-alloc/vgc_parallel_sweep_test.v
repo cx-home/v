@@ -40,13 +40,27 @@ mut:
 
 const node_count = 24 * 1024 * 1024 / 1280 // ~19.6k rounds of one node + one buffer
 
+// Bit 63 on every tag (cx-home/v#44): the collector scans a node's words
+// conservatively, so a tag (i * 2654435761 + 97 spans 0 .. 5.2e13) that falls
+// inside the arenas retains whatever span it points into. Where the arenas
+// sit moves per process under ASLR (FreeBSD), so the one-walker and the
+// eight-walker runs could each retain a different extra span: 2301 against
+// 2302 on CI 38492110432. A word with bit 63 set is no user-space address on
+// any target, so no tag or pad word aliases the heap and the span count is
+// the walk mode's alone.
+const tag_hi = u64(1) << 63
+
+fn tag_of(id u64) u64 {
+	return (id * 2654435761 + 97) | tag_hi
+}
+
 fn child() {
 	mut kept := []&Node{cap: node_count / 3 + 1}
 	mut sink := u64(0)
 	for i in 0 .. node_count {
 		mut n := &Node{
 			id:  u64(i)
-			tag: u64(i) * 2654435761 + 97
+			tag: tag_of(u64(i))
 		}
 		if i % 4 == 0 {
 			n.buf = []u8{len: 1024, init: u8(i)}
@@ -83,7 +97,7 @@ fn child() {
 		if n == unsafe { nil } {
 			continue
 		}
-		if n.tag != n.id * 2654435761 + 97 || n.pad[25] != (n.tag ^ n.id) {
+		if n.tag != tag_of(n.id) || n.pad[25] != (n.tag ^ n.id) {
 			println('BAD node ${n.id}')
 			exit(3)
 		}

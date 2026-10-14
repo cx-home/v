@@ -60,14 +60,9 @@ jobs:
           git config --global --add safe.directory .
           gmake
           sysctl kern.threads.max_threads_per_proc hw.ncpu
-          # cx-home/v#24: the idle-run coalesce row, traced, before the suite
-          VGC_GCTRACE=2 ./v -stats test bench/parallel-alloc/vgc_idle_defrag_test.v 2>&1 | tail -80 || true
-          # every mode reports, then the job fails if any did
-          rc=0
-          ./v test bench/parallel-alloc || rc=1
-          VGC_MARK_PAR_MIN_US=0 ./v test bench/parallel-alloc || rc=1
-          VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc || rc=1
-          exit $rc
+          # DIAG 3 cx-home/v#44 (never land): 50 pairs inside the suite, x3, on H10 + bit-63 tags
+          for k in 1 2 3; do ./v test bench/parallel-alloc 2>&1 | grep -E "LOOPDIAG (MISMATCH|bad)|vgc_parallel_sweep:| one: | par: " | head -100; done
+          exit 0
 
   # cx-home/v#20: the Windows OS-suspend STW (SuspendThread + GetThreadContext),
   # the stack bounds and the thread-exit callback. bench/parallel-alloc's
