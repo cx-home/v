@@ -649,6 +649,19 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 	}
 	match left {
 		ast.SelectorExpr {
+			// cx-private#1924 cut 3: a field of the collector's own metadata — a
+			// span descriptor, a central list, an mcache slot, an arena, a mark
+			// work buffer, the heap record — is never a heap object: every one is
+			// carved from vgc_os_alloc slabs (vgc_alloc_span_meta, the cache chunk
+			// table, vgc_workbuf_carve) or is the vgc_heap global, and none is ever
+			// made by a V allocation. The gate on such a store finds no span to
+			// dirty (or sets a card of a page no permanent span covers, which is
+			// never read), so it records nothing; the span-list relinks of the
+			// allocator and the sweep were ~1.6 M of template-render 5000's
+			// remaining executed gates.
+			if g.cm_is_vgc_meta(left.expr_type) {
+				return
+			}
 			// (*base).field = v : dirty *base's span, but only when base is a pointer
 			// (a heap object). A value-struct selector is inline in its owner: the
 			// store goes to whatever holds the owner (cx-home/v#15: `p.inner.f = v`
@@ -672,6 +685,18 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			}
 		}
 		ast.IndexExpr {
+			// a fixed array inline in the collector's metadata (vgc_heap.free_spans[n],
+			// the pool's list heads): the same rule as the field store above
+			if left.is_farray && left.left is ast.SelectorExpr
+				&& g.cm_is_vgc_meta((left.left as ast.SelectorExpr).expr_type) {
+				return
+			}
+			// a fixed array that is a global (vgc_mark_local[w]) is in the data
+			// segment, a root the termination re-scans like the plain global store
+			// `g = p`, which has never carried a gate
+			if left.is_farray && left.left is ast.Ident && (left.left as ast.Ident).kind == .global {
+				return
+			}
 			if g.cm_is_pure_lvalue(left.left) {
 				base := g.expr_string(left.left)
 				if left.is_array {
@@ -690,6 +715,18 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 		}
 		else {}
 	}
+}
+
+// cm_is_vgc_meta: the collector's metadata structs (vlib/builtin/vgc_d_vgc.c.v),
+// which live outside the GC heap (see gen_cm_write_barrier). A struct of these
+// names made by a V allocation would break the rule: the builtin makes none.
+fn (mut g Gen) cm_is_vgc_meta(t ast.Type) bool {
+	if t == 0 {
+		return false
+	}
+	sym := g.table.sym(t)
+	return sym.mod == 'builtin' && sym.name in ['VGC_Span', 'VGC_Cache', 'VGC_Central', 'VGC_Arena',
+		'VGC_WorkBuf', 'VGC_Heap']
 }
 
 // assign_stmt wraps the statement in the concurrent-mark write barrier
