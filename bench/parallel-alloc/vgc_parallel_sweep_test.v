@@ -40,13 +40,58 @@ mut:
 
 const node_count = 24 * 1024 * 1024 / 1280 // ~19.6k rounds of one node + one buffer
 
+// Bit 63 on every tag (cx-home/v#44): the collector scans a node's words
+// conservatively, so a tag (i * 2654435761 + 97 spans 0 .. 5.2e13) that falls
+// inside the arenas retains whatever span it points into. Where the arenas
+// sit moves per process under ASLR (FreeBSD), so the one-walker and the
+// eight-walker runs could each retain a different extra span: 2301 against
+// 2302 on CI 38492110432. A word with bit 63 set is no user-space address on
+// any target, so no tag or pad word aliases the heap and the span count is
+// the walk mode's alone.
+const tag_hi = u64(1) << 63
+
+fn tag_of(id u64) u64 {
+	return (id * 2654435761 + 97) | tag_hi
+}
+
+// The forced alias (VGC_PS_PLANT=1): a dropped 64 KB buffer's address is
+// written into kept node 0's pad[0] as plain integer data — what a tag did by
+// chance on FreeBSD. The collector scans that word conservatively, so the
+// buffer's span stays in use: the plant run reads exactly one span more than
+// the same run without it. The address crosses the stack only masked.
+const plant_mask = u64(0x5a5a000000000000)
+const plant_big = 64 * 1024
+
+@[noinline]
+fn plant_alloc_and_drop() u64 {
+	mut b := []u8{len: plant_big}
+	for i := 0; i < plant_big; i += 4096 {
+		b[i] = 1
+	}
+	return u64(voidptr(unsafe { &b[0] })) ^ plant_mask
+}
+
+@[noinline]
+fn plant_scrub() u64 {
+	mut buf := [4096]u64{}
+	for i in 0 .. buf.len {
+		buf[i] = u64(i)
+	}
+	return buf[4095]
+}
+
 fn child() {
 	mut kept := []&Node{cap: node_count / 3 + 1}
 	mut sink := u64(0)
+	mut key := u64(0)
+	if os.getenv('VGC_PS_PLANT') == '1' {
+		key = plant_alloc_and_drop()
+		sink += plant_scrub() & 1
+	}
 	for i in 0 .. node_count {
 		mut n := &Node{
 			id:  u64(i)
-			tag: u64(i) * 2654435761 + 97
+			tag: tag_of(u64(i))
 		}
 		if i % 4 == 0 {
 			n.buf = []u8{len: 1024, init: u8(i)}
@@ -55,6 +100,9 @@ fn child() {
 			sink += u64(b[i % 1024])
 		}
 		n.pad[25] = n.tag ^ n.id
+		if i == 0 && key != 0 {
+			n.pad[0] = key ^ plant_mask
+		}
 		if i % 3 == 0 {
 			kept << n
 		} else {
@@ -83,7 +131,7 @@ fn child() {
 		if n == unsafe { nil } {
 			continue
 		}
-		if n.tag != n.id * 2654435761 + 97 || n.pad[25] != (n.tag ^ n.id) {
+		if n.tag != tag_of(n.id) || n.pad[25] != (n.tag ^ n.id) {
 			println('BAD node ${n.id}')
 			exit(3)
 		}
@@ -117,6 +165,22 @@ fn run(env string) (string, string) {
 	assert check != '', r.output
 	assert spans != '', r.output
 	return '${check} spans_in_use=${spans}', r.output
+}
+
+// cx-home/v#44: the span count is the walk mode's alone only while no scanned
+// word aliases the heap. Forced: the same one-walker run with one planted
+// address reads exactly one span more, and the same checksum.
+fn test_an_integer_word_aliasing_a_dead_span_keeps_it() {
+	if os.getenv('VGC_PS_CHILD') != '' {
+		return
+	}
+	one, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
+	planted, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 VGC_PS_PLANT=1 ')
+	println('vgc_parallel_sweep: one walker ${one}; planted ${planted}')
+	assert one.all_before(' ') == planted.all_before(' '), 'the plant changed the live data: ${one} against ${planted}'
+	n_one := one.all_after('spans_in_use=').int()
+	n_planted := planted.all_after('spans_in_use=').int()
+	assert n_planted == n_one + 1, 'a word holding a dropped buffer address keeps exactly its span: ${n_one} against ${n_planted}'
 }
 
 fn test_parallel_walks_leave_the_heap_as_the_serial_walks_do() {
