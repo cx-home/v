@@ -119,6 +119,7 @@ fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u
 fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
+fn C.vgc_addr_to_arena2(addr usize) int
 fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_touched_ranges(lo usize, hi usize, los &usize, his &usize, max int) int // cx-home/v#15
 fn C.vgc_addr_to_arena(addr usize) int
@@ -4552,6 +4553,32 @@ fn vgc_span_alloc_obj(mut span VGC_Span) voidptr {
 		return unsafe { nil }
 	}
 	start_idx := span.free_index
+	// The fast path (cx-home/v#15 lever 3): a span the cache hands out is
+	// carved fresh or swept, and its slots above the hint are free in nearly
+	// every allocation — the hint's own slot is claimed with one load and one
+	// atomic OR, no byte scan, no pass bookkeeping. A taken slot (a stale
+	// hint, a racing claim) falls through to the scan below, which is the
+	// same claim over every slot. The slow path's forensics (vgc_birthcheck)
+	// stay on the scan: a -d vgc_birthcheck build takes the scan for every
+	// slot, so its checks see every birth.
+	$if !vgc_birthcheck ? {
+		if start_idx < span.nelems {
+			fast_byte := start_idx >> 3
+			fast_mask := u8(1) << (start_idx & 7)
+			if (unsafe { span.alloc_bits[fast_byte] } & fast_mask) == 0 {
+				old := unsafe {
+					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.alloc_bits) + usize(fast_byte))),
+						fast_mask)
+				}
+				if (old & fast_mask) == 0 {
+					unsafe { C.vgc_atomic_add_u32(&u32(voidptr(&span.alloc_count)), 1) }
+					span.free_index = start_idx + 1
+					vgc_alloc_black_hook(span, start_idx)
+					return unsafe { voidptr(span.base + usize(start_idx) * usize(span.elem_size)) }
+				}
+			}
+		}
+	}
 	nbytes := (span.nelems + 7) >> 3
 	start_byte := start_idx >> 3
 	end_byte := (start_idx + 7) >> 3
@@ -6017,6 +6044,13 @@ fn vgc_find_span(ptr voidptr) &VGC_Span {
 	mut arena_idx := C.vgc_addr_to_arena(addr)
 	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
+		// the chunk's second arena (cx-home/v#15 lever 3: an arena straddles
+		// two chunks, so the one entry missed for the older arena's part of a
+		// shared chunk and every such lookup scanned the arenas linearly)
+		arena_idx = C.vgc_addr_to_arena2(addr)
+	}
+	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
+		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		arena_idx = -1
 		for i in 0 .. nar {
 			a := unsafe { &vgc_heap.arenas[i] }
@@ -6062,13 +6096,22 @@ fn vgc_is_heap_ptr(addr usize) bool {
 	if addr < vgc_arena_lo || addr >= vgc_arena_hi {
 		return false
 	}
-	arena_idx := C.vgc_addr_to_arena(addr)
 	// ACQUIRE-load narenas (paired with vgc_span_alloc's RELEASE store).
-	if arena_idx < 0 || arena_idx >= int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas)))) {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	arena_idx := C.vgc_addr_to_arena(addr)
+	if arena_idx >= 0 && arena_idx < nar {
+		a := unsafe { &vgc_heap.arenas[arena_idx] }
+		if addr >= a.base && addr < a.base + a.used {
+			return true
+		}
+	}
+	// the chunk's second arena (see vgc_find_span)
+	arena2 := C.vgc_addr_to_arena2(addr)
+	if arena2 < 0 || arena2 >= nar {
 		return false
 	}
-	a := unsafe { &vgc_heap.arenas[arena_idx] }
-	return addr >= a.base && addr < a.base + a.used
+	a2 := unsafe { &vgc_heap.arenas[arena2] }
+	return addr >= a2.base && addr < a2.base + a2.used
 }
 
 // Safepoint: called when GC needs threads to stop. Spills callee-saved
