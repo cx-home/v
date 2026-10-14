@@ -47,8 +47,13 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
   static char vgc__image_marker; // dladdr anchor: resolves to the image carrying THIS vgc
   static int vgc__image_segments(const struct mach_header_64* mh, uintptr_t* los,
                                  uintptr_t* his, int max_ranges, int n) {
-      static const char* const seg_names[] = {"__DATA", "__DATA_CONST", "__DATA_DIRTY"};
-      for (int i = 0; i < 3 && n < max_ranges; i++) {
+      // cx-home/v#15: __DATA_CONST is not a root range. dyld writes its pointers
+      // (the GOT, const tables of addresses into __TEXT/__DATA) during the image's
+      // fixups and then maps the segment read-only before any initializer runs,
+      // so no store made after vgc's arenas exist can put a heap address there.
+      // Scanned, it was ~208 KB of conservative words on every cycle.
+      static const char* const seg_names[] = {"__DATA", "__DATA_DIRTY"};
+      for (int i = 0; i < 2 && n < max_ranges; i++) {
           unsigned long sz = 0;
           uint8_t* p = getsegmentdata(mh, seg_names[i], &sz);
           if (p != 0 && sz > 0) {
