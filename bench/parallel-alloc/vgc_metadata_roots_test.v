@@ -152,3 +152,50 @@ fn test_a_live_object_larger_than_an_arena_held_by_an_interior_pointer_survives(
 	assert bad == 0
 	assert gc_heap_usage().total_bytes >= u64(big), 'the live oversized object was swept'
 }
+
+// The collector's own clocks and CPU times are integers, not references, but
+// a value that falls inside the arenas would root what it points at: the
+// collecting thread's CPU time in ns (vgc_gc_cpu_t0, cx-home/v#42) reads
+// 0x1_0000_0000-0x2_0000_0000 after 4-8 s of work, where the macOS arenas
+// sit, and held an interior address of the streaming bench's dead 100 MiB
+// corpus copy: a seventh arena, peak RSS 513 -> 613 MB (cx-private's
+// perf-pair red on ffc9f039f). The words a cycle sets before its root scan
+// cannot be planted from here, so the case plants the ones a cycle sets after
+// it (the same exclusion covers both): the address of a dropped 40 MB buffer,
+// planted again before each of the two collections.
+const own_mask = u64(0xa5a5000000000000)
+const own_big = 40 * 1024 * 1024
+
+@[noinline]
+fn own_alloc_and_drop() u64 {
+	mut b := []u8{len: own_big}
+	for i := 0; i < own_big; i += 4096 {
+		b[i] = 1
+	}
+	return u64(voidptr(unsafe { &b[1000] })) ^ own_mask
+}
+
+@[noinline]
+fn own_plant(key u64) {
+	a := key ^ own_mask
+	vgc_gc_last_end = a
+	vgc_gate_last_interval = a
+	vgc_ph_swalk_ns = a
+	vgc_mark_last_ns = a
+}
+
+fn test_the_collectors_own_clock_words_do_not_root_what_they_alias() {
+	_ := scrub_stack()
+	base := collect_and_read()
+	key := own_alloc_and_drop()
+	_ := scrub_stack()
+	own_plant(key)
+	_ := scrub_stack()
+	gc_collect()
+	own_plant(key)
+	_ := scrub_stack()
+	gc_collect()
+	retained := u64(gc_heap_usage().total_bytes)
+	println('vgc_metadata_roots: clock words hold a dropped buffer address, base=${base} retained=${retained}')
+	assert retained < base + retained_bound, '${retained - base} bytes stay marked: a collector clock word holding an arena address roots the dropped buffer'
+}
