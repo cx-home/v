@@ -2390,6 +2390,68 @@ fn vgc_register_at_entry() {
 	}
 }
 
+// ── The native-linkage ABI (NATV-18; thirdparty/vgc/vgc_native.h) ──────────
+// vgc_thread_attach registers a thread the V runtime did not start (a pthread
+// created by native code, a C library's callback thread). Until it allocates,
+// such a thread is invisible to the collector — never parked, never suspended,
+// its stack and registers never scanned — so an object only it holds is freed
+// under it. Idempotent: 1 = registered by this call, 0 = already registered.
+@[export: 'vgc_thread_attach']
+fn vgc_thread_attach() int {
+	idx := C.vgc_get_cache_idx()
+	if idx >= 0 && idx < vgc_heap.ncaches {
+		return 0
+	}
+	vgc_register_thread()
+	return 1
+}
+
+// vgc_thread_detach releases the calling thread's slot before it exits (thread
+// exit does the same through the exit key). The exit key is cleared FIRST: the
+// released slot can be reused by another thread at once, and a destructor
+// still armed with this idx would release that thread's slot at this thread's
+// exit. A no-op for an unregistered thread.
+@[export: 'vgc_thread_detach']
+fn vgc_thread_detach() {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 || idx >= vgc_heap.ncaches {
+		return
+	}
+	C.vgc_install_thread_exit(-1)
+	vgc_thread_exit_cb(idx)
+}
+
+// vgc_native_pin / vgc_native_unpin: gc_pin/gc_unpin under fixed C names, for a
+// GC reference native code parks in memory the collector does not scan.
+@[export: 'vgc_native_pin']
+fn vgc_native_pin(p voidptr) {
+	vgc_pin(p)
+}
+
+@[export: 'vgc_native_unpin']
+fn vgc_native_unpin(p voidptr) {
+	vgc_unpin(p)
+}
+
+// vgc_native_safe_enter / vgc_native_safe_exit: the GC-safe blocking region
+// (cx #316) under fixed C names; the contract is vgc_safe_region_enter's.
+@[export: 'vgc_native_safe_enter']
+fn vgc_native_safe_enter() {
+	vgc_safe_region_enter()
+}
+
+@[export: 'vgc_native_safe_exit']
+fn vgc_native_safe_exit() {
+	vgc_safe_region_exit()
+}
+
+// vgc_native_abi_1 is the link-time check vgc_native.h references: a native
+// unit built against this ABI does not link with a runtime that lacks it.
+@[export: 'vgc_native_abi_1']
+fn vgc_native_abi_1() int {
+	return 1
+}
+
 // vgc_thread_exit_cb is invoked (via a pthread-key destructor, see
 // vgc_platform.h) when a registered thread exits. It marks the cache slot
 // unregistered so stop-the-world no longer waits on a dead thread, and
