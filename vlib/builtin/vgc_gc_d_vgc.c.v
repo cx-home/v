@@ -1898,6 +1898,10 @@ fn vgc_mark_roots() {
 		vgc_cache_data_segments()
 	}
 	nseg := vgc_nseg
+	$if vgc_rootdiag ? {
+		vgc_rd_begin_cycle()
+		vgc_rd_cat = 1
+	}
 	// Scan the WHOLE data segment, including the collector's own `vgc_heap` struct.
 	// It is tempting to skip vgc_heap (it is large and is "just" collector metadata),
 	// but doing so intermittently reclaims live data: vgc_heap's per-thread caches
@@ -1931,6 +1935,9 @@ fn vgc_mark_roots() {
 	// thread create/exit churn (see above); the slots live in vgc_os_alloc'd
 	// chunks now, outside the data segment, so they are scanned here, chunk by
 	// chunk, ncaches records in all — not a fixed 1,024 x 1.5 KB array.
+	$if vgc_rootdiag ? {
+		vgc_rd_cat = 2
+	}
 	mut left := vgc_heap.ncaches
 	for ci in 0 .. C.vgc_ncache_chunks() {
 		if left <= 0 {
@@ -1944,6 +1951,9 @@ fn vgc_mark_roots() {
 	// The suspend records too (the captured register files, this cycle's and
 	// earlier ones'): the fixed BSS tables they replaced were scanned whole with
 	// the data segment every cycle, and this keeps exactly that coverage.
+	$if vgc_rootdiag ? {
+		vgc_rd_cat = 3
+	}
 	for ci in 0 .. C.vgc_ncache_chunks() {
 		mut slo := usize(0)
 		mut shi := usize(0)
@@ -1960,7 +1970,17 @@ fn vgc_mark_roots() {
 			continue
 		}
 		if cache.stack_lo > 0 && cache.stack_hi > 0 && cache.stack_hi > cache.stack_lo {
+			$if vgc_rootdiag ? {
+				vgc_rd_cat = u32(10 + i)
+				vgc_rd_base = cache.stack_hi
+				vgc_rd_own = i == C.vgc_get_cache_idx()
+			}
 			vgc_scan_range(cache.stack_lo, cache.stack_hi, 0)
+			$if vgc_rootdiag ? {
+				vgc_rd_cat = 0
+				vgc_rd_base = 0
+				vgc_rd_own = false
+			}
 			// DIAGNOSTIC (root-scan-miss localizer): does THIS thread's stack hold
 			// a pointer to the watched object? Bounded to the stack ranges only.
 			if vgc_watch_addr != 0 {
@@ -1979,6 +1999,9 @@ fn vgc_mark_roots() {
 	np := vgc_npins
 	for k in 0 .. np {
 		vgc_shade(usize(unsafe { vgc_pins[k] }), 0)
+	}
+	$if vgc_rootdiag ? {
+		vgc_rd_cat = 0
 	}
 }
 
@@ -2095,7 +2118,15 @@ fn vgc_scan_range(lo usize, hi usize, w int) {
 	for addr + sizeof(usize) <= hi {
 		val := unsafe { *(&usize(voidptr(addr))) }
 		if val != 0 {
-			vgc_shade(val, w)
+			$if vgc_rootdiag ? {
+				if vgc_rd_cat != 0 {
+					vgc_rd_shade_root(addr, val, w)
+				} else {
+					vgc_shade(val, w)
+				}
+			} $else {
+				vgc_shade(val, w)
+			}
 		}
 		addr += sizeof(usize)
 	}
@@ -2145,6 +2176,10 @@ fn vgc_shade(addr usize, w int) {
 			}
 		}
 		if was == 0 {
+			$if vgc_rootdiag ? {
+				vgc_rd_bytes += u64(span.elem_size)
+				vgc_rd_objs++
+			}
 			// Newly marked - add to work queue for scanning (only if it may contain pointers)
 			if !span.noscan {
 				obj_addr := span.base + usize(obj_idx) * usize(span.elem_size)
@@ -2152,6 +2187,81 @@ fn vgc_shade(addr usize, w int) {
 			}
 		}
 	}
+}
+
+// ── -d vgc_rootdiag: which root word keeps what (cx-home/v#46) ───────────────
+// A conservative root scan keeps whatever a stale word names: a spill slot or an
+// uninitialised local in a live frame, a counter in the data segment that happens
+// to equal an arena address. Each instance so far (cx-home/v#45's clock word,
+// cx-private#1941's memo backing, the fmt_8k lane slot, #1886's joiner word) cost
+// a bisect to find, and the trigger was always a codegen change elsewhere that
+// moved a frame. Built with -d vgc_rootdiag, the root scan drains the mark work
+// after every root word and charges the bytes newly marked to that word: a word
+// reaching VGC_ROOTDIAG_MIN_KB or more (default 1024) is reported on stderr with
+// its root kind, its address (the offset below the stack top, or the data
+// symbol) and, on the collecting thread's own stack, the function whose frame
+// holds it. A diagnostic build: the per-word drain makes the root scan slower,
+// and the default build carries none of it.
+__global vgc_rd_cat = u32(0)
+__global vgc_rd_base = usize(0)
+__global vgc_rd_own = false
+__global vgc_rd_bytes = u64(0)
+__global vgc_rd_objs = u64(0)
+__global vgc_rd_min = u64(0)
+__global vgc_rd_top_cat = u32(0)
+__global vgc_rd_top_bytes = u64(0)
+__global vgc_rd_top_where = usize(0)
+__global vgc_rd_top_off = i64(0)
+
+fn C.vgc_rd_report(cycle u64, cat u32, where usize, off i64, word usize, bytes u64, objs u64, own int)
+
+fn vgc_rd_begin_cycle() {
+	if vgc_rd_min == 0 {
+		e := C.getenv(c'VGC_ROOTDIAG_MIN_KB')
+		kb := if e != unsafe { nil } { u64(C.atoll(e)) } else { u64(1024) }
+		vgc_rd_min = if kb == 0 { u64(1) } else { kb * 1024 }
+	}
+	vgc_rd_top_cat = 0
+	vgc_rd_top_bytes = 0
+	vgc_rd_top_where = 0
+	vgc_rd_top_off = 0
+}
+
+// vgc_rd_shade_root shades one root word and drains what it reaches before the
+// next word is read, so the bytes newly marked are this word's alone (the
+// first word to reach an object is charged with it).
+fn vgc_rd_shade_root(addr usize, val usize, w int) {
+	cat := vgc_rd_cat
+	b0 := vgc_rd_bytes
+	o0 := vgc_rd_objs
+	vgc_shade(val, w)
+	vgc_rd_cat = 0
+	vgc_drain_mark_work(w)
+	vgc_rd_cat = cat
+	got := vgc_rd_bytes - b0
+	if got == 0 {
+		return
+	}
+	off := if cat >= 10 { i64(vgc_rd_base) - i64(addr) } else { i64(0) }
+	if got > vgc_rd_top_bytes {
+		vgc_rd_top_cat = cat
+		vgc_rd_top_bytes = got
+		vgc_rd_top_where = addr
+		vgc_rd_top_off = off
+	}
+	if got >= vgc_rd_min {
+		C.vgc_rd_report(vgc_heap.gc_cycle, cat, addr, off, val, got, vgc_rd_objs - o0,
+			if cat >= 10 && vgc_rd_own { 1 } else { 0 })
+	}
+}
+
+// vgc_rootdiag_top answers the cycle's heaviest root word: its kind (1 data,
+// 2 cache slots, 3 suspend records, 10 + n thread n's stack, 0 none), the bytes it
+// alone reached, its address and, for a stack word, its offset below the stack
+// top. Only in a -d vgc_rootdiag build.
+@[markused]
+pub fn vgc_rootdiag_top() (u32, u64, usize, i64) {
+	return vgc_rd_top_cat, vgc_rd_top_bytes, vgc_rd_top_where, vgc_rd_top_off
 }
 
 // vgc_shade_spawn_root shades an in-flight spawn-argument struct AND unconditionally

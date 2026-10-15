@@ -2343,6 +2343,48 @@ static void vgc__wdec(uint64_t v) {
     while (v > 0 && i > 0) { b[--i] = (char)('0' + (v % 10)); v /= 10; }
     (void)!write(2, b + i, 24 - i);
 }
+// cx-home/v#46 (-d vgc_rootdiag): one heavy root word on stderr. A data word is
+// named by its symbol (dladdr, darwin); a word on the collecting thread's own
+// stack by the function whose frame holds it: the frame-pointer chain is walked
+// from here outward to the first frame whose fp lies above the word, and that
+// frame's function is the one the previous frame returns into.
+static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t off,
+                          uintptr_t word, uint64_t bytes, uint64_t objs, int own) {
+    const char* kind = cat == 1 ? "data" : cat == 2 ? "caches" : cat == 3 ? "suspend" : cat >= 10 ? "stack" : "other";
+    fprintf(stderr, "[rootdiag gc %llu] root=%s", (unsigned long long)cycle, kind);
+    if (cat >= 10) fprintf(stderr, " thread=%u off=%lld", cat - 10, (long long)off);
+    fprintf(stderr, " where=%p word=%p reaches=%llu B objs=%llu", (void*)where, (void*)word,
+            (unsigned long long)bytes, (unsigned long long)objs);
+#if defined(__APPLE__)
+    if (cat == 1) {
+        Dl_info di; memset(&di, 0, sizeof di);
+        if (dladdr((void*)where, &di) && di.dli_sname)
+            fprintf(stderr, " sym=%s+%lld", di.dli_sname, (long long)((char*)where - (char*)di.dli_saddr));
+    }
+    if (cat >= 10 && own) {
+        void** fp = (void**)__builtin_frame_address(0);
+        void* prev_lr = 0;
+        for (int i = 0; i < 4096 && fp; i++) {
+            if ((uintptr_t)fp > where) {
+                Dl_info di; memset(&di, 0, sizeof di);
+                if (prev_lr && dladdr(prev_lr, &di) && di.dli_sname)
+                    fprintf(stderr, " frame=%s fp_off=%lld", di.dli_sname, (long long)((intptr_t)fp - (intptr_t)where));
+                else
+                    fprintf(stderr, " frame=%p fp_off=%lld", prev_lr, (long long)((intptr_t)fp - (intptr_t)where));
+                break;
+            }
+            prev_lr = fp[1];
+            void** next = (void**)fp[0];
+            if (next <= fp) break;
+            fp = next;
+        }
+    }
+#else
+    (void)own;
+#endif
+    fprintf(stderr, "\n");
+}
+
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
                              uint64_t narenas, uint64_t nspans, uint64_t lthreads,
                              uint64_t headroom_kb, uint64_t pause_us,
