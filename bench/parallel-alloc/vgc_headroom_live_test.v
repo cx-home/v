@@ -150,14 +150,19 @@ fn test_the_adaptive_floor_follows_a_tiny_live_set() {
 	if which != '' {
 		return
 	}
-	fixed := ratio('VGC_HEADROOM_ADAPTIVE_FLOOR=0 ', 'tiny') * f64(tiny_live_bytes) / 1048576.0
-	adaptive := ratio('', 'tiny') * f64(tiny_live_bytes) / 1048576.0
-	println('vgc_headroom_live: 2 MB live — carved high fixed floor ${fixed:.1f} MB, adaptive floor ${adaptive:.1f} MB')
-	// the control: the fixed floor carves its first 16 MB of headroom whatever the
-	// band says (~34 MB once the band doubles it; since cx-home/v#42 the band reads
-	// the collector's CPU time, and a contended runner's mutator interval can keep
-	// it at 16 MB: Linux CI at 4 jobs carved 18.9 MB); the adaptive floor's bar is
-	// the one this test exists for
+	// The band is held up for both runs (the wall-time pacer and a 50 ms
+	// collector stall per cycle, as in test_the_bound_has_a_floor), so the pair
+	// reads the two floors and not two draws of the runner's band. Left to
+	// itself the band reads the collector's work CPU (cx-home/v#42), and Linux
+	// CI's walks-forced mode carved only 10.5 MB under the fixed floor
+	// (38745420552, fork 7bff2f5641; the same tree's default and markers-forced
+	// modes passed, and the descendant 4dd5d7dd25 passed all three).
+	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
+	fixed := ratio(band + 'VGC_HEADROOM_ADAPTIVE_FLOOR=0 ', 'tiny') * f64(tiny_live_bytes) / 1048576.0
+	adaptive := ratio(band, 'tiny') * f64(tiny_live_bytes) / 1048576.0
+	println('vgc_headroom_live: 2 MB live, band held up — carved high fixed floor ${fixed:.1f} MB, adaptive floor ${adaptive:.1f} MB')
+	// the control: the fixed floor carves live + its 32 MB floor (~34 MB); the
+	// adaptive floor's bar is the one this test exists for: live + 4 MB (~6 MB)
 	assert fixed >= 16.0, 'the fixed floor carved only ${fixed:.1f} MB over 2 MB live (expected 18-34 MB)'
 	assert fixed >= adaptive * 2.0, 'the adaptive floor carved ${adaptive:.1f} MB, not under half the fixed floor ${fixed:.1f} MB'
 	assert adaptive <= 14.0, 'the adaptive floor carved ${adaptive:.1f} MB over 2 MB live (expected ~6-10 MB)'
