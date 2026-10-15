@@ -1218,8 +1218,8 @@ fn vgc_perm_promote() {
 			}
 		}
 		vgc_perm_len = if vgc_perm_cards != unsafe { nil } { hi - lo } else { 0 }
-		vgc_wb_lo = vgc_perm_lo
-		vgc_wb_len = vgc_perm_len
+		vgc_wb.lo = vgc_perm_lo
+		vgc_wb.len = vgc_perm_len
 		// the page bitmap over the range (a promotion that widened the range
 		// takes a fresh one; the old is left to the OS at exit — promotions are
 		// one or two per process)
@@ -2031,16 +2031,16 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	w := usize(sizeof(usize))
 	// cx-home/v#15: the permanent range's bounds and the barrier gate's base are
 	// span addresses too — vgc_perm_hi is the END of the highest permanent span,
-	// which is the base of whatever span follows it, and vgc_perm_lo / vgc_wb_lo
+	// which is the base of whatever span follows it, and vgc_perm_lo / vgc_wb.lo
 	// the base of the lowest, whose first slot may hold a young object: scanned,
 	// they rooted that object for the life of the process (a dropped 1.9 MB
 	// array and the 7.5 MB of strings it held, permanent/perm_transient.v)
 	mut ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
 		usize(voidptr(&vgc_workbuf_end)), usize(voidptr(&vgc_perm_lo)), usize(voidptr(&vgc_perm_hi)),
-		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0]!
+		usize(voidptr(&vgc_wb.lo)), 0, 0, 0, 0, 0]!
 	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
 		usize(voidptr(&vgc_workbuf_end)) + w, usize(voidptr(&vgc_perm_lo)) + w,
-		usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0]!
+		usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb.lo)) + w, 0, 0, 0, 0, 0]!
 	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
 	// vgc_platform.h): the arena address maps, the chunk tables and the
 	// touched-page cache — VGC_STATIC_TABLES (5) of them, from slot 7.

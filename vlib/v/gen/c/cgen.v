@@ -1318,13 +1318,17 @@ pub fn (mut g Gen) init() {
 			// called it undeclared, which C99 refuses.
 			g.cheaders.writeln('void vgc_wb_store(void* obj);')
 			// cx-home/v#15: the gate the stores call instead — one range test on
-			// two globals of builtin's (extern for -usecache units): the call is
-			// made only for a store into [vgc_wb_lo, +vgc_wb_len), which is the
+			// one global record of builtin's (extern for -usecache units): the call is
+			// made only for a store into [vgc_wb.lo, +vgc_wb.len), which is the
 			// permanent generation's range once promoted (vgc_wb_store then marks
 			// the page's card), the whole address space during a concurrent middle
 			// (the span-dirtying barrier as before), and empty otherwise.
-			g.cheaders.writeln('extern size_t vgc_wb_lo; extern size_t vgc_wb_len;')
-			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if (__builtin_expect((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len, 0)) vgc_wb_store(p); }')
+			// cx-private#1924 (the gate cut): the two words are one 16-byte record, so
+			// the gate reaches both through one address (one GOT entry, one load
+			// pair) instead of two; vgc_platform.h defines the same record.
+			g.cheaders.writeln('#ifndef VGC_WB_RANGE_DEFINED\n#define VGC_WB_RANGE_DEFINED\nstruct vgc_wb_range { size_t lo; size_t len; } __attribute__((aligned(16)));\n#endif')
+			g.cheaders.writeln('extern struct vgc_wb_range vgc_wb;')
+			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if (__builtin_expect((size_t)(uintptr_t)p - vgc_wb.lo < vgc_wb.len, 0)) vgc_wb_store(p); }')
 		}
 		g.cheaders.writeln(c_float_to_unsigned_conversion_functions)
 		if !g.pref.skip_unused || g.table.used_features.safe_int {

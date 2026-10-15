@@ -1104,6 +1104,14 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
 // `buf` stays alive across the whole collection (mark+sweep) since the body
 // runs nested here. vgc_gc_start must NOT re-record the collector's own range.
 extern void vgc_gc_start(void);
+// cx-private#1924: the barrier gate's range [lo, lo + len) as one 16-byte record
+// (builtin's __global vgc_wb; cgen's cheaders declare the same struct for the
+// inline vgc_wb_gate of every unit), so a gate does one load pair, not two loads.
+#ifndef VGC_WB_RANGE_DEFINED
+#define VGC_WB_RANGE_DEFINED
+struct vgc_wb_range { size_t lo; size_t len; } __attribute__((aligned(16)));
+#endif
+
 static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t base) {
     jmp_buf buf;
     setjmp(buf);

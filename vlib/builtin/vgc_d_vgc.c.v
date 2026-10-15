@@ -985,13 +985,14 @@ __global vgc_perm_hi = usize(0)
 __global vgc_perm_pages = &u64(unsafe { nil })
 __global vgc_perm_pages_n = usize(0)
 // what the generated C's inline gate tests before calling vgc_wb_store (cgen
-// cheaders, vgc_wb_gate): the range [vgc_wb_lo, +vgc_wb_len) a store must land
+// cheaders, vgc_wb_gate): the range [vgc_wb.lo, +vgc_wb.len) a store must land
 // in to need the barrier — empty before the promotion, the permanent range
 // after it, the whole address space during a concurrent middle (vgc_wb_set).
 // vgc_wb_mode mirrors vgc_heap.wb_enabled for vgc_wb_store's own test.
 __global vgc_wb_mode = u32(0)
-__global vgc_wb_lo = usize(0)
-__global vgc_wb_len = usize(0)
+// cx-private#1924: one record (C struct vgc_wb_range, vgc_platform.h), so the
+// generated gate loads lo and len as a pair through one address.
+__global vgc_wb = C.vgc_wb_range{}
 __global vgc_perm_len = usize(0)
 // the card table: one byte per page of [vgc_perm_lo, vgc_perm_lo + len).
 // vgc_wb_store sets the page's card (an atomic byte store when it reads 0: a
@@ -1011,11 +1012,11 @@ fn vgc_wb_set(mode u32) {
 	C.vgc_atomic_store_u32(&vgc_wb_mode, mode)
 	// the gate's range (stored under the stop: the resumed mutators read it)
 	if (mode & 1) != 0 {
-		vgc_wb_lo = 0
-		vgc_wb_len = ~usize(0)
+		vgc_wb.lo = 0
+		vgc_wb.len = ~usize(0)
 	} else {
-		vgc_wb_lo = vgc_perm_lo
-		vgc_wb_len = vgc_perm_len
+		vgc_wb.lo = vgc_perm_lo
+		vgc_wb.len = vgc_perm_len
 	}
 }
 // the verifier's full re-mark clears to zero (every object traced)
@@ -1843,6 +1844,12 @@ fn vgc_spchk_report(pkey voidptr, myframe usize) {
 
 fn C.atoll(&char) i64
 fn C.getenv(&char) &char
+
+struct C.vgc_wb_range {
+mut:
+	lo  usize
+	len usize
+}
 fn C.vgc_now_ns() u64
 fn C.vgc_thread_cpu_ns() u64
 
