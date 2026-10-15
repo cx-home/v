@@ -14,4 +14,8 @@ void vna_unpark(void);
 void vna_gate(void* obj);
 int vna_abi(void);
 void vna_safe_roundtrip(void);
+void vna_poll_start(int poll);
+int vna_poll_finish(void);
+int vna_poll_live_n(void);
+int vna_poll_seen_so_far(void);
 #endif

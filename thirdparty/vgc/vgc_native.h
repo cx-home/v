@@ -16,6 +16,11 @@
 //     vgc_thread_detach() (optional: thread exit does it) after its last.
 //     Attach after the V runtime is up (main has started); never detach a
 //     thread V started, and never detach inside a safe region.
+//     A reference a native frame holds is the plain pointer: never masked,
+//     tagged, offset past the object or packed. The scan reads words as they
+//     are; cc may keep a masked word in a callee-saved register across a wait
+//     and unmask it only at the use, and the object is lost (cx-core-code
+//     fable/1934-linkage: 8/8 buffers lost that way, deterministically).
 //
 //  2. FRAMES. On a registered thread every frame is scanned conservatively,
 //     native frames included: [sp, stack base] plus the callee-saved registers
@@ -41,8 +46,11 @@
 //     no GC reference it will store or carry out may run inside
 //     vgc_native_safe_enter() / vgc_native_safe_exit(): the collector then
 //     neither waits for nor suspends the thread. A non-blocking native loop
-//     needs nothing: the stop's bounded park wait falls back to suspending it,
-//     which is sound (only its pause share is longer).
+//     needs nothing for soundness: the stop's bounded park wait falls back to
+//     suspending it. vgc_native_poll() at a loop back-edge makes it park at
+//     the stop instead (the alloc path's cooperative park), so the stop does
+//     not wait out the bound: one cached load and one test while no stop is
+//     requested. VGC_NATIVE_POLL is defined when the poll is available.
 //
 // Allocation: pointer-holding objects come from the scanned allocator
 // (malloc/vcalloc of the V runtime); a GC reference is never stored in a
@@ -81,6 +89,18 @@ static inline void vgc_native_wb_gate(void* p) { if (__builtin_expect((size_t)(u
 // V pub fn is static in an object-file build of the runtime, _VOBJECTFILE).
 void vgc_native_safe_enter(void);
 void vgc_native_safe_exit(void);
+
+// 5. the back-edge poll (rule 4). The flag's address is fixed for the
+// process; each unit caches it on first use.
+#define VGC_NATIVE_POLL 1
+void* vgc_native_stop_flag_addr(void);
+void vgc_native_poll_slow(void);
+static volatile uint32_t* vgc__native_stop_flag;
+static inline void vgc_native_poll(void) {
+    volatile uint32_t* f = vgc__native_stop_flag;
+    if (__builtin_expect(f == 0, 0)) { f = (volatile uint32_t*)vgc_native_stop_flag_addr(); vgc__native_stop_flag = f; }
+    if (__builtin_expect(*f != 0, 0)) vgc_native_poll_slow();
+}
 
 // the link-time ABI check
 int vgc_native_abi_1(void);

@@ -85,3 +85,36 @@ void vna_unpark(void) { vgc_native_unpin((void*)(vna_pinned_masked ^ VNA_MASK));
 void vna_gate(void* obj) { vgc_native_wb_gate(obj); vgc_native_wb_gate((void*)&vna_slot[0]); }
 int vna_abi(void) { return vgc_native_abi_1(); }
 void vna_safe_roundtrip(void) { vgc_native_safe_enter(); usleep(1000); vgc_native_safe_exit(); }
+
+// the back-edge poll: an attached native thread spinning in a loop that never
+// allocates, polling each iteration; it counts the iterations that saw a stop
+// requested (each then parks in vgc_native_poll_slow)
+static int vna_poll_stop, vna_poll_seen, vna_poll_on, vna_poll_live, vna_poll_seen_now;
+static pthread_t vna_poll_tid;
+static void* vna_poll_thread(void* arg) {
+    (void)arg;
+    vgc_thread_attach();
+    volatile uint32_t* f = (volatile uint32_t*)vgc_native_stop_flag_addr();
+    unsigned long n = 0;
+    int seen = 0;
+    vna_add(&vna_poll_live);
+    for (;;) {
+        if ((++n & 1023) == 0) {
+            if (vna_geti(&vna_poll_stop)) break;
+            pthread_mutex_lock(&vna_mu); vna_poll_seen_now = seen; pthread_mutex_unlock(&vna_mu);
+        }
+        if (*f != 0) seen++;
+        if (vna_poll_on) vgc_native_poll();
+    }
+    pthread_mutex_lock(&vna_mu); vna_poll_seen = seen; pthread_mutex_unlock(&vna_mu);
+    vgc_thread_detach();
+    return 0;
+}
+void vna_poll_start(int poll) { vna_poll_on = poll; vna_poll_stop = 0; vna_poll_seen = 0; vna_poll_live = 0; vna_poll_seen_now = 0; pthread_create(&vna_poll_tid, 0, vna_poll_thread, 0); }
+int vna_poll_finish(void) {
+    pthread_mutex_lock(&vna_mu); vna_poll_stop = 1; pthread_mutex_unlock(&vna_mu);
+    pthread_join(vna_poll_tid, 0);
+    return vna_geti(&vna_poll_seen);
+}
+int vna_poll_live_n(void) { return vna_geti(&vna_poll_live); }
+int vna_poll_seen_so_far(void) { return vna_geti(&vna_poll_seen_now); }

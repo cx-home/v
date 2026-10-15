@@ -2445,6 +2445,22 @@ fn vgc_native_safe_exit() {
 	vgc_safe_region_exit()
 }
 
+// vgc_native_stop_flag_addr / vgc_native_poll_slow: the back-edge poll of
+// vgc_native.h (vgc_native_poll). The header caches the flag's address per
+// unit (vgc_heap's address is fixed; its fields are not, across _vinit) and
+// reads it inline; only a raised flag calls out, to the alloc path's park.
+@[export: 'vgc_native_stop_flag_addr']
+fn vgc_native_stop_flag_addr() voidptr {
+	return voidptr(&vgc_heap.gc_stop_flag)
+}
+
+@[export: 'vgc_native_poll_slow']
+fn vgc_native_poll_slow() {
+	if C.vgc_atomic_load_u32(&vgc_heap.gc_stop_flag) != 0 {
+		vgc_safepoint()
+	}
+}
+
 // vgc_native_abi_1 is the link-time check vgc_native.h references: a native
 // unit built against this ABI does not link with a runtime that lacks it.
 @[export: 'vgc_native_abi_1']

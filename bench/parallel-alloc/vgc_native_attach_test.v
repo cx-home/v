@@ -30,6 +30,10 @@ fn C.vna_unpark()
 fn C.vna_gate(obj voidptr)
 fn C.vna_abi() int
 fn C.vna_safe_roundtrip()
+fn C.vna_poll_start(poll int)
+fn C.vna_poll_finish() int
+fn C.vna_poll_live_n() int
+fn C.vna_poll_seen_so_far() int
 
 const vna_n = 8
 const vna_len = 2048
@@ -116,6 +120,41 @@ fn test_gate_abi_and_safe_region_entry_points() {
 	assert C.vna_abi() == 1
 	C.vna_safe_roundtrip()
 	gc_collect()
+}
+
+// a native loop that polls at its back-edge parks at the stop: it sees the
+// stop flag raised (the cooperative park, not only the suspend fallback), and
+// every collection completes while it spins
+// collections while an attached native thread spins: 10 timed, then (polling)
+// more until the loop has seen a stop, at most 200 (a loaded box can keep the
+// spinner off-CPU through a few short stops)
+fn spin_and_collect(poll int) (int, time.Duration) {
+	C.vna_poll_start(poll)
+	for C.vna_poll_live_n() == 0 {
+		time.sleep(time.millisecond)
+	}
+	sw := time.new_stopwatch()
+	for _ in 0 .. 10 {
+		gc_collect()
+	}
+	took := sw.elapsed()
+	if poll == 1 {
+		for _ in 0 .. 190 {
+			if C.vna_poll_seen_so_far() > 0 {
+				break
+			}
+			gc_collect()
+			time.sleep(100 * time.microsecond)
+		}
+	}
+	return C.vna_poll_finish(), took
+}
+
+fn test_a_polling_native_loop_parks_at_the_stop() {
+	seen, took := spin_and_collect(1)
+	assert seen > 0
+	_, took0 := spin_and_collect(0) // no poll: each stop suspends the loop after the bounded wait
+	eprintln('native loop, 10 collections: polling ${took}, not polling ${took0}')
 }
 
 fn test_unattached_native_threads_lose_what_they_hold_red_witness() {
