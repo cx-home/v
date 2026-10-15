@@ -1843,6 +1843,8 @@ fn vgc_spchk_report(pkey voidptr, myframe usize) {
 
 fn C.atoll(&char) i64
 fn C.getenv(&char) &char
+fn C.vgc_clear_stack_set(n usize)
+fn C.vgc_clear_stack_below()
 fn C.vgc_now_ns() u64
 fn C.vgc_thread_cpu_ns() u64
 
@@ -2000,6 +2002,12 @@ pub fn vgc_init() {
 			vgc_headroom_min = vgc_base_floor
 			vgc_headroom_pinned = true
 		}
+	}
+	// cx-home/v#46 (a), measurement only: VGC_CLEAR_STACK_KB=N clears N KB below
+	// the allocator on every pacer check (vgc_maybe_gc); unset or 0 = off.
+	cs_env := C.getenv(c'VGC_CLEAR_STACK_KB')
+	if cs_env != unsafe { nil } && C.atoll(cs_env) > 0 && C.atoll(cs_env) <= 256 {
+		C.vgc_clear_stack_set(usize(C.atoll(cs_env)) * 1024)
 	}
 	trace_env := C.getenv(c'VGC_GCTRACE')
 	if trace_env != unsafe { nil } && C.atoll(trace_env) > 0 {
@@ -5132,6 +5140,7 @@ fn vgc_acct_free(sz u64) {
 
 // Amortized GC trigger check - avoids atomic loads on every allocation
 fn vgc_maybe_gc() {
+	C.vgc_clear_stack_below() // cx-home/v#46 (a): off unless VGC_CLEAR_STACK_KB
 	C.vgc_trace(21, C.vgc_get_cache_idx(), C.vgc_atomic_load_u64(&vgc_heap.heap_live),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.gc_enabled))) // MAYBE_GC entry (diagnostic, pre-gate)
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) != 0 {

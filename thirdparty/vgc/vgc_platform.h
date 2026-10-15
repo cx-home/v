@@ -1099,6 +1099,21 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
 // `buf` stays alive across the whole collection (mark+sweep) since the body
 // runs nested here. vgc_gc_start must NOT re-record the collector's own range.
 extern void vgc_gc_start(void);
+// cx-home/v#46 (a), MEASUREMENT ONLY: Boehm's GC_clear_stack. Zero
+// vgc_clear_stack_bytes of the dead stack below the caller (VGC_CLEAR_STACK_KB,
+// 0 = off, at most 256 KB), so a frame pushed later that never writes one of
+// its slots reads 0 there and not a pointer a dead deeper call left behind.
+// It cannot reach a stale slot inside a frame that is live at the clear.
+static size_t vgc_clear_stack_bytes = 0;
+static inline void vgc_clear_stack_set(size_t n) { vgc_clear_stack_bytes = n; }
+__attribute__((noinline)) static void vgc_clear_stack_below(void) {
+    size_t n = vgc_clear_stack_bytes;
+    if (n == 0) { return; }
+    volatile unsigned char* pad = (volatile unsigned char*)__builtin_alloca(n);
+    for (size_t i = 0; i < n; i += sizeof(uintptr_t)) { *(volatile uintptr_t*)(pad + i) = 0; }
+    __asm__ __volatile__("" : : "r"(pad) : "memory");
+}
+
 static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t base) {
     jmp_buf buf;
     setjmp(buf);
