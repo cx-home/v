@@ -821,6 +821,7 @@ __global vgc_base_floor = u64(256 * 1024 * 1024)
 // Permanent observability (GODEBUG=gctrace analog) — costs one integer test
 // per cycle when off.
 __global vgc_gctrace = u32(0)
+__global vgc_no_quarantine = false // cx-home/v#46 measurement only: VGC_NO_QUARANTINE=1
 // Set by an explicit gc_collect() (vgc_force_collect_release_os) and consumed
 // by the next sweep's trim point: that one cycle runs the unbudgeted, age-blind
 // vgc_pool_trim_all instead of the aged/budgeted vgc_pool_trim, so an explicit
@@ -2005,6 +2006,10 @@ pub fn vgc_init() {
 	}
 	// cx-home/v#46 (a), measurement only: VGC_CLEAR_STACK_KB=N clears N KB below
 	// the allocator on every pacer check (vgc_maybe_gc); unset or 0 = off.
+	nq_env := C.getenv(c'VGC_NO_QUARANTINE')
+	if nq_env != unsafe { nil } && C.atoll(nq_env) > 0 {
+		vgc_no_quarantine = true
+	}
 	cs_env := C.getenv(c'VGC_CLEAR_STACK_KB')
 	if cs_env != unsafe { nil } && C.atoll(cs_env) > 0 && C.atoll(cs_env) <= 256 {
 		C.vgc_clear_stack_set(usize(C.atoll(cs_env)) * 1024)
@@ -6240,6 +6245,9 @@ fn vgc_safe_cache_flush(cache_idx int) {
 // after the word is gone frees it. Only the owner writes a cached span's
 // alloc bits outside a stop (the atomic OR pairs with vgc_free's atomic AND).
 fn vgc_safe_cache_quarantine(cache_idx int) {
+	if vgc_no_quarantine {
+		return
+	}
 	mut c := unsafe { vgc_cache(cache_idx) }
 	mut any := false
 	for sc in 0 .. 136 {
