@@ -2013,14 +2013,15 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	// they rooted that object for the life of the process (a dropped 1.9 MB
 	// array and the 7.5 MB of strings it held, permanent/perm_transient.v)
 	mut ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
-		usize(voidptr(&vgc_workbuf_end)), 0, 0, 0, usize(voidptr(&vgc_perm_lo)),
-		usize(voidptr(&vgc_perm_hi)), usize(voidptr(&vgc_wb_lo))]!
+		usize(voidptr(&vgc_workbuf_end)), usize(voidptr(&vgc_perm_lo)), usize(voidptr(&vgc_perm_hi)),
+		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0]!
 	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
-		usize(voidptr(&vgc_workbuf_end)) + w, 0, 0, 0, usize(voidptr(&vgc_perm_lo)) + w,
-		usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w]!
+		usize(voidptr(&vgc_workbuf_end)) + w, usize(voidptr(&vgc_perm_lo)) + w,
+		usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0]!
 	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
-	// vgc_platform.h): the arena address map and the chunk tables.
-	C.vgc_static_tables(&ex_los[4], &ex_his[4])
+	// vgc_platform.h): the arena address maps, the chunk tables and the
+	// touched-page cache — VGC_STATIC_TABLES (5) of them, from slot 7.
+	C.vgc_static_tables(&ex_los[7], &ex_his[7])
 	// The collector's own clocks, CPU times and bit summaries are integers, not
 	// references, and nothing else stores into them: scanned, a value that falls
 	// inside the arenas roots whatever it points at. vgc_gc_cpu_t0 (cx-home/v#42)
@@ -2032,8 +2033,12 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	// arena was carved: peak RSS 513 -> 613 MB, the loop's perf-pair red on
 	// ffc9f039f (VGC_ROOTDIAG named the word; cx-home/v#45). Monotonic ns since boot (a CI
 	// VM minutes old: 1e11-1e12) and the pool's bit summaries alias the same way.
-	own_los := [usize(voidptr(&vgc_ph[0])), usize(voidptr(&vgc_walk_sum[0])), usize(voidptr(&vgc_pool_hot_bits[0])), usize(voidptr(&vgc_pool_cold_bits[0])), usize(voidptr(&vgc_gc_t0)), usize(voidptr(&vgc_gc_last_end)), usize(voidptr(&vgc_gc_cpu_t0)), usize(voidptr(&vgc_gc_wait_cpu)), usize(voidptr(&vgc_gate_last_pause)), usize(voidptr(&vgc_gate_last_interval)), usize(voidptr(&vgc_stw_last_pause_ns)), usize(voidptr(&vgc_perm_rescan_ns)), usize(voidptr(&vgc_root_last_ns)), usize(voidptr(&vgc_mark_last_ns)), usize(voidptr(&vgc_mark_last_work_ns)), usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)), usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)), usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)), usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns))]!
-	own_lens := [usize(8) * w, usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w]!
+	// cx-home/v#15 lever 5: the #58 scanned-window shadow (vgc_spchk_*, 32 KB):
+	// stack bounds, cycle numbers and parked flags, written only under
+	// -d vgc_spcheck, never a reference.
+	spchk_len := usize(vgc_spchk_slots) * w
+	own_los := [usize(voidptr(&vgc_spchk_lo[0])), usize(voidptr(&vgc_spchk_hi[0])), usize(voidptr(&vgc_spchk_cyc[0])), usize(voidptr(&vgc_spchk_parked[0])), usize(voidptr(&vgc_ph[0])), usize(voidptr(&vgc_walk_sum[0])), usize(voidptr(&vgc_pool_hot_bits[0])), usize(voidptr(&vgc_pool_cold_bits[0])), usize(voidptr(&vgc_gc_t0)), usize(voidptr(&vgc_gc_last_end)), usize(voidptr(&vgc_gc_cpu_t0)), usize(voidptr(&vgc_gc_wait_cpu)), usize(voidptr(&vgc_gate_last_pause)), usize(voidptr(&vgc_gate_last_interval)), usize(voidptr(&vgc_stw_last_pause_ns)), usize(voidptr(&vgc_perm_rescan_ns)), usize(voidptr(&vgc_root_last_ns)), usize(voidptr(&vgc_mark_last_ns)), usize(voidptr(&vgc_mark_last_work_ns)), usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)), usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)), usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)), usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns))]!
+	own_lens := [spchk_len, spchk_len, spchk_len, spchk_len, usize(8) * w, usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w]!
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur

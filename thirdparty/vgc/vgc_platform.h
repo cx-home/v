@@ -2669,7 +2669,16 @@ static inline void vgc_trace_init(void) {}
 // chunks outside the arenas, which vgc_mark_roots walks explicitly to the
 // high-water mark. Scanning them was ~190 KB of conservative words per cycle
 // (before cx-home/v#27 the fixed suspend tables made it ~1 MB on darwin:
-// pi-digits' data phase 120 -> 57 us of a ~430 us cycle).
+// pi-digits' data phase 120 -> 57 us of a ~430 us cycle). cx-home/v#15 lever
+// 5: vgc_addr_map2 (lever 3's second arena index per chunk, 128 KB) is the same
+// kind of table as vgc_addr_map and was scanned — 8 more pages for mincore to
+// ask about every cycle, and its packed indices the same aliasing hazard — and
+// the touched-page cache below holds page bits, not references.
+// VGC_STATIC_TABLES is the count; vgc_scan_data_range sizes its exclusions by it.
+#define VGC_STATIC_TABLES 5
+typedef struct { uintptr_t base; uint64_t bits[16]; } vgc_tc_window; // 1,024 pages from base
+static vgc_tc_window vgc_tc_windows[8];
+static int vgc_tc_nwindows;
 static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
     los[0] = (uintptr_t)&vgc_addr_map[0];
     his[0] = (uintptr_t)&vgc_addr_map[0] + sizeof(vgc_addr_map);
@@ -2677,7 +2686,11 @@ static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
     his[1] = (uintptr_t)&vgc_susp_chunks[0] + sizeof(vgc_susp_chunks);
     los[2] = (uintptr_t)&vgc_cache_chunk_tab[0];
     his[2] = (uintptr_t)&vgc_cache_chunk_tab[0] + sizeof(vgc_cache_chunk_tab);
-    return 3;
+    los[3] = (uintptr_t)&vgc_addr_map2[0];
+    his[3] = (uintptr_t)&vgc_addr_map2[0] + sizeof(vgc_addr_map2);
+    los[4] = (uintptr_t)&vgc_tc_windows[0];
+    his[4] = (uintptr_t)&vgc_tc_windows[0] + sizeof(vgc_tc_windows);
+    return VGC_STATIC_TABLES;
 }
 
 // cx-home/v#15: the data-segment root scan reads only the pages a process has
@@ -2699,6 +2712,26 @@ static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
 // read maps the shared zero page anyway (no RSS cost). Any failure — mincore
 // refusing the range, more pages than the vector, more runs than `max` — falls
 // back to the whole range, the scan before this change.
+// cx-home/v#15 lever 5: darwin's mincore costs ~0.46 us a page (one
+// vm_map_page_range_info walk per page: 94 pages took 41-44 us on dev2, 1 page
+// 0.6 us), so asking about every page of the data segment each cycle was most
+// of the data phase — pi-digits 3000: ~29 us of its 48. A page once seen
+// touched is remembered (vgc_tc_windows) and scanned on every later cycle
+// without asking: scanning a page is always sound (the scan is conservative;
+// a page that left core is only read back in), so only the pages not yet seen
+// touched are asked about, one mincore call per run of them.
+static inline vgc_tc_window* vgc_tc_window_for(uintptr_t base, uintptr_t top, uintptr_t ps) {
+    for (int i = 0; i < vgc_tc_nwindows; i++) {
+        vgc_tc_window* w = &vgc_tc_windows[i];
+        if (base >= w->base && top <= w->base + 1024 * ps) return w;
+    }
+    if (vgc_tc_nwindows < 8 && top - base <= 1024 * ps) {
+        vgc_tc_window* w = &vgc_tc_windows[vgc_tc_nwindows++];
+        w->base = base; // bits are zero: a static, and never reused
+        return w;
+    }
+    return 0; // no room: every page of the range is asked about, as before
+}
 #if defined(__APPLE__) && defined(MINCORE_PAGED_OUT)
 static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los, uintptr_t* his, int max) {
     if (hi <= lo || max < 1) {
@@ -2708,7 +2741,36 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
     uintptr_t base = lo & ~(ps - 1);
     uintptr_t npages = (hi - base + ps - 1) / ps;
     unsigned char vec[1024];
-    if (npages <= sizeof(vec) && mincore((caddr_t)base, (size_t)(npages * ps), (char*)vec) == 0) {
+    int asked = npages <= sizeof(vec);
+    if (asked) {
+        // the collector alone calls this, under the stop (vgc_mark_roots)
+        vgc_tc_window* w = vgc_tc_window_for(base, base + npages * ps, ps);
+        uintptr_t off = w ? (base - w->base) / ps : 0;
+        uintptr_t i = 0;
+        while (i < npages && asked) {
+            if (w && ((w->bits[(off + i) >> 6] >> ((off + i) & 63)) & 1)) {
+                vec[i++] = MINCORE_INCORE; // seen touched before
+                continue;
+            }
+            uintptr_t j = i + 1;
+            while (j < npages && !(w && ((w->bits[(off + j) >> 6] >> ((off + j) & 63)) & 1))) {
+                j++;
+            }
+            if (mincore((caddr_t)(base + i * ps), (size_t)((j - i) * ps), (char*)&vec[i]) != 0) {
+                asked = 0;
+                break;
+            }
+            if (w) {
+                for (uintptr_t k = i; k < j; k++) {
+                    if (vec[k] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) {
+                        w->bits[(off + k) >> 6] |= (uint64_t)1 << ((off + k) & 63);
+                    }
+                }
+            }
+            i = j;
+        }
+    }
+    if (asked) {
         int n = 0;
         int overflow = 0;
         for (uintptr_t i = 0; i < npages; i++) {
