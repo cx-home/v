@@ -1316,7 +1316,9 @@ pub fn (mut g Gen) init() {
 			// module's stores, but the builtin's @[export] prototype lives only in the
 			// unit that compiles builtin; a -usecache module unit (term.termios, ...)
 			// called it undeclared, which C99 refuses.
-			g.cheaders.writeln('void vgc_wb_store(void* obj);')
+			// cx-home/v#22: with the linkage V's @[export] gives it (dllexport on
+			// Windows), or msvc refuses the definition (C2375).
+			g.cheaders.writeln('#if defined(_WIN32) || defined(__CYGWIN__)\n__declspec(dllexport) void vgc_wb_store(void* obj);\n#else\nvoid vgc_wb_store(void* obj);\n#endif')
 			// cx-home/v#15: the gate the stores call instead — one range test on
 			// two globals of builtin's (extern for -usecache units): the call is
 			// made only for a store into [vgc_wb_lo, +vgc_wb_len), which is the

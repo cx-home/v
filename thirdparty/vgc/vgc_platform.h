@@ -10,6 +10,14 @@
 #include <stdlib.h> // abort (span-registry-full hard fail in vgc_span_alloc)
 
 static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnostics section)
+// VGC_V_EXPORT: the linkage V gives an @[export] fn (VV_EXP: dllexport on
+// Windows). A declaration here must carry it too — msvc refuses a dllexport
+// definition after a plain declaration (C2375, cx-home/v#22).
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define VGC_V_EXPORT __declspec(dllexport)
+#else
+  #define VGC_V_EXPORT
+#endif
 // vgc_ull: a u64 as unsigned long long, the type a %llu conversion reads — u64
 // (uint64_t) is unsigned long on LP64 Linux and the BSDs, which -Wformat refuses
 // under -cstrict (the out-of-memory report in vgc_d_vgc.c.v).
@@ -911,6 +919,15 @@ static inline uint8_t vgc_size_class(uint32_t size) {
   #define vgc_thread_yield() sched_yield()
 #endif
 
+// vgc_usleep: a short sleep. msvc's CRT has no usleep (cx-home/v#22); Sleep's
+// granularity is a millisecond, so a sub-millisecond wait sleeps one.
+#if defined(_WIN32) && !defined(__MINGW32__)
+  static inline void vgc_usleep(uint32_t us) { Sleep(us >= 1000 ? us / 1000 : 1); }
+#else
+  #include <unistd.h>
+  static inline void vgc_usleep(uint32_t us) { usleep(us); }
+#endif
+
 // ============================================================
 // Monotonic nanosecond clock — GC pacer overhead measurement (cx #71 adaptive
 // headroom). Called once per GC cycle (never on the allocation path), so a
@@ -1146,7 +1163,7 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
 // its own root scan would otherwise miss those registers -> swept live data.
 // `buf` stays alive across the whole collection (mark+sweep) since the body
 // runs nested here. vgc_gc_start must NOT re-record the collector's own range.
-extern void vgc_gc_start(void);
+extern VGC_V_EXPORT void vgc_gc_start(void);
 static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t base) {
     jmp_buf buf;
     setjmp(buf);
@@ -1404,7 +1421,7 @@ static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_fla
 }
 
 #ifndef _WIN32
-extern void vgc_thread_exit_cb(int idx);
+extern VGC_V_EXPORT void vgc_thread_exit_cb(int idx);
 static pthread_key_t _vgc_exit_key;
 static pthread_once_t _vgc_exit_once = PTHREAD_ONCE_INIT;
 static void _vgc_exit_destructor(void* val) {
@@ -1428,7 +1445,7 @@ static inline void vgc_install_thread_exit(int idx) {
 // skipped while the process shuts down (RtlDllShutdownInProgress): ExitProcess
 // has already terminated the other threads, and one of them may hold
 // cache_lock.
-extern void vgc_thread_exit_cb(int idx);
+extern VGC_V_EXPORT void vgc_thread_exit_cb(int idx);
 typedef void (WINAPI *vgc_fls_cb_t)(void*);
 typedef DWORD (WINAPI *vgc_fls_alloc_t)(vgc_fls_cb_t);
 typedef BOOL (WINAPI *vgc_fls_set_t)(DWORD, void*);
