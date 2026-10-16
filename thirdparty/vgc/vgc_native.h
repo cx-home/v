@@ -83,7 +83,14 @@ void vgc_native_unpin(void* p);
 extern size_t vgc_wb_lo;
 extern size_t vgc_wb_len;
 void vgc_wb_store(void* obj);
-static inline void vgc_native_wb_gate(void* p) { if (__builtin_expect((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len, 0)) vgc_wb_store(p); }
+#ifndef VGC_WB_UNLIKELY
+  #if defined(_MSC_VER) && !defined(__clang__)
+    #define VGC_WB_UNLIKELY(x) (x) // cx-home/v#22: msvc has no __builtin_expect
+  #else
+    #define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)
+  #endif
+#endif
+static inline void vgc_native_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_store(p); }
 
 // 4. blocking regions: gc_safe_region_enter/exit under fixed exported names (a
 // V pub fn is static in an object-file build of the runtime, _VOBJECTFILE).

@@ -1324,7 +1324,10 @@ pub fn (mut g Gen) init() {
 			// the page's card), the whole address space during a concurrent middle
 			// (the span-dirtying barrier as before), and empty otherwise.
 			g.cheaders.writeln('extern size_t vgc_wb_lo; extern size_t vgc_wb_len;')
-			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if (__builtin_expect((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len, 0)) vgc_wb_store(p); }')
+			// cx-home/v#22: msvc has no __builtin_expect; the hint is a macro the
+			// native header (thirdparty/vgc/vgc_native.h) defines the same way.
+			g.cheaders.writeln('#ifndef VGC_WB_UNLIKELY\n#if defined(_MSC_VER) && !defined(__clang__)\n#define VGC_WB_UNLIKELY(x) (x)\n#else\n#define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)\n#endif\n#endif')
+			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_store(p); }')
 		}
 		g.cheaders.writeln(c_float_to_unsigned_conversion_functions)
 		if !g.pref.skip_unused || g.table.used_features.safe_int {
