@@ -394,10 +394,13 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_store_u32(ptr, val) vgc_atomic_store_u32_fn((volatile uint32_t*)(ptr), (val))
   #define vgc_atomic_load_u64(ptr) vgc_atomic_load_u64_fn((volatile uint64_t*)(ptr))
   #define vgc_atomic_store_u64(ptr, val) vgc_atomic_store_u64_fn((volatile uint64_t*)(ptr), (val))
-  #define vgc_atomic_add_u64(ptr, val) _InterlockedExchangeAdd64((volatile int64_t*)(ptr), (int64_t)(val))
-  #define vgc_atomic_sub_u64(ptr, val) _InterlockedExchangeAdd64((volatile int64_t*)(ptr), -(int64_t)(val))
-  #define vgc_atomic_add_u32(ptr, val) _InterlockedExchangeAdd((volatile long*)(ptr), (long)(val))
-  #define vgc_atomic_sub_u32(ptr, val) _InterlockedExchangeAdd((volatile long*)(ptr), -(long)(val))
+  // cx-home/v#22: _InterlockedExchangeAdd answers the OLD value; the GCC arm's
+  // __atomic_add_fetch answers the NEW one, and callers read it (the walk
+  // cursor's chunk end, the mark pool's 1-based slot, the free ring's index).
+  #define vgc_atomic_add_u64(ptr, val) ((uint64_t)_InterlockedExchangeAdd64((volatile __int64*)(ptr), (__int64)(val)) + (uint64_t)(val))
+  #define vgc_atomic_sub_u64(ptr, val) ((uint64_t)_InterlockedExchangeAdd64((volatile __int64*)(ptr), -(__int64)(val)) - (uint64_t)(val))
+  #define vgc_atomic_add_u32(ptr, val) ((uint32_t)_InterlockedExchangeAdd((volatile long*)(ptr), (long)(val)) + (uint32_t)(val))
+  #define vgc_atomic_sub_u32(ptr, val) ((uint32_t)_InterlockedExchangeAdd((volatile long*)(ptr), -(long)(val)) - (uint32_t)(val))
   #define vgc_atomic_fetch_or_u8(ptr, val) ((uint8_t)_InterlockedOr8((volatile char*)(ptr), (char)(val)))
   #define vgc_atomic_fetch_and_u8(ptr, val) ((uint8_t)_InterlockedAnd8((volatile char*)(ptr), (char)(val)))
   static inline uint16_t vgc_atomic_load_u16_fn(volatile uint16_t* p) { uint16_t v = *p; _ReadBarrier(); return v; }
@@ -406,7 +409,14 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #define vgc_atomic_store_u16(ptr, val) vgc_atomic_store_u16_fn((volatile uint16_t*)(ptr), (uint16_t)(val))
   #define vgc_atomic_cas_u32(ptr, expected, desired) (_InterlockedCompareExchange((volatile long*)(ptr), (long)(desired), (long)*(expected)) == (long)*(expected))
   #define vgc_atomic_exchange_u32(ptr, val) (uint32_t)_InterlockedExchange((volatile long*)(ptr), (long)(val))
-  #define vgc_atomic_fence() _ReadWriteBarrier()
+  // cx-home/v#22: a full fence, as __atomic_thread_fence(__ATOMIC_SEQ_CST) is —
+  // _ReadWriteBarrier only stops the compiler, and the safepoint handshakes
+  // (store my flag, fence, load theirs) need the store-load order on x64 too.
+  #if defined(_M_ARM64)
+    #define vgc_atomic_fence() __dmb(_ARM64_BARRIER_ISH)
+  #else
+    #define vgc_atomic_fence() _mm_mfence()
+  #endif
 #else
   // GCC/Clang
   #define vgc_atomic_load_u32(ptr) __atomic_load_n((volatile uint32_t*)(ptr), __ATOMIC_ACQUIRE)
@@ -450,6 +460,11 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void vgc_os_recommit(void* ptr, size_t size) {
       VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE);
   }
+  #if defined(_MSC_VER) && defined(ALL_PROCESSOR_GROUPS)
+    // cx-home/v#22: winbase.h declares it only for _WIN32_WINNT >= 0x0601, which
+    // a V msvc build does not set (C4013); kernel32 exports it from Windows 7 on.
+    WINBASEAPI DWORD WINAPI GetActiveProcessorCount(WORD GroupNumber);
+  #endif
   static inline int vgc_num_cpus(void) {
   #if defined(ALL_PROCESSOR_GROUPS)
       DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -597,8 +612,26 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   #endif
       return sp;
   }
+#elif defined(_MSC_VER)
+  // cx-home/v#22: msvc has neither inline asm on x64 nor __builtin_frame_address.
+  // A call answers its caller's SP: the return-address slot sits one word below
+  // the SP the caller had at the call, so every caller local (the setjmp spill
+  // buffer included) is at or above the value returned.
+  #include <intrin.h>
+  __declspec(noinline) static uintptr_t vgc_real_sp(void) {
+      return (uintptr_t)_AddressOfReturnAddress() + sizeof(void*);
+  }
 #else
   static inline uintptr_t vgc_real_sp(void) { return (uintptr_t)__builtin_frame_address(0); }
+#endif
+
+// vgc_keep_alive(p): the object at p is live (and its stores done) up to here —
+// a spill buffer must survive the collection that reads it.
+#if defined(_MSC_VER) && !defined(__clang__)
+  static void* volatile vgc__keep_alive_sink;
+  #define vgc_keep_alive(p) do { vgc__keep_alive_sink = (void*)(p); _ReadWriteBarrier(); } while (0)
+#else
+  #define vgc_keep_alive(p) __asm__ __volatile__("" : : "r"(p) : "memory")
 #endif
 
 #if defined(_MSC_VER)
@@ -836,6 +869,12 @@ static void vgc_init_size_tables(void) {
 __attribute__((constructor)) static void vgc_size_tables_ctor(void) {
     vgc_init_size_tables();
 }
+#elif defined(_MSC_VER)
+// cx-home/v#22: msvc has no constructor attribute; the CRT runs every pointer
+// in .CRT$XCU before main, the same point a GCC constructor runs.
+static void __cdecl vgc_size_tables_ctor(void) { vgc_init_size_tables(); }
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU")) static void (__cdecl* vgc__size_tables_ctor_p)(void) = vgc_size_tables_ctor;
 #endif
 
 // Get size class for a given allocation size
@@ -853,7 +892,11 @@ static inline uint8_t vgc_size_class(uint32_t size) {
 // ============================================================
 // Pause / yield for spinlocks
 // ============================================================
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+  #define vgc_cpu_pause() _mm_pause() // cx-home/v#22: no inline asm on msvc x64
+#elif defined(_MSC_VER) && !defined(__clang__) && defined(_M_ARM64)
+  #define vgc_cpu_pause() __yield()
+#elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
   #define vgc_cpu_pause() __asm__ __volatile__("pause")
 #elif defined(__aarch64__) || defined(_M_ARM64)
   #define vgc_cpu_pause() __asm__ __volatile__("yield")
@@ -1115,7 +1158,7 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (base >= sp) { *lo = sp; *hi = base; } else { *lo = base; *hi = sp; }
     vgc_gc_start();
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    vgc_keep_alive(&buf);
 }
 
 // ── Waiting out a stop-the-world (cx-private#1893) ─────────────────────────
@@ -1234,7 +1277,7 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     vgc_atomic_add_u32(stopped_count, 1);
     vgc_wait_flag_clear(stop_flag);
     vgc_atomic_store_u32(my_stopped, 0);
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    vgc_keep_alive(&buf);
 }
 
 // ── GC-safe blocking regions (cx #316) ──────────────────────────────────────
@@ -1293,7 +1336,7 @@ static inline uintptr_t vgc_spill_regs(uintptr_t* regs, int reg_max) {
     const uintptr_t* w = (const uintptr_t*)&buf;
     for (int i = 0; i < n; i++) { regs[i] = w[i]; }
     for (int i = n; i < reg_max; i++) { regs[i] = 0; }
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    vgc_keep_alive(&buf);
     return sp;
 }
 static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
@@ -1320,7 +1363,7 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
     // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
     // recorded range and the completed snapshot.
     vgc_atomic_store_u32(my_safe, 1);
-    __asm__ __volatile__("" : : "r"(&buf) : "memory");
+    vgc_keep_alive(&buf);
 }
 
 // Leave the safe region. The order is load-bearing (the classic Dekker pairing
@@ -2326,9 +2369,15 @@ static inline void vgc_say(uint64_t tag, uint64_t v) { // loud one-line stderr n
 // and the level-0 address is the CALLER of the V fn that invokes the macro.
 // Levels >0 walk the frame-pointer chain — fine on macOS arm64 (fp kept) in
 // non-optimized diagnostic builds; never compiled into default builds.
-#define vgc_ra0() __builtin_return_address(0)
-#define vgc_ra1() __builtin_return_address(1)
-#define vgc_ra2() __builtin_return_address(2)
+#if defined(_MSC_VER) && !defined(__clang__)
+  #define vgc_ra0() _ReturnAddress() // msvc reads only the current frame's
+  #define vgc_ra1() ((void*)0)
+  #define vgc_ra2() ((void*)0)
+#else
+  #define vgc_ra0() __builtin_return_address(0)
+  #define vgc_ra1() __builtin_return_address(1)
+  #define vgc_ra2() __builtin_return_address(2)
+#endif
 // Text-segment anchor for offline symbolication (ASLR slide = runtime anchor
 // minus `nm` static address of this symbol).
 #define vgc_ra_anchor() ((void*)&vgc_say)

@@ -77,9 +77,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # msvc is not in the matrix: vgc does not compile under msvc (GNU inline
-        # asm, __builtin_frame_address; an msvc build defaults to no GC) — its own item
-        cc: [gcc]
+        # cx-home/v#22: msvc compiles vgc (intrinsic arms for the SP read, pause,
+        # fences and the keep-alive barrier), so it runs the same rows as gcc.
+        cc: [gcc, msvc]
     runs-on: windows-2025
     timeout-minutes: 40
     steps:
