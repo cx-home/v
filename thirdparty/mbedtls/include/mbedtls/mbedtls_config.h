@@ -4487,3 +4487,15 @@
 #undef MBEDTLS_THREADING_PTHREAD
 #undef MBEDTLS_THREADING_C
 #endif
+
+/*
+ * cx-home/v#39: SHA-256 and SHA-512/384 on the ARMv8 crypto extensions when
+ * the CPU has them (runtime detection; every Apple arm64 core, and Linux
+ * aarch64 through getauxval). A TLS 1.3 handshake's transcript hashes and
+ * HKDF run SHA-384 for TLS_AES_256_GCM_SHA384: ~21 % of a cx server's
+ * handshake samples in the portable C. Not under tcc or msvc.
+ */
+#if defined(__aarch64__) && !defined(__TINYC__) && !defined(_MSC_VER)
+#define MBEDTLS_SHA256_USE_ARMV8_A_CRYPTO_IF_PRESENT
+#define MBEDTLS_SHA512_USE_A64_CRYPTO_IF_PRESENT
+#endif

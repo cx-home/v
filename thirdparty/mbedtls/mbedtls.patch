@@ -18,7 +18,7 @@ diff -ur mbedtls.orig/include/mbedtls/check_config.h mbedtls/include/mbedtls/che
 diff -ur mbedtls.orig/include/mbedtls/mbedtls_config.h mbedtls/include/mbedtls/mbedtls_config.h
 --- mbedtls.orig/include/mbedtls/mbedtls_config.h	2026-04-02 17:26:31.910276365 +0200
 +++ mbedtls/include/mbedtls/mbedtls_config.h	2026-04-02 17:27:29.374384448 +0200
-@@ -4435,3 +4435,28 @@
+@@ -4435,3 +4435,40 @@
  //#define MBEDTLS_X509_MAX_FILE_PATH_LEN     512 /**< Maximum length of a path/filename string in bytes including the null terminator character ('\0'). */
  
  /** \} name SECTION: Module configuration options */
@@ -46,6 +46,18 @@ diff -ur mbedtls.orig/include/mbedtls/mbedtls_config.h mbedtls/include/mbedtls/m
 +#else
 +#undef MBEDTLS_THREADING_PTHREAD
 +#undef MBEDTLS_THREADING_C
++#endif
++
++/*
++ * cx-home/v#39: SHA-256 and SHA-512/384 on the ARMv8 crypto extensions when
++ * the CPU has them (runtime detection; every Apple arm64 core, and Linux
++ * aarch64 through getauxval). A TLS 1.3 handshake's transcript hashes and
++ * HKDF run SHA-384 for TLS_AES_256_GCM_SHA384: ~21 % of a cx server's
++ * handshake samples in the portable C. Not under tcc or msvc.
++ */
++#if defined(__aarch64__) && !defined(__TINYC__) && !defined(_MSC_VER)
++#define MBEDTLS_SHA256_USE_ARMV8_A_CRYPTO_IF_PRESENT
++#define MBEDTLS_SHA512_USE_A64_CRYPTO_IF_PRESENT
 +#endif
 diff -ur mbedtls.orig/include/mbedtls/threading_alt.h mbedtls/include/mbedtls/threading_alt.h
 --- mbedtls.orig/include/mbedtls/threading_alt.h	1970-01-01 00:00:00.000000000 +0000
