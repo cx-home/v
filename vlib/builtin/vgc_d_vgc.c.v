@@ -4837,8 +4837,8 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 // slot (vgc_cache_get_span), stamped at every cycle by vgc_protect_cached_spans
 // — the stamp is released: a RELEASE store, so the slot store before it is
 // visible first and a thread frozen between the two is still covered by the
-// stamp. A large-object span (vgc_alloc_large) has no slot and keeps its stamp:
-// the one sweep after its acquisition skips it, as before RTMEM-1. `gc_cycle - 1` can never equal the cycle the next sweep runs at
+// stamp. A large-object span (vgc_alloc_large) has no slot: its stamp is released
+// with its in-flight claim, once the object's address is in the allocating frame (cx-home/v#50). `gc_cycle - 1` can never equal the cycle the next sweep runs at
 // (gc_cycle only grows), so the span is swept normally from then on. Not used
 // under -d vgc_concurrent: that collector keeps the acquisition stamp beside the
 // stamp vgc_protect_cached_spans gives cache-resident spans in its
@@ -5503,9 +5503,14 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 	}
 	// cx-home/v#37: the object is set up and its address is in this frame
 	// (scanned at a park, captured by a suspend): the in-flight claim drops
-	// here; the acquisition stamp stays, so the one sweep after this skips the
-	// span as before.
-	C.vgc_atomic_store_u32(&span.inflight, 0)
+	// here, and with it the acquisition stamp (cx-home/v#50) — as a cache
+	// span's does once its slot protects it (RTMEM-1). Kept, the stamp made
+	// the one sweep after the allocation skip the span, so every large
+	// transient of an epoch survived the collection that ended it and the
+	// next epoch carved beside it (a 9 MB live set with a ~0.65 MB transient
+	// a loop: 34.0 -> 23.7 MB RSS). A thread frozen before this store is
+	// covered by the stamp and the claim; after it, by its frame.
+	vgc_span_release_acquisition(span)
 	return ptr
 }
 
