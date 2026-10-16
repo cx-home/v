@@ -361,12 +361,12 @@ diff -ur mbedtls.orig/library/ssl_tls12_client.c mbedtls/library/ssl_tls12_clien
 diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 --- mbedtls.orig/library/psa_crypto_ecp.c
 +++ mbedtls/library/psa_crypto_ecp.c
-@@ -24,6 +24,66 @@
+@@ -24,7 +24,70 @@
  #include <mbedtls/ecdh.h>
  #include <mbedtls/ecp.h>
  #include <mbedtls/error.h>
 +#include "mbedtls/platform_util.h"
-+
+ 
 +/* cx-home/v#39: X25519 (PSA_ECC_FAMILY_MONTGOMERY, 255 bits) runs on HACL*
 + * Curve25519 (library/cx_x25519_hacl.c) instead of the generic ladder: the
 + * 32-byte little-endian scalar and u-coordinate of RFC 7748 are PSA's key
@@ -381,6 +381,7 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 +#endif
 +void Hacl_Curve25519_crypto_scalarmult(uint8_t *mypublic, uint8_t *secret,
 +                                       uint8_t *basepoint);
++#include "cx_x25519_fiat.h" /* where it compiles, fiat's ladder runs instead (25.0 vs 33.2 us) */
 +
 +static int cx_psa_is_x25519(const psa_key_attributes_t *attributes)
 +{
@@ -407,7 +408,9 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 +    }
 +    memcpy(k, scalar, 32);
 +    memcpy(u, point, 32);
-+#if CX_X25519_HACL
++#if defined(CX_X25519_FIAT)
++    cx_x25519_fiat(r, k, u);
++#elif CX_X25519_HACL
 +    Hacl_Curve25519_crypto_scalarmult(r, k, u);
 +#else
 +    memset(r, 0, sizeof(r));
@@ -425,13 +428,15 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 +    *out_len = 32;
 +    return PSA_SUCCESS;
 +}
- 
++
  #if defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_BASIC) || \
      defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_IMPORT) || \
-@@ -295,6 +355,14 @@ psa_status_t mbedtls_psa_ecp_export_public_key(
+     defined(MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_EXPORT) || \
+@@ -294,6 +357,14 @@ psa_status_t mbedtls_psa_ecp_export_public_key(
+ {
      psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
      mbedtls_ecp_keypair *ecp = NULL;
- 
++
 +    /* cx-home/v#39: an X25519 key pair's public key is X25519(k, 9) */
 +    if (PSA_KEY_TYPE_IS_ECC_KEY_PAIR(attributes->type) &&
 +        cx_psa_is_x25519(attributes)) {
@@ -439,24 +444,24 @@ diff -ur mbedtls.orig/library/psa_crypto_ecp.c mbedtls/library/psa_crypto_ecp.c
 +        return cx_psa_x25519(key_buffer, key_buffer_size, base, 32,
 +                             data, data_size, data_length);
 +    }
-+
+ 
      status = mbedtls_psa_ecp_load_representation(
          attributes->type, attributes->bits,
-         key_buffer, key_buffer_size, &ecp);
-@@ -528,6 +596,12 @@ psa_status_t mbedtls_psa_key_agreement_ecdh(
+@@ -527,6 +598,12 @@ psa_status_t mbedtls_psa_key_agreement_ecdh(
+     if (!PSA_KEY_TYPE_IS_ECC_KEY_PAIR(attributes->type) ||
          !PSA_ALG_IS_ECDH(alg)) {
          return PSA_ERROR_INVALID_ARGUMENT;
-     }
++    }
 +    /* cx-home/v#39 */
 +    if (cx_psa_is_x25519(attributes)) {
 +        return cx_psa_x25519(key_buffer, key_buffer_size, peer_key,
 +                             peer_key_length, shared_secret,
 +                             shared_secret_size, shared_secret_length);
-+    }
+     }
      mbedtls_ecp_keypair *ecp = NULL;
      status = mbedtls_psa_ecp_load_representation(
-         attributes->type,
 Only in mbedtls/library: cx_x25519_hacl.c (cx-home/v#39: HACL* Curve25519 for the PSA builtin X25519; copy it over on an update)
+Only in mbedtls/library: cx_x25519_fiat.c, cx_x25519_fiat.h (cx-home/v#39: X25519 on fiat-crypto curve25519_64.c from thirdparty/fiat-25519, used where __int128 compiles; copy them over on an update)
 diff -ur mbedtls.orig/library/ecdsa.c mbedtls/library/ecdsa.c
 --- mbedtls.orig/library/ecdsa.c
 +++ mbedtls/library/ecdsa.c
