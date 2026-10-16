@@ -1,5 +1,9 @@
 module os
 
+#insert "@VEXEROOT/vlib/os/process_usage.h"
+
+fn C.v_os_wait4_usage(pid i32, status &int, options i32, out &i64) i32
+
 fn C.setpgid(pid i32, pgid i32) i32
 
 fn env_value_from_entries(env []string, name string) ?string {
@@ -137,8 +141,15 @@ fn (mut p Process) unix_is_alive() bool {
 fn (mut p Process) impl_check_pid_status(exit_early_on_ret0 bool, waitpid_options int) bool {
 	mut cstatus := 0
 	mut ret := -1
+	mut usage := [3]i64{}
 	$if !emscripten ? {
-		ret = C.waitpid(p.pid, &cstatus, waitpid_options)
+		// wait4, not waitpid: the reap hands over the child's usage (v#48)
+		ret = C.v_os_wait4_usage(p.pid, &cstatus, waitpid_options, &usage[0])
+	}
+	if ret > 0 {
+		p.user_ns = usage[0]
+		p.sys_ns = usage[1]
+		p.peak_rss = usage[2]
 	}
 	p.code = ret
 	if ret == -1 {
