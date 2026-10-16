@@ -27,6 +27,7 @@ fn C.vgc_get_cache_idx() int
 fn C.vgc_set_cache_idx(idx int)
 fn C.vgc_atomic_load_u32(ptr &u32) u32
 fn C.vgc_atomic_store_u32(ptr &u32, val u32)
+fn C.vgc_usleep(us u32) // usleep, or Sleep under msvc (cx-home/v#22)
 fn C.vgc_alloc_try_enter() int // coarse-alloc re-entrancy guard (-d vgc_coarse_alloc)
 fn C.vgc_alloc_exit()
 fn C.vgc_atomic_load_u64(ptr &u64) u64
@@ -2267,7 +2268,7 @@ fn vgc_register_thread_opt(wait bool) bool {
 		// object yet (its spawn argument sits in the spawn-root registry), so it
 		// WAITS for an exiting thread's slot; loud once a second (0x0ac7).
 		C.vgc_mutex_unlock(&vgc_heap.cache_lock)
-		C.usleep(100)
+		C.vgc_usleep(100)
 		waited_us += 100
 		if waited_us % 1000000 == 0 {
 			C.vgc_say(0x0ac7, waited_us / 1000000)
