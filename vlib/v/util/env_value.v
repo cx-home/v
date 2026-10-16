@@ -48,3 +48,12 @@ pub fn resolve_env_value(str string, check_for_presence bool) !string {
 	}
 	return rep
 }
+
+// usecache_type_shift reads VUSECACHE_TYPE_SHIFT (cx-home/v#49): the number of
+// inert type symbols ast.new_table registers after the builtin block, so a
+// test can move every non-builtin type index and check that a `v build-module`
+// layer's generated C does not depend on them. 0 (the default) changes nothing.
+pub fn usecache_type_shift() int {
+	n := os.getenv('VUSECACHE_TYPE_SHIFT').int()
+	return if n > 0 && n <= 4096 { n } else { 0 }
+}

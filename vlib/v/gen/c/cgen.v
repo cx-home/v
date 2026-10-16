@@ -1540,12 +1540,12 @@ pub fn (mut g Gen) write_typeof_functions() {
 			g.writeln2('}', '')
 			g.writeln('${static_prefix}u32 v_typeof_sumtype_idx_${sym.cname}(u32 sidx) {')
 			if g.pref.build_mode == .build_module {
-				g.writeln('\t\tif( sidx == _v_type_idx_${sym.cname}() ) return ${u32(ityp)};')
+				g.writeln('\t\tif( sidx == _v_type_idx_${sym.cname}() ) return ${g.type_lit(ast.idx_to_type(ityp))};')
 				for v in runtime_variants {
 					subtype := g.table.sym(v)
-					g.writeln('\tif( sidx == _v_type_idx_${subtype.cname}() ) return ${u32(v)};')
+					g.writeln('\tif( sidx == _v_type_idx_${subtype.cname}() ) return ${g.type_lit(v)};')
 				}
-				g.writeln('\treturn ${u32(ityp)};')
+				g.writeln('\treturn ${g.type_lit(ast.idx_to_type(ityp))};')
 			} else {
 				tidx := g.table.find_type_idx(sym.name)
 				g.writeln2('\tswitch(sidx) {', '\t\tcase ${tidx}: return ${u32(ityp)};')
@@ -2772,6 +2772,31 @@ fn (g &Gen) type_sidx(t ast.Type) string {
 		return '_v_type_idx_${sym.cname}()'
 	}
 	return u32(t).str()
+}
+
+// type_lit renders a whole ast.Type (index, nr_muls and flags) as a C expression
+// that means the same type in every translation unit of a -usecache program
+// (cx-home/v#49). A `v build-module` layer is compiled in its own type universe,
+// whose indices past the fixed builtin block (0..nil_type_idx) are registration
+// order and differ from the importing program's; so in build_module mode such an
+// index is read through the program-defined `_v_type_idx_<cname>()`, with the
+// muls/flags bits (universe-independent) or-ed in. The builtin block is the same
+// everywhere and stays a literal. The result is not a C constant expression in a
+// layer: callers that would put it in a `case` label must emit an if-chain there.
+fn (g &Gen) type_lit(t ast.Type) string {
+	if g.pref.build_mode != .build_module || t.idx() <= ast.nil_type_idx {
+		return u32(t).str()
+	}
+	sym := g.table.sym(ast.idx_to_type(t.idx()))
+	if sym.cname.contains('[') {
+		// no `_v_type_idx_` exists for an invalid-C-identifier cname (cx #520)
+		return u32(t).str()
+	}
+	hi := u32(t) & 0xffff0000
+	if hi == 0 {
+		return '_v_type_idx_${sym.cname}()'
+	}
+	return '(_v_type_idx_${sym.cname}() | ${hi}U)'
 }
 
 fn (g &Gen) unalias_type_keep_muls(typ ast.Type) ast.Type {
