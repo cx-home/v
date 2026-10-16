@@ -1337,9 +1337,9 @@ fn (mut g Gen) infix_expr_is_op(node ast.InfixExpr) {
 		g.write(' ${cmp_op} ')
 		if (left_sym.kind == .sum_type || is_aggregate) && node.left_type.nr_muls() > 0
 			&& variant_idx.nr_muls() <= node.left_type.nr_muls() {
-			g.write('${int(variant_idx.set_nr_muls(0))}')
+			g.write(g.type_lit(variant_idx.set_nr_muls(0)))
 		} else {
-			g.write('${int(variant_idx)}')
+			g.write(g.type_lit(variant_idx))
 		}
 	} else if node.right is ast.TypeNode {
 		g.write_type_tag_expr_for_is_left(node, is_aggregate, is_orig_sumtype)

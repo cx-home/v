@@ -85,7 +85,7 @@ fn (mut g Gen) gen_sumtype_equality_fn(left_type ast.Type) string {
 	fn_builder.writeln('\tif (${left_typ} == ${right_typ} && ${right_typ} == 0) { return true; } // uninitialized')
 	for typ in info.variants {
 		variant := g.unwrap(typ)
-		fn_builder.writeln('\tif (${left_typ} == ${int(variant.typ)}) {')
+		fn_builder.writeln('\tif (${left_typ} == ${g.type_lit(variant.typ)}) {')
 		name := '_${g.get_sumtype_variant_name(variant.typ, variant.sym)}'
 
 		left_arg := g.read_field(left_type, name, 'a')
@@ -663,7 +663,7 @@ fn (mut g Gen) gen_interface_equality_fn(left_type ast.Type) string {
 			if g.pref.skip_unused && sym.idx !in g.table.used_features.used_syms {
 				continue
 			}
-			fn_builder.writeln('\t\tif (idx == ${typ.idx()}) {')
+			fn_builder.writeln('\t\tif (idx == ${g.type_lit(ast.idx_to_type(typ.idx()))}) {')
 			fn_builder.write_string('\t\t\treturn ')
 			match sym.kind {
 				.struct {
