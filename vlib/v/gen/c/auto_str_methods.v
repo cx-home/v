@@ -540,7 +540,10 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 	} else {
 		clean_sum_type_v_type_name = util.strip_main_name(typ_str)
 	}
-	fn_builder.writeln('\tswitch(x._typ) {')
+	// cx-home/v#49: a layer reads variant ids through _v_type_idx_<T>(), which is no
+	// C constant, so it dispatches with an if-chain instead of case labels.
+	sum_str_in_layer := g.pref.build_mode == .build_module
+	fn_builder.writeln(if sum_str_in_layer { '\t{' } else { '\tswitch(x._typ) {' })
 	mut idxs := []int{}
 	for typ in info.variants {
 		if typ in idxs {
@@ -572,7 +575,11 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 				{_S("${clean_sum_type_v_type_name}(\'"), ${si_s_code}, {.d_s = ${val}}, 0, 0, 0},
 				{_S("\')"), 0, {0}, 0, 0, 0}
 			}))'
-			fn_builder.write_string('\t\tcase ${int(typ)}: return ${res};\n')
+			fn_builder.write_string(if sum_str_in_layer {
+				'\t\tif (x._typ == ${g.type_lit(typ)}) return ${res};\n'
+			} else {
+				'\t\tcase ${int(typ)}: return ${res};\n'
+			})
 		} else {
 			mut val := '${func_name}(${deref}(${typ_name}*)x._${g.get_sumtype_variant_name(typ, sym)}'
 			if should_use_indent_func(sym.kind) && !sym_has_str_method {
@@ -583,10 +590,18 @@ fn (mut g Gen) gen_str_for_union_sum_type(info ast.SumType, styp string, typ_str
 				{_S("${clean_sum_type_v_type_name}("), ${si_s_code}, {.d_s = ${val}}, 0, 0, 0},
 				{_S(")"), 0, {0}, 0, 0, 0}
 			}))'
-			fn_builder.write_string('\t\tcase ${int(typ)}: return ${res};\n')
+			fn_builder.write_string(if sum_str_in_layer {
+				'\t\tif (x._typ == ${g.type_lit(typ)}) return ${res};\n'
+			} else {
+				'\t\tcase ${int(typ)}: return ${res};\n'
+			})
 		}
 	}
-	fn_builder.writeln('\t\tdefault: return _S("unknown sum type value");')
+	fn_builder.writeln(if sum_str_in_layer {
+		'\t\treturn _S("unknown sum type value");'
+	} else {
+		'\t\tdefault: return _S("unknown sum type value");'
+	})
 	fn_builder.writeln('\t}')
 	fn_builder.writeln('}')
 	g.auto_fn_definitions << fn_builder.str()

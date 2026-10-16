@@ -178,6 +178,20 @@ pub fn new_table() &Table {
 		cur_fn:       unsafe { nil }
 	}
 	t.register_builtin_type_symbols()
+	// cx-home/v#49 test knob: VUSECACHE_TYPE_SHIFT=N registers N inert symbols
+	// right after the fixed builtin block, so every later type index moves by N.
+	// A `v build-module` layer's C must not change under it (its indices past the
+	// builtin block are read through `_v_type_idx_<cname>()`); the usecache shift
+	// test compares a layer's C at two shifts.
+	type_shift := util.usecache_type_shift()
+	for i in 0 .. type_shift {
+		t.register_sym(
+			kind:  .placeholder
+			name:  '__v_usecache_shift_${i}'
+			cname: '__v_usecache_shift_${i}'
+			mod:   'builtin'
+		)
+	}
 	t.is_fmt = true
 	global_table = t
 	return t

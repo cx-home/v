@@ -1343,8 +1343,8 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 
 			// TODO: type aliases
 			ret_typ := method.return_type
-			g.writeln('\t${node.val_var}.typ = ${int(typ)};')
-			g.writeln('\t${node.val_var}.return_type = ${int(ret_typ.idx())};')
+			g.writeln('\t${node.val_var}.typ = ${g.type_lit(typ)};')
+			g.writeln('\t${node.val_var}.return_type = ${g.type_lit(ast.idx_to_type(ret_typ.idx()))};')
 
 			g.type_resolver.update_ct_type('${node.val_var}.return_type', ret_typ)
 			g.type_resolver.update_ct_type('${node.val_var}.typ', typ)
@@ -1395,8 +1395,8 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 				styp := resolved_field_typ
 				unaliased_styp := g.table.unaliased_type(styp)
 
-				g.writeln('\t${node.val_var}.typ = ${int(styp.idx())};\t// ${g.table.type_to_str(styp)}')
-				g.writeln('\t${node.val_var}.unaliased_typ = ${int(unaliased_styp.idx())};\t// ${g.table.type_to_str(unaliased_styp)}')
+				g.writeln('\t${node.val_var}.typ = ${g.type_lit(ast.idx_to_type(styp.idx()))};\t// ${g.table.type_to_str(styp)}')
+				g.writeln('\t${node.val_var}.unaliased_typ = ${g.type_lit(ast.idx_to_type(unaliased_styp.idx()))};\t// ${g.table.type_to_str(unaliased_styp)}')
 				g.writeln('\t${node.val_var}.is_pub = ${field.is_pub};')
 				g.writeln('\t${node.val_var}.is_mut = ${field.is_mut};')
 				g.writeln('\t${node.val_var}.is_embed = ${field.is_embed};')
@@ -1503,7 +1503,7 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 				g.type_resolver.update_ct_type('${node.val_var}.typ', variant)
 
 				g.writeln('/* variant ${i} : ${g.table.type_to_str(variant)} */ {')
-				g.writeln('\t${node.val_var}.typ = ${int(variant)};\t// ')
+				g.writeln('\t${node.val_var}.typ = ${g.type_lit(variant)};\t// ')
 				g.stmts(node.stmts)
 				g.write_defer_stmts(node.scope, false, node.pos)
 				g.writeln('}')
@@ -1525,7 +1525,7 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 			g.type_resolver.update_ct_type('${node.val_var}.typ', param.typ)
 
 			g.writeln('/* method param ${i} : ${param.name} */ {')
-			g.writeln('\t${node.val_var}.typ = ${int(param.typ)};\t// ${g.table.type_to_str(param.typ)}')
+			g.writeln('\t${node.val_var}.typ = ${g.type_lit(param.typ)};\t// ${g.table.type_to_str(param.typ)}')
 			g.writeln('\t${node.val_var}.name = _S("${param.name}");')
 			g.stmts(node.stmts)
 			g.write_defer_stmts(node.scope, false, node.pos)
