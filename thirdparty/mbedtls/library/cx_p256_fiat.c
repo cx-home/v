@@ -14,7 +14,8 @@
  * m < 16^i, and the window adds c * 16^i * G (1 <= c <= 15) with
  * m + c * 16^i <= k < n, so it is never +-m*G.
  *
- * Inversions are Fermat powers by the public exponents p-2 and n-2.
+ * Inversions are Fermat powers by the public exponents p-2 (an addition
+ * chain) and n-2 (a fixed 4-bit window).
  */
 #include "cx_p256_fiat.h"
 
@@ -89,36 +90,52 @@ static void cx_fe_to_be(unsigned char b[32], const cx_fe a)
     }
 }
 
-/* out = a^e for a public exponent e (4 limbs, little-endian limbs) */
-static void cx_fe_pow(cx_fe out, const cx_fe a, const uint64_t e[4])
-{
-    cx_fe acc;
-    int i;
-    fiat_p256_set_one(acc);
-    for (i = 255; i >= 0; i--) {
-        fiat_p256_square(acc, acc);
-        if ((e[i >> 6] >> (i & 63)) & 1) {
-            fiat_p256_mul(acc, acc, a);
-        }
-    }
-    cx_fe_copy(out, acc);
-}
-
-/* p - 2 */
-static const uint64_t cx_p_minus_2[4] = {
-    0xfffffffffffffffdULL, 0x00000000ffffffffULL,
-    0x0000000000000000ULL, 0xffffffff00000001ULL
-};
-
 /* n - 2 */
 static const uint64_t cx_n_minus_2[4] = {
     0xf3b9cac2fc63254fULL, 0xbce6faada7179e84ULL,
     0xffffffffffffffffULL, 0xffffffff00000000ULL
 };
 
+static void cx_fe_sqn(cx_fe out, const cx_fe a, int n)
+{
+    int i;
+    fiat_p256_square(out, a);
+    for (i = 1; i < n; i++) {
+        fiat_p256_square(out, out);
+    }
+}
+
+/* a^(p-2) by an addition chain: 255 squarings and 12 multiplications (the
+ * plain square-and-multiply over p-2 takes 127). p-2 from the top: 32 ones,
+ * 31 zeros, a one, 96 zeros, 94 ones, a zero, a one. */
 static void cx_fe_inv(cx_fe out, const cx_fe a)
 {
-    cx_fe_pow(out, a, cx_p_minus_2);
+    cx_fe x2, x3, x6, x12, x15, x30, x32, t;
+    fiat_p256_square(t, a);
+    fiat_p256_mul(x2, t, a);           /* 2^2 - 1 */
+    fiat_p256_square(t, x2);
+    fiat_p256_mul(x3, t, a);           /* 2^3 - 1 */
+    cx_fe_sqn(t, x3, 3);
+    fiat_p256_mul(x6, t, x3);          /* 2^6 - 1 */
+    cx_fe_sqn(t, x6, 6);
+    fiat_p256_mul(x12, t, x6);         /* 2^12 - 1 */
+    cx_fe_sqn(t, x12, 3);
+    fiat_p256_mul(x15, t, x3);         /* 2^15 - 1 */
+    cx_fe_sqn(t, x15, 15);
+    fiat_p256_mul(x30, t, x15);        /* 2^30 - 1 */
+    cx_fe_sqn(t, x30, 2);
+    fiat_p256_mul(x32, t, x2);         /* 2^32 - 1: the top 32 ones */
+    cx_fe_sqn(t, x32, 32);
+    fiat_p256_mul(t, t, a);            /* 31 zeros, a one */
+    cx_fe_sqn(t, t, 96);               /* 96 zeros */
+    cx_fe_sqn(t, t, 32);
+    fiat_p256_mul(t, t, x32);
+    cx_fe_sqn(t, t, 32);
+    fiat_p256_mul(t, t, x32);
+    cx_fe_sqn(t, t, 30);
+    fiat_p256_mul(t, t, x30);          /* 94 ones */
+    cx_fe_sqn(t, t, 2);
+    fiat_p256_mul(out, t, a);          /* a zero, a one */
 }
 
 /* ---- points ------------------------------------------------------------- */
@@ -360,19 +377,31 @@ void cx_p256_fiat_sign_s(unsigned char s[32], const unsigned char k[32],
                          const unsigned char r[32], const unsigned char d[32],
                          const unsigned char e[32])
 {
-    uint64_t km[4], rm[4], dm[4], em[4], kinv[4], t[4];
+    uint64_t km[4], rm[4], dm[4], em[4], kinv[4], t[4], pw[16][4];
     uint8_t le[32];
     int i;
     cx_sc_from_be(km, k);
     cx_sc_from_be(rm, r);
     cx_sc_from_be(dm, d);
     cx_sc_from_be(em, e);
-    /* kinv = k^(n-2) */
+    /* kinv = k^(n-2): a fixed 4-bit window over the public exponent, 252
+     * squarings and at most 78 multiplications (square-and-multiply took
+     * ~160) */
+    fiat_p256_scalar_set_one(pw[0]);
+    for (i = 1; i < 16; i++) {
+        fiat_p256_scalar_mul(pw[i], pw[i - 1], km);
+    }
     fiat_p256_scalar_set_one(kinv);
-    for (i = 255; i >= 0; i--) {
-        fiat_p256_scalar_square(kinv, kinv);
-        if ((cx_n_minus_2[i >> 6] >> (i & 63)) & 1) {
-            fiat_p256_scalar_mul(kinv, kinv, km);
+    for (i = 63; i >= 0; i--) {
+        int nib = (int) ((cx_n_minus_2[i >> 4] >> ((i & 15) * 4)) & 0x0f);
+        if (i != 63) {
+            fiat_p256_scalar_square(kinv, kinv);
+            fiat_p256_scalar_square(kinv, kinv);
+            fiat_p256_scalar_square(kinv, kinv);
+            fiat_p256_scalar_square(kinv, kinv);
+        }
+        if (nib != 0) {
+            fiat_p256_scalar_mul(kinv, kinv, pw[nib]);
         }
     }
     fiat_p256_scalar_mul(t, rm, dm);
@@ -386,6 +415,7 @@ void cx_p256_fiat_sign_s(unsigned char s[32], const unsigned char k[32],
     mbedtls_platform_zeroize(km, sizeof(km));
     mbedtls_platform_zeroize(dm, sizeof(dm));
     mbedtls_platform_zeroize(kinv, sizeof(kinv));
+    mbedtls_platform_zeroize(pw, sizeof(pw));
     mbedtls_platform_zeroize(t, sizeof(t));
     mbedtls_platform_zeroize(le, sizeof(le));
 }
