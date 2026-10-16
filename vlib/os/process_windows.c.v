@@ -2,6 +2,10 @@ module os
 
 import strings
 
+#insert "@VEXEROOT/vlib/os/process_usage.h"
+
+fn C.v_os_process_usage_win(h voidptr, out &i64)
+
 fn C.GenerateConsoleCtrlEvent(event u32, pgid u32) bool
 fn C.GetModuleHandleA(name &char) HMODULE
 fn C.GetProcAddress(handle voidptr, procname &u8) voidptr
@@ -264,6 +268,7 @@ fn (mut p Process) win_wait() {
 	if p.wdata != 0 {
 		C.WaitForSingleObject(wdata.proc_info.h_process, C.INFINITE)
 		C.GetExitCodeProcess(wdata.proc_info.h_process, voidptr(&exit_code))
+		p.win_read_usage()
 		close_valid_handle(&wdata.child_stdin_read)
 		close_valid_handle(&wdata.child_stdout_write)
 		close_valid_handle(&wdata.child_stderr_write)
@@ -281,6 +286,7 @@ fn (mut p Process) win_is_alive() bool {
 	if exit_code == C.STILL_ACTIVE {
 		return true
 	}
+	p.win_read_usage()
 	return false
 }
 
@@ -471,4 +477,18 @@ fn requote_arg(arg string) string {
 	}
 	sb.write_u8(`"`)
 	return sb.str()
+}
+
+// win_read_usage keeps the exited child's CPU times and peak working set
+// (v#48), read before its handle closes.
+fn (mut p Process) win_read_usage() {
+	wdata := unsafe { &WProcess(p.wdata) }
+	if p.wdata == 0 || isnil(wdata.proc_info.h_process) {
+		return
+	}
+	mut usage := [3]i64{}
+	C.v_os_process_usage_win(wdata.proc_info.h_process, &usage[0])
+	p.user_ns = usage[0]
+	p.sys_ns = usage[1]
+	p.peak_rss = usage[2]
 }

@@ -33,6 +33,10 @@ pub mut:
 	stdio_fd         [3]int   // the stdio file descriptors for the child process, used only by the nix implementation
 	wdata            voidptr  // the WProcess; used only by the windows implementation
 	create_no_window bool     // sets a value indicating whether to start the process in a new window, The default is false; used only by the windows implementation
+	// the reaped child's resource usage (v#48), set once by the wait or is_alive that sees it exit; 0 before
+	user_ns  i64 // CPU time in user mode, ns
+	sys_ns   i64 // CPU time in the kernel, ns
+	peak_rss i64 // peak resident set, bytes (peak working set on Windows)
 }
 
 // new_process - create a new process descriptor.
