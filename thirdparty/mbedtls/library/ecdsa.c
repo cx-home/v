@@ -29,6 +29,7 @@
 
 #include "mbedtls/platform_util.h"
 #include "mbedtls/error.h"
+#include "cx_p256_fiat.h"
 
 #if defined(MBEDTLS_ECP_RESTARTABLE)
 
@@ -237,6 +238,61 @@ int mbedtls_ecdsa_can_do(mbedtls_ecp_group_id gid)
 }
 
 #if !defined(MBEDTLS_ECDSA_SIGN_ALT)
+#if defined(CX_P256_FIAT)
+/*
+ * cx-home/v#39: secp256r1 signs over fiat-crypto's verified arithmetic
+ * (library/cx_p256_fiat.c): k*G by a constant-time fixed-base window, the
+ * inverses by Fermat powers. The same steps as below in the same order, and
+ * the same calls to f_rng (one mbedtls_ecp_gen_privkey per key try), so
+ * deterministic signatures (RFC 6979) come out identical.
+ */
+static int cx_ecdsa_sign_p256(mbedtls_ecp_group *grp,
+                              mbedtls_mpi *r, mbedtls_mpi *s,
+                              const mbedtls_mpi *d, const unsigned char *buf, size_t blen,
+                              int (*f_rng)(void *, unsigned char *, size_t), void *p_rng)
+{
+    int ret, key_tries, sign_tries = 0;
+    mbedtls_mpi k, e;
+    unsigned char kb[32], xb[32], rb[32], db[32], eb[32], sb[32];
+
+    mbedtls_mpi_init(&k); mbedtls_mpi_init(&e);
+    MBEDTLS_MPI_CHK(derive_mpi(grp, &e, buf, blen));
+    MBEDTLS_MPI_CHK(mbedtls_mpi_write_binary(&e, eb, 32));
+    MBEDTLS_MPI_CHK(mbedtls_mpi_write_binary(d, db, 32));
+    do {
+        if (sign_tries++ > 10) {
+            ret = MBEDTLS_ERR_ECP_RANDOM_FAILED;
+            goto cleanup;
+        }
+        key_tries = 0;
+        do {
+            if (key_tries++ > 10) {
+                ret = MBEDTLS_ERR_ECP_RANDOM_FAILED;
+                goto cleanup;
+            }
+            MBEDTLS_MPI_CHK(mbedtls_ecp_gen_privkey(grp, &k, f_rng, p_rng));
+            MBEDTLS_MPI_CHK(mbedtls_mpi_write_binary(&k, kb, 32));
+            if (cx_p256_fiat_mul_base(xb, NULL, kb) != 0) {
+                ret = MBEDTLS_ERR_ECP_BAD_INPUT_DATA;
+                goto cleanup;
+            }
+            MBEDTLS_MPI_CHK(mbedtls_mpi_read_binary(r, xb, 32));
+            MBEDTLS_MPI_CHK(mbedtls_mpi_mod_mpi(r, r, &grp->N));
+        } while (mbedtls_mpi_cmp_int(r, 0) == 0);
+        MBEDTLS_MPI_CHK(mbedtls_mpi_write_binary(r, rb, 32));
+        cx_p256_fiat_sign_s(sb, kb, rb, db, eb);
+        MBEDTLS_MPI_CHK(mbedtls_mpi_read_binary(s, sb, 32));
+    } while (mbedtls_mpi_cmp_int(s, 0) == 0);
+
+cleanup:
+    mbedtls_platform_zeroize(kb, sizeof(kb));
+    mbedtls_platform_zeroize(db, sizeof(db));
+    mbedtls_platform_zeroize(sb, sizeof(sb));
+    mbedtls_mpi_free(&k); mbedtls_mpi_free(&e);
+    return ret;
+}
+#endif /* CX_P256_FIAT */
+
 /*
  * Compute ECDSA signature of a hashed message (SEC1 4.1.3)
  * Obviously, compared to SEC1 4.1.3, we skip step 4 (hash message)
@@ -264,6 +320,12 @@ int mbedtls_ecdsa_sign_restartable(mbedtls_ecp_group *grp,
     if (mbedtls_mpi_cmp_int(d, 1) < 0 || mbedtls_mpi_cmp_mpi(d, &grp->N) >= 0) {
         return MBEDTLS_ERR_ECP_INVALID_KEY;
     }
+
+#if defined(CX_P256_FIAT)
+    if (grp->id == MBEDTLS_ECP_DP_SECP256R1 && rs_ctx == NULL) {
+        return cx_ecdsa_sign_p256(grp, r, s, d, buf, blen, f_rng, p_rng);
+    }
+#endif
 
     mbedtls_ecp_point_init(&R);
     mbedtls_mpi_init(&k); mbedtls_mpi_init(&e);
