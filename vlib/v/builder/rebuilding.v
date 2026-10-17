@@ -583,15 +583,17 @@ pub fn (mut b Builder) validate_usecache_type_tables() {
 	for i, imp_path in paths {
 		b.rebuild_cached_module(vexe, imp_path)
 		mut fp := b.pref.cache_manager.mod_load(imp_path, '.types.txt', imp_path) or { '' }
-		if fp == '' {
-			// pre-fingerprint cache entry: rebuild once so the layer records one.
+		if fp == '' || !fp.starts_with(types_fingerprint_marker) {
+			// pre-fingerprint cache entry, or a full-table one from a compiler before
+			// cx-home/v#49 (its layer bakes in indices): rebuild once so the layer
+			// records a current one.
 			if stale := b.pref.cache_manager.mod_exists(imp_path, '.o', imp_path) {
 				os.rm(stale) or {}
 			}
 			b.rebuild_cached_module(vexe, imp_path)
 			fp = b.pref.cache_manager.mod_load(imp_path, '.types.txt', imp_path) or { '' }
 		}
-		mut ok := fp != ''
+		mut ok := fp.starts_with(types_fingerprint_marker)
 		if ok {
 			for line in fp.split_into_lines() {
 				ci := line.index(':') or { continue }
