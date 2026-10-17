@@ -188,10 +188,24 @@ fn test_parallel_walks_leave_the_heap_as_the_serial_walks_do() {
 		child()
 		return
 	}
-	one, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
+	one, o1 := run('VGC_ROOTDIAG_MIN_KB=0 VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
 	par, out :=
-		run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ')
+		run('VGC_ROOTDIAG_MIN_KB=0 VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ')
 	println('vgc_parallel_sweep: one walker ${one}; eight walkers ${par}')
+	if one != par {
+		println('==== V51 MISMATCH one-walker ====')
+		for l in o1.split_into_lines() {
+			if l.contains('rootdiag') || l.contains('marked=') {
+				println('ONE ${l}')
+			}
+		}
+		println('==== V51 MISMATCH eight-walker ====')
+		for l in out.split_into_lines() {
+			if l.contains('rootdiag') || l.contains('marked=') {
+				println('PAR ${l}')
+			}
+		}
+	}
 	assert one == par, 'the parallel walks left a different heap: ${one} against ${par}'
 	assert out.contains('walkers=8'), 'the walks did not engage (no walkers=8 phase line):\n${out}'
 	assert out.contains('markers=1'), 'expected one marker (the walks plan on their own):\n${out}'
