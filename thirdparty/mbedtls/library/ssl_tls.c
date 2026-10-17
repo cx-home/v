@@ -424,9 +424,12 @@ void mbedtls_ssl_cx_grow_out(mbedtls_ssl_context *ssl)
     }
 }
 
+/* The buffer half of mbedtls_ssl_cx_release, also run while a handshake waits
+ * for the peer's next flight (mbedtls_ssl_cx_release_wait). */
+static void ssl_cx_release_buffers(mbedtls_ssl_context *ssl);
+
 void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
 {
-    size_t in_new, out_new;
     if (ssl == NULL || ssl->conf == NULL ||
         ssl->conf->transport != MBEDTLS_SSL_TRANSPORT_STREAM ||
         !mbedtls_ssl_is_handshake_over(ssl) ||
@@ -447,6 +450,30 @@ void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
         ssl->handshake = NULL;
     }
 #endif
+    ssl_cx_release_buffers(ssl);
+}
+
+/* cx fork (cx-home/v#39): a handshake that returns MBEDTLS_ERR_SSL_WANT_READ
+ * with its flight flushed waits on the peer, often for the whole round trip
+ * (a server that has sent ServerHello..Finished waits for the client's
+ * Finished; a client for the server's flight). Its record buffers are idle
+ * then too: a server facing a reconnect wave from a slower client holds a
+ * thousand such connections at once, ~33 KB each at full size and ~2 KB here.
+ * The input buffer grows when a record header announces a record that does
+ * not fit (ssl_get_next_record), the output one at the next handshake step. */
+void mbedtls_ssl_cx_release_wait(mbedtls_ssl_context *ssl)
+{
+    if (ssl == NULL || ssl->conf == NULL ||
+        ssl->conf->transport != MBEDTLS_SSL_TRANSPORT_STREAM ||
+        ssl->in_buf == NULL || ssl->out_buf == NULL) {
+        return;
+    }
+    ssl_cx_release_buffers(ssl);
+}
+
+static void ssl_cx_release_buffers(mbedtls_ssl_context *ssl)
+{
+    size_t in_new, out_new;
     in_new = ssl->in_buf_len;
     out_new = ssl->out_buf_len;
     /* The input buffer shrinks only when everything it still holds lies in
@@ -1176,6 +1203,11 @@ static int ssl_handshake_init(mbedtls_ssl_context *ssl)
 #if defined(MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH)
     /* If the buffers are too small - reallocate */
 
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    /* cx fork (cx-home/v#39): a stream connection's buffers stay at their
+     * idle size until a record or a handshake step needs more */
+    if (ssl->conf->transport != MBEDTLS_SSL_TRANSPORT_STREAM)
+#endif
     handle_buffer_resizing(ssl, 0, MBEDTLS_SSL_IN_BUFFER_LEN,
                            MBEDTLS_SSL_OUT_BUFFER_LEN);
 #endif
@@ -1473,6 +1505,17 @@ int mbedtls_ssl_setup(mbedtls_ssl_context *ssl,
     if ((ret = ssl_conf_check(ssl)) != 0) {
         return ret;
     }
+#if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
+    /* cx fork (cx-home/v#39): a stream connection starts with idle-size
+     * record buffers (MBEDTLS_SSL_CX_RELEASE_BUFFERS); a ClientHello that fits
+     * never grows the input one, and the output one grows at the first
+     * handshake step that writes. An accepted connection whose ClientHello
+     * has not been read yet holds ~2 KB instead of ~33 KB. */
+    if (conf->transport == MBEDTLS_SSL_TRANSPORT_STREAM) {
+        in_buf_len = MBEDTLS_SSL_CX_IDLE_IN_LEN;
+        out_buf_len = MBEDTLS_SSL_CX_IDLE_OUT_LEN;
+    }
+#endif
     ssl->tls_version = ssl->conf->max_tls_version;
 
     /*
@@ -4649,7 +4692,8 @@ int mbedtls_ssl_handshake_step(mbedtls_ssl_context *ssl)
     }
 
 #if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
-    mbedtls_ssl_cx_grow_in(ssl);
+    /* the input buffer grows per record (ssl_get_next_record, and the
+     * reassembly of a fragmented handshake message), not per step */
     mbedtls_ssl_cx_grow_out(ssl);
 #endif
 
@@ -4766,6 +4810,9 @@ int mbedtls_ssl_handshake(mbedtls_ssl_context *ssl)
      * request is idle too */
     if (ret == 0) {
         mbedtls_ssl_cx_release(ssl);
+    } else if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+        /* waiting on the peer's next flight (cx-home/v#39) */
+        mbedtls_ssl_cx_release_wait(ssl);
     }
 #endif
     return ret;

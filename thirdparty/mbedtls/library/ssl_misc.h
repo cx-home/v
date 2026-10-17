@@ -594,6 +594,7 @@ extern "C" {
 void mbedtls_ssl_cx_grow_in(mbedtls_ssl_context *ssl);
 void mbedtls_ssl_cx_grow_out(mbedtls_ssl_context *ssl);
 void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl);
+void mbedtls_ssl_cx_release_wait(mbedtls_ssl_context *ssl);
 #endif
 
 typedef int  mbedtls_ssl_tls_prf_cb(const unsigned char *secret, size_t slen,
