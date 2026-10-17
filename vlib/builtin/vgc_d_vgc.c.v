@@ -3232,6 +3232,52 @@ fn vgc_tpool_drain_stw(self_idx int) {
 	}
 }
 
+// vgc_span_census answers the in-use spans by object size, ascending, as
+// "size:full/partial/empty" (objects allocated == nelems / some / none) — the
+// cx-home/v#51 evidence: which span a parallel-walk run holds that the serial
+// run does not. A diagnostic read of the span table, for a quiet heap (no
+// collection running); it allocates its answer.
+pub fn vgc_span_census() string {
+	mut sizes := []u32{}
+	mut full := []int{}
+	mut part := []int{}
+	mut empty := []int{}
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use {
+			continue
+		}
+		mut k := sizes.index(span.elem_size)
+		if k < 0 {
+			sizes << span.elem_size
+			full << 0
+			part << 0
+			empty << 0
+			k = sizes.len - 1
+		}
+		if span.alloc_count == 0 {
+			empty[k]++
+		} else if span.alloc_count >= span.nelems {
+			full[k]++
+		} else {
+			part[k]++
+		}
+	}
+	mut order := []int{len: sizes.len, init: index}
+	for i in 1 .. order.len {
+		mut j := i
+		for j > 0 && sizes[order[j - 1]] > sizes[order[j]] {
+			order[j - 1], order[j] = order[j], order[j - 1]
+			j--
+		}
+	}
+	mut out := []string{}
+	for k in order {
+		out << '${sizes[k]}:${full[k]}/${part[k]}/${empty[k]}'
+	}
+	return out.join(' ')
+}
+
 // vgc_pool_lock_takes answers (refills, lock takes) summed over every slot
 // ever used — the cx-private#1910 evidence: the share of span refills that
 // took free_spans_lock. Racy reads of slow-path counters; exact enough.

@@ -146,6 +146,9 @@ fn child() {
 		live++
 	}
 	println('CHECK=${sum}:${live} sink=${sink} cycles=${gc_cycles()}')
+	// cx-home/v#51: the in-use spans by object size, for a mismatch to name
+	// the span one run holds over the other
+	println('CENSUS=${vgc_span_census()}')
 }
 
 fn run(env string) (string, string) {
@@ -165,6 +168,22 @@ fn run(env string) (string, string) {
 	assert check != '', r.output
 	assert spans != '', r.output
 	return '${check} spans_in_use=${spans}', r.output
+}
+
+// cx-home/v#51: one run's per-cycle span counts and walker counts, and its
+// census, for the mismatch message
+fn evidence(out string) string {
+	mut cyc := []string{}
+	mut census := ''
+	for l in out.split_into_lines() {
+		if l.contains(' phases ') && l.contains('spans_in_use=') {
+			cyc << '${l.all_after('spans_in_use=').all_before(' ')}/w${l.all_after('walkers=').all_before(' ')}'
+		}
+		if l.starts_with('CENSUS=') {
+			census = l.all_after('CENSUS=')
+		}
+	}
+	return 'cycles ${cyc.join(' ')}; census ${census}'
 }
 
 // cx-home/v#44: the span count is the walk mode's alone only while no scanned
@@ -188,11 +207,11 @@ fn test_parallel_walks_leave_the_heap_as_the_serial_walks_do() {
 		child()
 		return
 	}
-	one, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
+	one, out1 := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
 	par, out :=
 		run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ')
 	println('vgc_parallel_sweep: one walker ${one}; eight walkers ${par}')
-	assert one == par, 'the parallel walks left a different heap: ${one} against ${par}'
+	assert one == par, 'the parallel walks left a different heap: ${one} against ${par}\none walker: ${evidence(out1)}\neight walkers: ${evidence(out)}'
 	assert out.contains('walkers=8'), 'the walks did not engage (no walkers=8 phase line):\n${out}'
 	assert out.contains('markers=1'), 'expected one marker (the walks plan on their own):\n${out}'
 }
