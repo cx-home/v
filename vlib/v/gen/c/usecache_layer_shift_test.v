@@ -16,7 +16,7 @@ fn layer_c(root string, mod_path string, shift int) string {
 	vcache := os.join_path(root, 'vcache_${shift}')
 	os.mkdir_all(vtmp) or { panic(err) }
 	os.mkdir_all(vcache) or { panic(err) }
-	cmd := 'VUSECACHE_TYPE_SHIFT=${shift} VTMP=${os.quoted_path(vtmp)} VCACHE=${os.quoted_path(vcache)} ${os.quoted_path(vexe)} -g -gc none build-module ${os.quoted_path(mod_path)}'
+	cmd := 'VUSECACHE_TYPE_SHIFT=${shift} VTMP=${os.quoted_path(vtmp)} VCACHE=${os.quoted_path(vcache)} ${os.quoted_path(vexe)} -keepc -gc none build-module ${os.quoted_path(mod_path)}'
 	res := os.execute(cmd)
 	assert res.exit_code == 0, '${cmd}\n${res.output}'
 	mut cfiles := os.walk_ext(vtmp, '.c')
@@ -25,7 +25,8 @@ fn layer_c(root string, mod_path string, shift int) string {
 	mut sb := []string{}
 	for f in cfiles {
 		for line in os.read_lines(f) or { panic(err) } {
-			if line.contains('__v_usecache_shift_') {
+			// the shift symbols themselves, and comment-only lines (the type table dump)
+			if line.contains('__v_usecache_shift_') || line.trim_space().starts_with('//') {
 				continue
 			}
 			sb << line.replace(vtmp, '<VTMP>').replace(vcache, '<VCACHE>')
@@ -37,7 +38,8 @@ fn layer_c(root string, mod_path string, shift int) string {
 fn first_difference(a string, b string) string {
 	al := a.split_into_lines()
 	bl := b.split_into_lines()
-	for i in 0 .. if al.len < bl.len { al.len } else { bl.len } {
+	n := if al.len < bl.len { al.len } else { bl.len }
+	for i in 0 .. n {
 		if al[i] != bl[i] {
 			return 'line ${i + 1}:\n  shift 0: ${al[i]}\n  shift 7: ${bl[i]}'
 		}
