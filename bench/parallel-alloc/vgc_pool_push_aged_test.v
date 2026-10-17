@@ -5,12 +5,16 @@
 // trim needs, and ten times the pushes cost about ten times the time, not a
 // hundred (the tail walk: 3k -> 30k pushes took 42 ms -> 6.76 s, 161x).
 //
-// The ratio is wall time (cx-home/v#38): on FreeBSD's 4-vCPU CI runner with
-// four test binaries in parallel the 100k arm read 30.2x the 10k one (vgc
-// 38301540287) where an idle box reads 11-14x. A run judges < 60x always —
-// still far under the quadratic walk's 161x — and the tight < 30x only when
-// the runner is not oversubscribed (one-minute load at the start and end at
-// most the CPU count; Windows, which has no getloadavg, judges as before).
+// The judge is the walk's step count (cx-home/v#54), not wall time: the 10k
+// arm took ~0.25 ms, and a 4-vCPU Linux runner at load 3.1 read the 100k arm
+// at 35.3x it (CI 39035141118), past the 30x bound #38 kept for runners that
+// are not oversubscribed — the 100k arm's 20 MB of descriptors leave the
+// caches the 10k arm runs in, so even an O(1) push reads more than 10x, and a
+// load average cannot tell a busy core from a cold cache. vgc_pool_push_aged
+// counts each step of its two-ended walk (vgc_pool_aged_selftest_steps); a
+// per-push walk takes steps in proportion to the chain (the tail walk: ~n*n/8
+// for n pushes), the filing this test guards takes at most one per push. The
+// times are printed, not judged.
 //
 //   ../../v -gc e test bench/parallel-alloc/vgc_pool_push_aged_test.v
 module main
@@ -53,17 +57,12 @@ fn test_aged_pushes_keep_trim_order() {
 }
 
 fn test_aged_pushes_cost_linear_time() {
-	load_start := load1()
 	small := least_ns(10_000)
+	small_steps := vgc_pool_aged_selftest_steps()
 	large := least_ns(100_000)
-	load_end := load1()
+	large_steps := vgc_pool_aged_selftest_steps()
 	ratio := f64(large) / f64(if small == 0 { u64(1) } else { small })
-	ncpu := f64(runtime.nr_cpus())
-	eprintln('vgc_pool_push_aged: 10k ${small} ns, 100k ${large} ns, ratio ${ratio:.1f} (load ${load_start:.1f} -> ${load_end:.1f} on ${ncpu} CPUs)')
-	assert ratio < 60.0, 'ten times the aged pushes cost ${ratio:.1f}x the time: the per-push walk is back'
-	if load_start > ncpu || load_end > ncpu {
-		eprintln('vgc_pool_push_aged: the tight 30x bound not judged on an oversubscribed runner')
-		return
-	}
-	assert ratio < 30.0, 'ten times the aged pushes cost ${ratio:.1f}x the time (load ${load_start:.1f} -> ${load_end:.1f} on ${ncpu} CPUs)'
+	eprintln('vgc_pool_push_aged: 10k ${small} ns ${small_steps} steps, 100k ${large} ns ${large_steps} steps, time ratio ${ratio:.1f} (load ${load1():.1f} on ${runtime.nr_cpus()} CPUs)')
+	assert small_steps <= 10_000, '10k aged pushes walked ${small_steps} chain steps: the per-push walk is back'
+	assert large_steps <= 100_000, '100k aged pushes walked ${large_steps} chain steps: the per-push walk is back'
 }

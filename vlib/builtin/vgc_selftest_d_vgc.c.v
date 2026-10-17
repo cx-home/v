@@ -128,6 +128,12 @@ pub fn vgc_rtmem_compensation_stats() (u64, u64, u64) {
 // trim needs it — the young spans (cyc - gen < vgc_pool_trim_age) in
 // non-increasing gen order, then only old-enough spans, prev/next and the
 // tail consistent and every span on it; ns is the filing time alone.
+// vgc_pool_aged_selftest_steps answers the walk steps the last
+// vgc_pool_aged_selftest run took (cx-home/v#54).
+pub fn vgc_pool_aged_selftest_steps() u64 {
+	return vgc_pool_aged_steps
+}
+
 pub fn vgc_pool_aged_selftest(n int) (u32, u64) {
 	np := u32(8191)
 	descs := unsafe { &VGC_Span(C.calloc(usize(n), sizeof(VGC_Span))) }
@@ -147,6 +153,7 @@ pub fn vgc_pool_aged_selftest(n int) (u32, u64) {
 	vgc_heap.free_spans_aged_mark[int(np) * 2 + 1] = unsafe { nil }
 	vgc_heap.gc_cycle = 100
 	cyc := u32(100)
+	vgc_pool_aged_steps = 0
 	t0 := C.vgc_now_ns()
 	for i in 0 .. n {
 		mut d := unsafe { &descs[i] }

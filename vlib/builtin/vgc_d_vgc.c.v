@@ -2833,6 +2833,12 @@ fn vgc_pool_push(mut span VGC_Span) {
 //     (free_spans_aged_mark) — the young part is age-ordered, so that is
 //     the boundary — and only a miss walks, from both ends at once, stopping at
 //     the boundary (one walk per chain and gen: the mark then holds).
+// vgc_pool_aged_steps counts the steps of push_aged's two-ended walk: the
+// quantity cx-home/v#54's test judges (a push that walks the chain costs steps
+// in proportion to the chain; the timing of 0.25 ms arms did not tell that
+// from a cold cache).
+__global vgc_pool_aged_steps = u64(0)
+
 fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 	vgc_pool_push(mut span)
 	span.pool_gen = gen
@@ -2866,6 +2872,7 @@ fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 				mut h := span.next
 				mut b := vgc_heap.free_spans_tail[n]
 				for {
+					vgc_pool_aged_steps++
 					if h == nil {
 						t = vgc_heap.free_spans_tail[n]
 						break
