@@ -260,13 +260,13 @@ fn test_an_integer_word_aliasing_a_dead_span_keeps_it() {
 	if os.getenv('VGC_PS_CHILD') != '' {
 		return
 	}
-	one, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
-	planted, _ := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 VGC_PS_PLANT=1 ')
+	one, out1 := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 ')
+	planted, outp := run('VGC_MARK_WORKERS=1 VGC_WALK_WORKERS=1 VGC_PS_PLANT=1 ')
 	println('vgc_parallel_sweep: one walker ${one}; planted ${planted}')
 	assert one.all_before(' ') == planted.all_before(' '), 'the plant changed the live data: ${one} against ${planted}'
 	n_one := one.all_after('spans_in_use=').int()
 	n_planted := planted.all_after('spans_in_use=').int()
-	assert n_planted == n_one + 1, 'a word holding a dropped buffer address keeps exactly its span: ${n_one} against ${n_planted}'
+	assert n_planted == n_one + 1, 'a word holding a dropped buffer address keeps exactly its span: ${n_one} against ${n_planted}\none walker: ${evidence(out1)}\nplanted: ${evidence(outp)}'
 }
 
 fn test_parallel_walks_leave_the_heap_as_the_serial_walks_do() {
