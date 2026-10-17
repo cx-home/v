@@ -3842,3 +3842,153 @@ fn vgc_memory_use() usize {
 	}
 	return total
 }
+
+// the mask on the addresses vgc_orphan_holders keeps (no user-space address)
+const vgc_oh_mask = usize(u64(0x5a5a000000000000))
+
+// vgc_orphan_holders answers, for the allocated objects of one object size that
+// no address in `known` points into (the caller's live set, sorted or not),
+// every word that holds an address inside one: in the data segments, the cache
+// slots, the suspend records, each registered thread's stack from the last
+// collection's stack pointer to its top (offsets below the top, as
+// -d vgc_rootdiag reports them; this function's own frames sit at the smallest
+// offsets), the pins, and the scanned heap objects. The cx-home/v#51 evidence:
+// which word keeps the span one run holds over the other. The addresses this
+// function keeps are stored masked, so its own arrays hold none.
+// A diagnostic read for a quiet heap (no collection running) on the calling
+// thread; it allocates its answer.
+pub fn vgc_orphan_holders(known []usize, size u32) string {
+	mut ks := known.clone()
+	ks.sort(a < b)
+	mut orphans := []usize{}
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use || span.elem_size != size
+			|| span.alloc_bits == unsafe { nil } {
+			continue
+		}
+		for idx in 0 .. span.nelems {
+			if C.vgc_bitmap_get(span.alloc_bits, idx) == 0 {
+				continue
+			}
+			o := span.base + usize(idx) * usize(span.elem_size)
+			mut lo := 0
+			mut hi := ks.len
+			for lo < hi {
+				mid := (lo + hi) / 2
+				if ks[mid] < o {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			if lo < ks.len && ks[lo] < o + usize(size) {
+				continue
+			}
+			if orphans.len < 16 {
+				orphans << (o ^ vgc_oh_mask)
+			}
+		}
+	}
+	if orphans.len == 0 {
+		return 'none'
+	}
+	mut out := []string{}
+	for om in orphans {
+		o := om ^ vgc_oh_mask
+		mut hs := []string{}
+		first := unsafe { *(&u8(voidptr(o))) }
+		pay := unsafe { *(&u8(voidptr(o + 8))) }
+		vgc_root_holders(mut hs, '', o, size)
+		mut objs := []usize{}
+		mut osz := []u32{}
+		for i in 0 .. vgc_heap.nspans {
+			span := unsafe { vgc_heap.allspans[i] }
+			if span == unsafe { nil } || !span.in_use || span.noscan || span.elem_size == 0
+				|| span.alloc_bits == unsafe { nil } {
+				continue
+			}
+			for idx in 0 .. span.nelems {
+				if C.vgc_bitmap_get(span.alloc_bits, idx) == 0 {
+					continue
+				}
+				h := span.base + usize(idx) * usize(span.elem_size)
+				n0 := hs.len
+				vgc_holders_in(mut hs, if span.has_ptrmap { 'heap-p' } else { 'heap-c' }, h,
+					h + usize(span.elem_size), h, o, size)
+				if hs.len > n0 && objs.len < 4 {
+					objs << (h ^ vgc_oh_mask)
+					osz << span.elem_size
+				}
+			}
+		}
+		// one level up: who holds a heap object that holds the orphan
+		for j, hm in objs {
+			h := hm ^ vgc_oh_mask
+			vgc_root_holders(mut hs, '0x${u64(h).hex()}<', h, osz[j])
+		}
+		out << '0x${u64(o).hex()} b0=${first} b8=${pay} by ${if hs.len == 0 { 'nothing' } else { hs.join(',') }}'
+	}
+	return out.join('; ')
+}
+
+// vgc_root_holders appends the root words (data segments, cache slots, suspend
+// records, registered stacks, pins) holding an address inside [o, o + size).
+fn vgc_root_holders(mut hs []string, pre string, o usize, size u32) {
+	for k in 0 .. vgc_nseg {
+		if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
+			vgc_holders_in(mut hs, '${pre}data${k}', vgc_seg_lo[k], vgc_seg_hi[k], vgc_seg_lo[k],
+				o, size)
+		}
+	}
+	mut left := vgc_heap.ncaches
+	for ci in 0 .. C.vgc_ncache_chunks() {
+		if left <= 0 {
+			break
+		}
+		n := if left < vgc_cache_chunk_slots { left } else { vgc_cache_chunk_slots }
+		base := usize(C.vgc_cache_chunk(ci))
+		vgc_holders_in(mut hs, '${pre}caches', base, base + usize(n) * usize(sizeof(VGC_Cache)),
+			base, o, size)
+		left -= n
+	}
+	for ci in 0 .. C.vgc_ncache_chunks() {
+		mut slo := usize(0)
+		mut shi := usize(0)
+		if C.vgc_susp_chunk_bounds(ci, &slo, &shi) != 0 {
+			vgc_holders_in(mut hs, '${pre}suspend', slo, shi, slo, o, size)
+		}
+	}
+	for i in 0 .. vgc_heap.ncaches {
+		c := unsafe { vgc_cache(i) }
+		if !c.registered || c.stack_lo == 0 || c.stack_hi <= c.stack_lo {
+			continue
+		}
+		vgc_holders_in(mut hs, '${pre}stack${i}', c.stack_lo, c.stack_hi, c.stack_hi, o, size)
+	}
+	for k in 0 .. vgc_npins {
+		p := usize(unsafe { vgc_pins[k] })
+		if p >= o && p < o + usize(size) {
+			hs << '${pre}pin${k}'
+		}
+	}
+}
+
+// vgc_holders_in appends one "kind+offset=value-offset" entry per word of
+// [lo, hi) that holds an address inside [o, o + size); offsets are from `rel`
+// (a range's start, or a stack's top).
+fn vgc_holders_in(mut hs []string, kind string, lo usize, hi usize, rel usize, o usize, size u32) {
+	mut a := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+	for a + sizeof(usize) <= hi {
+		v := unsafe { *(&usize(voidptr(a))) }
+		if v >= o && v < o + usize(size) && hs.len < 24 {
+			off := if rel > a { i64(rel - a) } else { i64(a - rel) }
+			hs << if kind.starts_with('heap') {
+				'${kind}${vgc_find_span(voidptr(a)).elem_size}+${off}@0x${u64(a).hex()}=+${v - o}'
+			} else {
+				'${kind}+${off}@0x${u64(a).hex()}=+${v - o}'
+			}
+		}
+		a += sizeof(usize)
+	}
+}

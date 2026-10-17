@@ -149,6 +149,26 @@ fn child() {
 	// cx-home/v#51: the in-use spans by object size, for a mismatch to name
 	// the span one run holds over the other
 	println('CENSUS=${vgc_span_census()}')
+	// cx-home/v#51: every allocated 1 KB buffer no kept node owns, and each word
+	// that holds its address (the 1152-byte class is where the extra span sat:
+	// CI 39035166177's census 1152:0/1641/0 against 1152:0/1640/0)
+	mut known := []usize{cap: kept.len}
+	for n in kept {
+		if n != unsafe { nil } && n.id % 4 == 0 {
+			known << usize(n.buf.data)
+		}
+	}
+	println('HOLDERS=${vgc_orphan_holders(known, 1152)}')
+	$if linux {
+		exe := os.executable()
+		maps := os.read_file('/proc/self/maps') or { '' }
+		for l in maps.split_into_lines() {
+			if l.ends_with(exe) {
+				println('BASE=0x${l.all_before('-')}')
+				break
+			}
+		}
+	}
 }
 
 fn run(env string) (string, string) {
@@ -175,6 +195,8 @@ fn run(env string) (string, string) {
 fn evidence(out string) string {
 	mut cyc := []string{}
 	mut census := ''
+	mut holders := ''
+	mut base := u64(0)
 	for l in out.split_into_lines() {
 		if l.contains(' phases ') && l.contains('spans_in_use=') {
 			cyc << '${l.all_after('spans_in_use=').all_before(' ')}/w${l.all_after('walkers=').all_before(' ')}'
@@ -182,8 +204,53 @@ fn evidence(out string) string {
 		if l.starts_with('CENSUS=') {
 			census = l.all_after('CENSUS=')
 		}
+		if l.starts_with('HOLDERS=') {
+			holders = l.all_after('HOLDERS=')
+		}
+		if l.starts_with('BASE=') {
+			base = l.all_after('BASE=0x').parse_uint(16, 64) or { 0 }
+		}
 	}
-	return 'cycles ${cyc.join(' ')}; census ${census}'
+	return 'cycles ${cyc.join(' ')}; census ${census}; holders ${holders}${data_symbols(holders,
+		base)}'
+}
+
+// data_symbols names the symbol of each data-segment holder (Linux: the child's
+// load base from /proc/self/maps and `nm -n` of this binary), for the message
+fn data_symbols(holders string, base u64) string {
+	if base == 0 || !holders.contains('data') {
+		return ''
+	}
+	r := os.execute('nm -n ${os.quoted_path(os.executable())}')
+	if r.exit_code != 0 {
+		return ''
+	}
+	mut addrs := []u64{}
+	mut names := []string{}
+	for l in r.output.split_into_lines() {
+		f := l.fields()
+		if f.len == 3 {
+			addrs << f[0].parse_uint(16, 64) or { continue }
+			names << f[2]
+		}
+	}
+	mut out := []string{}
+	for e in holders.split(',') {
+		if !e.contains('data') || !e.contains('@0x') {
+			continue
+		}
+		a := (e.all_after('@0x').all_before('=').parse_uint(16, 64) or { continue }) - base
+		mut best := -1
+		for i, x in addrs {
+			if x <= a {
+				best = i
+			}
+		}
+		if best >= 0 {
+			out << '${e.all_before('@')}=${names[best]}+${a - addrs[best]}'
+		}
+	}
+	return if out.len == 0 { '' } else { ' [${out.join(' ')}]' }
 }
 
 // cx-home/v#44: the span count is the walk mode's alone only while no scanned
