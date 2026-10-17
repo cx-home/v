@@ -126,9 +126,15 @@ fn test_gate_abi_and_safe_region_entry_points() {
 // stop flag raised (the cooperative park, not only the suspend fallback), and
 // every collection completes while it spins
 // collections while an attached native thread spins: 10 timed, then (polling)
-// more until the loop has seen a stop, at most 200 (a loaded box can keep the
-// spinner off-CPU through a few short stops)
-fn spin_and_collect(poll int) (int, time.Duration) {
+// more until the loop has seen a stop. A stop waits for parkers only until the
+// stopped count has not moved for ~0.1 ms (the #71 plateau exit), then
+// suspends the stragglers, so a spinner that is off-CPU for that window is
+// suspended, not parked. On a 4-vCPU runner with four test files and forced
+// markers that held for all of a fixed 200 stops (cx-home/v#53): the bound is
+// wall time (10 s of stops), not a count of them.
+const poll_budget = 10 * time.second
+
+fn spin_and_collect(poll int) (int, time.Duration, int) {
 	C.vna_poll_start(poll)
 	for C.vna_poll_live_n() == 0 {
 		time.sleep(time.millisecond)
@@ -138,22 +144,22 @@ fn spin_and_collect(poll int) (int, time.Duration) {
 		gc_collect()
 	}
 	took := sw.elapsed()
+	mut stops := 10
 	if poll == 1 {
-		for _ in 0 .. 190 {
-			if C.vna_poll_seen_so_far() > 0 {
-				break
-			}
+		budget := time.new_stopwatch()
+		for C.vna_poll_seen_so_far() == 0 && budget.elapsed() < poll_budget {
 			gc_collect()
+			stops++
 			time.sleep(100 * time.microsecond)
 		}
 	}
-	return C.vna_poll_finish(), took
+	return C.vna_poll_finish(), took, stops
 }
 
 fn test_a_polling_native_loop_parks_at_the_stop() {
-	seen, took := spin_and_collect(1)
-	assert seen > 0
-	_, took0 := spin_and_collect(0) // no poll: each stop suspends the loop after the bounded wait
+	seen, took, stops := spin_and_collect(1)
+	assert seen > 0, 'the polling native loop saw none of ${stops} stops in ${poll_budget}'
+	_, took0, _ := spin_and_collect(0) // no poll: each stop suspends the loop after the bounded wait
 	eprintln('native loop, 10 collections: polling ${took}, not polling ${took0}')
 }
 
