@@ -2927,12 +2927,27 @@ fn write_response_file_error(response_file string, err IError) {
 	verror('Unable to write to C response file "${response_file}", error: ${err}')
 }
 
-// types_fingerprint renders the table's (idx, name) pairs, one per line —
-// the ABI surface a cached module object bakes into its generated code
-// (cx-private#864). Consumers compare it against their own table.
+// types_fingerprint_marker heads a layer fingerprint written by a compiler whose
+// build-module C reads every type index past the builtin block through
+// `_v_type_idx_<cname>()` (cx-home/v#49). A fingerprint without it is a full
+// table from an older compiler, whose layer baked those indices in: the consumer
+// rebuilds such a layer once instead of trusting it.
+const types_fingerprint_marker = '# numbering-independent layer (cx-home/v#49)'
+
+// types_fingerprint renders the (idx, name) pairs a cached module object bakes
+// into its generated code as literals, one per line (cx-private#864). Since
+// cx-home/v#49 that is the fixed builtin block alone (0..nil_type_idx): every
+// later index is read through the program-defined `_v_type_idx_<cname>()`, so a
+// layer links into any program whose builtin block agrees — and the shift test
+// (vlib/v/gen/c/usecache_layer_shift_test.v) holds cgen to that. Consumers
+// compare it against their own table.
 fn types_fingerprint(table &ast.Table) string {
-	mut sb := strings.new_builder(64 * 1024)
+	mut sb := strings.new_builder(1024)
+	sb.writeln(types_fingerprint_marker)
 	for i, sym in table.type_symbols {
+		if i > ast.nil_type_idx {
+			break
+		}
 		sb.writeln('${i}:${sym.name}')
 	}
 	return sb.str()
