@@ -34,9 +34,10 @@ pub mut:
 	wdata            voidptr  // the WProcess; used only by the windows implementation
 	create_no_window bool     // sets a value indicating whether to start the process in a new window, The default is false; used only by the windows implementation
 	// the reaped child's resource usage (v#48), set once by the wait or is_alive that sees it exit; 0 before
-	user_ns  i64 // CPU time in user mode, ns
-	sys_ns   i64 // CPU time in the kernel, ns
-	peak_rss i64 // peak resident set, bytes (peak working set on Windows)
+	user_ns  i64             // CPU time in user mode, ns
+	sys_ns   i64             // CPU time in the kernel, ns
+	peak_rss i64             // peak resident set, bytes (peak working set on Windows)
+	rlimits  []ProcessRlimit // resource limits applied in the child between fork and exec (nix only; cx-home/cx-core-code#143)
 }
 
 // new_process - create a new process descriptor.
@@ -68,6 +69,32 @@ pub fn (mut p Process) set_work_folder(path string) {
 	}
 	p.work_folder = real_path(path)
 	return
+}
+
+// ProcessRlimit is one resource limit for a child process: the C RLIMIT_* resource
+// number and its soft and hard values (the platform's RLIM_INFINITY for none).
+pub struct ProcessRlimit {
+pub:
+	resource int
+	soft     u64
+	hard     u64
+}
+
+// set_rlimit - set one resource limit (a C RLIMIT_* number) for the new process; it
+// is applied in the child after fork and before exec (setrlimit), so the parent's own
+// limits never change. A later call for the same resource replaces the earlier one.
+// Nix only: on Windows the limits are ignored. A limit the child cannot set makes it
+// exit 127 before exec, with the reason on its stderr.
+pub fn (mut p Process) set_rlimit(resource int, soft u64, hard u64) {
+	if p.status != .not_started {
+		return
+	}
+	p.rlimits = p.rlimits.filter(it.resource != resource)
+	p.rlimits << ProcessRlimit{
+		resource: resource
+		soft:     soft
+		hard:     hard
+	}
 }
 
 // set_environment - set a custom environment variable mapping for the new process.
