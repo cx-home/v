@@ -1,0 +1,33 @@
+name: v51 diag
+
+# cx-home/v#51 diagnostic only (never merged): the one-walker and eight-walker
+# vgc_parallel_sweep children, 30 rounds each, under a -d vgc_rootdiag build and
+# the default bench/parallel-alloc suite as background load (the shape of the red
+# run 38995517651); a mismatch prints both runs' root reports.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'diag/**'
+
+jobs:
+  v51:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build V
+        run: make -j4 && ./v symlink
+      - name: Build the diag child
+        run: ./v -d vgc_rootdiag -o diag bench/v51diag/v51diag.v
+      - name: 30 rounds under the suite's load
+        run: |
+          (./v test bench/parallel-alloc > load.log 2>&1 || true) &
+          VGC_V51_N=30 ./diag | tee diag.log
+          wait
+          grep -c MISMATCH diag.log || true
