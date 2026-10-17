@@ -22,17 +22,18 @@ pub mut:
 	pid              int    // the PID of the process
 	code             int          = -1           // the exit code of the process, != -1 *only* when status is .exited *and* the process was not aborted
 	status           ProcessState = .not_started // the current status of the process
-	err              string   // if the process fails, contains the reason why
-	args             []string // the arguments that the command takes
-	work_folder      string   // the initial working folder of the process. When '', reuse the same folder as the parent process.
-	env_is_custom    bool     // true, when the environment was customized with .set_environment
-	env              []string // the environment with which the process was started  (list of 'var=val')
-	use_stdio_ctl    bool     // when true, at least one of the child's standard streams is redirected through a pipe
-	stdio_ctl        [3]bool  // which of the child's standard streams are redirected, indexed by ChildProcessPipeKind; the streams that are not, are inherited from the parent
-	use_pgroup       bool     // when true, the process will create a new process group, enabling .signal_pgkill()
-	stdio_fd         [3]int   // the stdio file descriptors for the child process, used only by the nix implementation
-	wdata            voidptr  // the WProcess; used only by the windows implementation
-	create_no_window bool     // sets a value indicating whether to start the process in a new window, The default is false; used only by the windows implementation
+	err              string          // if the process fails, contains the reason why
+	args             []string        // the arguments that the command takes
+	work_folder      string          // the initial working folder of the process. When '', reuse the same folder as the parent process.
+	env_is_custom    bool            // true, when the environment was customized with .set_environment
+	env              []string        // the environment with which the process was started  (list of 'var=val')
+	use_stdio_ctl    bool            // when true, at least one of the child's standard streams is redirected through a pipe
+	stdio_ctl        [3]bool         // which of the child's standard streams are redirected, indexed by ChildProcessPipeKind; the streams that are not, are inherited from the parent
+	use_pgroup       bool            // when true, the process will create a new process group, enabling .signal_pgkill()
+	stdio_fd         [3]int          // the stdio file descriptors for the child process, used only by the nix implementation
+	wdata            voidptr         // the WProcess; used only by the windows implementation
+	create_no_window bool            // sets a value indicating whether to start the process in a new window, The default is false; used only by the windows implementation
+	rlimits          []ProcessRlimit // resource limits applied in the child between fork and exec (nix only; cx-home/cx-core-code#143)
 }
 
 // new_process - create a new process descriptor.
@@ -64,6 +65,32 @@ pub fn (mut p Process) set_work_folder(path string) {
 	}
 	p.work_folder = real_path(path)
 	return
+}
+
+// ProcessRlimit is one resource limit for a child process: the C RLIMIT_* resource
+// number and its soft and hard values (the platform's RLIM_INFINITY for none).
+pub struct ProcessRlimit {
+pub:
+	resource int
+	soft     u64
+	hard     u64
+}
+
+// set_rlimit - set one resource limit (a C RLIMIT_* number) for the new process; it
+// is applied in the child after fork and before exec (setrlimit), so the parent's own
+// limits never change. A later call for the same resource replaces the earlier one.
+// Nix only: on Windows the limits are ignored. A limit the child cannot set makes it
+// exit 127 before exec, with the reason on its stderr.
+pub fn (mut p Process) set_rlimit(resource int, soft u64, hard u64) {
+	if p.status != .not_started {
+		return
+	}
+	p.rlimits = p.rlimits.filter(it.resource != resource)
+	p.rlimits << ProcessRlimit{
+		resource: resource
+		soft:     soft
+		hard:     hard
+	}
 }
 
 // set_environment - set a custom environment variable mapping for the new process.

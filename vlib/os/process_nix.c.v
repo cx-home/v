@@ -1,6 +1,13 @@
 module os
 
+#include <sys/resource.h>
+
 fn C.setpgid(pid i32, pgid i32) i32
+
+// struct rlimit is { rlim_t rlim_cur; rlim_t rlim_max; }, rlim_t a 64-bit unsigned on
+// every nix target V builds for; a [2]u64 has its layout (no C.rlimit struct here, so
+// a module that declares its own C.rlimit is not shadowed).
+fn C.setrlimit(resource i32, rlp voidptr) i32
 
 fn env_value_from_entries(env []string, name string) ?string {
 	prefix := '${name}='
@@ -91,6 +98,14 @@ fn (mut p Process) unix_spawn_process() int {
 		fd_close(pipeset[4])
 		C.dup2(pipeset[5], 2)
 		fd_close(pipeset[5])
+	}
+	// the child's own resource limits (set_rlimit), applied here so the parent's never change
+	for rl in p.rlimits {
+		lim := [rl.soft, rl.hard]!
+		if C.setrlimit(i32(rl.resource), voidptr(&lim[0])) != 0 {
+			eprintln('setrlimit(${rl.resource}, ${rl.soft}, ${rl.hard}): ${posix_get_error_msg(C.errno)}')
+			exit(127)
+		}
 	}
 	p.filename = p.unix_resolve_filename() or {
 		eprintln(err)
