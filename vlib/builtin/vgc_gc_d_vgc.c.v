@@ -3927,9 +3927,42 @@ pub fn vgc_orphan_holders(known []usize, size u32) string {
 			h := hm ^ vgc_oh_mask
 			vgc_root_holders(mut hs, '0x${u64(h).hex()}<', h, osz[j])
 		}
-		out << '0x${u64(o).hex()} b0=${first} b8=${pay} by ${if hs.len == 0 { 'nothing' } else { hs.join(',') }}'
+		out << '0x${u64(o).hex()} b0=${first} b8=${pay} [${vgc_orphan_state(o)}] by ${if hs.len == 0 { 'nothing' } else { hs.join(',') }}'
 	}
 	return out.join('; ')
+}
+
+// vgc_orphan_state answers why the sweep left the object at `o` allocated
+// (cx-home/v#51): its mark bit from the last cycle (m=1: a root or an object
+// reached it), the span's sweep stamp against the cycle (sg=), its in-flight
+// claim (if=), whether it sits on a central list (oc=), its fill (ac=n/N),
+// and the mutator slots whose cache holds the span (c=slot.class, or c=- when
+// none) and whose tiny cursor sits in it (t=slot). A span the sweep skipped
+// (cached, in flight, stamped this cycle) keeps every object it holds, marked
+// or not.
+fn vgc_orphan_state(o usize) string {
+	sp := vgc_find_span(voidptr(o))
+	if sp == unsafe { nil } {
+		return 'no span'
+	}
+	span := &VGC_Span(sp)
+	idx := u32((o - span.base) / usize(span.elem_size))
+	m := if span.mark_bits != unsafe { nil } { C.vgc_bitmap_get(span.mark_bits, idx) } else { -1 }
+	mut cached := []string{}
+	mut tiny := []string{}
+	for i in 0 .. vgc_heap.ncaches {
+		c := unsafe { vgc_cache(i) }
+		for sc in 0 .. 136 {
+			if unsafe { c.alloc[sc] } == span {
+				cached << '${i}.${sc}${if c.registered { '' } else { 'x' }}'
+			}
+		}
+		if c.tiny != 0 && c.tiny >= span.base
+			&& c.tiny < span.base + usize(span.npages) * vgc_page_size {
+			tiny << '${i}'
+		}
+	}
+	return 'm=${m} sg=${span.sweep_gen}/${vgc_heap.gc_cycle} if=${C.vgc_atomic_load_u32(&span.inflight)} oc=${span.on_central} ac=${span.alloc_count}/${span.nelems} c=${if cached.len == 0 { '-' } else { cached.join('+') }}${if tiny.len == 0 { '' } else { ' t=' + tiny.join('+') }}'
 }
 
 // vgc_root_holders appends the root words (data segments, cache slots, suspend
