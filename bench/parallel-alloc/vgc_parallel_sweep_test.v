@@ -344,6 +344,11 @@ fn test_an_integer_word_aliasing_a_dead_span_keeps_it() {
 
 fn test_parallel_walks_leave_the_heap_as_the_serial_walks_do() {
 	if os.getenv('VGC_PS_CHILD') != '' {
+		// cx-home/v#51: child()'s frame is laid on overwritten stack, not on what
+		// the runtime's start-up and the test runner left there (CI 39127330425
+		// after the loops moved out: the arena-base word sat 1280 bytes below
+		// main__child's frame pointer, in a slot child() never writes)
+		_ = plant_scrub()
 		child()
 		return
 	}
