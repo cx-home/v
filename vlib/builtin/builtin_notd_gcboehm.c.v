@@ -56,6 +56,13 @@ pub fn gc_disable() {}
 // keep the pool committed for reuse and only trim it aged and budgeted.
 pub fn gc_collect() {
 	$if vgc ? {
+		// cx-home/v#51: the collection's frames under this one land on zeroed
+		// stack, not on what a returned call left there
+		ci := C.vgc_get_cache_idx()
+		if ci >= 0 {
+			unsafe { C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo,
+				vgc_cache(ci).stack_limit_hi) }
+		}
 		vgc_force_collect_release_os()
 	}
 }

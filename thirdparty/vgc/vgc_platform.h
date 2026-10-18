@@ -1178,6 +1178,35 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
     vgc_keep_alive(&buf);
 }
 
+// cx-home/v#51: the frames between a collection's caller and the trampoline
+// above (gc_collect and the runtime calls under it, the jmp_buf whose signal
+// mask setjmp leaves unwritten) are carved out of stack that earlier calls at
+// that depth used. A slot they reserve but never write keeps what a returned
+// call left there, and the conservative scan of [trampoline sp, top] reads it
+// as a root: CI 39107667199 marked a dropped node at an arena's base in the
+// last cycle that no word held once the program's later calls had written
+// over the stack (and with it a 1 KB buffer's span);
+// bench/parallel-alloc/vgc_dead_stack_test.v plants the case. vgc_clear_dead_stack zeroes
+// VGC_DEAD_STACK_BYTES of the dead stack below its caller in a frame of its
+// own (a real local array, so a signal handler's frame never lands in what is
+// being written), so the collection's frames read zero where they do not
+// write. It is skipped when the thread's known stack lacks the room or the SP
+// is off it (a foreign stack, cx #743).
+#define VGC_DEAD_STACK_BYTES 8192
+#if defined(_MSC_VER) && !defined(__clang__)
+  __declspec(noinline) static void vgc_zero_dead_stack(void) {
+#else
+  __attribute__((noinline)) static void vgc_zero_dead_stack(void) {
+#endif
+    volatile uintptr_t pad[VGC_DEAD_STACK_BYTES / sizeof(uintptr_t)];
+    for (size_t i = 0; i < VGC_DEAD_STACK_BYTES / sizeof(uintptr_t); i++) pad[i] = 0;
+}
+static inline void vgc_clear_dead_stack(uintptr_t limit_lo, uintptr_t limit_hi) {
+    uintptr_t sp = vgc_real_sp();
+    if (limit_lo < limit_hi && (sp < limit_lo + 8 * VGC_DEAD_STACK_BYTES || sp > limit_hi)) return;
+    vgc_zero_dead_stack();
+}
+
 // ── Waiting out a stop-the-world (cx-private#1893) ─────────────────────────
 // A mutator parked at a safepoint used to spin on gc_stop_flag with the CPU's
 // pause/yield hint for the WHOLE collection (mark + sweep, milliseconds under a

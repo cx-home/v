@@ -95,6 +95,7 @@ fn C.vgc_susp_chunk_bounds(ci int, lo &usize, hi &usize) int // chunk ci's suspe
 fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
 fn C.vgc_thread_regs(idx int, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_clear_dead_stack(limit_lo usize, limit_hi usize) // cx-home/v#51: zero the dead stack below the caller
 fn C.vgc_num_cpus() int
 fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default ceiling)
 
@@ -5111,6 +5112,8 @@ fn vgc_force_collect() {
 	ci := C.vgc_get_cache_idx()
 	if ci >= 0 {
 		unsafe {
+			// cx-home/v#51: the trampoline's frame lands on zeroed stack
+			C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo, vgc_cache(ci).stack_limit_hi)
 			C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
 				vgc_cache(ci).stack_base)
 		}
@@ -5283,6 +5286,9 @@ fn vgc_maybe_gc() {
 			ci := C.vgc_get_cache_idx()
 			if ci >= 0 {
 				unsafe {
+					// cx-home/v#51: the trampoline's frame lands on zeroed stack
+					C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo,
+						vgc_cache(ci).stack_limit_hi)
 					C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo,
 						&vgc_cache(ci).stack_hi, vgc_cache(ci).stack_base)
 				}
