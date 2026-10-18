@@ -3339,6 +3339,7 @@ fn vgc_do_sweep() {
 		vgc_pool_trim_all()
 	} else {
 		vgc_pool_trim()
+		vgc_pool_return_above_floor() // cx-private#1836 L5
 	}
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 1)
 }

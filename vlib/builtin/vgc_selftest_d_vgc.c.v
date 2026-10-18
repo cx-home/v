@@ -399,3 +399,11 @@ pub fn vgc_mark_backoff_selftest() u32 {
 		return rc
 	}
 }
+
+// vgc_pool_hot_bytes answers the committed (hot) bytes in the free-span pool
+// and the floor the end-of-sweep return keeps (cx-private#1836 L5), for
+// bench/parallel-alloc/vgc_pool_floor_test.v. A racy read; exact between
+// collections on a single-threaded program.
+pub fn vgc_pool_hot_bytes() (u64, u64, bool) {
+	return vgc_heap.pool_bytes, vgc_pool_floor_bytes, vgc_pool_floor_on
+}

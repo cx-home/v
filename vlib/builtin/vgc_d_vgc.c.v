@@ -2035,6 +2035,15 @@ pub fn vgc_init() {
 	vgc_grow_gate_growing_pct = vgc_env_pct(c'VGC_GROW_GATE_GROWING_PCT', vgc_grow_gate_growing_pct)
 	vgc_grow_gate_rate_pct = vgc_env_pct(c'VGC_GROW_GATE_RATE_PCT', vgc_grow_gate_rate_pct)
 	vgc_pacer_wall = vgc_env_pct(c'VGC_PACER_WALL', vgc_pacer_wall)
+	pf_env := C.getenv(c'VGC_POOL_FLOOR_KB')
+	if pf_env != unsafe { nil } {
+		pf := C.atoll(pf_env)
+		if pf < 0 {
+			vgc_pool_floor_on = false
+		} else {
+			vgc_pool_floor_bytes = u64(pf) * 1024
+		}
+	}
 	stall_env := C.getenv(c'VGC_TEST_COLLECTOR_STALL_US')
 	if stall_env != unsafe { nil } && C.atoll(stall_env) > 0 && C.atoll(stall_env) <= 1000000 {
 		vgc_test_stall_us = u64(C.atoll(stall_env))
@@ -3700,6 +3709,41 @@ fn vgc_pool_compensate_arena(arena_idx int, start usize, want u64) (u64, usize, 
 	}
 	return took, 0, true
 }
+
+// cx-private#1836 L5: the hot pool above a floor goes back to the OS at the
+// end of every sweep. The aged trim (vgc_pool_trim) waits two cycles and
+// returns 128 spans a cycle, so a small heap whose transients empty a few MB
+// of spans each cycle (csvr: 1-5 MB pooled after every sweep against 3-4 MB
+// live) kept that pool resident for its whole run. The surplus is returned as
+// the compensation walk returns it — whole address-adjacent runs of hot
+// pooled spans, one decommit per run, the spans flagged cold and reusable
+// (vgc_pool_compensate_arena) — so the cost is one page-map walk per cycle
+// and a zero-fill fault per hardware page the next interval reuses. The
+// floor (VGC_POOL_FLOOR_KB, default 1024; negative = off) keeps the spans a
+// steady allocation rate re-pops at once.
+__global vgc_pool_floor_bytes = u64(1024) * 1024
+__global vgc_pool_floor_on = true
+
+// Caller: the sweep's tail (stopped, free_spans_lock held across the cycle).
+fn vgc_pool_return_above_floor() {
+	if !vgc_pool_floor_on || vgc_heap.pool_bytes <= vgc_pool_floor_bytes {
+		return
+	}
+	want := vgc_heap.pool_bytes - vgc_pool_floor_bytes
+	mut done := u64(0)
+	for i in 0 .. vgc_heap.narenas {
+		if done >= want {
+			break
+		}
+		took, _, _ := vgc_pool_compensate_arena(i, 0, want - done)
+		done += took
+	}
+	vgc_pool_floor_returned += done
+}
+
+// bytes the floor return has given back, cumulative (the trace's trimmed=
+// counts them too: they are cold pooled spans)
+__global vgc_pool_floor_returned = u64(0)
 
 // vgc_pool_decommit_run returns the pages [start, start + npages) of one arena
 // — a run of address-adjacent hot pooled spans — to the OS with ONE decommit
