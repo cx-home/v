@@ -80,14 +80,18 @@ fn plant_scrub() u64 {
 	return buf[4095]
 }
 
-fn child() {
-	mut kept := []&Node{cap: node_count / 3 + 1}
+// build allocates the shape (cx-home/v#51): its loop runs in its own frame, so
+// the loop's temporaries (array structs, element pointers, a node literal) die
+// with it. Run in child()'s frame, a dead temporary of that loop is a stack
+// slot the collector scans conservatively at every later collection: CI
+// 39126681128 (the test x400 under -d vgc_rootdiag) named it, a word 2080
+// bytes below main__child's frame pointer (tcc) holding an arena's base, which
+// is the address of the 1 KB buffer carved first in that arena — kept by the
+// program's own stale slot, not by the walk, in whichever run it happened to
+// hold one. The span count is the walk mode's only when no such slot is live.
+@[noinline]
+fn build(mut kept []&Node, key u64) u64 {
 	mut sink := u64(0)
-	mut key := u64(0)
-	if os.getenv('VGC_PS_PLANT') == '1' {
-		key = plant_alloc_and_drop()
-		sink += plant_scrub() & 1
-	}
 	for i in 0 .. node_count {
 		mut n := &Node{
 			id:  u64(i)
@@ -109,6 +113,33 @@ fn child() {
 			sink += n.tag & 0xff
 		}
 	}
+	return sink
+}
+
+// churn allocates and drops 16 MB of 1 KB buffers, in its own frame as build
+@[noinline]
+fn churn() u64 {
+	mut sink := u64(0)
+	for i in 0 .. 16384 {
+		t := []u8{len: 1024, init: u8(i)}
+		sink += u64(t[i % 1024])
+	}
+	return sink
+}
+
+// Before each collection the dead stack under child() is overwritten with
+// integers (plant_scrub, 32 KB): build()'s and churn()'s returned frames then
+// hold no address when gc_collect's frames are laid over them.
+fn child() {
+	mut kept := []&Node{cap: node_count / 3 + 1}
+	mut sink := u64(0)
+	mut key := u64(0)
+	if os.getenv('VGC_PS_PLANT') == '1' {
+		key = plant_alloc_and_drop()
+		sink += plant_scrub() & 1
+	}
+	sink += build(mut kept, key)
+	sink += plant_scrub() & 1
 	for _ in 0 .. 3 {
 		gc_collect()
 	}
@@ -118,12 +149,11 @@ fn child() {
 			kept[k] = unsafe { nil }
 		}
 	}
+	sink += plant_scrub() & 1
 	gc_collect()
 	gc_collect()
-	for i in 0 .. 16384 {
-		t := []u8{len: 1024, init: u8(i)}
-		sink += u64(t[i % 1024])
-	}
+	sink += churn()
+	sink += plant_scrub() & 1
 	gc_collect()
 	mut sum := u64(0)
 	mut live := u64(0)
