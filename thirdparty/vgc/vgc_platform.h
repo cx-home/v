@@ -2475,7 +2475,23 @@ static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t
         }
     }
 #else
-    (void)own;
+    // cx-home/v#51 (diag): off darwin the frame that holds a stack word is named
+    // by its return address (raw; the reader resolves it with the load base and
+    // `nm`), walking the frame-pointer chain as above
+    if (cat >= 10 && own) {
+        void** fp = (void**)__builtin_frame_address(0);
+        void* prev_lr = 0;
+        for (int i = 0; i < 4096 && fp; i++) {
+            if ((uintptr_t)fp > where) {
+                fprintf(stderr, " frame=%p fp_off=%lld", prev_lr, (long long)((intptr_t)fp - (intptr_t)where));
+                break;
+            }
+            prev_lr = fp[1];
+            void** next = (void**)fp[0];
+            if (next <= fp) break;
+            fp = next;
+        }
+    }
 #endif
     fprintf(stderr, "\n");
 }
