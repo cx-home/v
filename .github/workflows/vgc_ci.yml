@@ -38,7 +38,7 @@ jobs:
         run: VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
 
   # cx-home/v#51 diagnostic (branch fix/gaps2-v51-rd only): the parallel sweep
-  # test built with -d vgc_rootdiag, run 150 times in one job; each failure
+  # test built with -d vgc_rootdiag, run 400 times in one job; each failure
   # prints the last cycle's root words, so the word that keeps the arena-base
   # object is named by its kind and address.
   v51-loop:
@@ -48,11 +48,11 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build V
         run: make -j4 && ./v symlink
-      - name: vgc_parallel_sweep_test x150 (-d vgc_rootdiag)
+      - name: vgc_parallel_sweep_test x400 (-d vgc_rootdiag)
         run: |
           ./v -d vgc_rootdiag -skip-running -o ps_rd bench/parallel-alloc/vgc_parallel_sweep_test.v
           fails=0
-          for i in $(seq 1 150); do
+          for i in $(seq 1 400); do
             if [ $((i % 2)) = 0 ]; then export VGC_MARK_PAR_MIN_US=0; mp=0; else unset VGC_MARK_PAR_MIN_US; mp=default; fi
             if ! VGC_ROOTDIAG_MIN_KB=1 ./ps_rd > out.txt 2>&1; then
               fails=$((fails+1))
@@ -60,7 +60,7 @@ jobs:
               grep -v '^\[rootdiag' out.txt | head -c 30000
             fi
           done
-          echo "v51 loop: $fails of 150 runs failed"
+          echo "v51 loop: $fails of 400 runs failed"
           test $fails = 0
 
   vgc-freebsd:

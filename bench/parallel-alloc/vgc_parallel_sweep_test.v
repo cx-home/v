@@ -249,6 +249,9 @@ fn last_cycle_roots(rd []string, base u64) string {
 		if l.contains('root=data') {
 			data << 'rd-data@${l.all_after('where=').all_before(' ')}='
 		}
+		if l.contains(' frame=0x') {
+			data << 'rd-frame@${l.all_after(' frame=').all_before(' ')}='
+		}
 	}
 	return '; rootdiag gc ${last}: ${out.join(' | ')}${data_symbols(data.join(','), base)}'
 }
@@ -256,7 +259,7 @@ fn last_cycle_roots(rd []string, base u64) string {
 // data_symbols names the symbol of each data-segment holder (Linux: the child's
 // load base from /proc/self/maps and `nm -n` of this binary), for the message
 fn data_symbols(holders string, base u64) string {
-	if base == 0 || !holders.contains('data') {
+	if base == 0 || !(holders.contains('data') || holders.contains('rd-frame')) {
 		return ''
 	}
 	r := os.execute('nm -n ${os.quoted_path(os.executable())}')
@@ -274,10 +277,12 @@ fn data_symbols(holders string, base u64) string {
 	}
 	mut out := []string{}
 	for e in holders.split(',') {
-		if !e.contains('data') || !e.contains('@0x') {
+		if !(e.contains('data') || e.contains('rd-frame')) || !e.contains('@0x') {
 			continue
 		}
-		a := (e.all_after('@0x').all_before('=').parse_uint(16, 64) or { continue }) - base
+		// a PIE binary's symbols are offsets from the load base; a fixed one's are addresses
+		abs := e.all_after('@0x').all_before('=').parse_uint(16, 64) or { continue }
+		a := if addrs.len > 0 && addrs.last() >= base { abs } else { abs - base }
 		mut best := -1
 		for i, x in addrs {
 			if x <= a {
