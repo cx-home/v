@@ -159,6 +159,9 @@ fn child() {
 		}
 	}
 	println('HOLDERS=${vgc_orphan_holders(known, 1152)}')
+	// cx-home/v#51 (diag): where the cache records sit, so a -d vgc_rootdiag
+	// line of kind caches names its slot and field
+	println('CACHES=${vgc_cache_layout()}')
 	$if linux {
 		exe := os.executable()
 		maps := os.read_file('/proc/self/maps') or { '' }
@@ -197,6 +200,8 @@ fn evidence(out string) string {
 	mut census := ''
 	mut holders := ''
 	mut base := u64(0)
+	mut caches := ''
+	mut rd := []string{}
 	for l in out.split_into_lines() {
 		if l.contains(' phases ') && l.contains('spans_in_use=') {
 			cyc << '${l.all_after('spans_in_use=').all_before(' ')}/w${l.all_after('walkers=').all_before(' ')}'
@@ -210,9 +215,42 @@ fn evidence(out string) string {
 		if l.starts_with('BASE=') {
 			base = l.all_after('BASE=0x').parse_uint(16, 64) or { 0 }
 		}
+		if l.starts_with('CACHES=') {
+			caches = l.all_after('CACHES=')
+		}
+		if l.starts_with('[rootdiag gc ') {
+			rd << l
+		}
 	}
 	return 'cycles ${cyc.join(' ')}; census ${census}; holders ${holders}${data_symbols(holders,
-		base)}'
+		base)}${last_cycle_roots(rd, base)}; caches ${caches}'
+}
+
+// cx-home/v#51 (diag, a -d vgc_rootdiag build): the last cycle's root words that
+// alone reached less than 1 MB (the kept list's root reaches the whole live
+// set), each with its kind, address and value, and a data word's symbol
+fn last_cycle_roots(rd []string, base u64) string {
+	if rd.len == 0 {
+		return ''
+	}
+	last := rd.last().all_after('[rootdiag gc ').all_before(']')
+	mut out := []string{}
+	mut data := []string{}
+	for l in rd {
+		if l.all_after('[rootdiag gc ').all_before(']') != last {
+			continue
+		}
+		if l.all_after('reaches=').all_before(' ').u64() >= 1048576 {
+			continue
+		}
+		if out.len < 40 {
+			out << l.all_after('] ')
+		}
+		if l.contains('root=data') {
+			data << 'rd-data@${l.all_after('where=').all_before(' ')}='
+		}
+	}
+	return '; rootdiag gc ${last}: ${out.join(' | ')}${data_symbols(data.join(','), base)}'
 }
 
 // data_symbols names the symbol of each data-segment holder (Linux: the child's
