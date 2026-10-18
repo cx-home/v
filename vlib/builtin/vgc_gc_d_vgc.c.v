@@ -900,72 +900,173 @@ fn vgc_rescan_dirty_spans(term bool) {
 		// soundness gate (cm_stress) must reproduce live reclamation with it.
 		return
 	}
-	vgc_cm_rescan_spans = 0
-	vgc_cm_rescan_objs = 0
-	vgc_perm_young_objs = 0
-	nb := (vgc_heap.nspans + 7) / 8
-	for wi in 0 .. nb {
-		mut bits := unsafe { vgc_heap.inuse_bits[wi] }
-		for bits != 0 {
-			bi := C.vgc_ctz8(bits)
-			bits &= bits - 1
-			span := unsafe { vgc_heap.allspans[wi * 8 + bi] }
-			if span == unsafe { nil } || !span.in_use {
-				continue
-			}
-			mut dirty := C.vgc_atomic_load_u32(&span.dirty) != 0 || C.vgc_atomic_load_u32(&span.born) != 0
-			if span.perm != 0 && span.perm_bits != unsafe { nil } && !span.noscan {
-				if vgc_perm_cards_take(span) {
-					dirty = true
-				}
-				// cx-home/v#15: a permanent span. Dirtied since the last stop: its
-				// PERMANENT objects are scanned (every other object in it is traced
-				// or swept as usual — scanning a dead one would keep what it points
-				// to; at a concurrent termination every allocated object, as any
-				// dirty span: a black young object mutated in the middle) and
-				// young_bits re-taken; clean: only the permanent objects young_bits
-				// names (they hold a pointer to a non-permanent object, which only
-				// they keep alive).
-				vgc_rescan_perm_span(span, dirty, term)
-				if dirty {
-					unsafe {
-						C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
-						C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 0)
-					}
-				}
-				continue
-			}
-			if !dirty {
-				continue
-			}
-			unsafe {
-				C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
-				C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 0)
-			}
-			if span.noscan || span.alloc_bits == unsafe { nil } {
-				continue
-			}
-			vgc_cm_rescan_spans++
-			nbytes := (span.nelems + 7) / 8
-			for b in 0 .. nbytes {
-				alloc_byte := unsafe { span.alloc_bits[b] }
-				if alloc_byte == 0 {
+	for w in 0 .. vgc_max_markers {
+		vgc_rescan_sum[w * 16] = 0
+		vgc_rescan_sum[w * 16 + 1] = 0
+		vgc_rescan_sum[w * 16 + 2] = 0
+	}
+	vgc_rescan_term = term
+	C.vgc_atomic_store_u32(&vgc_walk_cursor, 0)
+	// cx-home/v#52: at eight allocating threads the termination re-scan was
+	// one thread walking every span they dirtied or allocated into (2.5 ms of
+	// a 3.5 ms stop, 3,000 objects a cycle) while the pool idled and every
+	// mutator waited; the spans are disjoint, so each pool thread takes a
+	// stripe of the span table and shades into its own work buffer
+	n := vgc_rescan_nworkers_cur
+	if n <= 1 || vgc_mark_pool_n == 0 {
+		vgc_rescan_walk(0, 1)
+	} else {
+		vgc_pool_run(vgc_pool_phase_rescan, n)
+	}
+	mut spans := u64(0)
+	mut objs := u64(0)
+	mut young := u64(0)
+	for w in 0 .. vgc_max_markers {
+		spans += vgc_rescan_sum[w * 16]
+		objs += vgc_rescan_sum[w * 16 + 1]
+		young += vgc_rescan_sum[w * 16 + 2]
+	}
+	vgc_cm_rescan_spans = spans
+	vgc_cm_rescan_objs = objs
+	vgc_perm_young_objs = young
+}
+
+// One thread's share of the re-scan (vgc_rescan_dirty_spans): it claims
+// vgc_rescan_chunk words of inuse_bits at a time from the shared cursor and
+// touches only the spans of its claims — their dirty and born flags, their
+// cards and young bits — and shades into its own work buffer (w), which a
+// pool thread publishes to the shared list before it reports the phase done
+// (the drain that follows may run on fewer markers than the re-scan had).
+fn vgc_rescan_walk(w int, n int) {
+	term := vgc_rescan_term
+	nb := u32((vgc_heap.nspans + 7) / 8)
+	mut spans := u64(0)
+	mut objs := u64(0)
+	mut young := u64(0)
+	for {
+		w1 := C.vgc_atomic_add_u32(&vgc_walk_cursor, vgc_rescan_chunk)
+		w0 := w1 - vgc_rescan_chunk
+		if w0 >= nb {
+			break
+		}
+		hi := if w1 < nb { w1 } else { nb }
+		for wi in w0 .. hi {
+			mut bits := unsafe { vgc_heap.inuse_bits[int(wi)] }
+			for bits != 0 {
+				bi := C.vgc_ctz8(bits)
+				bits &= bits - 1
+				span := unsafe { vgc_heap.allspans[int(wi) * 8 + bi] }
+				if span == unsafe { nil } || !span.in_use {
 					continue
 				}
-				for bit in 0 .. 8 {
-					idx := u32(b) * 8 + u32(bit)
-					if idx >= span.nelems {
-						break
+				mut dirty := C.vgc_atomic_load_u32(&span.dirty) != 0
+					|| C.vgc_atomic_load_u32(&span.born) != 0
+				if span.perm != 0 && span.perm_bits != unsafe { nil } && !span.noscan {
+					if vgc_perm_cards_take(span) {
+						dirty = true
 					}
-					if (alloc_byte & (u8(1) << u32(bit))) != 0 {
-						vgc_cm_rescan_objs++
-						obj_addr := span.base + usize(idx) * usize(span.elem_size)
-						vgc_scan_range(obj_addr, obj_addr + usize(span.elem_size), 0)
+					// cx-home/v#15: a permanent span. Dirtied since the last stop: its
+					// PERMANENT objects are scanned (every other object in it is traced
+					// or swept as usual — scanning a dead one would keep what it points
+					// to; at a concurrent termination every allocated object, as any
+					// dirty span: a black young object mutated in the middle) and
+					// young_bits re-taken; clean: only the permanent objects young_bits
+					// names (they hold a pointer to a non-permanent object, which only
+					// they keep alive).
+					ps, po, py := vgc_rescan_perm_span(span, dirty, term, w)
+					spans += ps
+					objs += po
+					young += py
+					if dirty {
+						unsafe {
+							C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+							C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 0)
+						}
+					}
+					continue
+				}
+				if !dirty {
+					continue
+				}
+				unsafe {
+					C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+					C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 0)
+				}
+				if span.noscan || span.alloc_bits == unsafe { nil } {
+					continue
+				}
+				spans++
+				nbytes := (span.nelems + 7) / 8
+				for b in 0 .. nbytes {
+					alloc_byte := unsafe { span.alloc_bits[b] }
+					if alloc_byte == 0 {
+						continue
+					}
+					for bit in 0 .. 8 {
+						idx := u32(b) * 8 + u32(bit)
+						if idx >= span.nelems {
+							break
+						}
+						if (alloc_byte & (u8(1) << u32(bit))) != 0 {
+							objs++
+							obj_addr := span.base + usize(idx) * usize(span.elem_size)
+							vgc_scan_range(obj_addr, obj_addr + usize(span.elem_size), w)
+						}
 					}
 				}
 			}
 		}
 	}
+	vgc_rescan_sum[w * 16] = spans
+	vgc_rescan_sum[w * 16 + 1] = objs
+	vgc_rescan_sum[w * 16 + 2] = young
+	if w > 0 {
+		vgc_work_flush_local(w)
+	}
+}
+
+// cx-home/v#52: this cycle's re-scan thread count, planned before stop 1 (the
+// pool grows outside a stop): one thread per quarter of vgc_mark_par_min_ns
+// of the last re-scan's work, up to the marker configuration and the CPUs
+// the rest of the box leaves free (the walks' load gate: a preempted thread
+// holds its claim through the join); serial in a fork child and under the
+// diagnostic builds whose shade path writes shared counters.
+fn vgc_rescan_plan() int {
+	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked || vgc_watch_addr != 0 {
+		return 1
+	}
+	$if vgc_rootdiag ? {
+		return 1
+	}
+	$if vgc_birthcheck ? {
+		return 1
+	}
+	$if vgc_passive ? {
+		return 1
+	}
+	q := vgc_mark_par_min_ns / 4
+	mut total := if q == 0 {
+		vgc_mark_workers_cfg
+	} else {
+		int(vgc_rescan_last_work_ns / q)
+	}
+	if total > vgc_mark_workers_cfg {
+		total = vgc_mark_workers_cfg
+	}
+	if vgc_walk_load_gate {
+		if C.vgc_box_busy(vgc_walk_ncpu) != 0 {
+			return 1
+		}
+		free_cpus := C.vgc_box_free_cpus(vgc_walk_ncpu,
+			int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
+		if total > free_cpus {
+			total = free_cpus
+		}
+	}
+	if total <= 1 {
+		return 1
+	}
+	return vgc_pool_ensure(total)
 }
 
 // vgc_perm_cards_take reads and clears the cards of a permanent span's pages
@@ -994,7 +1095,7 @@ fn vgc_perm_cards_take(span &VGC_Span) bool {
 // vgc_scan_perm_obj scans one object's words as vgc_scan_range does (every
 // heap pointer shaded) and reports whether any of them refers to an allocated
 // object outside the permanent generation (cx-home/v#15).
-fn vgc_scan_perm_obj(lo usize, hi usize) bool {
+fn vgc_scan_perm_obj(lo usize, hi usize, w int) bool {
 	mut young := false
 	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 	mut addr := start
@@ -1017,16 +1118,19 @@ fn vgc_scan_perm_obj(lo usize, hi usize) bool {
 			continue // a permanent object: black already
 		}
 		young = true
-		vgc_shade(val, 0)
+		vgc_shade(val, w)
 	}
 	return young
 }
 
 // One permanent span's re-scan (see vgc_rescan_dirty_spans). young_bits is a
 // subset of perm_bits: only a permanent object is a root for what it points to.
-fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool) {
+fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool, w int) (u64, u64, u64) {
+	mut spans := u64(0)
+	mut objs := u64(0)
+	mut young := u64(0)
 	if span.alloc_bits == unsafe { nil } {
-		return
+		return 0, 0, 0
 	}
 	yb := vgc_young_bits(span)
 	nbytes := (span.nelems + 7) / 8
@@ -1044,7 +1148,7 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool) {
 			continue
 		}
 		if !counted {
-			vgc_cm_rescan_spans++
+			spans++
 			counted = true
 		}
 		mut nyb := u8(0)
@@ -1058,12 +1162,12 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool) {
 				continue
 			}
 			obj_addr := span.base + usize(idx) * usize(span.elem_size)
-			if vgc_scan_perm_obj(obj_addr, obj_addr + usize(span.elem_size)) && (pbyte & m) != 0 {
+			if vgc_scan_perm_obj(obj_addr, obj_addr + usize(span.elem_size), w) && (pbyte & m) != 0 {
 				nyb |= m
-				vgc_perm_young_objs++
+				young++
 			}
 			if dirty {
-				vgc_cm_rescan_objs++
+				objs++
 			}
 		}
 		if dirty {
@@ -1071,7 +1175,7 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool) {
 				yb[b] = nyb
 			}
 		}
-	}
+	}	return spans, objs, young
 }
 
 // The roots, as both stops take them: the suspended threads' registers and
@@ -1342,6 +1446,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_gc_wait_cpu = 0
 	vgc_mark_nworkers_cur = vgc_mark_plan()
 	vgc_walk_nworkers_cur = vgc_walk_plan()
+	vgc_rescan_nworkers_cur = vgc_rescan_plan() // cx-home/v#52
 	self_idx := C.vgc_get_cache_idx()
 	C.vgc_trace(5, self_idx, u64(vgc_heap.gc_cycle), u64(vgc_heap.ncaches)) // GC_BEG
 
@@ -1414,6 +1519,7 @@ fn vgc_gc_start_concurrent() {
 	t_rescan := C.vgc_now_ns()
 	vgc_rescan_dirty_spans(true)
 	vgc_cm_rescan_ns = C.vgc_now_ns() - t_rescan
+	vgc_rescan_last_work_ns = vgc_cm_rescan_ns * u64(vgc_rescan_nworkers_cur)
 	vgc_cm_drain()
 	vgc_cm_verify(self_idx)
 	vgc_ph[5] = C.vgc_now_ns()
@@ -1495,6 +1601,7 @@ fn vgc_gc_start_concurrent() {
 	vgc_stw_resume(self_idx)
 	C.vgc_trace(12, self_idx, u64(vgc_heap.gc_cycle), 0) // GC_END
 	vgc_gc_owner = -1
+	vgc_rescan_nworkers_cur = 1 // the stop-the-world collector's re-scan is serial
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 }
 
@@ -2410,15 +2517,19 @@ fn vgc_walk_plan() int {
 // the walks' own clock).
 fn vgc_walk_adapt(walked_ns u64) {
 	rate := walked_ns / (u64(vgc_heap.nspans) + 1)
-	if vgc_walk_nworkers_cur <= 1 {
-		vgc_walk_rate1 = if vgc_walk_rate1 == 0 { rate } else { (vgc_walk_rate1 * 7 + rate) / 8 }
-		return
-	}
+	// cx-home/v#52: as the mark's (vgc_mark_adapt) — the back-off counts down
+	// on every cycle, so one halved to a single walker ends too
 	if vgc_walk_backoff > 0 {
 		vgc_walk_backoff--
 		if vgc_walk_backoff == 0 {
 			vgc_walk_n_target = 0
 		}
+	}
+	if vgc_walk_nworkers_cur <= 1 {
+		vgc_walk_rate1 = if vgc_walk_rate1 == 0 { rate } else { (vgc_walk_rate1 * 7 + rate) / 8 }
+		return
+	}
+	if vgc_walk_backoff > 0 || vgc_walk_n_target > 0 {
 		return
 	}
 	if vgc_walk_rate1 > 0 && rate * 10 > vgc_walk_rate1 * 9 {
@@ -2457,19 +2568,40 @@ fn vgc_mark_adapt(marked u64) {
 	$if vgc_concurrent ? {
 		cm = vgc_cm_this_cycle
 	}
+	// cx-home/v#52: the back-off counts down on EVERY cycle, the one-marker
+	// cycles included. It counted only parallel ones, so a lost two-marker
+	// probe (halved to one) was a back-off that never ended: the stores-mt
+	// driver at eight threads stayed on one marker for the whole run in three
+	// runs of five (a 6 ms middle against 1.1 ms, 570 ms against 220).
+	if vgc_mark_backoff > 0 {
+		vgc_mark_backoff--
+		if vgc_mark_backoff == 0 {
+			vgc_mark_n_target = 0
+		}
+	}
 	if vgc_mark_nworkers_cur <= 1 {
 		if cm {
 			vgc_mark_rate1_cm = if vgc_mark_rate1_cm == 0 { rate } else { (vgc_mark_rate1_cm * 7 + rate) / 8 }
 		} else {
 			vgc_mark_rate1 = if vgc_mark_rate1 == 0 { rate } else { (vgc_mark_rate1 * 7 + rate) / 8 }
 		}
+		// cx-home/v#52: a probe judged against a baseline the start-up's small
+		// heap set (145 ns/KB at 6 MB marked against 275 at 22 MB, the same
+		// one marker) lost at two markers with 160 and backed off for 32
+		// cycles of 275; once the one-marker cycles of the back-off move the
+		// baseline past the probe's rate, the probe won after all and the
+		// back-off ends
+		if vgc_mark_backoff > 0 && vgc_mark_lost_rate > 0 && vgc_mark_lost_cm == cm {
+			b1 := if cm { vgc_mark_rate1_cm } else { vgc_mark_rate1 }
+			if vgc_mark_lost_rate * 10 <= b1 * 9 {
+				vgc_mark_backoff = 0
+				vgc_mark_n_target = 0
+				vgc_mark_lost_rate = 0
+			}
+		}
 		return
 	}
-	if vgc_mark_backoff > 0 {
-		vgc_mark_backoff--
-		if vgc_mark_backoff == 0 {
-			vgc_mark_n_target = 0
-		}
+	if vgc_mark_backoff > 0 || vgc_mark_n_target > 0 {
 		return
 	}
 	base := if cm { vgc_mark_rate1_cm } else { vgc_mark_rate1 }
@@ -2480,6 +2612,8 @@ fn vgc_mark_adapt(marked u64) {
 		}
 		vgc_mark_n_target = n
 		vgc_mark_backoff = 32
+		vgc_mark_lost_rate = rate
+		vgc_mark_lost_cm = cm
 	}
 }
 
@@ -2539,6 +2673,8 @@ fn vgc_pool_phase_run(phase u32, slot int, n int) {
 		vgc_walk_count(slot, n)
 	} else if phase == vgc_pool_phase_sweep {
 		vgc_walk_sweep(slot, n)
+	} else if phase == vgc_pool_phase_rescan {
+		vgc_rescan_walk(slot, n)
 	}
 }
 

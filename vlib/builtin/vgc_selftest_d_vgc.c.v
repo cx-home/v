@@ -307,3 +307,95 @@ pub fn vgc_inflight_selftest() u32 {
 	}
 	return rc
 }
+
+// vgc_mark_backoff_selftest — cx-home/v#52: the marker plan's back-off
+// (vgc_mark_adapt) must end. It counted down only on parallel cycles, so a
+// probe halved to ONE marker never ran another parallel cycle and stayed on
+// one marker for the rest of the process (the stores-mt driver at eight
+// threads in three runs of five: 570 ms against 220). The adapt function is
+// driven with synthetic cycles of the concurrent kind on the calling thread
+// (the caller runs no collection meanwhile) and every global it touches is
+// restored. Driven by bench/parallel-alloc/vgc_mark_backoff_test.v. Returns 0,
+// else the id of the first failed check.
+pub fn vgc_mark_backoff_selftest() u32 {
+	$if !vgc_concurrent ? {
+		return 0
+	} $else {
+		s_ncur := vgc_mark_nworkers_cur
+		s_last := vgc_mark_last_ns
+		s_r1 := vgc_mark_rate1
+		s_r1cm := vgc_mark_rate1_cm
+		s_tgt := vgc_mark_n_target
+		s_bo := vgc_mark_backoff
+		s_lost := vgc_mark_lost_rate
+		s_lostcm := vgc_mark_lost_cm
+		s_cm := vgc_cm_this_cycle
+		mut rc := u32(0)
+		kb := u64(20000) // marked = 20000 KB less a byte: kb = marked / 1024 + 1
+		marked := (kb - 1) * 1024
+		vgc_cm_this_cycle = true
+		// (1) a two-marker probe at 160 ns/KB against a 145 baseline loses:
+		// one marker, a 32-cycle back-off
+		vgc_mark_rate1_cm = 145
+		vgc_mark_n_target = 0
+		vgc_mark_backoff = 0
+		vgc_mark_lost_rate = 0
+		vgc_mark_nworkers_cur = 2
+		vgc_mark_last_ns = 160 * kb
+		vgc_mark_adapt(marked)
+		if vgc_mark_n_target != 1 || vgc_mark_backoff != 32 {
+			rc = 1
+		}
+		// (2) the one-marker cycles of the back-off read 290 ns/KB: the
+		// baseline passes the probe's rate within a few cycles and the
+		// back-off ends (the probe won after all)
+		if rc == 0 {
+			vgc_mark_nworkers_cur = 1
+			vgc_mark_last_ns = 290 * kb
+			mut ended := 0
+			for i in 0 .. 8 {
+				vgc_mark_adapt(marked)
+				if vgc_mark_n_target == 0 && vgc_mark_backoff == 0 {
+					ended = i + 1
+					break
+				}
+			}
+			if ended == 0 {
+				rc = 2
+			}
+		}
+		// (3) a probe that truly lost (the one-marker rate stays at the
+		// baseline): the back-off still ends after its 32 cycles, not never
+		if rc == 0 {
+			vgc_mark_rate1_cm = 145
+			vgc_mark_n_target = 0
+			vgc_mark_backoff = 0
+			vgc_mark_nworkers_cur = 2
+			vgc_mark_last_ns = 160 * kb
+			vgc_mark_adapt(marked)
+			vgc_mark_nworkers_cur = 1
+			vgc_mark_last_ns = 145 * kb
+			for _ in 0 .. 31 {
+				vgc_mark_adapt(marked)
+			}
+			if vgc_mark_n_target != 1 || vgc_mark_backoff != 1 {
+				rc = 3 // ended early on a probe that lost, or counted no cycle
+			} else {
+				vgc_mark_adapt(marked)
+				if vgc_mark_n_target != 0 || vgc_mark_backoff != 0 {
+					rc = 4 // the 32nd one-marker cycle did not end it
+				}
+			}
+		}
+		vgc_mark_nworkers_cur = s_ncur
+		vgc_mark_last_ns = s_last
+		vgc_mark_rate1 = s_r1
+		vgc_mark_rate1_cm = s_r1cm
+		vgc_mark_n_target = s_tgt
+		vgc_mark_backoff = s_bo
+		vgc_mark_lost_rate = s_lost
+		vgc_mark_lost_cm = s_lostcm
+		vgc_cm_this_cycle = s_cm
+		return rc
+	}
+}

@@ -1170,6 +1170,10 @@ __global vgc_mark_rate1_cm = u64(0)
 __global vgc_mark_n_target = int(0)
 // a reduced marker count while backing off (0 = the configured count)
 __global vgc_mark_backoff = int(0)
+// cx-home/v#52: the losing probe's rate and kind (0 = none): a back-off ends
+// early once the one-marker baseline shows the probe won after all
+__global vgc_mark_lost_rate = u64(0)
+__global vgc_mark_lost_cm = false
 // parallel cycles left at the reduced count
 
 // cx-home/v#16 (fable-v16): the span WALKS — clearing the mark bits, counting
@@ -1204,6 +1208,10 @@ const vgc_pool_phase_mark = u32(0)
 const vgc_pool_phase_clear = u32(1)
 const vgc_pool_phase_count = u32(2)
 const vgc_pool_phase_sweep = u32(3)
+// cx-home/v#52: the concurrent cycle's termination re-scan of the dirty and
+// born spans (vgc_rescan_dirty_spans) on the pool, one span stripe a claim
+const vgc_pool_phase_rescan = u32(4)
+const vgc_rescan_chunk = u32(4)
 
 __global vgc_walk_workers_cfg = int(-1)
 // -1 = the marker count's configuration (VGC_MARK_WORKERS)
@@ -1229,6 +1237,15 @@ __global vgc_pool_phase = u32(0)
 __global vgc_pool_phase_n = int(1)
 // the thread count of that phase; a pool slot at or past it skips the phase
 __global vgc_walk_cursor = u32(0)
+// cx-home/v#52: this cycle's re-scan thread count (the collector included; 1 =
+// serial, the stop-the-world collector's and every diagnostic build's), whether
+// the re-scan running is the termination one, the last re-scan's work (its wall
+// times its threads) that sizes the next plan, and the per-thread counters
+// (spans, objects, permanent young objects at vgc_rescan_sum[w * 16 + 0/1/2])
+__global vgc_rescan_nworkers_cur = int(1)
+__global vgc_rescan_term = false
+__global vgc_rescan_last_work_ns = u64(0)
+__global vgc_rescan_sum = [vgc_walk_sum_len]u64{}
 // the next inuse_bits word to claim (reset by the collector before each walk)
 __global vgc_walk_sum = [vgc_walk_sum_len]u64{}
 // per-walker marked-byte sums, one per 128-byte stride (vgc_walk_sum[w * 16])
@@ -1914,6 +1931,9 @@ fn vgc_atfork_child() {
 	vgc_mark_n_target = 0
 	vgc_mark_last_work_ns = 0
 	vgc_mark_backoff = 0
+	vgc_mark_lost_rate = 0
+	vgc_rescan_nworkers_cur = 1
+	vgc_rescan_last_work_ns = 0
 	vgc_walk_nworkers_cur = 1
 	vgc_walk_n_target = 0
 	vgc_walk_backoff = 0
