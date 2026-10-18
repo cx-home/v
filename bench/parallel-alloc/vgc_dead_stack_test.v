@@ -37,10 +37,19 @@ fn fill(p &u64, n int, v u64) {
 
 // leave writes the address of a buffer nothing keeps into 8 KB of its frame
 @[noinline]
-fn leave() {
+fn leave() (u64, u64) {
 	b := []u8{len: 64 * 1024, init: 7}
 	mut a := [1024]u64{}
 	fill(&a[0], dead_words, u64(voidptr(b.data)))
+	return unsafe { u64(voidptr(&a[0])) }, unsafe { u64(voidptr(&a[dead_words - 1])) }
+}
+
+// frame_here answers an address in a frame one call below the caller's: where
+// gc_collect's own frame sits, for the failure message
+@[noinline]
+fn frame_here() u64 {
+	x := u64(0)
+	return u64(voidptr(&x)) + x
 }
 
 // spans answers the in-use span count of one object size in the census
@@ -60,9 +69,11 @@ fn spans(census string, size string) int {
 fn test_a_dead_frame_keeps_nothing_across_gc_collect() {
 	gc_collect()
 	before := vgc_span_census()
-	leave()
+	leave_lo, leave_hi := leave()
+	callee := frame_here()
 	gc_collect()
 	after := vgc_span_census()
-	assert spans(after, '65544') == spans(before, '65544'), 'a returned frame kept its buffer: census before ${before}, after ${after}, holders ${vgc_orphan_holders([]usize{},
+	mine := u64(0)
+	assert spans(after, '65544') == spans(before, '65544'), 'a returned frame kept its buffer: census before ${before}, after ${after}; test frame 0x${u64(voidptr(&mine)).hex()}, a callee frame 0x${callee.hex()}, leave array 0x${leave_lo.hex()}..0x${leave_hi.hex()}, stack top = holder address + offset; holders ${vgc_orphan_holders([]usize{},
 		65544)}'
 }
