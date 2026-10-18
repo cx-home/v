@@ -3843,6 +3843,19 @@ fn vgc_memory_use() usize {
 	return total
 }
 
+// vgc_cache_layout answers where the cache records sit and where the fields a
+// root word can name lie in one record (cx-home/v#51 diagnostic): a
+// -d vgc_rootdiag line of kind caches gives the word's address, and this
+// turns it into a slot and a field. A diagnostic read; it allocates its answer.
+pub fn vgc_cache_layout() string {
+	mut chunks := []string{}
+	for ci in 0 .. C.vgc_ncache_chunks() {
+		chunks << '0x${u64(usize(C.vgc_cache_chunk(ci))).hex()}'
+	}
+	return 'chunks=${chunks.join(',')} slots=${vgc_cache_chunk_slots} rec=${sizeof(VGC_Cache)} alloc=${__offsetof(VGC_Cache,
+		alloc)} tiny=${__offsetof(VGC_Cache, tiny)} safe_regs=${__offsetof(VGC_Cache, safe_regs)} ncaches=${vgc_heap.ncaches}'
+}
+
 // the mask on the addresses vgc_orphan_holders keeps (no user-space address)
 const vgc_oh_mask = usize(u64(0x5a5a000000000000))
 
