@@ -37,10 +37,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: VJOBS=1 VGC_MARK_PAR_MIN_US=0 VGC_WALK_WORKERS=8 VGC_WALK_PAR_MIN_SPANS=64 VGC_WALK_LOAD_GATE=0 ./v test bench/parallel-alloc
 
-  # cx-home/v#51 diagnostic (branch fix/gaps2-v51-rd only): the parallel sweep
-  # test built with -d vgc_rootdiag, run 400 times in one job; each failure
-  # prints the last cycle's root words, so the word that keeps the arena-base
-  # object is named by its kind and address.
+  # cx-home/v#51 guard: the parallel sweep test, built with -d vgc_rootdiag, run
+  # 400 times in one job. A 1-in-80 mismatch (a stale stack word keeping an
+  # arena-base buffer) needs hundreds of runs to show; a failure prints the last
+  # cycle's root words with their kind, address and frame, so the word is named
+  # by the run that finds it (0 of 1,200 after the fix; 20 of 1,600 before it).
   v51-loop:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -48,18 +49,6 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build V
         run: make -j4 && ./v symlink
-      - name: vgc_dead_stack_test x5 (-d vgc_rootdiag, frames named)
-        if: ${{ !cancelled() }}
-        run: |
-          ./v -d vgc_rootdiag -skip-running -o ds_rd bench/parallel-alloc/vgc_dead_stack_test.v
-          nm -n ds_rd > ds.nm
-          for i in 1 2 3 4 5; do
-            VGC_ROOTDIAG_MIN_KB=32 ./ds_rd > ds.txt 2>&1 && echo "ds run $i: OK" || echo "ds run $i: FAIL"
-            grep -a 'rootdiag\|Message' ds.txt | head -8
-            for a in $(grep -o 'frame=0x[0-9a-f]*' ds.txt | cut -d= -f2 | sort -u); do
-              best=""; while read x t n; do [ -z "$n" ] && continue; [ $((0x$x)) -le $((a)) ] && best="$n +$(( a - 0x$x ))"; done < ds.nm || true; echo "  frame $a = $best"
-            done
-          done
       - name: vgc_parallel_sweep_test x400 (-d vgc_rootdiag)
         if: ${{ !cancelled() }}
         run: |

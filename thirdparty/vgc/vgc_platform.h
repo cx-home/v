@@ -2474,7 +2474,7 @@ static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t
             fp = next;
         }
     }
-#else
+#elif defined(__GNUC__) || defined(__clang__) || defined(__TINYC__)
     // cx-home/v#51 (diag): off darwin the frame that holds a stack word is named
     // by its return address (raw; the reader resolves it with the load base and
     // `nm`), walking the frame-pointer chain as above
@@ -2492,6 +2492,8 @@ static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t
             fp = next;
         }
     }
+#else
+    (void)own;
 #endif
     fprintf(stderr, "\n");
 }
