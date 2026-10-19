@@ -177,6 +177,9 @@ fn vgc_gc_start() {
 	// latency per cycle, not N.
 	vgc_stw_stop(self_idx)
 
+	if vgc_gctrace >= 3 {
+		vgc_gctrace_occ_pre()
+	}
 	// Clear mark bits on all spans (prepare for new cycle)
 	vgc_ph[0] = C.vgc_now_ns()
 	$if vgc_concurrent ? {
@@ -1500,6 +1503,9 @@ fn vgc_gc_start_concurrent() {
 
 	// ===== STOP 1: the snapshot of the roots =====
 	vgc_stw_stop(self_idx)
+	if vgc_gctrace >= 3 {
+		vgc_gctrace_occ_pre()
+	}
 	vgc_ph[0] = C.vgc_now_ns()
 	// cut 1: this cycle's births start at zero (every thread is stopped: its
 	// born_delta is reset here, not by it), and the middle's bound is a share
@@ -1677,6 +1683,24 @@ fn vgc_gc_start_concurrent() {
 // class (noscan apart): their bytes against the bytes their allocated slots
 // hold, the waste the span granularity costs. One totals line and the eight
 // classes that waste the most. Read-only, no allocation (the world is stopped).
+// the in-use spans at the cycle's start (the heap at its peak): bytes, the
+// bytes their allocated slots hold, the pool
+fn vgc_gctrace_occ_pre() {
+	mut tb := u64(0)
+	mut tu := u64(0)
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use {
+			continue
+		}
+		tb += u64(span.npages) * u64(vgc_page_size)
+		tu += u64(span.alloc_count) * u64(span.elem_size)
+	}
+	C.fprintf(C.stderr, c'[gc %llu] pre spans=%lluKB used=%lluKB pool=%lluKB live=%lluKB\n',
+		C.vgc_ull(vgc_heap.gc_cycle), C.vgc_ull(tb / 1024), C.vgc_ull(tu / 1024),
+		C.vgc_ull(vgc_heap.pool_bytes / 1024), C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.heap_live) / 1024))
+}
+
 fn vgc_gctrace_occupancy() {
 	mut nsp := [136]u32{}
 	mut sb := [136]u64{}
@@ -1716,6 +1740,26 @@ fn vgc_gctrace_occupancy() {
 		C.vgc_ull(vgc_heap.gc_cycle), C.vgc_ull(tot_sb / 1024), C.vgc_ull(tot_ub / 1024),
 		C.vgc_ull(large_sb / 1024), C.vgc_ull(large_ub / 1024), tiny_n,
 		C.vgc_ull(vgc_heap.pool_bytes / 1024))
+	// the spans each thread's cache holds (protected from the sweep)
+	for ci in 0 .. vgc_heap.ncaches {
+		c := unsafe { vgc_cache(ci) }
+		if !c.registered {
+			continue
+		}
+		mut cn := u32(0)
+		mut cb := u64(0)
+		mut cu := u64(0)
+		for sc in 0 .. 136 {
+			s := unsafe { c.alloc[sc] }
+			if s != unsafe { nil } && s.in_use {
+				cn++
+				cb += u64(s.npages) * u64(vgc_page_size)
+				cu += u64(s.alloc_count) * u64(s.elem_size)
+			}
+		}
+		C.fprintf(C.stderr, c'[gc %llu] occ  cache %d: spans=%u span=%lluKB used=%lluKB\n',
+			C.vgc_ull(vgc_heap.gc_cycle), ci, cn, C.vgc_ull(cb / 1024), C.vgc_ull(cu / 1024))
+	}
 	for _ in 0 .. 8 {
 		mut best := -1
 		mut bw := u64(0)
