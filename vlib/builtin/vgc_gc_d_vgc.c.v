@@ -1683,6 +1683,9 @@ fn vgc_gc_start_concurrent() {
 // class (noscan apart): their bytes against the bytes their allocated slots
 // hold, the waste the span granularity costs. One totals line and the eight
 // classes that waste the most. Read-only, no allocation (the world is stopped).
+__global vgc_swept_by_class = [136]u64{}
+__global vgc_swept_es = [136]u32{}
+
 // the in-use spans at the cycle's start (the heap at its peak): bytes, the
 // bytes their allocated slots hold, the pool
 fn vgc_gctrace_occ_pre() {
@@ -1759,6 +1762,32 @@ fn vgc_gctrace_occupancy() {
 		}
 		C.fprintf(C.stderr, c'[gc %llu] occ  cache %d: spans=%u span=%lluKB used=%lluKB\n',
 			C.vgc_ull(vgc_heap.gc_cycle), ci, cn, C.vgc_ull(cb / 1024), C.vgc_ull(cu / 1024))
+	}
+	// what this cycle's sweep reclaimed, the eight largest classes
+	mut swt := u64(0)
+	for k in 0 .. 136 {
+		swt += vgc_swept_by_class[k]
+	}
+	C.fprintf(C.stderr, c'[gc %llu] swept total=%lluKB\n', C.vgc_ull(vgc_heap.gc_cycle), C.vgc_ull(swt / 1024))
+	for _ in 0 .. 8 {
+		mut bk := -1
+		mut bv := u64(0)
+		for k in 0 .. 136 {
+			if vgc_swept_by_class[k] > bv {
+				bv = vgc_swept_by_class[k]
+				bk = k
+			}
+		}
+		if bk < 0 {
+			break
+		}
+		C.fprintf(C.stderr, c'[gc %llu] swept  elem=%u%s %lluKB\n', C.vgc_ull(vgc_heap.gc_cycle),
+			vgc_swept_es[bk], if bk == 0 { c' large' } else if bk % 2 == 1 { c' noscan' } else { c'' },
+			C.vgc_ull(bv / 1024))
+		vgc_swept_by_class[bk] = 0
+	}
+	for k in 0 .. 136 {
+		vgc_swept_by_class[k] = 0
 	}
 	for _ in 0 .. 8 {
 		mut best := -1
@@ -3741,6 +3770,14 @@ fn vgc_sweep_span_bits(span &VGC_Span) u8 {
 		}
 	}
 
+	if freed > 0 && vgc_gctrace >= 3 {
+		// cx-home/v#56: what the sweep reclaims, by class (VGC_GCTRACE=3)
+		k := if span.class_idx == 0 { 0 } else { int(span.class_idx) * 2 + (if span.noscan { 1 } else { 0 }) }
+		if k < 136 {
+			_ = C.vgc_atomic_add_u64(&vgc_swept_by_class[k], u64(freed) * u64(span.elem_size))
+			vgc_swept_es[k] = span.elem_size
+		}
+	}
 	if freed > 0 {
 		unsafe {
 			(&VGC_Span(span)).alloc_count -= freed
