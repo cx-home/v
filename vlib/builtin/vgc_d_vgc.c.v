@@ -887,8 +887,13 @@ __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 // The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
 // live_floor) (cx-home/v#14, vgc_update_trigger). The first collection still
 // triggers at vgc_headroom_floor_lo. VGC_HEADROOM_FLOOR_LO1_MB overrides
-// (decimal MB, default 2).
-__global vgc_headroom_floor_lo1 = u64(2) * 1024 * 1024
+// (decimal MB, default 1). cx-examples#297: at 2 MB a program whose live set
+// is about 1 MB (json-codec 1 KB x100,000: marked 1 MB) paced to a 3 MB goal,
+// three times its live set, where the one-thread rule means one; at 1 MB its
+// goal is 2 MB: peak RSS 16.3 -> 15.5 MB, cycles 286 -> 316, the time
+// unchanged (0.88-0.91 s). A live set of 2 MB or more (csv-aggregate: 3 MB)
+// paces as before.
+__global vgc_headroom_floor_lo1 = u64(1) * 1024 * 1024
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
