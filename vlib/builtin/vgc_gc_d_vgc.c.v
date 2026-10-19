@@ -3608,8 +3608,30 @@ fn vgc_do_sweep() {
 		vgc_pool_trim_all()
 	} else {
 		vgc_pool_trim()
+		if vgc_pool_keep_bytes >= 0 {
+			vgc_pool_trim_surplus(u64(vgc_pool_keep_bytes))
+		}
 	}
 	C.vgc_atomic_store_u32(&vgc_heap.sweep_done, 1)
+}
+
+// cx-home/v#56 (probe): VGC_POOL_KEEP_KB=N decommits the hot pool, oldest
+// first and with no age gate, down to N KB at the end of every sweep — what
+// the pool's surplus costs in resident memory against the re-fault time.
+__global vgc_pool_keep_bytes = i64(-1)
+
+fn vgc_pool_trim_surplus(keep u64) {
+	for idx := vgc_max_pooled_pages; idx >= 1; idx-- {
+		if vgc_heap.pool_bytes <= keep {
+			return
+		}
+		mut s := vgc_heap.free_spans_tail[idx]
+		for s != unsafe { nil } && vgc_heap.pool_bytes > keep {
+			prv := s.prev
+			vgc_pool_trim_decommit(mut s)
+			s = unsafe { prv }
+		}
+	}
 }
 
 // Sweep a single span: free unmarked objects.

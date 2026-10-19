@@ -2181,6 +2181,13 @@ pub fn vgc_init() {
 				vgc_perm_cycle = u64(pc)
 			}
 		}
+		pk_env := C.getenv(c'VGC_POOL_KEEP_KB')
+		if pk_env != unsafe { nil } {
+			pk := C.atoll(pk_env)
+			if pk >= 0 {
+				vgc_pool_keep_bytes = i64(pk) * 1024
+			}
+		}
 		// cx-home/v#56: the nursery's size and the old generation's growth
 		nk_env := C.getenv(c'VGC_NURSERY_KB')
 		if nk_env != unsafe { nil } {
