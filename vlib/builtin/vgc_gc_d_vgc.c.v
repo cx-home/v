@@ -274,6 +274,7 @@ fn vgc_gc_start() {
 	// optimization that must come with alloc-black + a correct barrier.)
 
 	// Parallel mark: drain the work queue (workers only; mutators are stopped)
+	mcpu0, mwait0 := vgc_mark_cpu_begin()
 	vgc_parallel_mark()
 	vgc_watch_snapshot(4) // STAGE 4: post parallel-mark drain
 
@@ -297,6 +298,7 @@ fn vgc_gc_start() {
 	} else {
 		1
 	})
+	vgc_mark_work_from_cpu(mcpu0, mwait0)
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the promotion cycle, and the verifier's full re-mark
@@ -1494,7 +1496,10 @@ fn vgc_gc_start_concurrent() {
 	vgc_stw_resume(self_idx)
 
 	// ===== MIDDLE: the world runs, the markers trace =====
+	mcpu0, mwait0 := vgc_mark_cpu_begin()
 	vgc_cm_drain()
+	mcpu1 := C.vgc_thread_cpu_ns()
+	mwait1 := vgc_gc_wait_cpu
 	t_stop2 := C.vgc_now_ns()
 	vgc_cm_middle_ns = t_stop2 - t_resume1
 
@@ -1517,9 +1522,18 @@ fn vgc_gc_start_concurrent() {
 	vgc_cm_born_last = born
 	vgc_cm_roots(self_idx)
 	t_rescan := C.vgc_now_ns()
+	rcpu0, _ := vgc_mark_cpu_begin()
 	vgc_rescan_dirty_spans(true)
 	vgc_cm_rescan_ns = C.vgc_now_ns() - t_rescan
 	vgc_rescan_last_work_ns = vgc_cm_rescan_ns * u64(vgc_rescan_nworkers_cur)
+	// cx-home/v#55: a serial re-scan's work is its CPU time when the box
+	// stretched its wall (vgc_mark_work_from_cpu)
+	if rcpu0 != 0 && vgc_rescan_nworkers_cur <= 1 {
+		rcpu1 := C.vgc_thread_cpu_ns()
+		if rcpu1 > rcpu0 && rcpu1 - rcpu0 < vgc_rescan_last_work_ns {
+			vgc_rescan_last_work_ns = rcpu1 - rcpu0
+		}
+	}
 	vgc_cm_drain()
 	vgc_cm_verify(self_idx)
 	vgc_ph[5] = C.vgc_now_ns()
@@ -1531,6 +1545,7 @@ fn vgc_gc_start_concurrent() {
 	} else {
 		1
 	})
+	vgc_mark_work_from_cpu_at(mcpu0, mwait0, mcpu1, mwait1)
 	vgc_wb_set(vgc_perm_on * 2) // cx-home/v#15: the permanent regime stays
 
 	marked := vgc_count_marked()
@@ -2406,6 +2421,49 @@ fn vgc_shade_spawn_root(addr usize) {
 // Translated from Go's gcDrain() with multiple workers.
 // The markers of this cycle (cx-home/v#16): one, or the pool plus the
 // collector. Decided and the pool created BEFORE the world stops.
+// cx-home/v#55: the marker plan's work estimate on the collecting thread's
+// CPU time. The plan engages the pool once the last mark's work reaches
+// vgc_mark_par_min_ns, and a one-marker mark's work was its WALL time; with
+// N processes on one box (the MP cells: 28 copies of one program) a 0.3-1.3
+// ms mark read 2-8 ms of wall while it waited for a core, so every copy woke
+// up to seven markers that spun on an emptied grey set and the copies scaled
+// worse than Python's (json-codec 1 MB: 0.86 of Python's scaling, 1.02 with
+// VGC_MARK_WORKERS=1). A one-marker mark's work is now the lesser of its wall
+// and its CPU time, less the waits the cycle spun (vgc_gc_wait_cpu): a mark
+// the box slowed down reads what it cost, and a large single process (its
+// mark's CPU close to its wall) plans as before. A parallel mark keeps n x
+// wall (vgc_mark_adapt judges whether it paid). Where there is no thread CPU
+// clock (Windows) or VGC_PACER_WALL=1, the wall time, as before.
+@[inline]
+fn vgc_mark_cpu_begin() (u64, u64) {
+	if vgc_pacer_wall != 0 || vgc_gc_cpu_t0 == 0 {
+		return 0, 0
+	}
+	return C.vgc_thread_cpu_ns(), vgc_gc_wait_cpu
+}
+
+fn vgc_mark_work_from_cpu(cpu0 u64, wait0 u64) {
+	if cpu0 == 0 {
+		return
+	}
+	vgc_mark_work_from_cpu_at(cpu0, wait0, C.vgc_thread_cpu_ns(), vgc_gc_wait_cpu)
+}
+
+fn vgc_mark_work_from_cpu_at(cpu0 u64, wait0 u64, cpu1 u64, wait1 u64) {
+	if cpu0 == 0 || vgc_mark_nworkers_cur > 1 || cpu1 <= cpu0 {
+		return
+	}
+	mut cpu := cpu1 - cpu0
+	if wait1 > wait0 {
+		w := wait1 - wait0
+		cpu = if w < cpu { cpu - w } else { 0 }
+	}
+	vgc_mark_last_cpu_ns = cpu
+	if cpu < vgc_mark_last_work_ns {
+		vgc_mark_last_work_ns = cpu
+	}
+}
+
 fn vgc_mark_plan() int {
 	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_work_ns < vgc_mark_par_min_ns || vgc_mark_forked {
 		return 1

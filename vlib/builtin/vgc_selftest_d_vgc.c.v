@@ -399,3 +399,52 @@ pub fn vgc_mark_backoff_selftest() u32 {
 		return rc
 	}
 }
+
+// vgc_mark_cpu_plan_selftest — cx-home/v#55: a one-marker mark the box slowed
+// down (5 ms of wall, 0.5 ms of the collecting thread's CPU) plans on its CPU
+// time, so the next cycle stays on one marker; a mark whose CPU matches its
+// wall (a large single process) still reaches the pool; a parallel mark keeps
+// its n x wall estimate. Globals restored. Driven by
+// bench/parallel-alloc/vgc_mark_cpu_plan_test.v. 0, else the failed check.
+pub fn vgc_mark_cpu_plan_selftest() u32 {
+	s_ncur := vgc_mark_nworkers_cur
+	s_work := vgc_mark_last_work_ns
+	s_cpu := vgc_mark_last_cpu_ns
+	mut rc := u32(0)
+	ms := u64(1000000)
+	vgc_mark_nworkers_cur = 1
+	vgc_mark_last_work_ns = 5 * ms
+	vgc_mark_work_from_cpu_at(1000, 0, 1000 + ms / 2, 0)
+	if vgc_mark_last_work_ns != ms / 2 {
+		rc = 1
+	}
+	if rc == 0 {
+		// the waits the cycle spun are not work
+		vgc_mark_last_work_ns = 5 * ms
+		vgc_mark_work_from_cpu_at(1000, 0, 1000 + 3 * ms, 2 * ms)
+		if vgc_mark_last_work_ns != ms {
+			rc = 2
+		}
+	}
+	if rc == 0 {
+		// CPU close to wall: the wall stays the estimate
+		vgc_mark_last_work_ns = 5 * ms
+		vgc_mark_work_from_cpu_at(1000, 0, 1000 + 6 * ms, 0)
+		if vgc_mark_last_work_ns != 5 * ms {
+			rc = 3
+		}
+	}
+	if rc == 0 {
+		// a parallel mark is untouched
+		vgc_mark_nworkers_cur = 4
+		vgc_mark_last_work_ns = 8 * ms
+		vgc_mark_work_from_cpu_at(1000, 0, 1000 + ms / 2, 0)
+		if vgc_mark_last_work_ns != 8 * ms {
+			rc = 4
+		}
+	}
+	vgc_mark_nworkers_cur = s_ncur
+	vgc_mark_last_work_ns = s_work
+	vgc_mark_last_cpu_ns = s_cpu
+	return rc
+}

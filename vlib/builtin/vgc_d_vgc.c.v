@@ -910,6 +910,8 @@ const vgc_max_markers = 16
 __global vgc_mark_workers_cfg = int(-1)
 // -1 = decide at init
 __global vgc_mark_par_min_ns = u64(1000) * 1000
+// cx-home/v#55: the last one-marker mark's CPU time (vgc_mark_work_from_cpu)
+__global vgc_mark_last_cpu_ns = u64(0)
 // cx-private#1910: the concurrent cycle's selection (vgc_gc_start). VGC_CM: 0 =
 // the stop-the-world cycle always, 1 = the concurrent cycle always, 2 (default)
 // = concurrent when the last mark's work reached VGC_CM_MIN_US (default 1000
