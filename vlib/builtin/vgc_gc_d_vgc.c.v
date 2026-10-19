@@ -1673,6 +1673,69 @@ fn vgc_gc_start_concurrent() {
 // thread-multiplier), arena/span pressure, live mutators. Env-gated (one integer
 // test per cycle when off).
 @[markused]
+// cx-home/v#56: VGC_GCTRACE=3 — the in-use spans after the sweep, by size
+// class (noscan apart): their bytes against the bytes their allocated slots
+// hold, the waste the span granularity costs. One totals line and the eight
+// classes that waste the most. Read-only, no allocation (the world is stopped).
+fn vgc_gctrace_occupancy() {
+	mut nsp := [136]u32{}
+	mut sb := [136]u64{}
+	mut ub := [136]u64{}
+	mut es := [136]u32{}
+	mut tot_sb := u64(0)
+	mut tot_ub := u64(0)
+	mut large_sb := u64(0)
+	mut large_ub := u64(0)
+	mut tiny_n := u32(0)
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use {
+			continue
+		}
+		bytes := u64(span.npages) * u64(vgc_page_size)
+		used := u64(span.alloc_count) * u64(span.elem_size)
+		tot_sb += bytes
+		tot_ub += used
+		if span.is_tiny {
+			tiny_n++
+		}
+		if span.class_idx == 0 {
+			large_sb += bytes
+			large_ub += used
+			continue
+		}
+		k := int(span.class_idx) * 2 + (if span.noscan { 1 } else { 0 })
+		if k < 136 {
+			nsp[k]++
+			sb[k] += bytes
+			ub[k] += used
+			es[k] = span.elem_size
+		}
+	}
+	C.fprintf(C.stderr, c'[gc %llu] occ spans=%lluKB used=%lluKB large=%lluKB/%lluKB tiny_spans=%u pool=%lluKB\n',
+		C.vgc_ull(vgc_heap.gc_cycle), C.vgc_ull(tot_sb / 1024), C.vgc_ull(tot_ub / 1024),
+		C.vgc_ull(large_sb / 1024), C.vgc_ull(large_ub / 1024), tiny_n,
+		C.vgc_ull(vgc_heap.pool_bytes / 1024))
+	for _ in 0 .. 8 {
+		mut best := -1
+		mut bw := u64(0)
+		for k in 0 .. 136 {
+			if sb[k] > ub[k] && sb[k] - ub[k] > bw {
+				bw = sb[k] - ub[k]
+				best = k
+			}
+		}
+		if best < 0 {
+			break
+		}
+		C.fprintf(C.stderr, c'[gc %llu] occ  elem=%u%s spans=%u span=%lluKB used=%lluKB waste=%lluKB\n',
+			C.vgc_ull(vgc_heap.gc_cycle), es[best], if best % 2 == 1 { c' noscan' } else { c'' },
+			nsp[best], C.vgc_ull(sb[best] / 1024), C.vgc_ull(ub[best] / 1024), C.vgc_ull(bw / 1024))
+		sb[best] = 0
+		ub[best] = 0
+	}
+}
+
 fn vgc_gctrace_emit() {
 	if vgc_gctrace == 0 {
 		return
@@ -1692,6 +1755,9 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024, vgc_idle_defrag_merged_kb)
+	if vgc_gctrace >= 3 {
+		vgc_gctrace_occupancy()
+	}
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
 		// bytes the root scan walked and the spans the clear/sweep walks visited.
