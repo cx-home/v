@@ -1029,6 +1029,22 @@ fn vgc_wb_set(mode u32) {
 }
 // the verifier's full re-mark clears to zero (every object traced)
 __global vgc_perm_clear_zero = false
+// cx-home/v#56: the young generation (nursery). With VGC_NURSERY_KB=N (> 0) every
+// collection after the first promotes its survivors (sticky mark bits on the
+// permanent generation's perm_bits and card barrier): a minor cycle starts with
+// every old object marked, traces from the roots, the dirty cards and the
+// young_bits only, and sweeps what the young objects left; the pacer triggers
+// it after N KB of allocation. A full cycle (from zero, as the verifier's
+// re-mark) runs when the old generation reaches its goal: the old set after
+// the last full cycle plus VGC_NURSERY_OLD_PCT percent of it (at least the
+// nursery). 0 (the default) keeps the single-generation collector.
+__global vgc_nursery_bytes = u64(0)
+__global vgc_nursery_old_pct = u64(25)
+__global vgc_nursery_old_goal = u64(0)
+__global vgc_nursery_full_next = false
+__global vgc_nursery_full = false // this cycle is a full one (from zero)
+__global vgc_nursery_minors = u64(0)
+__global vgc_nursery_fulls = u64(0)
 // the perm_bits slab: 272-byte buffers (perm_bits + young_bits), bump-carved,
 // never returned (a span keeps its buffer across recycling, zeroed by span_init)
 __global vgc_perm_slab_cur = usize(0)
@@ -2164,6 +2180,24 @@ pub fn vgc_init() {
 			if pc >= 0 {
 				vgc_perm_cycle = u64(pc)
 			}
+		}
+		// cx-home/v#56: the nursery's size and the old generation's growth
+		nk_env := C.getenv(c'VGC_NURSERY_KB')
+		if nk_env != unsafe { nil } {
+			nk := C.atoll(nk_env)
+			if nk >= 0 && nk <= 1048576 {
+				vgc_nursery_bytes = u64(nk) * 1024
+			}
+		}
+		np_env := C.getenv(c'VGC_NURSERY_OLD_PCT')
+		if np_env != unsafe { nil } {
+			np := C.atoll(np_env)
+			if np >= 1 && np <= 1000 {
+				vgc_nursery_old_pct = u64(np)
+			}
+		}
+		if vgc_perm_mode == 0 {
+			vgc_nursery_bytes = 0
 		}
 	} $else {
 		vgc_perm_mode = 0

@@ -98,7 +98,8 @@ fn vgc_gc_start() {
 		// (an object born in a concurrent middle is filled after the stop with
 		// no barrier, so it must not be promoted)
 		promote := vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
+			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request
+			|| vgc_nursery_bytes != 0)
 		if !promote && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
@@ -178,7 +179,19 @@ fn vgc_gc_start() {
 
 	// Clear mark bits on all spans (prepare for new cycle)
 	vgc_ph[0] = C.vgc_now_ns()
+	$if vgc_concurrent ? {
+		// cx-home/v#56: a full cycle starts every object white (the old
+		// generation is traced and its garbage swept); a minor one starts the
+		// old generation black
+		vgc_nursery_full = vgc_nursery_bytes != 0 && (vgc_nursery_full_next || vgc_perm_on == 0)
+		if vgc_nursery_full {
+			vgc_perm_clear_zero = true
+		}
+	}
 	vgc_clear_mark_bits()
+	$if vgc_concurrent ? {
+		vgc_perm_clear_zero = false
+	}
 	vgc_ph[1] = C.vgc_now_ns()
 	vgc_watch_snapshot(0) // STAGE 0: post-clear (expect found+in_use+alloc, mark=0)
 
@@ -257,7 +270,9 @@ fn vgc_gc_start() {
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the permanent spans written since the last cycle (their
 		// objects are black from the clear; what they point to is found here)
-		if vgc_perm_on != 0 {
+		// (a full nursery cycle traces the old generation from the roots: its
+		// cards name nothing the trace does not reach, and promotion clears them)
+		if vgc_perm_on != 0 && !vgc_nursery_full {
 			t_rescan := C.vgc_now_ns()
 			vgc_rescan_dirty_spans(false)
 			vgc_perm_rescan_ns = C.vgc_now_ns() - t_rescan
@@ -302,12 +317,27 @@ fn vgc_gc_start() {
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the promotion cycle, and the verifier's full re-mark
-		if vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
+		if vgc_nursery_bytes != 0 {
+			// cx-home/v#56: the verifier first (it judges this cycle's mark, and
+			// what it adds must be promoted with the rest), then every survivor
+			// becomes old
+			if vgc_perm_on != 0 {
+				vgc_cm_verify(self_idx)
+			}
 			vgc_perm_promote()
-		}
-		if vgc_perm_on != 0 {
-			vgc_cm_verify(self_idx)
+			if vgc_nursery_full {
+				vgc_nursery_fulls++
+			} else {
+				vgc_nursery_minors++
+			}
+		} else {
+			if vgc_perm_mode != 0
+				&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
+				vgc_perm_promote()
+			}
+			if vgc_perm_on != 0 {
+				vgc_cm_verify(self_idx)
+			}
 		}
 	}
 
@@ -1232,12 +1262,19 @@ fn vgc_perm_promote() {
 	$if vgc_concurrent ? {
 		mut nsp := u64(0)
 		mut nbytes_total := u64(0)
-		mut lo := vgc_perm_lo
-		mut hi := vgc_perm_hi
+		// cx-home/v#56: under the nursery every promotion is the whole marked
+		// set (a full cycle's sweep may leave a span with no old object: it
+		// leaves the generation here), and the range is the arenas' — old spans
+		// lie anywhere in them; the card table and the page bitmap are taken
+		// again only when an arena widens it (a mutator suspended inside the
+		// barrier may still hold the old table, so it is never freed)
+		nursery := vgc_nursery_bytes != 0
+		mut lo := if nursery { vgc_arena_lo } else { vgc_perm_lo }
+		mut hi := if nursery { vgc_arena_hi } else { vgc_perm_hi }
 		// vgc_set_permanent's epoch: only the marked candidates (allocated
 		// before the call) are promoted; without one (VGC_PERM_CYCLE=N) the
 		// whole marked set is, as before
-		epoch := vgc_perm_epoch
+		epoch := vgc_perm_epoch && !nursery
 		for i in 0 .. vgc_heap.nspans {
 			span := unsafe { vgc_heap.allspans[i] }
 			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
@@ -1256,6 +1293,15 @@ fn vgc_perm_promote() {
 				})
 			}
 			if any == 0 {
+				if nursery && span.perm != 0 {
+					unsafe {
+						(&VGC_Span(span)).perm = 0
+						if span.perm_bits != nil {
+							C.memset(span.perm_bits, 0, 272)
+						}
+						C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+					}
+				}
 				continue
 			}
 			if span.perm_bits == unsafe { nil } {
@@ -3993,6 +4039,25 @@ fn vgc_update_trigger() {
 	}
 	if goal < marked + min_budget {
 		goal = marked + min_budget
+	}
+	$if vgc_concurrent ? {
+		// cx-home/v#56: under the nursery the next cycle comes after the
+		// nursery's allocation; it is a full one when the old generation (all
+		// of this cycle's survivors) reached its goal, which a full cycle sets
+		if vgc_nursery_bytes != 0 && vgc_perm_on != 0 {
+			if vgc_nursery_full {
+				mut grow := marked * vgc_nursery_old_pct / 100
+				if grow < vgc_nursery_bytes {
+					grow = vgc_nursery_bytes
+				}
+				vgc_nursery_old_goal = marked + grow
+			}
+			vgc_nursery_full_next = marked >= vgc_nursery_old_goal
+			ngoal := marked + vgc_nursery_bytes
+			if ngoal < goal {
+				goal = ngoal
+			}
+		}
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 }
