@@ -1702,6 +1702,32 @@ fn vgc_gctrace_occ_pre() {
 	C.fprintf(C.stderr, c'[gc %llu] pre spans=%lluKB used=%lluKB pool=%lluKB live=%lluKB\n',
 		C.vgc_ull(vgc_heap.gc_cycle), C.vgc_ull(tb / 1024), C.vgc_ull(tu / 1024),
 		C.vgc_ull(vgc_heap.pool_bytes / 1024), C.vgc_ull(C.vgc_atomic_load_u64(&vgc_heap.heap_live) / 1024))
+	// the hot pool by span size (pages): the five largest buckets
+	mut pb := [33]u64{}
+	for idx := 1; idx <= vgc_max_pooled_pages; idx++ {
+		mut sp := vgc_heap.free_spans[idx]
+		for sp != unsafe { nil } {
+			b := if idx <= 32 { idx } else { 0 }
+			pb[b] += u64(idx) * u64(vgc_page_size)
+			sp = sp.next
+		}
+	}
+	for _ in 0 .. 5 {
+		mut bk := -1
+		mut bv := u64(0)
+		for k in 0 .. 33 {
+			if pb[k] > bv {
+				bv = pb[k]
+				bk = k
+			}
+		}
+		if bk < 0 {
+			break
+		}
+		C.fprintf(C.stderr, c'[gc %llu] pre  pool pages=%d%s %lluKB\n', C.vgc_ull(vgc_heap.gc_cycle), bk,
+			if bk == 0 { c' (>32)' } else { c'' }, C.vgc_ull(bv / 1024))
+		pb[bk] = 0
+	}
 }
 
 fn vgc_gctrace_occupancy() {
