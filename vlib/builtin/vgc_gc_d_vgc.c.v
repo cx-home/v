@@ -3794,7 +3794,7 @@ fn vgc_update_trigger() {
 		mut f := marked * 2
 		mut lo := vgc_headroom_floor_lo
 		if nt <= 1 {
-			f = marked
+			f = marked * vgc_goal_live_pct / 100
 			lo = vgc_headroom_floor_lo1
 		}
 		if f < lo {

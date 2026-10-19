@@ -889,6 +889,7 @@ __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 // triggers at vgc_headroom_floor_lo. VGC_HEADROOM_FLOOR_LO1_MB overrides
 // (decimal MB, default 2).
 __global vgc_headroom_floor_lo1 = u64(2) * 1024 * 1024
+__global vgc_goal_live_pct = u64(100)
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
@@ -2010,6 +2011,15 @@ pub fn vgc_init() {
 	}
 	vgc_heap.gc_enabled = 1
 	vgc_heap.gc_percent = 100
+	// EXPERIMENT (#292 memory): VGC_GOGC and VGC_GOAL_LIVE_PCT
+	gogc_env := C.getenv(c'VGC_GOGC')
+	if gogc_env != unsafe { nil } {
+		vgc_heap.gc_percent = int(C.atoll(gogc_env))
+	}
+	glp_env := C.getenv(c'VGC_GOAL_LIVE_PCT')
+	if glp_env != unsafe { nil } {
+		vgc_goal_live_pct = u64(C.atoll(glp_env))
+	}
 	mb_env := C.getenv(c'VGC_NEXT_GC_MB')
 	if mb_env != unsafe { nil } {
 		mb := C.atoll(mb_env)
