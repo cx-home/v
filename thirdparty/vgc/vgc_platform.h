@@ -2834,6 +2834,12 @@ static inline void vgc_trace_init(void) {}
 typedef struct { uintptr_t base; uint64_t bits[16]; } vgc_tc_window; // 1,024 pages from base
 static vgc_tc_window vgc_tc_windows[8];
 static int vgc_tc_nwindows;
+// cx-home/v#56: a stop-the-world cycle's markers each scan a slice of the data
+// segments (vgc_roots_data_slice), so vgc_touched_ranges runs on several threads
+// at once; the window table is read and grown under this lock (two markers
+// taking one new window wrote two bases into it, and a slice then read another
+// window's page bits as its own: untouched .bss pages faulted in).
+static volatile uint32_t vgc_tc_lock;
 static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
     los[0] = (uintptr_t)&vgc_addr_map[0];
     his[0] = (uintptr_t)&vgc_addr_map[0] + sizeof(vgc_addr_map);
@@ -2898,7 +2904,9 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
     unsigned char vec[1024];
     int asked = npages <= sizeof(vec);
     if (asked) {
-        // the collector alone calls this, under the stop (vgc_mark_roots)
+        // the collector or the markers, under the stop (vgc_mark_roots,
+        // vgc_roots_data_slice): the window table under vgc_tc_lock
+        vgc_mutex_lock(&vgc_tc_lock);
         vgc_tc_window* w = vgc_tc_window_for(base, base + npages * ps, ps);
         uintptr_t off = w ? (base - w->base) / ps : 0;
         uintptr_t i = 0;
@@ -2924,6 +2932,7 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
             }
             i = j;
         }
+        vgc_mutex_unlock(&vgc_tc_lock);
     }
     if (asked) {
         int n = 0;
