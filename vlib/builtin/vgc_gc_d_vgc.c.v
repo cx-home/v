@@ -2464,9 +2464,44 @@ fn vgc_mark_work_from_cpu_at(cpu0 u64, wait0 u64, cpu1 u64, wait1 u64) {
 	}
 }
 
+// cx-home/v#56: a stop holds every registered mutator, so its length costs
+// that many threads' time: an http server's ~200 stops a second at 27 threads
+// and a 1 MB live set (a ~200 us mark, a 2,500-span table: both below the
+// pool's lines) spent ~9 % of its wall stopped, and its p99 at c128 rode the
+// stop (cx-private#1869). With four markers and four walkers the mean stop
+// went 482 -> 345 us. vgc_stop_weighed_cpus answers, for work below its
+// line, the CPUs the pool may take this stop: 0 when the work times the
+// registered mutators stays below the line (a one-thread program plans as
+// before), else the CPUs the rest of the box leaves free (vgc_box_free_cpus;
+// 0 on a busy box). VGC_STOP_WEIGH=0: the lines alone, as before.
+fn vgc_stop_weighed_cpus(work u64, line u64) int {
+	if !vgc_stop_weigh {
+		return 0
+	}
+	n := u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
+	if n <= 1 || work * n < line {
+		return 0
+	}
+	if C.vgc_box_busy(vgc_walk_ncpu) != 0 {
+		return 0
+	}
+	return C.vgc_box_free_cpus(vgc_walk_ncpu, int(n))
+}
+
 fn vgc_mark_plan() int {
-	if vgc_mark_workers_cfg <= 1 || vgc_mark_last_work_ns < vgc_mark_par_min_ns || vgc_mark_forked {
+	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked {
 		return 1
+	}
+	mut floor := 1
+	if vgc_mark_last_work_ns < vgc_mark_par_min_ns {
+		// cx-home/v#56: below the line, a stop that holds several mutators
+		// (vgc_stop_weighed_cpus) still engages the pool when its mark's work times
+		// the threads it holds reaches the line, four markers at the floor
+		free := vgc_stop_weighed_cpus(vgc_mark_last_work_ns, vgc_mark_par_min_ns)
+		if free < 2 {
+			return 1
+		}
+		floor = if free < 4 { free } else { 4 }
 	}
 	mut total := vgc_mark_workers_cfg
 	// One marker per vgc_mark_par_min_ns of the previous mark's work: a 3 ms
@@ -2475,10 +2510,13 @@ fn vgc_mark_plan() int {
 	// mark's wall time, mostly idle-spinning on an emptied grey set.
 	// VGC_MARK_PAR_MIN_US=0 forces the configured count (and is no divisor:
 	// x86 traps on it, arm64 reads 0 and would never engage the pool).
-	by_work := if vgc_mark_par_min_ns == 0 {
+	mut by_work := if vgc_mark_par_min_ns == 0 {
 		total
 	} else {
 		int(vgc_mark_last_work_ns / vgc_mark_par_min_ns)
+	}
+	if by_work < floor {
+		by_work = floor
 	}
 	if by_work < total {
 		total = by_work
@@ -2537,8 +2575,15 @@ fn vgc_walk_plan() int {
 		return 1
 	}
 	nsp := u64(vgc_heap.nspans)
+	mut weighed := false
 	if nsp < vgc_walk_min_spans {
-		return 1
+		// cx-home/v#56: a table below the line walks on four walkers when the
+		// stop holds enough mutators that the table times their count reaches
+		// it (vgc_stop_weighed_cpus), as the mark
+		if vgc_stop_weighed_cpus(nsp, vgc_walk_min_spans) < 2 {
+			return 1
+		}
+		weighed = true
 	}
 	mut free_cpus := 1 << 20 // VGC_WALK_LOAD_GATE=0: the configured count, uncapped
 	if vgc_walk_load_gate {
@@ -2549,6 +2594,9 @@ fn vgc_walk_plan() int {
 			int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
 	}
 	mut total := int(nsp / (vgc_walk_min_spans / 4))
+	if weighed {
+		total = 4
+	}
 	if total > cfg {
 		total = cfg
 	}

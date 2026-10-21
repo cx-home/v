@@ -1223,6 +1223,9 @@ const vgc_rescan_chunk = u32(4)
 __global vgc_walk_workers_cfg = int(-1)
 // -1 = the marker count's configuration (VGC_MARK_WORKERS)
 __global vgc_walk_min_spans = u64(8192)
+// cx-home/v#56: below the pool's lines, the work times the stopped mutators
+// (vgc_stop_weighed_cpus). VGC_STOP_WEIGH=0: the lines alone, as before.
+__global vgc_stop_weigh = true
 // spans in the table before a walk is split; one walker per quarter of it
 __global vgc_walk_rate1 = u64(0)
 // ns per span of the three walks with one walker (a running mean)
@@ -2186,6 +2189,10 @@ pub fn vgc_init() {
 		}
 	}
 	vgc_walk_ncpu = C.vgc_ncpu()
+	sw_env := C.getenv(c'VGC_STOP_WEIGH')
+	if sw_env != unsafe { nil } {
+		vgc_stop_weigh = C.atoll(sw_env) != 0
+	}
 	lg_env := C.getenv(c'VGC_WALK_LOAD_GATE')
 	if lg_env != unsafe { nil } {
 		vgc_walk_load_gate = C.atoll(lg_env) != 0
