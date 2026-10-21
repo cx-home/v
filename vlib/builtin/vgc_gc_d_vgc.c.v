@@ -229,6 +229,7 @@ fn vgc_gc_start() {
 	// would overwrite the range with a higher SP and drop the spilled regs.
 
 	// Scan roots: stacks + globals (conservative scanning)
+	vgc_roots_par_n = vgc_roots_plan()
 	vgc_mark_roots()
 	vgc_root_last_ns = vgc_ph[4] - vgc_ph[1] // cx-private#1910: the next cycle's selection
 	vgc_watch_snapshot(2) // STAGE 2: post stack roots
@@ -259,10 +260,14 @@ fn vgc_gc_start() {
 		// objects are black from the clear; what they point to is found here)
 		if vgc_perm_on != 0 {
 			t_rescan := C.vgc_now_ns()
+			// cx-home/v#56: on the markers when the roots were (vgc_roots_plan)
+			vgc_rescan_nworkers_cur = vgc_roots_par_n
 			vgc_rescan_dirty_spans(false)
+			vgc_rescan_nworkers_cur = 1
 			vgc_perm_rescan_ns = C.vgc_now_ns() - t_rescan
 		}
 	}
+	vgc_roots_par_n = 1
 
 	// FULL stop-the-world mark+sweep: the world stays stopped from here through
 	// the end of sweep. The previous design resumed mutators here and marked
@@ -2007,6 +2012,52 @@ fn vgc_fixup_caches() {
 	}
 }
 
+// cx-home/v#56: a stop-the-world cycle whose mark runs on the pool also takes
+// its roots there: each marker scans a slice of every data segment and every
+// n-th thread's stack into its own work buffer (the mark drains them, as the
+// concurrent termination's re-scan stripes), and the permanent generation's
+// re-scan stripes the span table on them. On an http server at c128 these were
+// the stop's serial part beside a four-marker mark: data segments ~50 us
+// (1.58 MB), stacks ~37 us (27 threads), the permanent re-scan ~50 us. One
+// marker, a watched address or the root diagnostics: serial, as before.
+fn vgc_roots_plan() int {
+	$if vgc_rootdiag ? {
+		return 1
+	}
+	n := vgc_mark_nworkers_cur
+	if n <= 1 || vgc_mark_pool_n == 0 || vgc_watch_addr != 0 || !vgc_roots_par {
+		return 1
+	}
+	return n
+}
+
+fn vgc_roots_data_slice(slot int, n int) {
+	for k in 0 .. vgc_nseg {
+		lo := vgc_seg_lo[k]
+		hi := vgc_seg_hi[k]
+		if lo == 0 || hi <= lo {
+			continue
+		}
+		span := hi - lo
+		a := if slot == 0 { lo } else { (lo + span * usize(slot) / usize(n)) & ~usize(7) }
+		b := if slot == n - 1 { hi } else { (lo + span * usize(slot + 1) / usize(n)) & ~usize(7) }
+		if b > a {
+			vgc_scan_data_range(a, b, slot)
+		}
+	}
+}
+
+fn vgc_roots_stacks_slice(slot int, n int) {
+	mut i := slot
+	for i < vgc_heap.ncaches {
+		cache := unsafe { vgc_cache(i) }
+		if cache.registered && cache.stack_lo > 0 && cache.stack_hi > cache.stack_lo {
+			vgc_scan_range(cache.stack_lo, cache.stack_hi, slot)
+		}
+		i += n
+	}
+}
+
 fn vgc_mark_roots() {
 	// Scan the global / BSS data segments (V __global roots). Without this, an
 	// object reachable only through a global (e.g. rand.default_rng) is reclaimed,
@@ -2047,9 +2098,14 @@ fn vgc_mark_roots() {
 			}
 		}
 	}
-	for k in 0 .. nseg {
-		if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
-			vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k])
+	if vgc_roots_par_n > 1 {
+		// cx-home/v#56: a slice of every data segment per marker (vgc_roots_plan)
+		vgc_pool_run(vgc_pool_phase_roots_data, vgc_roots_par_n)
+	} else {
+		for k in 0 .. nseg {
+			if vgc_seg_lo[k] > 0 && vgc_seg_hi[k] > vgc_seg_lo[k] {
+				vgc_scan_data_range(vgc_seg_lo[k], vgc_seg_hi[k], 0)
+			}
 		}
 	}
 	// The per-thread cache slots, to the high-water mark only (cx-home/v#27): the
@@ -2085,8 +2141,14 @@ fn vgc_mark_roots() {
 	}
 	vgc_ph[3] = C.vgc_now_ns()
 
-	// Scan each registered thread's stack
-	for i in 0 .. vgc_heap.ncaches {
+	// Scan each registered thread's stack (cx-home/v#56: every n-th one per
+	// marker, vgc_roots_plan)
+	mut nstk := vgc_heap.ncaches
+	if vgc_roots_par_n > 1 {
+		vgc_pool_run(vgc_pool_phase_roots_stacks, vgc_roots_par_n)
+		nstk = 0
+	}
+	for i in 0 .. nstk {
 		cache := unsafe { vgc_cache(i) }
 		if !cache.registered {
 			continue
@@ -2145,7 +2207,7 @@ fn vgc_mark_roots() {
 // because vgc_shade already refuses addresses at or above it. The caches stay
 // scanned: their tiny cursor and in-flight spans are load-bearing roots during
 // thread create/exit churn (see vgc_mark_roots).
-fn vgc_scan_data_range(lo usize, hi usize) {
+fn vgc_scan_data_range(lo usize, hi usize, worker int) {
 	// cx-home/v#27: the caches no longer sit inside vgc_heap (chunks, scanned to
 	// the high-water mark by vgc_mark_roots), so the whole struct is excluded.
 	heap_lo := usize(voidptr(&vgc_heap))
@@ -2202,7 +2264,7 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 			}
 		}
 		if ex_lo > cur {
-			vgc_scan_touched(cur, if ex_lo < hi { ex_lo } else { hi })
+			vgc_scan_touched(cur, if ex_lo < hi { ex_lo } else { hi }, worker)
 		}
 		if ex_hi <= cur {
 			break
@@ -2217,14 +2279,14 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 // zeroed page in, so the scan kept the whole data segment resident and spent
 // about half its time on zero pages. Off darwin (or on any mincore failure)
 // the range is scanned whole, as before.
-fn vgc_scan_touched(lo usize, hi usize) {
+fn vgc_scan_touched(lo usize, hi usize, w int) {
 	mut los := [usize(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0, 0, 0]!
 	mut his := [usize(0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0, 0, 0]!
 	n := C.vgc_touched_ranges(lo, hi, &los[0], &his[0], 32)
 	for k in 0 .. n {
-		vgc_scan_range(los[k], his[k], 0)
+		vgc_scan_range(los[k], his[k], w)
 	}
 }
 
@@ -2781,6 +2843,10 @@ fn vgc_pool_phase_run(phase u32, slot int, n int) {
 		vgc_walk_sweep(slot, n)
 	} else if phase == vgc_pool_phase_rescan {
 		vgc_rescan_walk(slot, n)
+	} else if phase == vgc_pool_phase_roots_data {
+		vgc_roots_data_slice(slot, n)
+	} else if phase == vgc_pool_phase_roots_stacks {
+		vgc_roots_stacks_slice(slot, n)
 	}
 }
 

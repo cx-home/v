@@ -1218,6 +1218,13 @@ const vgc_pool_phase_sweep = u32(3)
 // cx-home/v#52: the concurrent cycle's termination re-scan of the dirty and
 // born spans (vgc_rescan_dirty_spans) on the pool, one span stripe a claim
 const vgc_pool_phase_rescan = u32(4)
+// cx-home/v#56: a stop-the-world cycle's roots on the markers (vgc_roots_plan)
+const vgc_pool_phase_roots_data = u32(5)
+const vgc_pool_phase_roots_stacks = u32(6)
+// this cycle's root-scan markers (1: the collector alone). VGC_ROOTS_PAR=0: the
+// roots and the permanent re-scan on the collector alone, as before.
+__global vgc_roots_par_n = int(1)
+__global vgc_roots_par = true
 const vgc_rescan_chunk = u32(4)
 
 __global vgc_walk_workers_cfg = int(-1)
@@ -2189,6 +2196,10 @@ pub fn vgc_init() {
 		}
 	}
 	vgc_walk_ncpu = C.vgc_ncpu()
+	rp_env := C.getenv(c'VGC_ROOTS_PAR')
+	if rp_env != unsafe { nil } {
+		vgc_roots_par = C.atoll(rp_env) != 0
+	}
 	sw_env := C.getenv(c'VGC_STOP_WEIGH')
 	if sw_env != unsafe { nil } {
 		vgc_stop_weigh = C.atoll(sw_env) != 0
