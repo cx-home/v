@@ -1002,15 +1002,22 @@ __global vgc_wb_mode = u32(0)
 __global vgc_wb_lo = usize(0)
 __global vgc_wb_len = usize(0)
 __global vgc_perm_len = usize(0)
-// the card table: one byte per page of [vgc_perm_lo, vgc_perm_lo + len).
-// vgc_wb_store sets the page's card (an atomic byte store when it reads 0: a
-// line sixteen threads wrote on every ring store cost stw_scaling T=16
-// -12..-30 %; set once per stop it stays shared) before and after a pointer
-// store into the range; the stop reads a permanent span's cards as its dirty
-// bit (vgc_perm_cards_take) and clears them. A card of a page no permanent
-// span covers is never read.
+// the card table: one byte per card (1 << vgc_perm_card_shift bytes) of
+// [vgc_perm_lo, vgc_perm_lo + len). vgc_wb_store sets the card of the address
+// it is given (an atomic byte store when it reads 0: a line sixteen threads
+// wrote on every ring store cost stw_scaling T=16 -12..-30 %; set once per
+// stop it stays shared) before and after a pointer store into the range; the
+// stop re-scans a permanent span's permanent objects that overlap a set card
+// (vgc_perm_cards_take) and clears them. A card no permanent span covers is
+// never read. cx-home/v#56: the card was the collector's 8 KB page, so an
+// initializing store into a young object in a permanent span's free slot had
+// the stop re-scan every permanent object of the span (~50 of 160 spans,
+// ~2,800 objects, ~49 us a stop on an http server whose permanent objects
+// nobody wrote); a 512-byte card re-scans the permanent objects beside it.
+// VGC_PERM_CARD_SHIFT=N (9..13): the card is 1 << N bytes (13: the page, as before).
 __global vgc_perm_cards = &u8(unsafe { nil })
 __global vgc_perm_cards_n = usize(0)
+__global vgc_perm_card_shift = u32(9)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime.
@@ -2125,6 +2132,13 @@ pub fn vgc_init() {
 		pv := C.atoll(pm_env)
 		if pv >= 0 {
 			vgc_mark_par_min_ns = u64(pv) * 1000
+		}
+	}
+	pcs_env := C.getenv(c'VGC_PERM_CARD_SHIFT')
+	if pcs_env != unsafe { nil } {
+		sv := C.atoll(pcs_env)
+		if sv >= 9 && sv <= 13 {
+			vgc_perm_card_shift = u32(sv)
 		}
 	}
 	$if vgc_concurrent ? {

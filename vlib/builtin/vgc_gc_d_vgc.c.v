@@ -964,9 +964,9 @@ fn vgc_rescan_walk(w int, n int) {
 				mut dirty := C.vgc_atomic_load_u32(&span.dirty) != 0
 					|| C.vgc_atomic_load_u32(&span.born) != 0
 				if span.perm != 0 && span.perm_bits != unsafe { nil } && !span.noscan {
-					if vgc_perm_cards_take(span) {
-						dirty = true
-					}
+					// cx-home/v#56: a card names the objects it overlaps (cm), not the span
+					mut cm := [136]u8{}
+					carded := vgc_perm_cards_take(span, &cm[0])
 					// cx-home/v#15: a permanent span. Dirtied since the last stop: its
 					// PERMANENT objects are scanned (every other object in it is traced
 					// or swept as usual — scanning a dead one would keep what it points
@@ -975,11 +975,11 @@ fn vgc_rescan_walk(w int, n int) {
 					// young_bits re-taken; clean: only the permanent objects young_bits
 					// names (they hold a pointer to a non-permanent object, which only
 					// they keep alive).
-					ps, po, py := vgc_rescan_perm_span(span, dirty, term, w)
+					ps, po, py := vgc_rescan_perm_span(span, dirty, carded, &cm[0], term, w)
 					spans += ps
 					objs += po
 					young += py
-					if dirty {
+					if dirty || carded {
 						unsafe {
 							C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
 							C.vgc_atomic_store_u32(&(&VGC_Span(span)).born, 0)
@@ -1071,23 +1071,43 @@ fn vgc_rescan_plan() int {
 	return vgc_pool_ensure(total)
 }
 
-// vgc_perm_cards_take reads and clears the cards of a permanent span's pages
-// (STW): true when a store landed in the span since the last stop.
-fn vgc_perm_cards_take(span &VGC_Span) bool {
-	if vgc_perm_cards == unsafe { nil } || span.base < vgc_perm_lo {
+// vgc_perm_cards_take reads and clears the cards of a permanent span (STW):
+// true when a store landed in the span since the last stop. Each object that
+// overlaps a set card gets its bit in sel (136 zeroed bytes, the layout of
+// perm_bits): the store's address lies in that object (cx-home/v#56).
+fn vgc_perm_cards_take(span &VGC_Span, sel &u8) bool {
+	if vgc_perm_cards == unsafe { nil } || span.base < vgc_perm_lo || span.elem_size == 0 {
 		return false
 	}
-	first := (span.base - vgc_perm_lo) / vgc_page_size
+	sh := vgc_perm_card_shift
+	first := (span.base - vgc_perm_lo) >> sh
+	ncards := (usize(span.npages) * vgc_page_size) >> sh
+	es := usize(span.elem_size)
 	mut any := false
-	for k in 0 .. usize(span.npages) {
-		pg := first + k
-		if pg >= vgc_perm_cards_n {
+	for k in 0 .. ncards {
+		c := first + k
+		if c >= vgc_perm_cards_n {
 			break
 		}
-		if unsafe { vgc_perm_cards[pg] } != 0 {
-			any = true
+		if unsafe { vgc_perm_cards[c] } == 0 {
+			continue
+		}
+		any = true
+		unsafe {
+			vgc_perm_cards[c] = 0
+		}
+		i0 := (k << sh) / es
+		mut i1 := (((k + 1) << sh) - 1) / es
+		if i0 >= usize(span.nelems) {
+			continue
+		}
+		if i1 >= usize(span.nelems) {
+			i1 = usize(span.nelems) - 1
+		}
+		for i in i0 .. i1 + 1 {
 			unsafe {
-				vgc_perm_cards[pg] = 0
+				p := &u8(voidptr(usize(sel) + (i >> 3)))
+				*p |= u8(1) << (i & 7)
 			}
 		}
 	}
@@ -1127,7 +1147,11 @@ fn vgc_scan_perm_obj(lo usize, hi usize, w int) bool {
 
 // One permanent span's re-scan (see vgc_rescan_dirty_spans). young_bits is a
 // subset of perm_bits: only a permanent object is a root for what it points to.
-fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool, w int) (u64, u64, u64) {
+// carded (cx-home/v#56): a span not dirty whose cards were set re-scans the
+// objects cm names (the ones a store landed in) and young_bits', not all its
+// permanent objects; the stored-into object is in cm whatever its generation,
+// so a termination takes it as a dirty span takes every allocated object.
+fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, carded bool, cm &u8, term bool, w int) (u64, u64, u64) {
 	mut spans := u64(0)
 	mut objs := u64(0)
 	mut young := u64(0)
@@ -1139,7 +1163,13 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool, w int) (u64, u64,
 	mut counted := false
 	for b in 0 .. nbytes {
 		pbyte := unsafe { span.perm_bits[b] }
-		sel := if !dirty {
+		sel := if !dirty && carded {
+			if term {
+				(unsafe { span.alloc_bits[b] } & unsafe { cm[b] }) | unsafe { yb[b] }
+			} else {
+				(unsafe { span.alloc_bits[b] } & pbyte & unsafe { cm[b] }) | unsafe { yb[b] }
+			}
+		} else if !dirty {
 			unsafe { yb[b] }
 		} else if term {
 			unsafe { span.alloc_bits[b] }
@@ -1168,11 +1198,11 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool, w int) (u64, u64,
 				nyb |= m
 				young++
 			}
-			if dirty {
+			if dirty || carded {
 				objs++
 			}
 		}
-		if dirty {
+		if dirty || carded {
 			unsafe {
 				yb[b] = nyb
 			}
@@ -1314,7 +1344,7 @@ fn vgc_perm_promote() {
 		vgc_perm_hi = hi
 		// the card table over the range, before the length that opens the gate
 		if hi > lo {
-			ncards := (hi - lo) / vgc_page_size + 1
+			ncards := ((hi - lo) >> vgc_perm_card_shift) + 1
 			if ncards > vgc_perm_cards_n || vgc_perm_cards == unsafe { nil } {
 				vgc_perm_cards = unsafe { &u8(C.vgc_os_alloc(ncards)) }
 				vgc_perm_cards_n = if vgc_perm_cards != unsafe { nil } { ncards } else { 0 }
@@ -3096,13 +3126,13 @@ pub fn vgc_wb_store(obj voidptr) {
 			return
 		}
 		if (mode & 1) == 0 {
-			// the permanent regime alone: the page's card, set when not set
+			// the permanent regime alone: the address's card, set when not set
 			// (vgc_perm_cards doc); the stop reads it as the span's dirty bit
 			addr := usize(obj)
 			if addr < vgc_perm_lo || addr - vgc_perm_lo >= vgc_perm_len || vgc_perm_cards == unsafe { nil } {
 				return
 			}
-			card := unsafe { &u8(voidptr(usize(vgc_perm_cards) + (addr - vgc_perm_lo) / vgc_page_size)) }
+			card := unsafe { &u8(voidptr(usize(vgc_perm_cards) + ((addr - vgc_perm_lo) >> vgc_perm_card_shift))) }
 			if unsafe { *card } == 0 {
 				_ = C.vgc_atomic_fetch_or_u8(card, 1)
 			}
