@@ -178,7 +178,7 @@ fn vgc_gc_start() {
 
 	// Clear mark bits on all spans (prepare for new cycle)
 	vgc_ph[0] = C.vgc_now_ns()
-	vgc_clear_mark_bits()
+	vgc_cycle_start_marks()
 	vgc_ph[1] = C.vgc_now_ns()
 	vgc_watch_snapshot(0) // STAGE 0: post-clear (expect found+in_use+alloc, mark=0)
 
@@ -314,24 +314,13 @@ fn vgc_gc_start() {
 	// Disable write barrier (cx-home/v#15: the permanent regime stays)
 	vgc_wb_set(vgc_perm_on * 2)
 
-	// Compute live bytes from mark bits
-	marked := vgc_count_marked()
-	vgc_ph[6] = C.vgc_now_ns()
-	vgc_mark_adapt(marked) // cx-home/v#16: the next cycle's marker count
-	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
-	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, marked)
-	// Reset heap_live to match what we actually found alive. The per-thread
-	// live_delta/alloc_delta (un-flushed accounting) are now stale — `marked` is
-	// the true live set — so flush each thread's total-alloc stat and zero both
-	// deltas. Safe: the world is stopped, so no mutator is mid-update.
-	for ci in 0 .. vgc_heap.ncaches {
-		unsafe {
-			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
-			vgc_cache(ci).alloc_delta = 0
-			vgc_cache(ci).live_delta = 0
-		}
+	// Compute live bytes from mark bits (cx-home/v#56: in the sweep's walk
+	// when the walks are fused, vgc_sweep_fused; settled after vgc_do_sweep)
+	vgc_sweep_fused = vgc_fuse_walks
+	if !vgc_sweep_fused {
+		vgc_settle_marked(vgc_count_marked(), 0)
 	}
-	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
+	vgc_ph[6] = C.vgc_now_ns()
 
 	// === Phase 4: Sweep ===
 	vgc_heap.sweep_gen++
@@ -377,6 +366,9 @@ fn vgc_gc_start() {
 	vgc_protect_cached_spans()
 	C.vgc_trace(9, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP0
 	vgc_do_sweep()
+	if vgc_sweep_fused {
+		vgc_settle_marked(vgc_sweep_marked, 0)
+	}
 	vgc_ph[7] = C.vgc_now_ns()
 	// cx-home/v#16: the three walks' time, for the next cycle's walker count
 	vgc_walk_adapt((vgc_ph[1] - vgc_ph[0]) + (vgc_ph[6] - vgc_ph[5]) + vgc_ph_swalk_ns)
@@ -1472,7 +1464,7 @@ fn vgc_gc_start_concurrent() {
 			vgc_cm_born_bound = vgc_cm_born_min
 		}
 	}
-	vgc_clear_mark_bits()
+	vgc_cycle_start_marks()
 	vgc_ph[1] = C.vgc_now_ns()
 	// The barrier and alloc-gray are live BEFORE the roots are taken and
 	// before any mutator runs again: gc_phase is already vgc_phase_mark (the
@@ -1548,30 +1540,18 @@ fn vgc_gc_start_concurrent() {
 	vgc_mark_work_from_cpu_at(mcpu0, mwait0, mcpu1, mwait1)
 	vgc_wb_set(vgc_perm_on * 2) // cx-home/v#15: the permanent regime stays
 
-	marked := vgc_count_marked()
-	vgc_ph[6] = C.vgc_now_ns()
-	vgc_mark_adapt(marked)
-	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	// cut 1: the count read every bit the alloc-black hook set — the middle's
 	// births, alive or already dead, which this cycle could not judge. The
 	// pacer's live set (heap_marked, the goal's base and the trace's marked=)
 	// is the count less the births; heap_live keeps the whole count, so the
-	// births stand as allocation since this cycle and the next one judges them.
-	mut net := marked
-	if born < net {
-		net -= born
-	} else {
-		net = 0
+	// births stand as allocation since this cycle and the next one judges them
+	// (vgc_settle_marked). cx-home/v#56: counted in the sweep's walk when the
+	// walks are fused.
+	vgc_sweep_fused = vgc_fuse_walks
+	if !vgc_sweep_fused {
+		vgc_settle_marked(vgc_count_marked(), born)
 	}
-	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, net)
-	for ci in 0 .. vgc_heap.ncaches {
-		unsafe {
-			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
-			vgc_cache(ci).alloc_delta = 0
-			vgc_cache(ci).live_delta = 0
-		}
-	}
-	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
+	vgc_ph[6] = C.vgc_now_ns()
 
 	// Sweep, stopped: no span is freed during the middle, so this is the STW
 	// collector's sweep. vgc_protect_cached_spans first, as there (a span a
@@ -1583,6 +1563,9 @@ fn vgc_gc_start_concurrent() {
 	vgc_protect_cached_spans()
 	C.vgc_trace(9, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP0
 	vgc_do_sweep()
+	if vgc_sweep_fused {
+		vgc_settle_marked(vgc_sweep_marked, born)
+	}
 	vgc_ph[7] = C.vgc_now_ns()
 	vgc_walk_adapt((vgc_ph[1] - vgc_ph[0]) + (vgc_ph[6] - vgc_ph[5]) + vgc_ph_swalk_ns)
 	C.vgc_trace(10, self_idx, u64(vgc_heap.gc_cycle), 0) // SWEEP1
@@ -1750,6 +1733,52 @@ fn vgc_scan_suspended_roots(self_idx int) {
 // ============================================================
 
 // Clear all mark bits before a new GC cycle
+// cx-home/v#56: a cycle's start state of the mark bits — zero, a permanent
+// span's perm_bits — is written by the LAST cycle's sweep walk (vgc_walk_sweep,
+// when the walks are fused) as it leaves each span, so the cycle starts without
+// a walk of the span table of its own. vgc_marks_ready says the sweep did so;
+// vgc_marks_stray that a mark was set after its span was left (the alloc-black
+// hook during the sweep phase: a mutator that slipped the stop), so this cycle
+// clears as before. Spans carved or re-initialized since start zeroed
+// (vgc_span_init); a permanent object freed since loses its mark bit with its
+// permanent bit (vgc_free).
+fn vgc_cycle_start_marks() {
+	if C.vgc_atomic_load_u32(&vgc_marks_ready) == 0 || C.vgc_atomic_load_u32(&vgc_marks_stray) != 0 {
+		vgc_clear_mark_bits()
+	} else {
+		vgc_span_meta_promote_pending() // as vgc_clear_mark_bits does
+	}
+	C.vgc_atomic_store_u32(&vgc_marks_ready, 0)
+	C.vgc_atomic_store_u32(&vgc_marks_stray, 0)
+}
+
+// vgc_settle_marked takes a cycle's count of marked bytes into the pacer's
+// counters (cx-home/v#56: before the sweep, or after it when the sweep's walk
+// counted): heap_marked is the count less `born` (the concurrent middle's
+// births, which the cycle could not judge); heap_live is the whole count, and
+// the per-thread live_delta/alloc_delta (un-flushed accounting) are stale
+// against it, so each thread's total-alloc stat is flushed and both deltas
+// zeroed. Safe: the world is stopped, so no mutator is mid-update.
+fn vgc_settle_marked(marked u64, born u64) {
+	vgc_mark_adapt(marked) // cx-home/v#16: the next cycle's marker count
+	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
+	mut net := marked
+	if born < net {
+		net -= born
+	} else {
+		net = 0
+	}
+	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, net)
+	for ci in 0 .. vgc_heap.ncaches {
+		unsafe {
+			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_delta = 0
+			vgc_cache(ci).live_delta = 0
+		}
+	}
+	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
+}
+
 fn vgc_clear_mark_bits() {
 	// Cycle start, under STW with vgc_heap.lock held (both the STW and concurrent
 	// collectors route through here once per cycle): promote descriptors retired
@@ -1839,11 +1868,13 @@ fn vgc_walk_count(w int, n int) {
 fn vgc_walk_sweep(w int, n int) {
 	nb := u32((vgc_heap.nspans + 7) / 8)
 	tags := unsafe { &u8(voidptr(vgc_walk_tag)) }
+	fused := vgc_sweep_fused
+	mut total := u64(0)
 	for {
 		w1 := C.vgc_atomic_add_u32(&vgc_walk_cursor, vgc_walk_chunk)
 		w0 := w1 - vgc_walk_chunk
 		if w0 >= nb {
-			return
+			break
 		}
 		hi := if w1 < nb { w1 } else { nb }
 		for wi in w0 .. hi {
@@ -1856,15 +1887,47 @@ fn vgc_walk_sweep(w int, n int) {
 				if span == unsafe { nil } || !span.in_use {
 					continue
 				}
+				if !fused {
+					tag := vgc_sweep_span_bits(span)
+					if tag != vgc_walk_tag_none {
+						unsafe {
+							tags[idx] = tag
+						}
+					}
+					continue
+				}
+				// cx-home/v#56: the walks fused — the count (vgc_walk_count's),
+				// the sweep, then the next cycle's start state (vgc_walk_clear's)
+				// in one visit of the span
+				if span.mark_bits != unsafe { nil } {
+					nbytes := (span.nelems + 7) / 8
+					mut count := u32(0)
+					for b in 0 .. nbytes {
+						count += u32(C.vgc_popcount8(unsafe { span.mark_bits[b] }))
+					}
+					if count > span.nelems {
+						count = span.nelems
+					}
+					total += u64(count) * u64(span.elem_size)
+				}
 				tag := vgc_sweep_span_bits(span)
 				if tag != vgc_walk_tag_none {
 					unsafe {
 						tags[idx] = tag
 					}
 				}
+				if span.mark_bits != unsafe { nil } {
+					bitmap_size := (span.nelems + 7) / 8
+					if span.perm != 0 && span.perm_bits != unsafe { nil } {
+						unsafe { C.memcpy(span.mark_bits, span.perm_bits, bitmap_size) }
+					} else {
+						unsafe { C.memset(span.mark_bits, 0, bitmap_size) }
+					}
+				}
 			}
 		}
 	}
+	vgc_walk_sum[w * 16] = total
 }
 
 // The sweep's serial tail: the verdicts in slot order — the order the serial
@@ -2182,8 +2245,8 @@ fn vgc_scan_data_range(lo usize, hi usize) {
 	// stack bounds, cycle numbers and parked flags, written only under
 	// -d vgc_spcheck, never a reference.
 	spchk_len := usize(vgc_spchk_slots) * w
-	own_los := [usize(voidptr(&vgc_spchk_lo[0])), usize(voidptr(&vgc_spchk_hi[0])), usize(voidptr(&vgc_spchk_cyc[0])), usize(voidptr(&vgc_spchk_parked[0])), usize(voidptr(&vgc_ph[0])), usize(voidptr(&vgc_walk_sum[0])), usize(voidptr(&vgc_pool_hot_bits[0])), usize(voidptr(&vgc_pool_cold_bits[0])), usize(voidptr(&vgc_gc_t0)), usize(voidptr(&vgc_gc_last_end)), usize(voidptr(&vgc_gc_cpu_t0)), usize(voidptr(&vgc_gc_wait_cpu)), usize(voidptr(&vgc_gate_last_pause)), usize(voidptr(&vgc_gate_last_interval)), usize(voidptr(&vgc_stw_last_pause_ns)), usize(voidptr(&vgc_perm_rescan_ns)), usize(voidptr(&vgc_root_last_ns)), usize(voidptr(&vgc_mark_last_ns)), usize(voidptr(&vgc_mark_last_work_ns)), usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)), usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)), usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)), usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns))]!
-	own_lens := [spchk_len, spchk_len, spchk_len, spchk_len, usize(8) * w, usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w]!
+	own_los := [usize(voidptr(&vgc_spchk_lo[0])), usize(voidptr(&vgc_spchk_hi[0])), usize(voidptr(&vgc_spchk_cyc[0])), usize(voidptr(&vgc_spchk_parked[0])), usize(voidptr(&vgc_ph[0])), usize(voidptr(&vgc_walk_sum[0])), usize(voidptr(&vgc_pool_hot_bits[0])), usize(voidptr(&vgc_pool_cold_bits[0])), usize(voidptr(&vgc_gc_t0)), usize(voidptr(&vgc_gc_last_end)), usize(voidptr(&vgc_gc_cpu_t0)), usize(voidptr(&vgc_gc_wait_cpu)), usize(voidptr(&vgc_gate_last_pause)), usize(voidptr(&vgc_gate_last_interval)), usize(voidptr(&vgc_stw_last_pause_ns)), usize(voidptr(&vgc_perm_rescan_ns)), usize(voidptr(&vgc_root_last_ns)), usize(voidptr(&vgc_mark_last_ns)), usize(voidptr(&vgc_mark_last_work_ns)), usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)), usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)), usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)), usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns)), usize(voidptr(&vgc_sweep_marked))]!
+	own_lens := [spchk_len, spchk_len, spchk_len, spchk_len, usize(8) * w, usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w]!
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur
@@ -3085,6 +3148,20 @@ fn vgc_write_barrier(new_val voidptr) {
 // store landed and the next cycle re-scans the span. Off-cycle and before the
 // promotion it is a single atomic load + return; the dirty bit is read before
 // it is written, so a span already dirty costs no store.
+// vgc_perm_obj_at: whether addr lies in a permanent object (cx-home/v#56).
+fn vgc_perm_obj_at(addr usize) bool {
+	span := vgc_find_span(voidptr(addr))
+	if span == unsafe { nil } || !span.in_use || span.perm == 0 || span.perm_bits == unsafe { nil }
+		|| span.elem_size == 0 || addr < span.base {
+		return false
+	}
+	idx := u32((addr - span.base) / usize(span.elem_size))
+	if idx >= span.nelems {
+		return false
+	}
+	return C.vgc_bitmap_get(span.perm_bits, idx) != 0
+}
+
 @[export: 'vgc_wb_store']
 pub fn vgc_wb_store(obj voidptr) {
 	$if vgc_concurrent ? {
@@ -3104,6 +3181,14 @@ pub fn vgc_wb_store(obj voidptr) {
 			}
 			card := unsafe { &u8(voidptr(usize(vgc_perm_cards) + (addr - vgc_perm_lo) / vgc_page_size)) }
 			if unsafe { *card } == 0 {
+				// cx-home/v#56: only a permanent object's store (vgc_perm_card_obj).
+				// Sound: an object is permanent from its promotion to its free;
+				// a promotion between this call and the store makes the stored
+				// value permanent too (it is live then), and the call after the
+				// store sees the target's new state.
+				if vgc_perm_card_obj && !vgc_perm_obj_at(addr) {
+					return
+				}
 				_ = C.vgc_atomic_fetch_or_u8(card, 1)
 			}
 			return
@@ -3328,8 +3413,22 @@ fn vgc_do_sweep() {
 	// cx-home/v#16: the per-span bit work on the pool, then the verdicts
 	// (recycle / relink) applied here, by this thread, in slot order.
 	C.vgc_atomic_store_u32(&vgc_walk_active, 1)
+	if vgc_sweep_fused {
+		for w in 0 .. vgc_max_markers {
+			vgc_walk_sum[w * 16] = 0
+		}
+	}
 	vgc_walk_run(vgc_pool_phase_sweep)
 	C.vgc_atomic_store_u32(&vgc_walk_active, 0)
+	if vgc_sweep_fused {
+		// cx-home/v#56: the walk counted and left every span's start state
+		mut total := u64(0)
+		for w in 0 .. vgc_max_markers {
+			total += vgc_walk_sum[w * 16]
+		}
+		vgc_sweep_marked = total
+		C.vgc_atomic_store_u32(&vgc_marks_ready, 1)
+	}
 	t_walked := C.vgc_now_ns()
 	vgc_ph_swalk_ns = t_walked - vgc_ph[6]
 	vgc_walk_sweep_apply()

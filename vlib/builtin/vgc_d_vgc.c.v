@@ -1011,6 +1011,23 @@ __global vgc_perm_len = usize(0)
 // span covers is never read.
 __global vgc_perm_cards = &u8(unsafe { nil })
 __global vgc_perm_cards_n = usize(0)
+// cx-home/v#56: a card is set only for a store into a PERMANENT object
+// (vgc_wb_store): a permanent span's free slots hold young objects, traced
+// and swept as any other, and their initializing stores dirtied the page's
+// card, so ~50 permanent spans a cycle were re-scanned whole on an http
+// server whose permanent objects nobody wrote. VGC_PERM_CARD_OBJ=0: the
+// page's card on every store into the range, as before.
+__global vgc_perm_card_obj = true
+// cx-home/v#56: the sweep's walk also counts the marked bytes and leaves each
+// span's next start state (vgc_walk_sweep, vgc_cycle_start_marks), so a
+// cycle walks the span table once, not three times. VGC_FUSE_WALKS=0: the
+// clear and the count walk the table apart, as before. vgc_sweep_fused is
+// this cycle's choice, vgc_sweep_marked the walk's count.
+__global vgc_fuse_walks = true
+__global vgc_sweep_fused = false
+__global vgc_sweep_marked = u64(0)
+__global vgc_marks_ready = u32(0)
+__global vgc_marks_stray = u32(0)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime.
@@ -2126,6 +2143,14 @@ pub fn vgc_init() {
 		if pv >= 0 {
 			vgc_mark_par_min_ns = u64(pv) * 1000
 		}
+	}
+	fw_env := C.getenv(c'VGC_FUSE_WALKS')
+	if fw_env != unsafe { nil } {
+		vgc_fuse_walks = C.atoll(fw_env) != 0
+	}
+	pco_env := C.getenv(c'VGC_PERM_CARD_OBJ')
+	if pco_env != unsafe { nil } {
+		vgc_perm_card_obj = C.atoll(pco_env) != 0
 	}
 	$if vgc_concurrent ? {
 		// cx-private#1910: the concurrent cycle's selection (see vgc_gc_start)
@@ -4676,7 +4701,24 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 	$if vgc_allocblack_off ? {
 		return
 	}
-	if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
+	gph := C.vgc_atomic_load_u32(&vgc_heap.gc_phase)
+	if gph != vgc_phase_off {
+		// cx-home/v#56: from the sweep's walk on, the mark bits hold the next
+		// cycle's start state (vgc_marks_ready). Past the walk (the sweep
+		// phase, through the resume) the cycle is judged: a birth needs no
+		// mark and one set now would start the next cycle black. Between the
+		// next cycle's phase change and its stop, the old clear wiped the mark
+		// this hook set, so none is set, but the span is still born (alloc-
+		// gray: an object filled after that stop is re-scanned). A mark set
+		// during the walk itself (a mutator that slipped the stop) may land in
+		// a span the walk has left: the next cycle clears (vgc_marks_stray).
+		ready := C.vgc_atomic_load_u32(&vgc_marks_ready) != 0
+		if ready && gph == vgc_phase_sweep {
+			return
+		}
+		if !ready && gph == vgc_phase_sweep {
+			C.vgc_atomic_store_u32(&vgc_marks_stray, 1)
+		}
 		if span.mark_bits != unsafe { nil } {
 			// ATOMIC OR, not vgc_bitmap_test_and_set (a plain read-modify-write):
 			// this hook runs in MUTATOR context — concurrently with other mutators
@@ -4686,8 +4728,11 @@ fn vgc_alloc_black_hook(span &VGC_Span, obj_idx u32) {
 			// torn mark byte here ERASES freshly-set neighbor marks => sweep
 			// frees live objects — worse than no hook at all.
 			mask := u8(1) << (obj_idx & 7)
-			old := unsafe {
-				C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
+			mut old := mask
+			if !ready {
+				old = unsafe {
+					C.vgc_atomic_fetch_or_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), mask)
+				}
 			}
 			$if vgc_concurrent ? {
 				// alloc-GRAY (cx-private#1910): the newborn's span is re-scanned at
@@ -5770,6 +5815,15 @@ fn vgc_free(ptr voidptr) {
 			unsafe {
 				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + usize(obj_idx >> 3))), ~mask)
 				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + 136 + usize(obj_idx >> 3))), ~mask)
+			}
+			// cx-home/v#56: the last sweep already wrote the next cycle's
+			// start state from perm_bits (vgc_marks_ready), so the mark goes
+			// with the permanent bit — else the slot's next occupant starts
+			// that cycle black
+			if C.vgc_atomic_load_u32(&vgc_marks_ready) != 0 && span.mark_bits != unsafe { nil } {
+				unsafe {
+					_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.mark_bits) + usize(obj_idx >> 3))), ~mask)
+				}
 			}
 		}
 		// a freed candidate leaves the epoch: the slot's next occupant is born after it
