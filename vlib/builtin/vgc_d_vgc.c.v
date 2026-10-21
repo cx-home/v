@@ -1011,6 +1011,13 @@ __global vgc_perm_len = usize(0)
 // span covers is never read.
 __global vgc_perm_cards = &u8(unsafe { nil })
 __global vgc_perm_cards_n = usize(0)
+// cx-home/v#56: a card is set only for a store into a PERMANENT object
+// (vgc_wb_store): a permanent span's free slots hold young objects, traced
+// and swept as any other, and their initializing stores dirtied the page's
+// card, so ~50 permanent spans a cycle were re-scanned whole on an http
+// server whose permanent objects nobody wrote. VGC_PERM_CARD_OBJ=0: the
+// page's card on every store into the range, as before.
+__global vgc_perm_card_obj = true
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime.
@@ -2126,6 +2133,10 @@ pub fn vgc_init() {
 		if pv >= 0 {
 			vgc_mark_par_min_ns = u64(pv) * 1000
 		}
+	}
+	pco_env := C.getenv(c'VGC_PERM_CARD_OBJ')
+	if pco_env != unsafe { nil } {
+		vgc_perm_card_obj = C.atoll(pco_env) != 0
 	}
 	$if vgc_concurrent ? {
 		// cx-private#1910: the concurrent cycle's selection (see vgc_gc_start)

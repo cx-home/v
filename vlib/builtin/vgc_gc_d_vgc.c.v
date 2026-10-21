@@ -3085,6 +3085,20 @@ fn vgc_write_barrier(new_val voidptr) {
 // store landed and the next cycle re-scans the span. Off-cycle and before the
 // promotion it is a single atomic load + return; the dirty bit is read before
 // it is written, so a span already dirty costs no store.
+// vgc_perm_obj_at: whether addr lies in a permanent object (cx-home/v#56).
+fn vgc_perm_obj_at(addr usize) bool {
+	span := vgc_find_span(voidptr(addr))
+	if span == unsafe { nil } || !span.in_use || span.perm == 0 || span.perm_bits == unsafe { nil }
+		|| span.elem_size == 0 || addr < span.base {
+		return false
+	}
+	idx := u32((addr - span.base) / usize(span.elem_size))
+	if idx >= span.nelems {
+		return false
+	}
+	return C.vgc_bitmap_get(span.perm_bits, idx) != 0
+}
+
 @[export: 'vgc_wb_store']
 pub fn vgc_wb_store(obj voidptr) {
 	$if vgc_concurrent ? {
@@ -3104,6 +3118,14 @@ pub fn vgc_wb_store(obj voidptr) {
 			}
 			card := unsafe { &u8(voidptr(usize(vgc_perm_cards) + (addr - vgc_perm_lo) / vgc_page_size)) }
 			if unsafe { *card } == 0 {
+				// cx-home/v#56: only a permanent object's store (vgc_perm_card_obj).
+				// Sound: an object is permanent from its promotion to its free;
+				// a promotion between this call and the store makes the stored
+				// value permanent too (it is live then), and the call after the
+				// store sees the target's new state.
+				if vgc_perm_card_obj && !vgc_perm_obj_at(addr) {
+					return
+				}
 				_ = C.vgc_atomic_fetch_or_u8(card, 1)
 			}
 			return
