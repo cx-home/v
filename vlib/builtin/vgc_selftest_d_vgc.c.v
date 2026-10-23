@@ -448,3 +448,47 @@ pub fn vgc_mark_cpu_plan_selftest() u32 {
 	vgc_mark_last_cpu_ns = s_cpu
 	return rc
 }
+
+// vgc_uaf_foreign_selftest — cx-private#2011. The passive UAF oracle
+// (vgc_uaf_check_buf) bounds an address by [vgc_arena_lo, vgc_arena_hi), the
+// span of the arenas. On Linux glibc's per-thread malloc arenas are mmaps that
+// land inside that span, so a libc buffer between two arenas read as "span
+// recycled/decommitted" (0xbf3 = 0xdec0): the concurrency-soundness gate's
+// first Linux run counted ~2,000 such catches on the HTTP stressors, every one
+// a clone of picoev's C.malloc'd request buffer. This plants that shape with
+// no threads: a C.malloc'd buffer, the arena bounds widened over it, and the
+// oracle must answer "not a vgc free" without counting a catch. A buffer vgc
+// itself freed must still be caught. Driven by
+// bench/parallel-alloc/vgc_uaf_foreign_test.v. 0 = ok; 1 = setup (the libc
+// buffer is inside an arena); 2 = the foreign address read as freed (the old
+// check); 3 = a vgc-freed buffer was not caught.
+pub fn vgc_uaf_foreign_selftest() u32 {
+	foreign := unsafe { C.malloc(64) }
+	f := usize(foreign)
+	if vgc_addr_in_arena(f) {
+		unsafe { C.free(foreign) }
+		return 1
+	}
+	lo := vgc_arena_lo
+	hi := vgc_arena_hi
+	if f < vgc_arena_lo {
+		vgc_arena_lo = f
+	}
+	if f + 64 > vgc_arena_hi {
+		vgc_arena_hi = f + 64
+	}
+	count0 := vgc_uaf_count
+	caught := vgc_uaf_check_buf(f, 8)
+	vgc_arena_lo = lo
+	vgc_arena_hi = hi
+	unsafe { C.free(foreign) }
+	if caught || vgc_uaf_count != count0 {
+		return 2
+	}
+	p := unsafe { malloc_noscan(32) }
+	vgc_free(p)
+	if !vgc_uaf_check_buf(usize(p), 8) {
+		return 3
+	}
+	return 0
+}

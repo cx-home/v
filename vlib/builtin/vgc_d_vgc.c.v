@@ -6593,6 +6593,21 @@ fn vgc_uaf_report(loc usize, slen int, strptr usize) {
 	vgc_uaf_classify(0xdc0, strptr)
 }
 
+// vgc_addr_in_arena reports whether `addr` lies inside one of the heap's
+// arenas — the union of [base, base + size), not the [vgc_arena_lo,
+// vgc_arena_hi) span that also covers the foreign mappings between them
+// (cx-private#2011). Diagnostic path only (the oracle's nil-span case).
+fn vgc_addr_in_arena(addr usize) bool {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	for i in 0 .. nar {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if addr >= a.base && addr < a.base + a.size {
+			return true
+		}
+	}
+	return false
+}
+
 // vgc_uaf_check_buf: inspects ONLY span metadata for the char buffer at `strptr`
 // (never the possibly-unmapped data page — crash-safe), reporting whether it has
 // been freed (alloc bit clear) or its span recycled. Returns true on a freed
@@ -6602,6 +6617,17 @@ fn vgc_uaf_check_buf(strptr usize, slen int) bool {
 		return false // literal / malloc / non-GC memory — not a vgc free
 	}
 	span := vgc_find_span(voidptr(strptr))
+	// cx-private#2011: [vgc_arena_lo, vgc_arena_hi) is the SPAN of the arenas,
+	// not their union. Other mappings sit between them — on Linux glibc's
+	// per-thread malloc arenas (64 MB-aligned mmaps, one per contended thread)
+	// land there, and cx-platform-net's picoev C.mallocs its request buffers
+	// in them. A nil span at such an address is foreign memory, not a
+	// recycled span: the reactor's header/method/path clones read as 200
+	// "freed" catches per run (0xbf3 = 0xdec0) with no free behind them.
+	// Only a nil span INSIDE an arena is a decommitted vgc span.
+	if span == unsafe { nil } && !vgc_addr_in_arena(strptr) {
+		return false
+	}
 	if span == unsafe { nil } || !span.in_use || span.elem_size == 0 {
 		vgc_uaf_count++
 		if vgc_uaf_count <= 200 {
