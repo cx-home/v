@@ -99,7 +99,9 @@ fn vgc_gc_start() {
 		// no barrier, so it must not be promoted)
 		promote := vgc_perm_mode != 0
 			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
-		if !promote && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
+		// cx-home/v#56: under the young generation every cycle promotes, so every
+		// cycle is stop-the-world (the minor ones trace only what is young)
+		if !promote && vgc_gen_mode == 0 && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
 			vgc_gc_start_concurrent()
@@ -178,7 +180,22 @@ fn vgc_gc_start() {
 
 	// Clear mark bits on all spans (prepare for new cycle)
 	vgc_ph[0] = C.vgc_now_ns()
+	$if vgc_concurrent ? {
+		// cx-home/v#56: a full cycle marks from zero — the old objects are
+		// traced too, so the dead ones are swept — the first time, and when the
+		// old generation grew half again past the last full cycle's survivors
+		// plus four nurseries (what minor cycles promoted and has since died
+		// waits for it); every other cycle is a minor one
+		if vgc_gen_mode != 0 {
+			vgc_gen_full = vgc_perm_on == 0
+				|| vgc_perm_bytes > vgc_gen_old_at_full + vgc_gen_old_at_full / 2 + 4 * vgc_gen_nursery
+			vgc_perm_clear_zero = vgc_gen_full
+		}
+	}
 	vgc_clear_mark_bits()
+	$if vgc_concurrent ? {
+		vgc_perm_clear_zero = false
+	}
 	vgc_ph[1] = C.vgc_now_ns()
 	vgc_watch_snapshot(0) // STAGE 0: post-clear (expect found+in_use+alloc, mark=0)
 
@@ -257,8 +274,10 @@ fn vgc_gc_start() {
 	vgc_watch_snapshot(3) // STAGE 3: post spawn-root shade
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the permanent spans written since the last cycle (their
-		// objects are black from the clear; what they point to is found here)
-		if vgc_perm_on != 0 {
+		// objects are black from the clear; what they point to is found here).
+		// cx-home/v#56: not on a full cycle, which traces the old objects from
+		// the roots (a re-scan would keep a dead old object's referents alive)
+		if vgc_perm_on != 0 && !(vgc_gen_mode != 0 && vgc_gen_full) {
 			t_rescan := C.vgc_now_ns()
 			// cx-home/v#56: on the markers when the roots were (vgc_roots_plan)
 			vgc_rescan_nworkers_cur = vgc_roots_par_n
@@ -307,12 +326,21 @@ fn vgc_gc_start() {
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the promotion cycle, and the verifier's full re-mark
-		if vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
-			vgc_perm_promote()
-		}
-		if vgc_perm_on != 0 {
-			vgc_cm_verify(self_idx)
+		if vgc_gen_mode != 0 {
+			// cx-home/v#56: the verifier first (what it finds missed is marked
+			// and so promoted with the rest), then every marked object is old
+			if vgc_perm_on != 0 && !vgc_gen_full {
+				vgc_cm_verify(self_idx)
+			}
+			vgc_gen_promote(vgc_gen_full)
+		} else {
+			if vgc_perm_mode != 0
+				&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
+				vgc_perm_promote()
+			}
+			if vgc_perm_on != 0 {
+				vgc_cm_verify(self_idx)
+			}
 		}
 	}
 
@@ -1369,6 +1397,146 @@ fn vgc_perm_promote() {
 	}
 }
 
+// vgc_gen_promote (cx-home/v#56): under the stop of a cycle whose mark reached
+// closure, every marked object becomes old (the permanent generation's bits):
+// a minor cycle adds its marked objects to the old set (sticky mark bits), a
+// full cycle — which marked from zero — replaces the old set with them, so an
+// old object that died since the last full cycle leaves it and is swept with
+// the rest. Afterwards no old object points at a young one (everything marked
+// is old, and an unmarked object is reachable from nothing), so the young bits
+// and the dirty bits start empty and the card table starts clean: the barrier
+// records the next young pointer stored into an old object, as for #15.
+fn vgc_gen_promote(full bool) {
+	$if vgc_concurrent ? {
+		mut nsp := u64(0)
+		mut nbytes_total := u64(0)
+		mut lo := usize(0)
+		mut hi := usize(0)
+		for i in 0 .. vgc_heap.nspans {
+			span := unsafe { vgc_heap.allspans[i] }
+			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
+				continue
+			}
+			nb := (span.nelems + 7) / 8
+			mut any := u8(0)
+			for b in 0 .. nb {
+				any |= unsafe { span.mark_bits[b] }
+			}
+			if any == 0 {
+				// nothing marked: nothing old (a minor cycle starts every old
+				// object marked, so only a full cycle can find an old span dead)
+				if span.perm != 0 && span.perm_bits != unsafe { nil } {
+					unsafe {
+						C.memset(span.perm_bits, 0, 272)
+						(&VGC_Span(span)).perm = 0
+					}
+				}
+				continue
+			}
+			if span.perm_bits == unsafe { nil } {
+				pb := vgc_perm_bits_alloc()
+				if pb == unsafe { nil } {
+					continue
+				}
+				unsafe {
+					(&VGC_Span(span)).perm_bits = pb
+				}
+			}
+			unsafe {
+				if full || span.perm == 0 {
+					C.memcpy(span.perm_bits, span.mark_bits, nb)
+				} else {
+					for b in 0 .. nb {
+						pp := &u8(voidptr(usize(span.perm_bits) + usize(b)))
+						*pp = *pp | span.mark_bits[b]
+					}
+				}
+				C.memset(vgc_young_bits(span), 0, 136)
+				(&VGC_Span(span)).perm = 1
+				C.vgc_atomic_store_u32(&(&VGC_Span(span)).dirty, 0)
+			}
+			mut count := u32(0)
+			for b in 0 .. nb {
+				count += u32(C.vgc_popcount8(unsafe { span.perm_bits[b] }))
+			}
+			if count > span.nelems {
+				count = span.nelems
+			}
+			nsp++
+			nbytes_total += u64(count) * u64(span.elem_size)
+			if lo == 0 || span.base < lo {
+				lo = span.base
+			}
+			end := span.base + usize(span.npages) * vgc_page_size
+			if end > hi {
+				hi = end
+			}
+		}
+		vgc_perm_lo = lo
+		vgc_perm_hi = hi
+		// the card table over the range, clean (a grown range takes a fresh one)
+		if hi > lo {
+			ncards := (hi - lo) / vgc_page_size + 1
+			if ncards > vgc_perm_cards_n || vgc_perm_cards == unsafe { nil } {
+				if vgc_perm_cards != unsafe { nil } {
+					C.vgc_os_free(voidptr(vgc_perm_cards), vgc_perm_cards_n)
+				}
+				// headroom for the range to grow before the next reallocation
+				nc := ncards + ncards / 4 + 64
+				vgc_perm_cards = unsafe { &u8(C.vgc_os_alloc(nc)) }
+				vgc_perm_cards_n = if vgc_perm_cards != unsafe { nil } { nc } else { 0 }
+			}
+			if vgc_perm_cards != unsafe { nil } {
+				unsafe { C.memset(vgc_perm_cards, 0, vgc_perm_cards_n) }
+			}
+		}
+		vgc_perm_len = if vgc_perm_cards != unsafe { nil } && hi > lo { hi - lo } else { 0 }
+		vgc_wb_lo = vgc_perm_lo
+		vgc_wb_len = vgc_perm_len
+		// the page bitmap over the range, rebuilt from the old spans
+		if hi > lo {
+			npg := (hi - lo + vgc_page_size - 1) / vgc_page_size
+			nwords := (npg + 63) / 64
+			if nwords > vgc_perm_pages_n || vgc_perm_pages == unsafe { nil } {
+				if vgc_perm_pages != unsafe { nil } {
+					C.vgc_os_free(voidptr(vgc_perm_pages), vgc_perm_pages_n * 8)
+				}
+				nw := nwords + nwords / 4 + 8
+				vgc_perm_pages = unsafe { &u64(C.vgc_os_alloc(nw * 8)) }
+				vgc_perm_pages_n = if vgc_perm_pages != unsafe { nil } { nw } else { 0 }
+			}
+			if vgc_perm_pages != unsafe { nil } {
+				unsafe { C.memset(vgc_perm_pages, 0, vgc_perm_pages_n * 8) }
+				for i in 0 .. vgc_heap.nspans {
+					span := unsafe { vgc_heap.allspans[i] }
+					if span == unsafe { nil } || !span.in_use || span.perm == 0 {
+						continue
+					}
+					p0 := (span.base - lo) / vgc_page_size
+					for k in 0 .. usize(span.npages) {
+						pg := p0 + k
+						if pg < npg {
+							unsafe {
+								vgc_perm_pages[pg / 64] |= u64(1) << (pg % 64)
+							}
+						}
+					}
+				}
+			}
+		}
+		vgc_perm_spans = nsp
+		vgc_perm_bytes = nbytes_total
+		vgc_perm_promoted_cycle = vgc_heap.gc_cycle
+		vgc_perm_on = 1
+		if full {
+			vgc_gen_fulls++
+			vgc_gen_old_at_full = nbytes_total
+		} else {
+			vgc_gen_minors++
+		}
+	}
+}
+
 // -d vgc_cm_verify: under the termination stop, after the concurrent mark's
 // final drain, the heap is marked again from scratch — exactly the STW
 // collector's mark — and every object that mark reaches but the concurrent
@@ -1676,6 +1844,10 @@ fn vgc_gctrace_emit() {
 				C.vgc_gctrace_perm(u64(vgc_heap.gc_cycle), vgc_perm_spans, vgc_perm_bytes / 1024,
 					vgc_cm_rescan_spans, vgc_cm_rescan_objs, vgc_perm_young_objs, vgc_perm_rescan_ns / 1000,
 					vgc_cm_verify_missed, u64(if vgc_perm_promoted_cycle == vgc_heap.gc_cycle { 1 } else { 0 }))
+				if vgc_gen_mode != 0 {
+					C.vgc_gctrace_gen(u64(vgc_heap.gc_cycle), u64(if vgc_gen_full { 1 } else { 0 }),
+						vgc_gen_minors, vgc_gen_fulls, vgc_gen_old_at_full / 1024)
+				}
 			}
 			// cx-private#1910: the concurrent cycle's shape — the two stops, the
 			// middle, the termination re-scan's spans/objects and time
@@ -4049,6 +4221,14 @@ fn vgc_update_trigger() {
 	if extra < vgc_headroom {
 		extra = vgc_headroom
 	}
+	$if vgc_concurrent ? {
+		// cx-home/v#56: under the young generation the marked set is old (it was
+		// promoted) and the next minor cycle traces only what is born after it,
+		// so it runs a nursery past the marked set
+		if vgc_gen_mode != 0 {
+			extra = vgc_gen_nursery
+		}
+	}
 	mut goal := marked + extra
 	// the grow gate's credit (cx-private#1916, vgc_d_vgc.c.v)
 	vgc_grow_gate_credit += vgc_grow_gate_rate_pct * 10
@@ -4104,6 +4284,11 @@ fn vgc_update_trigger() {
 	mut min_budget := marked / 16
 	if min_budget < hr_min {
 		min_budget = hr_min
+	}
+	$if vgc_concurrent ? {
+		if vgc_gen_mode != 0 && min_budget > vgc_gen_nursery {
+			min_budget = vgc_gen_nursery
+		}
 	}
 	if goal < marked + min_budget {
 		goal = marked + min_budget

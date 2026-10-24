@@ -115,6 +115,7 @@ fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, 
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
+fn C.vgc_gctrace_gen(cycle u64, full u64, minors u64, fulls u64, old_full_kb u64) // VGC_GCTRACE=2 young-generation line (cx-home/v#56)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -969,6 +970,22 @@ __global vgc_cm_cut_last = false
 // vgc_wb_store; see vgc_perm_promote for the soundness argument). A later
 // vgc_set_permanent promotes the live set of that cycle on top.
 __global vgc_perm_mode = int(1)
+// cx-home/v#56: the young generation, on the permanent generation's machinery.
+// VGC_GEN=1 turns it on (vgc_concurrent only; it needs VGC_PERM on). Every
+// cycle then promotes what it marked (sticky mark bits: a minor cycle starts
+// the old objects marked and traces the roots, the dirtied old spans, the old
+// objects that hold a young pointer, and the young objects reached from them),
+// and a full cycle — the first one, then whenever the old generation has grown
+// half again past what the last full cycle left plus four nurseries — marks
+// from zero, sweeps the dead old objects and promotes the survivors in their
+// place. The pacer sets the next minor cycle a nursery past the marked set
+// (VGC_GEN_NURSERY_KB, default 1024), not a live set past it.
+__global vgc_gen_mode = int(0)
+__global vgc_gen_nursery = u64(1024) * 1024
+__global vgc_gen_full = false
+__global vgc_gen_old_at_full = u64(0)
+__global vgc_gen_minors = u64(0)
+__global vgc_gen_fulls = u64(0)
 __global vgc_perm_cycle = u64(0) // 0: no automatic promotion (vgc_set_permanent only)
 __global vgc_perm_on = u32(0)
 __global vgc_perm_request = false
@@ -1070,6 +1087,11 @@ fn vgc_young_bits(span &VGC_Span) &u8 {
 @[markused]
 pub fn vgc_set_permanent() {
 	$if vgc_concurrent ? {
+		// cx-home/v#56: under the young generation every cycle promotes what it
+		// marked, so the embedder's epoch has nothing to add
+		if vgc_gen_mode != 0 {
+			return
+		}
 		if vgc_perm_mode != 0 && vgc_perm_snapshot() {
 			vgc_perm_request = true
 		}
@@ -2173,6 +2195,18 @@ pub fn vgc_init() {
 			pc := C.atoll(pc_env)
 			if pc >= 0 {
 				vgc_perm_cycle = u64(pc)
+			}
+		}
+		// cx-home/v#56: the young generation
+		gen_env := C.getenv(c'VGC_GEN')
+		if gen_env != unsafe { nil } && C.atoll(gen_env) == 1 && vgc_perm_mode != 0 {
+			vgc_gen_mode = 1
+		}
+		gn_env := C.getenv(c'VGC_GEN_NURSERY_KB')
+		if gn_env != unsafe { nil } {
+			gn := C.atoll(gn_env)
+			if gn >= 64 {
+				vgc_gen_nursery = u64(gn) * 1024
 			}
 		}
 	} $else {

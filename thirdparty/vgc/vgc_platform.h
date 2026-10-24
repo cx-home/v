@@ -2599,6 +2599,19 @@ static void vgc_gctrace_perm(uint64_t cycle, uint64_t spans, uint64_t kb, uint64
     vgc__ws("\n");
 }
 
+// VGC_GCTRACE=2 young-generation line (cx-home/v#56): whether this cycle was a
+// full one, the minor and full cycles so far, and the old generation the last
+// full cycle left.
+static void vgc_gctrace_gen(uint64_t cycle, uint64_t full, uint64_t minors, uint64_t fulls,
+                            uint64_t old_full_kb) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] gen full="); vgc__wdec(full);
+    vgc__ws(" minors="); vgc__wdec(minors);
+    vgc__ws(" fulls="); vgc__wdec(fulls);
+    vgc__ws(" old_at_full_KB="); vgc__wdec(old_full_kb);
+    vgc__ws("\n");
+}
+
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
 // object holds a pointer to an ALLOCATED-but-UNMARKED object that sweep is about
 // to reclaim — i.e. the mark did not reach closure. `kind`: 0 = referrer is a
