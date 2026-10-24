@@ -983,6 +983,11 @@ __global vgc_perm_mode = int(1)
 __global vgc_gen_mode = int(0)
 __global vgc_gen_nursery = u64(1024) * 1024
 __global vgc_gen_full = false
+// the old generation's growth past the last full cycle's survivors that starts
+// the next full cycle: a fraction of them (VGC_GEN_OLD_PCT, default 25) plus a
+// slack (VGC_GEN_OLD_SLACK_KB, default one nursery)
+__global vgc_gen_old_pct = u64(25)
+__global vgc_gen_old_slack = u64(0)
 __global vgc_gen_old_at_full = u64(0)
 __global vgc_gen_minors = u64(0)
 __global vgc_gen_fulls = u64(0)
@@ -2207,6 +2212,21 @@ pub fn vgc_init() {
 			gn := C.atoll(gn_env)
 			if gn >= 64 {
 				vgc_gen_nursery = u64(gn) * 1024
+			}
+		}
+		vgc_gen_old_slack = vgc_gen_nursery
+		gs_env := C.getenv(c'VGC_GEN_OLD_SLACK_KB')
+		if gs_env != unsafe { nil } {
+			gs := C.atoll(gs_env)
+			if gs >= 0 {
+				vgc_gen_old_slack = u64(gs) * 1024
+			}
+		}
+		gp_env := C.getenv(c'VGC_GEN_OLD_PCT')
+		if gp_env != unsafe { nil } {
+			gp := C.atoll(gp_env)
+			if gp >= 0 && gp <= 1000 {
+				vgc_gen_old_pct = u64(gp)
 			}
 		}
 	} $else {

@@ -183,12 +183,13 @@ fn vgc_gc_start() {
 	$if vgc_concurrent ? {
 		// cx-home/v#56: a full cycle marks from zero — the old objects are
 		// traced too, so the dead ones are swept — the first time, and when the
-		// old generation grew half again past the last full cycle's survivors
-		// plus four nurseries (what minor cycles promoted and has since died
-		// waits for it); every other cycle is a minor one
+		// old generation grew past the last full cycle's survivors by
+		// VGC_GEN_OLD_PCT of them plus VGC_GEN_OLD_SLACK_KB (what minor cycles
+		// promoted and has since died waits for it, and pins the spans it sits
+		// in); every other cycle is a minor one
 		if vgc_gen_mode != 0 {
 			vgc_gen_full = vgc_perm_on == 0
-				|| vgc_perm_bytes > vgc_gen_old_at_full + vgc_gen_old_at_full / 2 + 4 * vgc_gen_nursery
+				|| vgc_perm_bytes > vgc_gen_old_at_full + vgc_gen_old_at_full * vgc_gen_old_pct / 100 + vgc_gen_old_slack
 			vgc_perm_clear_zero = vgc_gen_full
 		}
 	}
