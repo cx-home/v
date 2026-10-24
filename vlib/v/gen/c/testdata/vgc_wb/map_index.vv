@@ -1,0 +1,47 @@
+module main
+
+// cx-core-code#208: `m[k] = v` stores through the pointer map_get_and_set
+// answers into the map's value buffer; the statement must gate that buffer
+// before and after the store, as an array element store gates its buffer.
+@[heap]
+struct Rec {
+	a int
+}
+
+struct Box {
+mut:
+	m  map[int]&Rec
+	sm map[string]&Rec
+}
+
+fn store_field(mut b Box, r &Rec) {
+	b.m[1] = r
+	b.sm['k'] = r
+}
+
+fn store_local(r &Rec) map[int]&Rec {
+	mut m := map[int]&Rec{}
+	m[3] = r
+	return m
+}
+
+fn store_param(mut pm map[string]&Rec, r &Rec) {
+	pm['p'] = r
+}
+
+fn store_ints(mut b map[int]int) {
+	b[1] = 2
+}
+
+fn main() {
+	mut b := Box{}
+	r := &Rec{
+		a: 1
+	}
+	store_field(mut b, r)
+	store_param(mut b.sm, r)
+	println(store_local(r).len + b.m.len + b.sm.len)
+	mut ints := map[int]int{}
+	store_ints(mut ints)
+	println(ints.len)
+}

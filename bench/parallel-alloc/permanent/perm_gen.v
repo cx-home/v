@@ -9,7 +9,11 @@
 //   (c) an old array buffer        old.arr[k] = r
 //   (d) a fixed array inside       old.farr[k] = r
 //   (e) a push that regrows        old.list << r     (the header's data store)
-//   (f) an old map                 old.m[k] = r      (the key/value buffers)
+//   (f) an old map                 old.m[k] = r      (the key/value buffers;
+//       every key is in the map before the promotion, so its value buffer is
+//       permanent and each store goes through the pointer map_get_and_set
+//       answers — cx-core-code#208: no barrier covered that store, and a
+//       value held only by a permanent map's buffer was swept)
 //   (g) a store through a pointer  *p = r, p = &old.hold
 //   (h) a cycle in the middle of a statement: old.hold = mk_collect(r), the
 //       right-hand side forcing a collection between the barrier call before
@@ -86,10 +90,19 @@ mut:
 }
 
 fn new_old() &Old {
-	return &Old{
+	mut o := &Old{
 		arr: []&Rec{len: window, init: unsafe { nil }}
 		ids: []u64{len: window}
 	}
+	// (f)'s keys before the promotion: the map's buffers are permanent and no
+	// later store inserts a key. 4096 of them: the value buffer is a large
+	// object alone in its span, which no later allocation makes `born`, so
+	// only the store's own barrier can get it re-scanned
+	for k in 0 .. 4096 {
+		o.m[k] = mk(u64(k))
+		o.mids[k] = u64(k)
+	}
+	return o
 }
 
 fn worker(id u64, steps int, mut old Old) u64 {

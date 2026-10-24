@@ -708,9 +708,24 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 				} else if left.is_farray {
 					// fixed array element: its address is interior to the owning object.
 					g.writeln('vgc_wb_gate((voidptr)(&(${base})));')
+				} else if left.is_map {
+					// m[k] = v : the store is `*map_get_and_set(&m, &k, &zero) = v`, a
+					// write through the pointer get_and_set answers into the map's
+					// value buffer, outside map_set (which only inserts the zero
+					// value for a new key): dirty the value buffer as an array
+					// element store dirties the array's (cx-core-code#208 — a value
+					// stored this way into a permanent map was never re-scanned and
+					// what it held was swept while the map still named it). The call
+					// after the statement reads the buffer the insertion may have
+					// grown into.
+					arrow := if left.left_type.is_ptr() || left.left.is_auto_deref_var() {
+						'->'
+					} else {
+						'.'
+					}
+					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
+					g.writeln('vgc_wb_gate((voidptr)((${base})${arrow}${val}key_values.values));')
 				}
-				// maps: handled by map_set's own barrier (the key/value buffers move
-				// in bulk inside the builtin, where codegen has no per-store hook).
 			}
 		}
 		else {}
