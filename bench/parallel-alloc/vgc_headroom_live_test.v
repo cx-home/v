@@ -91,6 +91,10 @@ fn test_the_headroom_is_bounded_by_the_live_set() {
 		child(small_live_bytes)
 		return
 	}
+	if which == 'start' {
+		start_child()
+		return
+	}
 	if which != '' {
 		return
 	}
@@ -244,4 +248,50 @@ fn test_one_allocating_thread_paces_to_twice_the_live_set() {
 	four := ratio('', 'small4')
 	println('vgc_headroom_live: 8 MB live, four allocating threads — ${four:.3f}x (one thread ${one_free:.3f}x)')
 	assert four > one_free, 'four allocating threads carved ${four:.3f}x, not more than one thread ${one_free:.3f}x: the per-thread floor lost its 2 x marked base'
+}
+
+// start_child: start-up's allocation with nothing collected yet — 8 MB of 4 KB
+// transients from the process's first allocation, the carved high-water
+// (gc_memory_use) read as it goes.
+fn start_child() {
+	mut high := gc_memory_use()
+	mut sink := u64(0)
+	for i in 0 .. 8 * 1024 * 1024 / chunk {
+		t := []u8{len: chunk, init: u8(i)}
+		sink += t[i % chunk]
+		c := gc_memory_use()
+		if c > high {
+			high = c
+		}
+	}
+	println('CARVED=${f64(high) / f64(1024 * 1024):.3f} sink=${sink}')
+}
+
+fn carved_mb(env string) f64 {
+	r := os.execute('VGC_LIVE_CHILD=start ${env}${os.quoted_path(os.executable())}')
+	assert r.exit_code == 0, r.output
+	for l in r.output.split_into_lines() {
+		if l.starts_with('CARVED=') {
+			return l.all_after('CARVED=').all_before(' ').f64()
+		}
+	}
+	panic(r.output)
+}
+
+// cx-home/v#56 (cx-private#1977): the first collection triggers at ONE
+// allocating thread's floor (vgc_headroom_floor_lo1, 1 MB) — start-up is one
+// thread — so a program's start-up carves about that much before its first
+// cycle, not the several-thread floor (4 MB) it carved before; the spans it
+// carved stayed committed for the run (json-codec 1 KB: peak RSS 16.39 MB at
+// the 4 MB trigger, 15.20 MB at 1 MB). The pair reads the trigger alone: the
+// same churn with the one-thread floor raised to the old trigger carves past it.
+fn test_the_first_collection_triggers_at_the_one_thread_floor() {
+	if os.getenv('VGC_LIVE_CHILD') != '' {
+		return
+	}
+	one := carved_mb('')
+	four := carved_mb('VGC_HEADROOM_FLOOR_LO1_MB=4 ')
+	println('vgc_headroom_live: start-up churn carved ${one:.3f} MB at the default first trigger, ${four:.3f} MB with it at 4 MB')
+	assert four >= 4.0, 'with the first trigger at 4 MB the churn carved only ${four:.3f} MB'
+	assert one < 3.0, 'the first collection did not come at the one-thread floor: ${one:.3f} MB carved (bar 3 MB)'
 }

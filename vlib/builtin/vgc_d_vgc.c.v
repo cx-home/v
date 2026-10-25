@@ -885,8 +885,8 @@ __global vgc_headroom_live_floor = u64(32) * 1024 * 1024
 __global vgc_headroom_adaptive_floor = true
 __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 // The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
-// live_floor) (cx-home/v#14, vgc_update_trigger). The first collection still
-// triggers at vgc_headroom_floor_lo. VGC_HEADROOM_FLOOR_LO1_MB overrides
+// live_floor) (cx-home/v#14, vgc_update_trigger), and the first collection's
+// trigger (cx-home/v#56: start-up is one thread). VGC_HEADROOM_FLOOR_LO1_MB overrides
 // (decimal MB, default 1). cx-examples#297: at 2 MB a program whose live set
 // is about 1 MB (json-codec 1 KB x100,000: marked 1 MB) paced to a 3 MB goal,
 // three times its live set, where the one-thread rule means one; at 1 MB its
@@ -2250,10 +2250,15 @@ pub fn vgc_init() {
 	// a handful of cheap early cycles (~log2(ceiling/min) collections).
 	vgc_heap.next_gc = vgc_headroom
 	// cx-home/v#14: with the adaptive floor the first cycle triggers at its low
-	// clamp too, not at the 8 MB initial headroom (cx-core-code#123).
+	// clamp too, not at the 8 MB initial headroom (cx-core-code#123) — the ONE
+	// allocating thread's clamp (vgc_headroom_floor_lo1), since start-up is one
+	// thread (cx-home/v#56, cx-private#1977): at the several-thread clamp (4 MB)
+	// a program's start-up carved its whole first trigger before anything was
+	// collected, and the spans stayed (json-codec 1 KB: 618 spans for a 1 MB
+	// marked set, peak RSS 16.39 MB; at 1 MB, 469 spans, 15.20 MB).
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0
-		&& vgc_headroom_floor_lo < vgc_heap.next_gc {
-		vgc_heap.next_gc = vgc_headroom_floor_lo
+		&& vgc_headroom_floor_lo1 < vgc_heap.next_gc {
+		vgc_heap.next_gc = vgc_headroom_floor_lo1
 	}
 	vgc_gc_last_end = C.vgc_now_ns()
 	vgc_heap.gc_phase = vgc_phase_off
