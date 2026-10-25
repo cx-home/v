@@ -295,3 +295,20 @@ fn test_the_first_collection_triggers_at_the_one_thread_floor() {
 	assert four >= 4.0, 'with the first trigger at 4 MB the churn carved only ${four:.3f} MB'
 	assert one < 3.0, 'the first collection did not come at the one-thread floor: ${one:.3f} MB carved (bar 3 MB)'
 }
+
+// cx-home/v#56 (cx-private#1977 L5): ONE allocating thread paces to half its
+// marked set (vgc_one_thread_pct, 50): the GOGC term, the band's live-set cap
+// and the floor's scale. 8 MB live under the held-up band carves about 1.5x the
+// live set, where Go's GOGC=100 (VGC_ONE_THREAD_PCT=100, the previous pacing)
+// carves about 2x.
+fn test_one_allocating_thread_paces_to_half_its_live_set() {
+	if os.getenv('VGC_LIVE_CHILD') != '' {
+		return
+	}
+	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
+	half := ratio(band, 'small')
+	full := ratio(band + 'VGC_ONE_THREAD_PCT=100 ', 'small')
+	println('vgc_headroom_live: 8 MB live, one allocating thread, band held up — ${half:.3f}x at 50 %, ${full:.3f}x at 100 %')
+	assert half < full, 'one thread at 50 % carved ${half:.3f}x, not less than ${full:.3f}x at 100 %'
+	assert half <= 1.8, 'one thread at 50 % carved ${half:.3f}x over 8 MB live (expected ~1.5x)'
+}

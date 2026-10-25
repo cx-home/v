@@ -893,7 +893,16 @@ __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 // goal is 2 MB: peak RSS 16.3 -> 15.5 MB, cycles 286 -> 316, the time
 // unchanged (0.88-0.91 s). A live set of 2 MB or more (csv-aggregate: 3 MB)
 // paces as before.
-__global vgc_headroom_floor_lo1 = u64(1) * 1024 * 1024
+__global vgc_headroom_floor_lo1 = u64(256) * 1024
+// One allocating thread's headroom as a percentage of the marked set: the GOGC term, the band's
+// live-set cap and the floor's scale for ONE thread (cx-home/v#56, cx-private#1977 L5). At Go's
+// 100 a 1.45 MB live set (json-codec 1 KB) paced to a 2.9 MB goal and its garbage up to the goal
+// stood resident at every cycle: peak RSS 14.55 MB against Python's 13.84, where a reference-
+// counted heap keeps none. At 50 the goal is 1.5x the live set: 13.55 MB, about twice the
+// collections of a cycle that costs ~0.12 ms (parse 1 KB ~10 % slower, still above Python's
+// rate). Several allocating threads keep GOGC=100. VGC_ONE_THREAD_PCT overrides (100 restores
+// the previous pacing); the floor below follows it (VGC_HEADROOM_FLOOR_LO1_KB, default 256).
+__global vgc_one_thread_pct = u64(50)
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
@@ -2101,6 +2110,20 @@ pub fn vgc_init() {
 		l1 := C.atoll(lo1_env)
 		if l1 > 0 {
 			vgc_headroom_floor_lo1 = u64(l1) * 1024 * 1024
+		}
+	}
+	lo1k_env := C.getenv(c'VGC_HEADROOM_FLOOR_LO1_KB')
+	if lo1k_env != unsafe { nil } {
+		l1k := C.atoll(lo1k_env)
+		if l1k > 0 {
+			vgc_headroom_floor_lo1 = u64(l1k) * 1024
+		}
+	}
+	otp_env := C.getenv(c'VGC_ONE_THREAD_PCT')
+	if otp_env != unsafe { nil } {
+		otp := C.atoll(otp_env)
+		if otp > 0 {
+			vgc_one_thread_pct = u64(otp)
 		}
 	}
 	if vgc_headroom_floor_lo1 > vgc_headroom_floor_lo {

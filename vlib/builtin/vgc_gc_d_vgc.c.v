@@ -3908,7 +3908,7 @@ fn vgc_update_trigger() {
 		mut f := marked * 2
 		mut lo := vgc_headroom_floor_lo
 		if nt <= 1 {
-			f = marked
+			f = marked * vgc_one_thread_pct / 100
 			lo = vgc_headroom_floor_lo1
 		}
 		if f < lo {
@@ -3998,7 +3998,11 @@ fn vgc_update_trigger() {
 			hr_max = vgc_heap_soft_limit
 		}
 		if vgc_headroom_live_pct > 0 {
-			mut live_cap := marked * vgc_headroom_live_pct / 100
+			mut live_pct := vgc_headroom_live_pct
+			if nt <= 1 && vgc_one_thread_pct < live_pct {
+				live_pct = vgc_one_thread_pct
+			}
+			mut live_cap := marked * live_pct / 100
 			mut floor := afloor
 			if vgc_headroom_per_thread && nt > 1 {
 				// cx-home/v#16: floor x the threads that allocated this cycle —
@@ -4046,6 +4050,10 @@ fn vgc_update_trigger() {
 	vgc_gc_last_end = now
 
 	mut extra := marked * gc_percent / 100
+	// one allocating thread: the GOGC term at vgc_one_thread_pct (cx-home/v#56)
+	if nt <= 1 && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
+		extra = marked * gc_percent / 100 * vgc_one_thread_pct / 100
+	}
 	if extra < vgc_headroom {
 		extra = vgc_headroom
 	}
