@@ -238,7 +238,7 @@ fn test_one_allocating_thread_paces_to_twice_the_live_set() {
 	// reads the floors alone (macOS: 2.066x / 3.115x).
 	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
 	one := ratio(band, 'small')
-	one_old := ratio(band + 'VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
+	one_old := ratio(band + 'VGC_ONE_THREAD_PCT=100 VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
 	println('vgc_headroom_live: 8 MB live, one allocating thread, band held up — ${one:.3f}x (GOGC=100 floor), ${one_old:.3f}x (2 x marked)')
 	assert one <= 2.5, 'one allocating thread carved ${one:.3f}x over 8 MB live (expected ~2x: live + 1 x marked)'
 	assert one < one_old, 'the 1 x marked floor carved ${one:.3f}x, not less than ${one_old:.3f}x'
