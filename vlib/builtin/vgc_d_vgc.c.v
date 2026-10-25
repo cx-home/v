@@ -2130,10 +2130,6 @@ pub fn vgc_init() {
 	if pgc_env != unsafe { nil } {
 		vgc_pool_goal_comp = C.atoll(pgc_env) != 0
 	}
-	psg_env := C.getenv(c'VGC_POOL_SWEEP_GOAL')
-	if psg_env != unsafe { nil } {
-		vgc_pool_sweep_goal = C.atoll(psg_env) != 0
-	}
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
 		pv := C.atoll(pm_env)
@@ -3656,14 +3652,8 @@ fn vgc_committed_above_goal() bool {
 // is exclusive while it runs.
 fn vgc_pool_compensate(nbytes u64) {
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
-	vgc_pool_compensate_held(nbytes)
-	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
-}
-
-// vgc_pool_compensate_held is vgc_pool_compensate's walk; the caller holds
-// free_spans_lock (a mutator's carve, or the collector across its cycle).
-fn vgc_pool_compensate_held(nbytes u64) {
 	if vgc_heap.pool_bytes < vgc_compensate_min_run * u64(vgc_page_size) {
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 		return
 	}
 	if vgc_compensate_cursor_cycle != vgc_heap.gc_cycle {
@@ -3683,36 +3673,7 @@ fn vgc_pool_compensate_held(nbytes u64) {
 			vgc_compensate_cursor_page = next
 		}
 	}
-}
-
-// cx-home/v#56 (cx-private#1977, L2b): the committed span pages are held to the
-// pacer goal at every cycle, not only when a carve happens. The compensation
-// above runs from a carve; a program whose heap stops growing (json-codec 1 KB:
-// marked 1 MB, goal 2 MB) carves nothing in its steady state, and the hot pool
-// it pooled at its first cycles stayed committed for the rest of the run — 469
-// spans, 1.9 MB of them pooled and free, against a 2 MB goal. At the end of the
-// cycle, with the next goal computed and free_spans_lock still held, the hot
-// pool above the goal is returned (address-adjacent runs, the same walk); the
-// mutator cannot reach more than the goal before the next collection, so what
-// is returned is what it would not have used. VGC_POOL_SWEEP_GOAL=0 switches it
-// off (and VGC_POOL_GOAL_COMP=0 with the rest of the compensation).
-__global vgc_pool_sweep_goal = true
-
-fn vgc_pool_trim_to_goal() {
-	if !vgc_pool_goal_comp || !vgc_pool_sweep_goal {
-		return
-	}
-	n := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
-	mut carved := u64(0)
-	for i in 0 .. n {
-		carved += u64(vgc_heap.arenas[i].used)
-	}
-	cold := vgc_heap.pool_trimmed_bytes
-	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
-	if carved <= cold || carved - cold <= goal {
-		return
-	}
-	vgc_pool_compensate_held(carved - cold - goal)
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 }
 
 // vgc_pool_compensate_arena walks one arena's page map span by span from page

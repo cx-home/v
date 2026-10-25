@@ -407,7 +407,6 @@ fn vgc_gc_start() {
 	// spans acquired during THIS cycle. Doing the bump here closes the window: every
 	// post-resume acquisition stamps exactly the cycle the next sweep checks against.
 	vgc_update_trigger()
-	vgc_pool_trim_to_goal()
 	$if vgc_concurrent ? {
 		// cx-private#1910: what the next concurrent cycle's stops are judged by
 		if vgc_gc_last_end > vgc_gc_t0 {
@@ -1597,7 +1596,6 @@ fn vgc_gc_start_concurrent() {
 	// vgc_gc_start's note: a mutator resumed before the bump stamps a span it
 	// acquires with the old cycle). The trace line's pause is the two stops.
 	vgc_update_trigger()
-	vgc_pool_trim_to_goal()
 	vgc_cm_stop2_ns = vgc_gc_last_end - t_stop2
 	vgc_cm_pause_ns = vgc_cm_stop1_ns + vgc_cm_stop2_ns
 	// the feedback (vgc_cm_backoff): this cycle's stops against the last

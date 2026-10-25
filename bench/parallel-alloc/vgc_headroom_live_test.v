@@ -95,10 +95,6 @@ fn test_the_headroom_is_bounded_by_the_live_set() {
 		start_child()
 		return
 	}
-	if which == 'steady' {
-		steady_child()
-		return
-	}
 	if which != '' {
 		return
 	}
@@ -298,67 +294,4 @@ fn test_the_first_collection_triggers_at_the_one_thread_floor() {
 	println('vgc_headroom_live: start-up churn carved ${one:.3f} MB at the default first trigger, ${four:.3f} MB with it at 4 MB')
 	assert four >= 4.0, 'with the first trigger at 4 MB the churn carved only ${four:.3f} MB'
 	assert one < 3.0, 'the first collection did not come at the one-thread floor: ${one:.3f} MB carved (bar 3 MB)'
-}
-
-// steady_child: a 1 MB live set, then 64 MB of mixed-size transients past it
-// (many cycles at a steady goal); the committed span bytes (carved less what
-// the trim returned) read at the end, and the highest seen after a cycle.
-fn steady_child() {
-	mut head := &Node(unsafe { nil })
-	for i in 0 .. 1024 * 1024 / node_bytes {
-		mut n := &Node{
-			next: head
-		}
-		n.pad[0] = u64(i)
-		head = n
-	}
-	mut sink := u64(0)
-	mut worst := u64(0)
-	c0 := gc_cycles()
-	mut seen := c0
-	for i in 0 .. 64 * 1024 * 1024 / 1024 {
-		// sizes across several classes, as an interpreter's transients are
-		t := []u8{len: 256 + (i % 7) * 128, init: u8(i)}
-		sink += t[i % t.len]
-		c := gc_cycles()
-		if c != seen && c > c0 + 4 {
-			seen = c
-			committed := u64(gc_memory_use()) - u64(gc_heap_usage().unmapped_bytes)
-			if committed > worst {
-				worst = committed
-			}
-		}
-	}
-	mut kept := 0
-	for n := head; n != unsafe { nil }; n = n.next {
-		kept++
-	}
-	println('COMMITTED=${f64(worst) / f64(1024 * 1024):.3f} sink=${sink} kept=${kept}')
-}
-
-fn committed_mb(env string) f64 {
-	r := os.execute('VGC_LIVE_CHILD=steady ${env}${os.quoted_path(os.executable())}')
-	assert r.exit_code == 0, r.output
-	for l in r.output.split_into_lines() {
-		if l.starts_with('COMMITTED=') {
-			return l.all_after('COMMITTED=').all_before(' ').f64()
-		}
-	}
-	panic(r.output)
-}
-
-// cx-home/v#56 (cx-private#1977, L2b): in a steady state — the live set fixed,
-// the transients swept every cycle — the committed span pages are held near the
-// pacer goal at every cycle, not only when a carve happens: the hot pool above
-// the goal is returned at the end of the cycle. With the sweep trim off
-// (VGC_POOL_SWEEP_GOAL=0) the pool pooled at the first cycles stays committed.
-fn test_the_committed_heap_is_held_to_the_goal_in_a_steady_state() {
-	if os.getenv('VGC_LIVE_CHILD') != '' {
-		return
-	}
-	on := committed_mb('')
-	off := committed_mb('VGC_POOL_SWEEP_GOAL=0 ')
-	println('vgc_headroom_live: steady 1 MB live set, committed span pages after a cycle: ${on:.3f} MB with the sweep trim, ${off:.3f} MB without')
-	assert on < off, 'the sweep trim did not lower the committed heap: ${on:.3f} MB against ${off:.3f} MB'
-	assert on <= 3.0, 'the committed heap is ${on:.3f} MB over a 1 MB live set (goal about 2 MB, bar 3 MB)'
 }
