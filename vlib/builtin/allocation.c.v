@@ -693,7 +693,7 @@ pub fn gc_cycles() u64 {
 // being monotone makes the meter immune to collection dips.
 pub fn gc_total_allocated() u64 {
 	$if vgc ? {
-		return u64(C.vgc_atomic_load_u64(&vgc_heap.total_alloc))
+		return vgc_total_allocated()
 	} $else $if gcboehm ? {
 		return u64(C.GC_get_total_bytes())
 	} $else {
