@@ -904,6 +904,16 @@ __global vgc_headroom_floor_lo1 = u64(256) * 1024
 // the previous pacing); the floor below follows it (VGC_HEADROOM_FLOOR_LO1_KB, default 256).
 __global vgc_one_thread_pct = u64(50)
 
+// vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
+// marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
+// small heap whose garbage up to the goal is resident at the peak (json-codec 1 KB, 1 MB: 1-8 MB
+// marked). A heap past the floor keeps Go's pacing: at 100 MB marked the 50 % goal doubled the
+// cycles, cost 20 % of the wall and carved a third arena (cx --from=json --to=json on 300k records:
+// 2 arenas at GOGC 100, 3 at 50 %), where the arena count is the gate's row (cx-private#1884).
+fn vgc_one_thread_small(marked u64) bool {
+	return marked < vgc_headroom_live_floor
+}
+
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
 // marked on one thread, and under eight allocating threads a 10 ms mark every

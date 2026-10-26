@@ -3908,8 +3908,10 @@ fn vgc_update_trigger() {
 		mut f := marked * 2
 		mut lo := vgc_headroom_floor_lo
 		if nt <= 1 {
-			f = marked * vgc_one_thread_pct / 100
 			lo = vgc_headroom_floor_lo1
+			if vgc_one_thread_small(marked) {
+				f = marked * vgc_one_thread_pct / 100
+			}
 		}
 		if f < lo {
 			f = lo
@@ -3999,7 +4001,7 @@ fn vgc_update_trigger() {
 		}
 		if vgc_headroom_live_pct > 0 {
 			mut live_pct := vgc_headroom_live_pct
-			if nt <= 1 && vgc_one_thread_pct < live_pct {
+			if nt <= 1 && vgc_one_thread_small(marked) && vgc_one_thread_pct < live_pct {
 				live_pct = vgc_one_thread_pct
 			}
 			mut live_cap := marked * live_pct / 100
@@ -4051,7 +4053,7 @@ fn vgc_update_trigger() {
 
 	mut extra := marked * gc_percent / 100
 	// one allocating thread: the GOGC term at vgc_one_thread_pct (cx-home/v#56)
-	if nt <= 1 && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
+	if nt <= 1 && vgc_one_thread_small(marked) && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
 		extra = marked * gc_percent / 100 * vgc_one_thread_pct / 100
 	}
 	if extra < vgc_headroom {
@@ -4123,9 +4125,20 @@ fn vgc_update_trigger() {
 // Heap usage reporting
 // ============================================================
 
+// vgc_total_allocated is the bytes the program has allocated since it started: the flushed
+// count plus every thread's un-flushed delta (vgc_acct_alloc flushes about every 1 MB), so a
+// meter reading a window smaller than a flush sees what was allocated, not what was flushed —
+// a racy read of each slot, exact once the threads are quiet (gc_total_allocated, cx-home/v#56).
+fn vgc_total_allocated() u64 {
+	mut all := C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
+	for ci in 0 .. vgc_heap.ncaches {
+		all += unsafe { vgc_cache(ci).alloc_delta }
+	}
+	return all
+}
+
 fn vgc_heap_usage() (usize, usize, usize, usize, usize) {
 	live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
-	total_alloc := C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 	// Count actual in-use span pages as heap size
 	mut in_use_bytes := usize(0)
 	for i in 0 .. vgc_heap.nspans {
@@ -4142,11 +4155,7 @@ fn vgc_heap_usage() (usize, usize, usize, usize, usize) {
 	// The per-thread un-flushed deltas (vgc_acct_alloc flushes every ~1 MB)
 	// are counted too, so a reader sees what was allocated, not what was
 	// flushed — a racy read of each slot, exact once the threads are quiet.
-	mut pending := u64(0)
-	for ci in 0 .. vgc_heap.ncaches {
-		pending += unsafe { vgc_cache(ci).alloc_delta }
-	}
-	all := total_alloc + pending
+	all := vgc_total_allocated()
 	since := if all > vgc_heap.total_alloc_at_gc { all - vgc_heap.total_alloc_at_gc } else { u64(0) }
 	return in_use_bytes, free_bytes, usize(live), usize(vgc_heap.pool_trimmed_bytes), usize(since)
 }

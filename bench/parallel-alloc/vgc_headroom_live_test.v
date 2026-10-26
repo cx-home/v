@@ -312,3 +312,21 @@ fn test_one_allocating_thread_paces_to_half_its_live_set() {
 	assert half < full, 'one thread at 50 % carved ${half:.3f}x, not less than ${full:.3f}x at 100 %'
 	assert half <= 1.8, 'one thread at 50 % carved ${half:.3f}x over 8 MB live (expected ~1.5x)'
 }
+
+// cx-home/v#56: the one-thread percentage paces a SMALL heap — one whose marked
+// set is under the live floor (32 MB). Past it one thread keeps Go's GOGC=100: at
+// 100 MB marked the 50 % goal doubled the cycles, cost 20 % of the wall and carved
+// a third arena (cx --from=json --to=json on 300k records: 2 arenas at 100 %, 3 at
+// 50 %). The pair reads the scope alone: 40 MB live carves the same at 50 % and
+// at 100 %, where 8 MB live (the test above) carves less at 50 %.
+fn test_one_allocating_thread_over_the_live_floor_paces_as_before() {
+	if os.getenv('VGC_LIVE_CHILD') != '' {
+		return
+	}
+	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
+	half := ratio(band, 'big')
+	full := ratio(band + 'VGC_ONE_THREAD_PCT=100 ', 'big')
+	println('vgc_headroom_live: 40 MB live, one allocating thread, band held up — ${half:.3f}x at 50 %, ${full:.3f}x at 100 %')
+	diff := if half > full { half - full } else { full - half }
+	assert diff <= 0.15, 'over the live floor the one-thread percentage still paced: ${half:.3f}x at 50 % against ${full:.3f}x at 100 %'
+}
