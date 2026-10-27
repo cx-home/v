@@ -5308,7 +5308,7 @@ const vgc_acct_flush = u64(1) << 20
 // fixed 1 MB, n threads could hold n MB the pacer had not seen: four csv workers
 // against a 1 MB budget carved ~400 spans past the goal before a collection
 // (17.5 MB peak against one worker's 14.0). VGC_ACCT_FLUSH_DIV=0 keeps 1 MB.
-__global vgc_acct_flush_cur = vgc_acct_flush
+__global vgc_acct_flush_cur = u64(1048576) // vgc_acct_flush (a plain cast: a const or a shift leaves the global untyped in files checked before this one)
 __global vgc_acct_flush_div = u64(16)
 const vgc_acct_flush_min = u64(64) * 1024
 

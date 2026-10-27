@@ -4121,9 +4121,12 @@ fn vgc_update_trigger() {
 		goal = marked + min_budget
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
-	// cx-home/v#56: the per-thread accounting flush follows the budget
+	// cx-home/v#56: the per-thread accounting flush follows the budget when
+	// more than one thread allocated this cycle. One allocating thread hides
+	// at most one flush (the pacer triggers at most 1 MB late) and a smaller
+	// flush only adds its collections (fasta 1M: 527 -> 773, pause 56 -> 80 ms).
 	vgc_acct_flush_cur = vgc_acct_flush
-	if vgc_acct_flush_div > 0 && goal > marked {
+	if vgc_acct_flush_div > 0 && nt > 1 && goal > marked {
 		mut f := (goal - marked) / vgc_acct_flush_div
 		if f < vgc_acct_flush_min {
 			f = vgc_acct_flush_min
