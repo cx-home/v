@@ -386,6 +386,7 @@ mut:
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
 	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
+	gen_bytes   u64 // flushed bytes this thread allocated since the last stop (alloc_gen's ~1 MB)
 	// cx-private#1910: bytes of the objects this thread's alloc-black hook marked
 	// during the concurrent middle (the cycle's births), flushed into
 	// vgc_cm_born every vgc_cm_born_flush bytes; summed and reset at the
@@ -2129,6 +2130,13 @@ pub fn vgc_init() {
 			vgc_headroom_floor_lo1 = u64(l1k) * 1024
 		}
 	}
+	afd_env := C.getenv(c'VGC_ACCT_FLUSH_DIV')
+	if afd_env != unsafe { nil } {
+		afd := C.atoll(afd_env)
+		if afd >= 0 {
+			vgc_acct_flush_div = u64(afd)
+		}
+	}
 	otp_env := C.getenv(c'VGC_ONE_THREAD_PCT')
 	if otp_env != unsafe { nil } {
 		otp := C.atoll(otp_env)
@@ -2398,6 +2406,7 @@ fn vgc_register_thread_opt(wait bool) bool {
 		vgc_cache(idx).stopped = 0
 		vgc_cache(idx).live_delta = 0
 		vgc_cache(idx).alloc_delta = 0
+		vgc_cache(idx).gen_bytes = 0
 		vgc_cache(idx).next_free_p1 = 0
 		vgc_cache(idx).cov_safe = false
 		vgc_cache(idx).cov_req = false
@@ -2595,6 +2604,7 @@ fn vgc_thread_exit_cb(idx int) {
 		C.vgc_atomic_add_u64(&vgc_heap.total_alloc, vgc_cache(idx).alloc_delta)
 		vgc_cache(idx).live_delta = 0
 		vgc_cache(idx).alloc_delta = 0
+		vgc_cache(idx).gen_bytes = 0
 		vgc_cache(idx).registered = false
 		vgc_cache(idx).stack_lo = 0
 		vgc_cache(idx).stack_hi = 0
@@ -5293,6 +5303,15 @@ fn vgc_collect_and_retry_span(cache_idx int, span_class int) &VGC_Span {
 // the 256 MB GC goal, so the pacer trigger lags negligibly.
 const vgc_acct_flush = u64(1) << 20
 
+// cx-home/v#56: the flush threshold the pacer sets at each cycle — a sixteenth of
+// the cycle's budget (goal - marked), between 64 KB and vgc_acct_flush. With the
+// fixed 1 MB, n threads could hold n MB the pacer had not seen: four csv workers
+// against a 1 MB budget carved ~400 spans past the goal before a collection
+// (17.5 MB peak against one worker's 14.0). VGC_ACCT_FLUSH_DIV=0 keeps 1 MB.
+__global vgc_acct_flush_cur = vgc_acct_flush
+__global vgc_acct_flush_div = u64(16)
+const vgc_acct_flush_min = u64(64) * 1024
+
 // Hot-path allocation accounting. Bumps THIS thread's private deltas; flushes to
 // the global heap_live/total_alloc only every ~vgc_acct_flush of total alloc (so
 // it flushes periodically even when live_delta oscillates near zero under balanced
@@ -5310,12 +5329,15 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_cache(cache_idx).live_delta += i64(live_sz)
 		vgc_cache(cache_idx).alloc_delta += total_n
-		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush {
+		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush_cur {
 			// cx-home/v#16 / cx-private#1916: the pacer counts a thread as
-			// allocating this cycle once it has flushed (~1 MB): a server's
+			// allocating this cycle once it has allocated ~1 MB: a server's
 			// many request threads that each allocate a little no longer scale
 			// the headroom cap and floor as if each were an allocation stream
-			vgc_cache(cache_idx).alloc_gen = u32(vgc_heap.gc_cycle)
+			vgc_cache(cache_idx).gen_bytes += vgc_cache(cache_idx).alloc_delta
+			if vgc_cache(cache_idx).gen_bytes >= vgc_acct_flush {
+				vgc_cache(cache_idx).alloc_gen = u32(vgc_heap.gc_cycle)
+			}
 			ld := vgc_cache(cache_idx).live_delta
 			if ld >= 0 {
 				C.vgc_atomic_add_u64(&vgc_heap.heap_live, u64(ld))
@@ -5341,7 +5363,7 @@ fn vgc_acct_free(sz u64) {
 	}
 	unsafe {
 		vgc_cache(idx).live_delta -= i64(sz)
-		if vgc_cache(idx).live_delta <= -i64(vgc_acct_flush) {
+		if vgc_cache(idx).live_delta <= -i64(vgc_acct_flush_cur) {
 			C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-vgc_cache(idx).live_delta))
 			vgc_cache(idx).live_delta = 0
 		}
