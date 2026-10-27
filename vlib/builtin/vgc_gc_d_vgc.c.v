@@ -329,14 +329,21 @@ fn vgc_gc_start() {
 	// live_delta/alloc_delta (un-flushed accounting) are now stale — `marked` is
 	// the true live set — so flush each thread's total-alloc stat and zero both
 	// deltas. Safe: the world is stopped, so no mutator is mid-update.
+	mut acct_threads := 0
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
+			// cx-home/v#56: a thread that allocated vgc_acct_flush_min or more
+			// since the last stop counts toward the scaled flush
+			if vgc_cache(ci).gen_bytes + vgc_cache(ci).alloc_delta >= vgc_acct_flush_min {
+				acct_threads++
+			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
 			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
 		}
 	}
+	vgc_acct_threads = acct_threads
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
 
 	// === Phase 4: Sweep ===
@@ -1570,14 +1577,21 @@ fn vgc_gc_start_concurrent() {
 		net = 0
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, net)
+	mut acct_threads := 0
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
+			// cx-home/v#56: a thread that allocated vgc_acct_flush_min or more
+			// since the last stop counts toward the scaled flush
+			if vgc_cache(ci).gen_bytes + vgc_cache(ci).alloc_delta >= vgc_acct_flush_min {
+				acct_threads++
+			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
 			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
 		}
 	}
+	vgc_acct_threads = acct_threads
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
 
 	// Sweep, stopped: no span is freed during the middle, so this is the STW
@@ -4122,11 +4136,13 @@ fn vgc_update_trigger() {
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 	// cx-home/v#56: the per-thread accounting flush follows the budget when
-	// more than one thread allocated this cycle. One allocating thread hides
-	// at most one flush (the pacer triggers at most 1 MB late) and a smaller
-	// flush only adds its collections (fasta 1M: 527 -> 773, pause 56 -> 80 ms).
+	// more than one thread allocated 64 KB or more this cycle (vgc_acct_threads,
+	// counted at the stop's fold; alloc_gen's ~1 MB stamp misses a short pass's
+	// workers). One allocating thread hides at most one flush (the pacer
+	// triggers at most 1 MB late) and a smaller flush only adds its collections
+	// (fasta 1M: 527 -> 773, summed pause 56 -> 80 ms).
 	vgc_acct_flush_cur = vgc_acct_flush
-	if vgc_acct_flush_div > 0 && nt > 1 && goal > marked {
+	if vgc_acct_flush_div > 0 && vgc_acct_threads > 1 && goal > marked {
 		mut f := (goal - marked) / vgc_acct_flush_div
 		if f < vgc_acct_flush_min {
 			f = vgc_acct_flush_min

@@ -19,8 +19,8 @@
 // 1 MB late, and the scaled flush only added collections (fasta 1M: 527 -> 773,
 // summed pause 56 -> 80 ms). So the check first collects with the main thread
 // alone allocating and reads the flush at 1 MB (code 5), then lets the four
-// workers allocate 1 MB each (alloc_gen stamps a thread as allocating at
-// ~1 MB), collects, and reads the workers' unflushed bytes as above.
+// workers allocate 1 MB each (a thread counts at 64 KB since the last stop),
+// collects, and reads the workers' unflushed bytes as above.
 //
 // Driven by bench/parallel-alloc/vgc_acct_flush_test.v (module main). Only
 // compiled under -d vgc / -gc e (the `_d_vgc` filename suffix).

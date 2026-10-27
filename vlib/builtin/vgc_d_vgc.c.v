@@ -5310,6 +5310,9 @@ const vgc_acct_flush = u64(1) << 20
 // (17.5 MB peak against one worker's 14.0). VGC_ACCT_FLUSH_DIV=0 keeps 1 MB.
 __global vgc_acct_flush_cur = u64(1048576) // vgc_acct_flush (a plain cast: a const or a shift leaves the global untyped in files checked before this one)
 __global vgc_acct_flush_div = u64(16)
+// the threads that allocated vgc_acct_flush_min or more between the last two
+// stops (counted at the stop's fold of their deltas)
+__global vgc_acct_threads = int(0)
 const vgc_acct_flush_min = u64(64) * 1024
 
 // Hot-path allocation accounting. Bumps THIS thread's private deltas; flushes to
