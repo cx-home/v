@@ -333,6 +333,7 @@ fn vgc_gc_start() {
 		unsafe {
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
+			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
 		}
 	}
@@ -1573,6 +1574,7 @@ fn vgc_gc_start_concurrent() {
 		unsafe {
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
+			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
 		}
 	}
@@ -4119,6 +4121,17 @@ fn vgc_update_trigger() {
 		goal = marked + min_budget
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
+	// cx-home/v#56: the per-thread accounting flush follows the budget
+	vgc_acct_flush_cur = vgc_acct_flush
+	if vgc_acct_flush_div > 0 && goal > marked {
+		mut f := (goal - marked) / vgc_acct_flush_div
+		if f < vgc_acct_flush_min {
+			f = vgc_acct_flush_min
+		}
+		if f < vgc_acct_flush {
+			vgc_acct_flush_cur = f
+		}
+	}
 }
 
 // ============================================================
