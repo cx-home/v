@@ -113,6 +113,8 @@ fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs searc
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
+fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64) // VGC_GCTRACE=3 carve line (cx-home/v#58)
+fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
@@ -217,6 +219,11 @@ mut:
 	in_use     bool  // true if span is allocated to a size class
 	has_ptrmap bool  // true if ptrmap is valid (precise scanning available)
 	is_tiny    bool  // true if the tiny allocator carved a packed block from this span
+	// cx-home/v#58: the pooled span held one large object, or is a piece of
+	// one (a split's remainder, a run merged from one): a request under half
+	// its size splits it only once no arena tail serves the request — see
+	// vgc_pool_split_cap. A pooled run of cache spans is split freely.
+	large_born bool
 	// (multiple independently-allocated sub-objects share one slot; an individual
 	// free must NOT reclaim such a slot — see vgc_free / the tiny allocator).
 	// Pointer bitmap: bit N = word offset N contains a pointer.
@@ -821,8 +828,11 @@ __global vgc_base_floor = u64(256 * 1024 * 1024)
 // VGC_GCTRACE=1 enables the per-cycle pacing trace (vgc_gctrace_line): cycle,
 // marked, goal, headroom, pause, arenas, spans, the pool's hot and trimmed KB,
 // the KB the sweep's defrag merged into runs (cx-home/v#14), live threads.
-// Permanent observability (GODEBUG=gctrace analog) — costs one integer test
-// per cycle when off.
+// VGC_GCTRACE=3 adds a line per carve (the request the pool did not serve,
+// with the pool's bytes and its largest hot, cold and oversized spans) and per
+// best-fit split (the request, the span it cut, the cap) — cx-home/v#58's
+// reading of a batch writer. Permanent observability (GODEBUG=gctrace analog)
+// — costs one integer test per cycle when off.
 __global vgc_gctrace = u32(0)
 // Set by an explicit gc_collect() (vgc_force_collect_release_os) and consumed
 // by the next sweep's trim point: that one cycle runs the unbudgeted, age-blind
@@ -3098,6 +3108,7 @@ fn vgc_span_split(mut span VGC_Span, want u32) bool {
 		rspan.base = rem_base
 		rspan.npages = rem
 		rspan.decommitted = span.decommitted
+		rspan.large_born = span.large_born
 	}
 	vgc_span_repoint_pages(arena_idx, rem_base, rem, rspan)
 	span.npages = want
@@ -3125,14 +3136,50 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 		return unsafe { nil }, false
 	}
 	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
-	span, cold := vgc_get_free_span_locked(npages)
+	span, cold := vgc_get_free_span_locked(npages, vgc_pool_split_cap(npages))
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	return span, cold
+}
+
+// vgc_pool_split_cap is the largest pooled LARGE-OBJECT span (VGC_Span.large_born)
+// a request of npages may split while an arena tail can serve it: twice the
+// request, and never under the merge floor (cx-home/v#58). A batch writer's
+// part frames (10 to 38 MB, grown through the same sizes every period) were
+// pooled whole and nibbled down by the smaller requests between the periods —
+// the best fit takes the smallest span that covers a request, and with the
+// smaller spans of the pool spent that was a frame — so the next period's
+// frames found no span of their sizes and carved new arenas: 1 -> 11 arenas
+// over 1.5M rows while the pool held hundreds of MB. Within twice the request
+// a split leaves a remainder no bigger than the request (a frame grown in
+// steps is cut into its own earlier steps); past it the request goes to an
+// arena tail, and a span past the cap is split only once no tail is left
+// (vgc_get_free_span_any), before a new arena. A stash-sized request a tail
+// serves carves its batch there too (vgc_span_alloc_once), so the stash keeps
+// its one lock take per batch (cx-home/v#40).
+fn vgc_pool_split_cap(npages u32) u32 {
+	c := npages * 2
+	if c < u32(vgc_pool_merge_min) {
+		return u32(vgc_pool_merge_min)
+	}
+	return c
+}
+
+// vgc_get_free_span_any is the lookup with no split cap: the arena tails are
+// spent, so a pooled span of any size is split rather than a new arena
+// carved (cx-home/v#58).
+fn vgc_get_free_span_any(npages u32) (&VGC_Span, bool) {
+	if npages == 0 {
+		return unsafe { nil }, false
+	}
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	span, cold := vgc_get_free_span_locked(npages, 0)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	return span, cold
 }
 
 // The pool lookup proper, under free_spans_lock (cx-private#1910: shared by the
 // locked path above and the stash refill below).
-fn vgc_get_free_span_locked(npages u32) (&VGC_Span, bool) {
+fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 	if npages <= u32(vgc_max_pooled_pages) {
 		// Exact fit, hot first (no recommit), then cold.
 		mut span := vgc_heap.free_spans[npages]
@@ -3160,8 +3207,14 @@ fn vgc_get_free_span_locked(npages u32) (&VGC_Span, bool) {
 			if cand == unsafe { nil } {
 				cand = vgc_heap.free_spans_cold[n]
 			}
+			if cand != unsafe { nil } && cap != 0 && n > cap && cand.large_born {
+				cand = unsafe { nil } // a large object's span, past the cap: the tail first
+			}
 			if cand != unsafe { nil } {
 				cold := cand.decommitted
+				if vgc_gctrace >= 3 {
+					C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages), u64(cap), 0)
+				}
 				vgc_pool_unlink(mut cand)
 				vgc_span_split(mut cand, npages)
 				vgc_span_pop_finish(mut cand)
@@ -3172,8 +3225,11 @@ fn vgc_get_free_span_locked(npages u32) (&VGC_Span, bool) {
 	// Oversized list: first fit, split the tail back into circulation.
 	mut o := vgc_heap.free_oversized
 	for o != unsafe { nil } {
-		if o.npages >= npages {
+		if o.npages >= npages && (cap == 0 || o.npages <= cap || !o.large_born) {
 			cold := o.decommitted
+			if vgc_gctrace >= 3 {
+				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(o.npages), u64(cap), 1)
+			}
 			vgc_pool_unlink(mut o)
 			vgc_span_split(mut o, npages)
 			vgc_span_pop_finish(mut o)
@@ -3245,7 +3301,8 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 		vgc_pool_unlink_finish(mut first)
 		return first, cold
 	}
-	span, cold := vgc_get_free_span_locked(npages)
+	cap := vgc_pool_split_cap(npages)
+	span, cold := vgc_get_free_span_locked(npages, cap)
 	// cx-home/v#40: no exact-fit span pooled — the pool holds larger runs (the
 	// sweep's defrag merges adjacent free spans), so the take above split one.
 	// Split the batch's other pieces off pooled runs too, under this one lock
@@ -3265,8 +3322,11 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 			if cand == unsafe { nil } {
 				cand = vgc_heap.free_spans_cold[n]
 			}
-			if cand == unsafe { nil } {
+			if cand == unsafe { nil } || (n > cap && cand.large_born) {
 				break
+			}
+			if vgc_gctrace >= 3 {
+				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages), u64(cap), 2)
 			}
 			vgc_pool_unlink(mut cand)
 			vgc_span_split(mut cand, npages)
@@ -3829,6 +3889,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 	// free here either. Cold pooled spans are decommitted LATER, aged and budgeted,
 	// by the STW pool trim (vgc_pool_trim, cx #360) — once per pool residence, so
 	// the syscall churn cannot return.
+	span.large_born = span.class_idx == 0 && span.nelems == 1 && span.elem_size > 0
 	span.in_use = false
 	C.vgc_atomic_store_u32(&span.inflight, 0) // cx-home/v#37: pooled, in nobody's flight
 	C.vgc_atomic_fetch_and_u8(unsafe { &vgc_heap.inuse_bits[span.slot >> 3] },
@@ -3892,6 +3953,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 				vgc_pool_unlink(mut p)
 				vgc_span_repoint_pages(arena_idx, cur.base, cur.npages, p)
 				p.npages += cur.npages
+				p.large_born = p.large_born || cur.large_born
 				vgc_retire_span_desc(mut cur)
 				cur = p
 			}
@@ -3912,6 +3974,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 					vgc_pool_unlink(mut s)
 					vgc_span_repoint_pages(arena_idx, s.base, s.npages, cur)
 					cur.npages += s.npages
+					cur.large_born = cur.large_born || s.large_born
 					vgc_retire_span_desc(mut s)
 				}
 			}
@@ -4300,6 +4363,7 @@ fn vgc_pool_defrag(min_age u32) u64 {
 				q_np := q.npages
 				vgc_span_repoint_pages(i, q.base, q_np, s)
 				s.npages += q_np
+				s.large_born = s.large_born || q.large_born
 				vgc_retire_span_desc(mut q)
 				q_idx += usize(q_np)
 			}
@@ -4388,6 +4452,44 @@ fn vgc_wait_gc_done() {
 	}
 }
 
+// vgc_span_recycled_ready sets up a span the pool handed out: the cycle stamp
+// and the in-flight claim, and the cold-run compensation.
+fn vgc_span_recycled_ready(mut span VGC_Span, cold bool, npages u32) {
+	// Stamp the current GC cycle: a concurrent sweep must not reclaim this span as
+	// "empty" (alloc_count 0) while it is in-flight to the mutator / mid-span_init.
+	// See vgc_sweep_span's sweep_gen guard.
+	unsafe {
+		span.sweep_gen = u32(vgc_heap.gc_cycle)
+		C.vgc_atomic_store_u32(&span.inflight, 1) // cx-home/v#37: in flight until the owner holds it
+	}
+	if cold && (npages >= u32(vgc_pool_merge_min) || vgc_committed_above_goal()) {
+		// A large request served from a COLD run commits as many pages as a
+		// carve of it would, beside the same idle hot pool: compensate it
+		// the same way (cx-home/v#14 — once the idle merge forms cold runs
+		// that cover the emitter's buffers, json-codec 1 MB x100 read 86.7
+		// -> 99.0 MB without this: the hot idle pool stayed resident while
+		// the recommitted run was touched, where a carve would have
+		// decommitted an equal amount).
+		vgc_pool_compensate(u64(usize(npages) * vgc_page_size))
+	}
+}
+
+// vgc_arena_tail_take bumps the first arena with nbytes of tail left and
+// answers the carve's base and arena, or 0 and -1. vgc_heap.lock held.
+fn vgc_arena_tail_take(nbytes usize) (usize, int) {
+	for i in 0 .. vgc_heap.narenas {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if a.used + nbytes <= a.size {
+			base := a.base + a.used
+			unsafe {
+				vgc_heap.arenas[i].used += nbytes
+			}
+			return base, i
+		}
+	}
+	return 0, -1
+}
+
 fn vgc_span_alloc(npages u32) &VGC_Span {
 	// Each wait lets one collection's sweep refill the pool; collections can run
 	// back to back (an explicit gc_collect loop on a 2-vCPU box), so a few waits
@@ -4402,48 +4504,67 @@ fn vgc_span_alloc(npages u32) &VGC_Span {
 	return last
 }
 
+// vgc_gctrace_carve_emit writes the VGC_GCTRACE=3 carve line (cx-home/v#58's
+// diagnostic): a request the pool did not serve, with the pool's bytes and
+// its largest hot, cold and oversized spans in pages. vgc_heap.lock held.
+fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int) {
+	mut hot := u32(0)
+	mut cold := u32(0)
+	for w := 128; w >= 0; w-- {
+		for b := 63; b >= 0; b-- {
+			bit := u64(1) << u64(b)
+			if hot == 0 && vgc_pool_hot_bits[w] & bit != 0 {
+				hot = u32(w << 6) + u32(b)
+			}
+			if cold == 0 && vgc_pool_cold_bits[w] & bit != 0 {
+				cold = u32(w << 6) + u32(b)
+			}
+		}
+	}
+	mut over := u32(0)
+	mut o := vgc_heap.free_oversized
+	for o != unsafe { nil } {
+		if o.npages > over {
+			over = o.npages
+		}
+		o = o.next
+	}
+	C.vgc_gctrace_carve(u64(vgc_heap.gc_cycle), u64(npages), u64(new_arena), u64(arena_idx),
+		C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) / 1024, C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes) / 1024,
+		u64(hot), u64(cold), u64(over))
+}
+
 // vgc_span_alloc_once answers the span, and whether it returned nil because it
 // waited for a collection in flight instead of carving (may_wait only).
 fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 	// First try to reuse a free span (cx-private#1910: this thread's stash first)
-	recycled, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
+	mut recycled, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
 	nbytes := usize(npages) * vgc_page_size
 	if recycled != unsafe { nil } {
-		// Stamp the current GC cycle: a concurrent sweep must not reclaim this span as
-		// "empty" (alloc_count 0) while it is in-flight to the mutator / mid-span_init.
-		// See vgc_sweep_span's sweep_gen guard.
-		unsafe {
-			recycled.sweep_gen = u32(vgc_heap.gc_cycle)
-			C.vgc_atomic_store_u32(&recycled.inflight, 1) // cx-home/v#37: in flight until the owner holds it
-		}
-		if cold && (npages >= u32(vgc_pool_merge_min) || vgc_committed_above_goal()) {
-			// A large request served from a COLD run commits as many pages as a
-			// carve of it would, beside the same idle hot pool: compensate it
-			// the same way (cx-home/v#14 — once the idle merge forms cold runs
-			// that cover the emitter's buffers, json-codec 1 MB x100 read 86.7
-			// -> 99.0 MB without this: the hot idle pool stayed resident while
-			// the recommitted run was touched, where a carve would have
-			// decommitted an equal amount).
-			vgc_pool_compensate(u64(nbytes))
-		}
+		vgc_span_recycled_ready(mut recycled, cold, npages)
 		return recycled, false
 	}
 
 	C.vgc_mutex_lock(&vgc_heap.lock)
 	// Try to find space in existing arenas
-	mut base := usize(0)
-	mut arena_idx := -1
+	mut base, mut arena_idx := vgc_arena_tail_take(nbytes)
 	mut new_arena := false
-	for i in 0 .. vgc_heap.narenas {
-		a := unsafe { &vgc_heap.arenas[i] }
-		if a.used + nbytes <= a.size {
-			base = a.base + a.used
-			arena_idx = i
-			unsafe {
-				vgc_heap.arenas[i].used += nbytes
-			}
-			break
+	if base == 0 {
+		// No arena tail serves it: a pooled span past the split cap is split
+		// now, before a new arena is carved (cx-home/v#58). The pool lock is
+		// taken before the heap lock (vgc_span_split's order), so the heap
+		// lock is dropped for the lookup and the tails are read again after.
+		C.vgc_mutex_unlock(&vgc_heap.lock)
+		mut any, cold_any := vgc_get_free_span_any(npages)
+		if any != unsafe { nil } {
+			vgc_span_recycled_ready(mut any, cold_any, npages)
+			return any, false
 		}
+		C.vgc_mutex_lock(&vgc_heap.lock)
+		base, arena_idx = vgc_arena_tail_take(nbytes)
+	}
+	if vgc_gctrace >= 3 && base != 0 {
+		vgc_gctrace_carve_emit(npages, 0, arena_idx)
 	}
 	if base != 0 && npages <= u32(vgc_max_pooled_pages) {
 		// An in-arena carve of a pooled size: the pool held no span covering
@@ -4515,6 +4636,9 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 		// page map existed) is the data race vgc_find_span hit.
 		new_arena = true
 		base = usize(mem)
+		if vgc_gctrace >= 3 {
+			vgc_gctrace_carve_emit(npages, 1, arena_idx)
+		}
 		// Register in address map for O(1) lookup
 		C.vgc_addr_map_register(usize(mem), asize, arena_idx)
 		// Update global arena bounds for fast pointer rejection
@@ -4580,6 +4704,45 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 	// (allspans registration happened inside vgc_new_span_desc — fresh descriptors
 	// are appended there under the same vgc_heap.lock hold; recycled descriptors
 	// never left the registry.)
+
+	// cx-home/v#58: a stash-sized request the tail served while the pool held
+	// a span its cap kept whole — the batch comes off the tail too, into the
+	// thread's stash, so the refill keeps its one lock take per batch
+	// (cx-home/v#40; vgc_span_stash_split_test). A stashed span's state:
+	// in_use false, pooled false, on no list, not in flight (VGC_Cache.tpool).
+	if arena_idx >= 0 && npages <= u32(vgc_tpool_max_pages) && vgc_pool_first_at_least(npages + 1) != 0 {
+		ci := C.vgc_get_cache_idx()
+		if ci >= 0 && ci < vgc_heap.ncaches {
+			mut c := unsafe { vgc_cache(ci) }
+			for _ in 1 .. vgc_tpool_batch(npages) {
+				base2, idx2 := vgc_arena_tail_take(nbytes)
+				if base2 == 0 {
+					break
+				}
+				mut extra := vgc_new_span_desc()
+				if extra == unsafe { nil } {
+					unsafe {
+						vgc_heap.arenas[idx2].used -= nbytes
+					}
+					break
+				}
+				unsafe {
+					eslot := extra.slot
+					C.memset(extra, 0, sizeof(VGC_Span))
+					extra.slot = eslot
+					extra.base = base2
+					extra.npages = npages
+					extra.sweep_gen = u32(vgc_heap.gc_cycle)
+				}
+				vgc_span_repoint_pages(idx2, base2, npages, extra)
+				unsafe {
+					extra.next = c.tpool[npages]
+					c.tpool[npages] = extra
+				}
+				c.tpool_n++
+			}
+		}
+	}
 
 	// Publish a newly-added arena to the LOCK-FREE readers (vgc_find_span /
 	// vgc_get_obj_size) with a RELEASE store, as the LAST write — after arenas[idx]

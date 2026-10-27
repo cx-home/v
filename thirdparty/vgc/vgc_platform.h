@@ -2515,6 +2515,29 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
     vgc__ws("KB threads="); vgc__wdec(lthreads);
     vgc__ws("\n");
 }
+// VGC_GCTRACE=3 carve line (cx-home/v#58): a request the pool did not serve.
+static void vgc_gctrace_carve(uint64_t cycle, uint64_t npages, uint64_t new_arena, uint64_t arena_idx,
+                              uint64_t pool_kb, uint64_t trimmed_kb, uint64_t hot_max, uint64_t cold_max,
+                              uint64_t over_max) {
+    vgc__ws("[carve "); vgc__wdec(cycle);
+    vgc__ws("] npages="); vgc__wdec(npages);
+    vgc__ws(" new="); vgc__wdec(new_arena);
+    vgc__ws(" arena="); vgc__wdec(arena_idx);
+    vgc__ws(" pool="); vgc__wdec(pool_kb);
+    vgc__ws("KB trimmed="); vgc__wdec(trimmed_kb);
+    vgc__ws("KB hotmax="); vgc__wdec(hot_max);
+    vgc__ws(" coldmax="); vgc__wdec(cold_max);
+    vgc__ws(" overmax="); vgc__wdec(over_max);
+    vgc__ws("\n");
+}
+static void vgc_gctrace_split(uint64_t cycle, uint64_t npages, uint64_t from_pages, uint64_t cap, uint64_t kind) {
+    vgc__ws("[split "); vgc__wdec(cycle);
+    vgc__ws("] npages="); vgc__wdec(npages);
+    vgc__ws(" from="); vgc__wdec(from_pages);
+    vgc__ws(" cap="); vgc__wdec(cap);
+    vgc__ws(" kind="); vgc__wdec(kind);
+    vgc__ws("\n");
+}
 // VGC_GCTRACE=1 grow-gate line (cx-private#1916): a collection the grow gate
 // fired before the goal — `probe=1` when the set read as growing (the
 // cx-home/v#7 last-carve probe) — with the heap at the trigger, so a trace
