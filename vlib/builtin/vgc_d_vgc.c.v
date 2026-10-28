@@ -219,10 +219,11 @@ mut:
 	in_use     bool  // true if span is allocated to a size class
 	has_ptrmap bool  // true if ptrmap is valid (precise scanning available)
 	is_tiny    bool  // true if the tiny allocator carved a packed block from this span
-	// cx-home/v#58: the pooled span held one large object, or is a piece of
-	// one (a split's remainder, a run merged from one): a request under half
-	// its size splits it only once no arena tail serves the request — see
-	// vgc_pool_split_cap. A pooled run of cache spans is split freely.
+	// cx-home/v#58: the pooled span held one large object of a size asked
+	// for more than once (vgc_large_demand), or is a piece of one (a split's
+	// remainder, a run merged from one): a request under half its size splits
+	// it only once no arena tail serves the request — see vgc_pool_split_cap.
+	// A pooled run of cache spans, or a once-asked size's span, is split freely.
 	large_born bool
 	// (multiple independently-allocated sub-objects share one slot; an individual
 	// free must NOT reclaim such a slot — see vgc_free / the tiny allocator).
@@ -3141,8 +3142,9 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 	return span, cold
 }
 
-// vgc_pool_split_cap is the largest pooled LARGE-OBJECT span (VGC_Span.large_born)
-// a request of npages may split while an arena tail can serve it: twice the
+// vgc_pool_split_cap is the largest pooled LARGE-OBJECT span (VGC_Span.large_born:
+// a large object of a size asked for more than once, vgc_large_demand) a
+// request of npages may split while an arena tail can serve it: twice the
 // request, and never under the merge floor (cx-home/v#58). A batch writer's
 // part frames (10 to 38 MB, grown through the same sizes every period) were
 // pooled whole and nibbled down by the smaller requests between the periods —
@@ -3156,6 +3158,40 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 // (vgc_get_free_span_any), before a new arena. A stash-sized request a tail
 // serves carves its batch there too (vgc_span_alloc_once), so the stash keeps
 // its one lock take per batch (cx-home/v#40).
+// vgc_large_demand counts the requests of each large-object size, by span
+// pages (the sizes past vgc_max_pooled_pages share the last entry; saturates
+// at 2). A pooled large object's span is kept whole for the next request of
+// its size (VGC_Span.large_born, the cap below) only when its size has been
+// asked for more than once: a batch writer's frames grow through the same
+// steps every period, so the second period's requests find the first's spans;
+// an array doubled through each size once — a JSON document's parse, every
+// size asked for once — never asks for a size again, and a span kept whole
+// for it only sent the smaller requests to the arena tails while the pool
+// idled (convert.json_300k: 2 -> 4 arenas, 24 MB pooled at the carves).
+__global vgc_large_demand = [8193]u32{} // vgc_max_pooled_pages + 1 entries
+
+fn vgc_large_demand_idx(npages u32) int {
+	if npages > u32(vgc_max_pooled_pages) {
+		return vgc_max_pooled_pages
+	}
+	return int(npages)
+}
+
+fn vgc_large_demand_note(npages u32) {
+	i := vgc_large_demand_idx(npages)
+	unsafe {
+		if C.vgc_atomic_load_u32(&vgc_large_demand[i]) < 2 {
+			C.vgc_atomic_add_u32(&vgc_large_demand[i], 1)
+		}
+	}
+}
+
+// vgc_large_size_recurs answers whether a large object of npages was asked
+// for more than once.
+fn vgc_large_size_recurs(npages u32) bool {
+	return unsafe { C.vgc_atomic_load_u32(&vgc_large_demand[vgc_large_demand_idx(npages)]) >= 2 }
+}
+
 fn vgc_pool_split_cap(npages u32) u32 {
 	c := npages * 2
 	if c < u32(vgc_pool_merge_min) {
@@ -3890,6 +3926,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 	// by the STW pool trim (vgc_pool_trim, cx #360) — once per pool residence, so
 	// the syscall churn cannot return.
 	span.large_born = span.class_idx == 0 && span.nelems == 1 && span.elem_size > 0
+		&& vgc_large_size_recurs(span.npages)
 	span.in_use = false
 	C.vgc_atomic_store_u32(&span.inflight, 0) // cx-home/v#37: pooled, in nobody's flight
 	C.vgc_atomic_fetch_and_u8(unsafe { &vgc_heap.inuse_bits[span.slot >> 3] },
@@ -5758,6 +5795,7 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 // Allocate a large object (> 32KB) with its own span
 fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 	npages := u32((n + vgc_page_size - 1) / vgc_page_size)
+	vgc_large_demand_note(npages)
 	mut span := vgc_span_alloc(npages)
 	if span == unsafe { nil } {
 		// Reclaim + retry before OOM (see vgc_collect_and_retry_span).
