@@ -3155,9 +3155,11 @@ fn vgc_get_free_span(npages u32) (&VGC_Span, bool) {
 // a split leaves a remainder no bigger than the request (a frame grown in
 // steps is cut into its own earlier steps); past it the request goes to an
 // arena tail, and a span past the cap is split only once no tail is left
-// (vgc_get_free_span_any), before a new arena. A stash-sized request a tail
-// serves carves its batch there too (vgc_span_alloc_once), so the stash keeps
-// its one lock take per batch (cx-home/v#40).
+// (vgc_get_free_span_any), before a new arena. A span whose own size recurs
+// is kept from every request but a near-exact fit (vgc_pool_keeps_whole: the
+// cap alone let a request over half the frame cut it). A stash-sized request
+// a tail serves carves its batch there too (vgc_span_alloc_once), so the
+// stash keeps its one lock take per batch (cx-home/v#40).
 // vgc_large_demand counts the requests of each large-object size, by span
 // pages (the sizes past vgc_max_pooled_pages share the last entry; saturates
 // at 2). A pooled large object's span is kept whole for the next request of
@@ -3198,6 +3200,28 @@ fn vgc_pool_split_cap(npages u32) u32 {
 		return u32(vgc_pool_merge_min)
 	}
 	return c
+}
+
+// vgc_pool_keeps_whole answers whether the pooled span cand of n pages is
+// kept whole from a request of npages while an arena tail serves the request
+// (cap != 0; with no tail, cap is 0 and any span is split before a new arena
+// is carved). A large object's span is kept past the cap, and one whose
+// own size recurs (vgc_large_size_recurs: a whole frame, or a remainder of a
+// frame's size — a merged run's size does not recur) is kept from every
+// request but a near-exact fit, within the merge floor of its size: the cap
+// alone let a request over half the span split it — the writer's 21 MB
+// request took its 38 MB frame's span while a tail served it, the next
+// period's 38 MB request carved an arena, and the writer at 1.5M rows read
+// 8 -> 10 arenas on the second cut (measure/bin/collector-epic/bench58.out,
+// the G row; vgc_writer_shape_reuse_test.v).
+fn vgc_pool_keeps_whole(cand &VGC_Span, n u32, npages u32, cap u32) bool {
+	if cap == 0 || !cand.large_born {
+		return false
+	}
+	if n > cap {
+		return true
+	}
+	return n > npages + u32(vgc_pool_merge_min) && vgc_large_size_recurs(n)
 }
 
 // vgc_get_free_span_any is the lookup with no split cap: the arena tails are
@@ -3243,8 +3267,8 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 			if cand == unsafe { nil } {
 				cand = vgc_heap.free_spans_cold[n]
 			}
-			if cand != unsafe { nil } && cap != 0 && n > cap && cand.large_born {
-				cand = unsafe { nil } // a large object's span, past the cap: the tail first
+			if cand != unsafe { nil } && vgc_pool_keeps_whole(cand, n, npages, cap) {
+				cand = unsafe { nil } // a large object's span kept for its size: the tail first
 			}
 			if cand != unsafe { nil } {
 				cold := cand.decommitted
@@ -3358,7 +3382,7 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 			if cand == unsafe { nil } {
 				cand = vgc_heap.free_spans_cold[n]
 			}
-			if cand == unsafe { nil } || (n > cap && cand.large_born) {
+			if cand == unsafe { nil } || vgc_pool_keeps_whole(cand, n, npages, cap) {
 				break
 			}
 			if vgc_gctrace >= 3 {
