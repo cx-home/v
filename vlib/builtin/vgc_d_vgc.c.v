@@ -3203,22 +3203,27 @@ fn vgc_pool_split_cap(npages u32) u32 {
 }
 
 // vgc_pool_keeps_whole answers whether the pooled span cand of n pages is
-// kept whole from a request of npages while an arena tail serves the request
-// (cap != 0; with no tail, cap is 0 and any span is split before a new arena
-// is carved). A large object's span is kept past the cap, and one whose
-// own size recurs (vgc_large_size_recurs: a whole frame, or a remainder of a
-// frame's size — a merged run's size does not recur) is kept from every
-// request but a near-exact fit, within the merge floor of its size: the cap
-// alone let a request over half the span split it — the writer's 21 MB
-// request took its 38 MB frame's span while a tail served it, the next
-// period's 38 MB request carved an arena, and the writer at 1.5M rows read
-// 8 -> 10 arenas on the second cut (measure/bin/collector-epic/bench58.out,
-// the G row; vgc_writer_shape_reuse_test.v).
+// kept whole from a request of npages: passed over for the next pooled size
+// up (vgc_pool_best_fit), then the arena tail while one serves the request
+// (cap != 0), and with no tail (cap 0) split only once nothing else fits,
+// before a new arena is carved. A large object's span is kept past the cap
+// while a tail serves, and one whose own size recurs (vgc_large_size_recurs:
+// a whole frame, or a remainder of a frame's size — a merged run's size does
+// not recur) is kept from every request but a near-exact fit, within the
+// merge floor of its size: the cap alone let a request over half the span
+// split it — the writer's 21 MB request took its 38 MB frame's span while a
+// tail served it, the next period's 38 MB request carved an arena, and the
+// writer at 1.5M rows read 8 -> 10 arenas on the second cut
+// (measure/bin/collector-epic/bench58.out, the G row;
+// vgc_writer_shape_reuse_test.v); and with the tails spent, the smaller
+// requests split the frames first — the best fit is the smallest span —
+// while larger runs sat pooled, 196 MB at the third cut's sixth carve (the H
+// row, 9 arenas; vgc_kept_frame_passed_over_test.v).
 fn vgc_pool_keeps_whole(cand &VGC_Span, n u32, npages u32, cap u32) bool {
-	if cap == 0 || !cand.large_born {
+	if !cand.large_born {
 		return false
 	}
-	if n > cap {
+	if cap != 0 && n > cap {
 		return true
 	}
 	return n > npages + u32(vgc_pool_merge_min) && vgc_large_size_recurs(n)
@@ -3240,6 +3245,7 @@ fn vgc_get_free_span_any(npages u32) (&VGC_Span, bool) {
 // The pool lookup proper, under free_spans_lock (cx-private#1910: shared by the
 // locked path above and the stash refill below).
 fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
+	mut kept := &VGC_Span(unsafe { nil })
 	if npages <= u32(vgc_max_pooled_pages) {
 		// Exact fit, hot first (no recommit), then cold.
 		mut span := vgc_heap.free_spans[npages]
@@ -3261,25 +3267,20 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 		// Hot preferred at equal size; cold is still far cheaper than carving.
 		// cx-private#1910: the summary bits name the list; the walk over 8192
 		// heads is gone.
-		n := vgc_pool_first_at_least(npages + 1)
-		if n != 0 && n <= u32(vgc_max_pooled_pages) {
-			mut cand := vgc_heap.free_spans[n]
-			if cand == unsafe { nil } {
-				cand = vgc_heap.free_spans_cold[n]
+		// A span kept whole for its own size (vgc_pool_keeps_whole) is passed
+		// over for the next size up; with no tail left it is split only once
+		// neither the pool nor the oversized list holds another span that fits.
+		mut cand := &VGC_Span(unsafe { nil })
+		cand, kept = vgc_pool_best_fit(npages, cap)
+		if cand != unsafe { nil } {
+			cold := cand.decommitted
+			if vgc_gctrace >= 3 {
+				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages), u64(cap), 0)
 			}
-			if cand != unsafe { nil } && vgc_pool_keeps_whole(cand, n, npages, cap) {
-				cand = unsafe { nil } // a large object's span kept for its size: the tail first
-			}
-			if cand != unsafe { nil } {
-				cold := cand.decommitted
-				if vgc_gctrace >= 3 {
-					C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages), u64(cap), 0)
-				}
-				vgc_pool_unlink(mut cand)
-				vgc_span_split(mut cand, npages)
-				vgc_span_pop_finish(mut cand)
-				return cand, cold
-			}
+			vgc_pool_unlink(mut cand)
+			vgc_span_split(mut cand, npages)
+			vgc_span_pop_finish(mut cand)
+			return cand, cold
 		}
 	}
 	// Oversized list: first fit, split the tail back into circulation.
@@ -3297,7 +3298,46 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 		}
 		o = o.next
 	}
+	// No tail and nothing else fits: the kept span is split before a new
+	// arena is carved (cx-home/v#58).
+	if kept != unsafe { nil } {
+		cold := kept.decommitted
+		if vgc_gctrace >= 3 {
+			C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(kept.npages), u64(cap), 0)
+		}
+		vgc_pool_unlink(mut kept)
+		vgc_span_split(mut kept, npages)
+		vgc_span_pop_finish(mut kept)
+		return kept, cold
+	}
 	return unsafe { nil }, false
+}
+
+// vgc_pool_best_fit answers the smallest pooled span past npages that a
+// request of npages may split, walking the sizes up past the spans kept
+// whole (vgc_pool_keeps_whole), and the first kept span met when no tail
+// serves the request (cap 0): the caller splits it only once the oversized
+// list holds nothing either. While a tail serves the request a kept span is
+// never answered: the tail first.
+fn vgc_pool_best_fit(npages u32, cap u32) (&VGC_Span, &VGC_Span) {
+	mut kept := &VGC_Span(unsafe { nil })
+	mut n := vgc_pool_first_at_least(npages + 1)
+	for n != 0 && n <= u32(vgc_max_pooled_pages) {
+		mut cand := vgc_heap.free_spans[n]
+		if cand == unsafe { nil } {
+			cand = vgc_heap.free_spans_cold[n]
+		}
+		if cand != unsafe { nil } {
+			if !vgc_pool_keeps_whole(cand, n, npages, cap) {
+				return cand, kept
+			}
+			if cap == 0 && kept == unsafe { nil } {
+				kept = cand
+			}
+		}
+		n = vgc_pool_first_at_least(n + 1)
+	}
+	return unsafe { nil }, kept
 }
 
 // vgc_get_free_span_cached is the mutator's pool lookup (cx-private#1910): a
@@ -3374,15 +3414,8 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32) (&VGC_Span, bool) {
 		want := vgc_tpool_batch(npages) - 1
 		mut got := 0
 		for got < want {
-			n := vgc_pool_first_at_least(npages + 1)
-			if n == 0 || n > u32(vgc_max_pooled_pages) {
-				break
-			}
-			mut cand := vgc_heap.free_spans[n]
+			mut cand, _ := vgc_pool_best_fit(npages, cap)
 			if cand == unsafe { nil } {
-				cand = vgc_heap.free_spans_cold[n]
-			}
-			if cand == unsafe { nil } || vgc_pool_keeps_whole(cand, n, npages, cap) {
 				break
 			}
 			if vgc_gctrace >= 3 {
