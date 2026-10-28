@@ -511,6 +511,11 @@ mut:
 	// RELEASE store that publishes base/size (new arenas), or was already
 	// published when the arena was (existing-arena span carves).
 	page_span &&VGC_Span = unsafe { nil }
+	// owner is the cache index + 1 of the thread whose new spans come off this
+	// arena's tail (0: none; vgc_arena_tail_take, cx-examples#403). Two threads
+	// carving one arena's tail fault its pages in turn, and first touches of one
+	// mapping from many threads serialize in the kernel.
+	owner int
 }
 
 // VGC_WorkBuf is a work buffer for the mark phase.
@@ -1344,6 +1349,14 @@ __global vgc_ph_sapply_ns = u64(0)
 // heaps. A thread counts when it allocated since the previous cycle.
 // VGC_HEADROOM_PER_THREAD=0 switches the scaling off.
 __global vgc_headroom_per_thread = true
+// One arena tail per allocating thread (cx-examples#403): a thread carves new
+// spans from an arena no other live thread carves, so its first touches of
+// fresh pages do not interleave with another thread's in one mapping. On macOS
+// 28 threads first-touching 1 MB pieces of shared 64 MB mappings spent 26 s of
+// system time on 13 GB where 64 MB mappings of their own spent 4 s, and 28
+// xlsx parses in one process read 24 s of system time against 1.5 s for 12.
+// One thread carves exactly as first fit did. VGC_ARENA_OWNER=0 switches it off.
+__global vgc_arena_owner_on = true
 // markers this cycle, the collector included
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
@@ -2311,6 +2324,10 @@ pub fn vgc_init() {
 		if d >= 1 && d <= 8 {
 			vgc_cpu_limit_div = u64(d)
 		}
+	}
+	ao_env := C.getenv(c'VGC_ARENA_OWNER')
+	if ao_env != unsafe { nil } {
+		vgc_arena_owner_on = C.atoll(ao_env) != 0
 	}
 	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
 	if lim_env != unsafe { nil } {
@@ -4617,12 +4634,26 @@ fn vgc_span_recycled_ready(mut span VGC_Span, cold bool, npages u32) {
 	}
 }
 
-// vgc_arena_tail_take bumps the first arena with nbytes of tail left and
-// answers the carve's base and arena, or 0 and -1. vgc_heap.lock held.
+// vgc_arena_tail_take bumps the first arena with nbytes of tail left that no
+// other live thread carves (vgc_arena_owner_on; the calling thread then owns
+// it) and answers the carve's base and arena, or 0 and -1: the caller maps a
+// new arena rather than carve another thread's tail. At the arena ceiling any
+// tail serves. vgc_heap.lock held.
 fn vgc_arena_tail_take(nbytes usize) (usize, int) {
+	me := if vgc_arena_owner_on { C.vgc_get_cache_idx() + 1 } else { 0 }
+	mut other := -1
 	for i in 0 .. vgc_heap.narenas {
 		a := unsafe { &vgc_heap.arenas[i] }
 		if a.used + nbytes <= a.size {
+			if me > 0 && a.owner != me && vgc_arena_owner_live(a.owner) {
+				if other < 0 {
+					other = i
+				}
+				continue
+			}
+			if me > 0 && a.owner != me {
+				vgc_arena_claim(i, me)
+			}
 			base := a.base + a.used
 			unsafe {
 				vgc_heap.arenas[i].used += nbytes
@@ -4630,7 +4661,70 @@ fn vgc_arena_tail_take(nbytes usize) (usize, int) {
 			return base, i
 		}
 	}
+	if other >= 0 && vgc_heap.narenas + 1 >= vgc_arena_ceiling() {
+		base := vgc_heap.arenas[other].base + vgc_heap.arenas[other].used
+		unsafe {
+			vgc_heap.arenas[other].used += nbytes
+		}
+		return base, other
+	}
 	return 0, -1
+}
+
+// vgc_arena_owner_live answers whether arena owner `o` (cache index + 1) is a
+// registered thread's cache: an exited thread's arena is free to claim.
+fn vgc_arena_owner_live(o int) bool {
+	if o <= 0 || o > vgc_heap.ncaches {
+		return false
+	}
+	return unsafe { vgc_cache(o - 1).registered }
+}
+
+// vgc_arena_claim makes `me` (cache index + 1) the owner of arena `idx` and
+// releases the arena it carved before, so its tail serves other threads.
+// vgc_heap.lock held.
+fn vgc_arena_claim(idx int, me int) {
+	for j in 0 .. vgc_heap.narenas {
+		if vgc_heap.arenas[j].owner == me {
+			unsafe {
+				vgc_heap.arenas[j].owner = 0
+			}
+		}
+	}
+	unsafe {
+		vgc_heap.arenas[idx].owner = me
+	}
+}
+
+// vgc_arena_ceiling is the arena count vgc_span_alloc may map (VGC_MAX_ARENAS,
+// or the compiled capacity before vgc_init parsed it).
+fn vgc_arena_ceiling() int {
+	return if vgc_max_arenas_eff > 0 { vgc_max_arenas_eff } else { int(vgc_max_arenas) }
+}
+
+// vgc_arena_index_of answers the arena holding address `p`, or -1 (a test hook:
+// bench/parallel-alloc/vgc_arena_owner_test.v).
+pub fn vgc_arena_index_of(p voidptr) int {
+	addr := usize(p)
+	C.vgc_mutex_lock(&vgc_heap.lock)
+	defer {
+		C.vgc_mutex_unlock(&vgc_heap.lock)
+	}
+	for i in 0 .. vgc_heap.narenas {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if addr >= a.base && addr < a.base + a.size {
+			return i
+		}
+	}
+	return -1
+}
+
+// vgc_arena_owner_set switches the one-tail-per-thread carve on or off and
+// answers the previous setting (a test hook, as VGC_ARENA_OWNER).
+pub fn vgc_arena_owner_set(on bool) bool {
+	prev := vgc_arena_owner_on
+	vgc_arena_owner_on = on
+	return prev
 }
 
 fn vgc_span_alloc(npages u32) &VGC_Span {
@@ -4771,6 +4865,13 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 			vgc_heap.arenas[arena_idx].size = asize
 			vgc_heap.arenas[arena_idx].used = nbytes
 			vgc_heap.arenas[arena_idx].page_span = &&VGC_Span(psmem)
+			vgc_heap.arenas[arena_idx].owner = 0
+		}
+		if vgc_arena_owner_on && asize == vgc_arena_size {
+			me := C.vgc_get_cache_idx() + 1
+			if me > 0 {
+				vgc_arena_claim(arena_idx, me)
+			}
 		}
 		// narenas is NOT bumped here: it is the publication point for this whole
 		// arena (base/size/used + the page_span map filled below) and must be
