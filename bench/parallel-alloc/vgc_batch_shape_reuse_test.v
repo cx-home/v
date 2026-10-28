@@ -17,12 +17,18 @@
 // arena tail can serve it (vgc_pool_split_cap); past that it carves the tail,
 // and only with no tail left is the span split rather than a new arena carved.
 //
-// The shape: a 32 MB buffer dropped and collected (pooled whole), then a 1 MB
-// buffer held, then another 32 MB request. Pinned: the 1 MB request split the
-// 32 MB span, and the second 32 MB request carved 32 MB of new arena. Now:
-// the 1 MB request takes the arena tail and the second 32 MB request is the
-// pooled span, so the committed arena bytes (gc_memory_use) grow by the 1 MB
-// only. Its own process (a fresh heap: one arena with its tail free).
+// The rule holds for a size the program asked for more than once
+// (vgc_large_demand): the writer's frames recur every period; a size asked
+// for once — an array doubled through each size, a JSON document's parse —
+// is not kept whole (vgc_once_seen_size_split_test.v).
+//
+// The shape: a 32 MB frame dropped and collected twice (the second period's
+// frame takes the first's pooled span; the size recurs), then a 1 MB buffer
+// held, then another 32 MB request. Pinned: the 1 MB request split the 32 MB
+// span, and the next 32 MB request carved 32 MB of new arena. Now: the 1 MB
+// request takes the arena tail and the next 32 MB request is the pooled
+// span, so the committed arena bytes (gc_memory_use) grow by the 1 MB only.
+// Its own process (a fresh heap: one arena with its tail free).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_batch_shape_reuse_test.v
 module main
@@ -47,12 +53,14 @@ fn test_a_freed_large_span_serves_the_next_request_of_its_size() {
 	n := 32 * mb
 	assert drop_frame(n) == n
 	gc_collect()
+	assert drop_frame(n) == n // the second period's frame: the size recurs
+	gc_collect()
 	use0 := gc_memory_use()
 	small := fill(mb)
 	use1 := gc_memory_use()
 	again := fill(n)
 	use2 := gc_memory_use()
-	println('vgc_batch_shape_reuse: committed ${use0 / mb} MB after the 32 MB frame was pooled, ${use1 / mb} MB after a 1 MB buffer, ${use2 / mb} MB after the next 32 MB frame (${small.len} ${again.len})')
+	println('vgc_batch_shape_reuse: committed ${use0 / mb} MB after the 32 MB frame was pooled twice, ${use1 / mb} MB after a 1 MB buffer, ${use2 / mb} MB after the next 32 MB frame (${small.len} ${again.len})')
 	assert use0 > 0
 	assert use2 <= use0 + 2 * mb, 'the next 32 MB frame did not take the pooled span: committed ${use0 / mb} -> ${use2 / mb} MB (the 1 MB buffer in between: ${use1 / mb} MB)'
 }
