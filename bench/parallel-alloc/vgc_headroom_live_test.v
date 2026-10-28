@@ -296,37 +296,56 @@ fn test_the_first_collection_triggers_at_the_one_thread_floor() {
 	assert one < 3.0, 'the first collection did not come at the one-thread floor: ${one:.3f} MB carved (bar 3 MB)'
 }
 
-// cx-home/v#56 (cx-private#1977 L5): ONE allocating thread paces to half its
-// marked set (vgc_one_thread_pct, 50): the GOGC term, the band's live-set cap
-// and the floor's scale. 8 MB live under the held-up band carves about 1.5x the
-// live set, where Go's GOGC=100 (VGC_ONE_THREAD_PCT=100, the previous pacing)
-// carves about 2x.
-fn test_one_allocating_thread_paces_to_half_its_live_set() {
+// cx-home/v#56 (cx-private#1977 L5), cx-examples#296 and #297: ONE allocating
+// thread paces to a quarter of its marked set (vgc_one_thread_pct, 25): the GOGC
+// term, the band's live-set cap and the floor's scale. 8 MB live under the
+// held-up band carves about 1.25x the live set, where the half term
+// (VGC_ONE_THREAD_PCT=50) carves about 1.5x and Go's GOGC=100
+// (VGC_ONE_THREAD_PCT=100, the pacing before) about 2x.
+fn test_one_allocating_thread_paces_to_a_quarter_of_its_live_set() {
 	if os.getenv('VGC_LIVE_CHILD') != '' {
 		return
 	}
 	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
-	half := ratio(band, 'small')
+	quarter := ratio(band, 'small')
+	half := ratio(band + 'VGC_ONE_THREAD_PCT=50 ', 'small')
 	full := ratio(band + 'VGC_ONE_THREAD_PCT=100 ', 'small')
-	println('vgc_headroom_live: 8 MB live, one allocating thread, band held up — ${half:.3f}x at 50 %, ${full:.3f}x at 100 %')
+	println('vgc_headroom_live: 8 MB live, one allocating thread, band held up — ${quarter:.3f}x at 25 %, ${half:.3f}x at 50 %, ${full:.3f}x at 100 %')
 	assert half < full, 'one thread at 50 % carved ${half:.3f}x, not less than ${full:.3f}x at 100 %'
-	assert half <= 1.8, 'one thread at 50 % carved ${half:.3f}x over 8 MB live (expected ~1.5x)'
+	assert quarter < half, 'one thread at 25 % carved ${quarter:.3f}x, not less than ${half:.3f}x at 50 %'
+	assert quarter <= 1.55, 'one thread at 25 % carved ${quarter:.3f}x over 8 MB live (expected ~1.25x)'
+}
+
+// cx-examples#296, #297: the small heap's grace (vgc_one_thread_grace, 2 MB). The
+// one-thread term is never under half the marked set while that half is under
+// 2 MB: 2 MB live carves the same at 25 % and at 50 % (its term is 1 MB either
+// way), where 8 MB live (the test above) carves less at 25 %.
+fn test_the_one_thread_term_keeps_half_of_a_small_live_set() {
+	if os.getenv('VGC_LIVE_CHILD') != '' {
+		return
+	}
+	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
+	quarter := ratio(band, 'tiny')
+	half := ratio(band + 'VGC_ONE_THREAD_PCT=50 ', 'tiny')
+	println('vgc_headroom_live: 2 MB live, one allocating thread, band held up — ${quarter:.3f}x at 25 %, ${half:.3f}x at 50 %')
+	diff := if quarter > half { quarter - half } else { half - quarter }
+	assert diff <= 0.15, 'under the grace the quarter still paced: ${quarter:.3f}x at 25 % against ${half:.3f}x at 50 %'
 }
 
 // cx-home/v#56: the one-thread percentage paces a SMALL heap — one whose marked
 // set is under the live floor (32 MB). Past it one thread keeps Go's GOGC=100: at
 // 100 MB marked the 50 % goal doubled the cycles, cost 20 % of the wall and carved
 // a third arena (cx --from=json --to=json on 300k records: 2 arenas at 100 %, 3 at
-// 50 %). The pair reads the scope alone: 40 MB live carves the same at 50 % and
-// at 100 %, where 8 MB live (the test above) carves less at 50 %.
+// 50 %). The pair reads the scope alone: 40 MB live carves the same at 25 % and
+// at 100 %, where 8 MB live (the tests above) carves less at 25 %.
 fn test_one_allocating_thread_over_the_live_floor_paces_as_before() {
 	if os.getenv('VGC_LIVE_CHILD') != '' {
 		return
 	}
 	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
-	half := ratio(band, 'big')
+	quarter := ratio(band, 'big')
 	full := ratio(band + 'VGC_ONE_THREAD_PCT=100 ', 'big')
-	println('vgc_headroom_live: 40 MB live, one allocating thread, band held up — ${half:.3f}x at 50 %, ${full:.3f}x at 100 %')
-	diff := if half > full { half - full } else { full - half }
-	assert diff <= 0.15, 'over the live floor the one-thread percentage still paced: ${half:.3f}x at 50 % against ${full:.3f}x at 100 %'
+	println('vgc_headroom_live: 40 MB live, one allocating thread, band held up — ${quarter:.3f}x at 25 %, ${full:.3f}x at 100 %')
+	diff := if quarter > full { quarter - full } else { full - quarter }
+	assert diff <= 0.15, 'over the live floor the one-thread percentage still paced: ${quarter:.3f}x at 25 % against ${full:.3f}x at 100 %'
 }

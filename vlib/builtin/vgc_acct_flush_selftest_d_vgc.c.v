@@ -22,6 +22,10 @@
 // workers allocate 1 MB each (a thread counts at 64 KB since the last stop),
 // collects, and reads the workers' unflushed bytes as above.
 //
+// The check paces one allocating thread at 50 % of the marked set (the term
+// it was written under) whatever vgc_one_thread_pct reads: the warm-up must
+// stay under the one-thread cycle's budget (cx-examples#296).
+//
 // Driven by bench/parallel-alloc/vgc_acct_flush_test.v (module main). Only
 // compiled under -d vgc / -gc e (the `_d_vgc` filename suffix).
 //
@@ -99,6 +103,18 @@ fn vgc_aft_each() u64 {
 pub fn vgc_acct_flush_selftest() u32 {
 	if C.vgc_get_cache_idx() < 0 {
 		return 1
+	}
+	// The flush is independent of one allocating thread's term, but the setup
+	// is not: the four workers' warm-up (1 MB each) runs on the budget the main
+	// thread's one-thread cycle set, and a collection of its own inside it
+	// resets their count in every try. At the 25 % term (cx-examples#296) the
+	// 8 MB live set's budget is 2 MB, under the warm-up's 4 MB, so no try
+	// scaled the flush and the check read 4. Pace this check at 50 % (a 4 MB
+	// budget, the term it was written under) and restore the term after.
+	otp := vgc_one_thread_pct
+	vgc_one_thread_pct = 50
+	defer {
+		vgc_one_thread_pct = otp
 	}
 	live := unsafe { malloc_noscan(8 * 1024 * 1024) }
 	vgc_force_collect()

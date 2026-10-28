@@ -912,9 +912,19 @@ __global vgc_headroom_floor_lo1 = u64(256) * 1024
 // stood resident at every cycle: peak RSS 14.55 MB against Python's 13.84, where a reference-
 // counted heap keeps none. At 50 the goal is 1.5x the live set: 13.55 MB, about twice the
 // collections of a cycle that costs ~0.12 ms (parse 1 KB ~10 % slower, still above Python's
-// rate). Several allocating threads keep GOGC=100. VGC_ONE_THREAD_PCT overrides (100 restores
-// the previous pacing); the floor below follows it (VGC_HEADROOM_FLOOR_LO1_KB, default 256).
-__global vgc_one_thread_pct = u64(50)
+// rate). At 25 (cx-examples#296, #297) the goal is 1.25x the live set: the 1 MB document
+// (marked 11 MB) paced to a 17 MB goal at 50 and its peak read 30.12 MB against Python's 28.70;
+// at 25 the goal is 14 MB and the peak 27.6-27.8 MB, 314 cycles of ~0.2 ms for 176 (wall 0.67-0.69 s
+// for 0.62-0.64; Python 1.02 s). Several allocating threads keep GOGC=100. VGC_ONE_THREAD_PCT
+// overrides (100 restores Go's pacing); the floor below follows it (VGC_HEADROOM_FLOOR_LO1_KB,
+// default 256). vgc_one_thread_term applies it with the grace below.
+__global vgc_one_thread_pct = u64(25)
+// The small heap's grace: the one-thread term is never under half the marked set while that half
+// is under this many bytes. A 1.45 MB live set (json-codec 1 KB) already reads under Python at
+// half (13.44 against 13.72 MB, ~300 cycles); a quarter would double its cycles for 0.36 MB. The
+// cut pays where the half term is itself megabytes: from 4 MB marked the term holds at 2 MB, from
+// 8 MB it is the quarter.
+__global vgc_one_thread_grace = u64(2) * 1024 * 1024
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -924,6 +934,21 @@ __global vgc_one_thread_pct = u64(50)
 // 2 arenas at GOGC 100, 3 at 50 %), where the arena count is the gate's row (cx-private#1884).
 fn vgc_one_thread_small(marked u64) bool {
 	return marked < vgc_headroom_live_floor
+}
+
+// vgc_one_thread_term is one allocating thread's term in bytes for a marked set under the live
+// floor: vgc_one_thread_pct of the marked set, but not under half of it while that half is under
+// vgc_one_thread_grace. The GOGC term, the band's live-set cap and the adaptive floor all use it.
+fn vgc_one_thread_term(marked u64) u64 {
+	mut t := marked * vgc_one_thread_pct / 100
+	mut grace := marked / 2
+	if grace > vgc_one_thread_grace {
+		grace = vgc_one_thread_grace
+	}
+	if t < grace {
+		t = grace
+	}
+	return t
 }
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
