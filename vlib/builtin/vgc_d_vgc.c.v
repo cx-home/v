@@ -1335,6 +1335,12 @@ __global vgc_heap_soft_limit = u64(2) * 1024 * 1024 * 1024
 // it because _vinit zero-initializes __globals regardless of the source
 // initializer (the vgc_heap note above).
 const vgc_default_soft_limit = u64(2) * 1024 * 1024 * 1024
+
+// The CPU limiter's state past the soft limit (vgc_update_trigger, cx-examples#403): the
+// minimum budget over the live set is marked/16 << vgc_limit_shift, 0..4.
+__global vgc_limit_shift = u32(0)
+// VGC_CPU_LIMIT=0 switches the limiter off (the budget stays marked/16 past the limit).
+__global vgc_cpu_limit = true
 // ── cx #71 ADAPTIVE PACER HEADROOM ──────────────────────────────────────────
 // vgc_headroom is how many bytes of net heap growth beyond the marked (live)
 // set the pacer allows before the next backstop cycle. It REPLACES the fixed
@@ -2263,6 +2269,10 @@ pub fn vgc_init() {
 	// Soft limit: the pinned 2 GB default (NOT derived from the arena capacity —
 	// see vgc_heap_soft_limit / cx #282), env-overridable.
 	vgc_heap_soft_limit = vgc_default_soft_limit
+	cl_env := C.getenv(c'VGC_CPU_LIMIT')
+	if cl_env != unsafe { nil } {
+		vgc_cpu_limit = C.atoll(cl_env) != 0
+	}
 	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
 	if lim_env != unsafe { nil } {
 		lmb := C.atoll(lim_env)

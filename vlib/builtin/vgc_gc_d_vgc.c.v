@@ -3889,6 +3889,57 @@ fn vgc_alloc_threads() int {
 	return n
 }
 
+// vgc_limit_step is the CPU limiter's next shift (cx-examples#403; vgc_update_trigger): at
+// the soft limit (`limited`), a cycle whose collector time `pause` reached the mutators'
+// wall time `interval` doubles the budget (shift + 1, at most 4: the live set), one under
+// 1/8 of it halves it (shift - 1), one between keeps it; under the limit it is 0.
+fn vgc_limit_step(shift u32, limited bool, pause u64, interval u64) u32 {
+	if !limited {
+		return 0
+	}
+	if pause >= interval {
+		return if shift < 4 { shift + 1 } else { shift }
+	}
+	if pause * 8 < interval && shift > 0 {
+		return shift - 1
+	}
+	return shift
+}
+
+// vgc_limit_selftest checks vgc_limit_step (bench/parallel-alloc/vgc_limit_test.v):
+// 0 = ok, else the number of the first failed case.
+pub fn vgc_limit_selftest() u32 {
+	// a collector as costly as the mutators doubles the budget, up to the live set
+	if vgc_limit_step(0, true, 200, 100) != 1 {
+		return 1
+	}
+	if vgc_limit_step(3, true, 100, 100) != 4 {
+		return 2
+	}
+	if vgc_limit_step(4, true, 500, 100) != 4 {
+		return 3
+	}
+	// a cheap cycle halves it back; one between keeps it
+	if vgc_limit_step(2, true, 10, 100) != 1 {
+		return 4
+	}
+	if vgc_limit_step(0, true, 10, 100) != 0 {
+		return 5
+	}
+	if vgc_limit_step(2, true, 50, 100) != 2 {
+		return 6
+	}
+	// under the limit the budget is marked/16 again
+	if vgc_limit_step(3, false, 500, 100) != 0 {
+		return 7
+	}
+	// the first cycle has no interval yet: its pause alone reads as costly
+	if vgc_limit_step(0, true, 5, 0) != 1 {
+		return 8
+	}
+	return 0
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -4127,7 +4178,19 @@ fn vgc_update_trigger() {
 	// 1/16th of the live set (Go's GOMEMLIMIT keeps an analogous minimum headroom
 	// under its limit) with the adaptive floor as the small-heap lower bound.
 	// Goals already more than that budget under the limit are untouched.
-	mut min_budget := marked / 16
+	// The collector's CPU limit past the soft limit (cx-examples#403): Go's GC CPU limiter
+	// lets the heap pass GOMEMLIMIT rather than spend more than half the CPU collecting.
+	// Twelve parses holding 475 MB each crossed 2 GB with marked/16 budgets: 20 cycles
+	// marking 2-4 GB apiece, 150-240 ms each with every mutator stopped, 42 s of CPU for
+	// 18 s of work. So while the live set holds the goal at its minimum budget, a cycle
+	// whose collector time reached the mutators' wall time since the previous cycle
+	// (vgc_gate_last_pause / _interval, the overhead band above) doubles the next
+	// budget, up to the live set itself (shift 4); a cycle under 1/8 of it halves it
+	// back; a goal under the limit again resets it.
+	vgc_limit_shift = vgc_limit_step(vgc_limit_shift, vgc_cpu_limit
+		&& goal < marked + marked / 16 && !vgc_headroom_pinned, vgc_gate_last_pause,
+		vgc_gate_last_interval)
+	mut min_budget := (marked / 16) << vgc_limit_shift
 	if min_budget < hr_min {
 		min_budget = hr_min
 	}
