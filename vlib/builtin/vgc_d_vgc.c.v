@@ -1341,6 +1341,12 @@ const vgc_default_soft_limit = u64(2) * 1024 * 1024 * 1024
 __global vgc_limit_shift = u32(0)
 // VGC_CPU_LIMIT=0 switches the limiter off (the budget stays marked/16 past the limit).
 __global vgc_cpu_limit = true
+// The limiter's step-up threshold (cx-examples#403): a cycle whose collector time times
+// this reached the mutators' wall time doubles the budget. 4 = a stop of a fifth of the
+// wall time (every mutator waits through it); VGC_CPU_LIMIT_DIV=1 is 70cb3f5f5's
+// pause >= interval. vgc_init re-applies the default (_vinit zeroes __globals).
+__global vgc_cpu_limit_div = u64(4)
+const vgc_default_cpu_limit_div = u64(4)
 // ── cx #71 ADAPTIVE PACER HEADROOM ──────────────────────────────────────────
 // vgc_headroom is how many bytes of net heap growth beyond the marked (live)
 // set the pacer allows before the next backstop cycle. It REPLACES the fixed
@@ -2272,6 +2278,14 @@ pub fn vgc_init() {
 	cl_env := C.getenv(c'VGC_CPU_LIMIT')
 	if cl_env != unsafe { nil } {
 		vgc_cpu_limit = C.atoll(cl_env) != 0
+	}
+	vgc_cpu_limit_div = vgc_default_cpu_limit_div
+	cld_env := C.getenv(c'VGC_CPU_LIMIT_DIV')
+	if cld_env != unsafe { nil } {
+		d := C.atoll(cld_env)
+		if d >= 1 && d <= 8 {
+			vgc_cpu_limit_div = u64(d)
+		}
 	}
 	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
 	if lim_env != unsafe { nil } {

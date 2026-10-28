@@ -3890,14 +3890,17 @@ fn vgc_alloc_threads() int {
 }
 
 // vgc_limit_step is the CPU limiter's next shift (cx-examples#403; vgc_update_trigger): at
-// the soft limit (`limited`), a cycle whose collector time `pause` reached the mutators'
-// wall time `interval` doubles the budget (shift + 1, at most 4: the live set), one under
-// 1/8 of it halves it (shift - 1), one between keeps it; under the limit it is 0.
-fn vgc_limit_step(shift u32, limited bool, pause u64, interval u64) u32 {
+// the soft limit (`limited`), a cycle whose collector time `pause` x `div` reached the
+// mutators' wall time `interval` doubles the budget (shift + 1, at most 4: the live set),
+// one under 1/8 of it halves it (shift - 1), one between keeps it; under the limit it is
+// 0. The cycles past the limit stop the world, so the mutators lose the whole pause:
+// div 4 (vgc_cpu_limit_div) steps up at a fifth of the wall time stopped, where div 1
+// waited for half — twelve parses past 2 GB sat at 40 % stopped, each cycle just under it.
+fn vgc_limit_step(shift u32, limited bool, pause u64, interval u64, div u64) u32 {
 	if !limited {
 		return 0
 	}
-	if pause >= interval {
+	if pause * div >= interval {
 		return if shift < 4 { shift + 1 } else { shift }
 	}
 	if pause * 8 < interval && shift > 0 {
@@ -3910,32 +3913,45 @@ fn vgc_limit_step(shift u32, limited bool, pause u64, interval u64) u32 {
 // 0 = ok, else the number of the first failed case.
 pub fn vgc_limit_selftest() u32 {
 	// a collector as costly as the mutators doubles the budget, up to the live set
-	if vgc_limit_step(0, true, 200, 100) != 1 {
+	if vgc_limit_step(0, true, 200, 100, 1) != 1 {
 		return 1
 	}
-	if vgc_limit_step(3, true, 100, 100) != 4 {
+	if vgc_limit_step(3, true, 100, 100, 1) != 4 {
 		return 2
 	}
-	if vgc_limit_step(4, true, 500, 100) != 4 {
+	if vgc_limit_step(4, true, 500, 100, 1) != 4 {
 		return 3
 	}
 	// a cheap cycle halves it back; one between keeps it
-	if vgc_limit_step(2, true, 10, 100) != 1 {
+	if vgc_limit_step(2, true, 10, 100, 1) != 1 {
 		return 4
 	}
-	if vgc_limit_step(0, true, 10, 100) != 0 {
+	if vgc_limit_step(0, true, 10, 100, 1) != 0 {
 		return 5
 	}
-	if vgc_limit_step(2, true, 50, 100) != 2 {
+	if vgc_limit_step(2, true, 50, 100, 1) != 2 {
 		return 6
 	}
 	// under the limit the budget is marked/16 again
-	if vgc_limit_step(3, false, 500, 100) != 0 {
+	if vgc_limit_step(3, false, 500, 100, 1) != 0 {
 		return 7
 	}
 	// the first cycle has no interval yet: its pause alone reads as costly
-	if vgc_limit_step(0, true, 5, 0) != 1 {
+	if vgc_limit_step(0, true, 5, 0, 1) != 1 {
 		return 8
+	}
+	// div 4: a collector at a quarter of the mutators' time doubles it, under 1/8 halves
+	if vgc_limit_step(2, true, 25, 100, 4) != 3 {
+		return 9
+	}
+	if vgc_limit_step(2, true, 20, 100, 4) != 2 {
+		return 10
+	}
+	if vgc_limit_step(2, true, 10, 100, 4) != 1 {
+		return 11
+	}
+	if vgc_limit_step(4, true, 30, 100, 4) != 4 {
+		return 12
 	}
 	return 0
 }
@@ -4189,7 +4205,7 @@ fn vgc_update_trigger() {
 	// back; a goal under the limit again resets it.
 	vgc_limit_shift = vgc_limit_step(vgc_limit_shift, vgc_cpu_limit
 		&& goal < marked + marked / 16 && !vgc_headroom_pinned, vgc_gate_last_pause,
-		vgc_gate_last_interval)
+		vgc_gate_last_interval, vgc_cpu_limit_div)
 	mut min_budget := (marked / 16) << vgc_limit_shift
 	if min_budget < hr_min {
 		min_budget = hr_min
