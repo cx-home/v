@@ -2582,6 +2582,13 @@ fn vgc_mark_plan() int {
 		floor = if free < 4 { free } else { 4 }
 	}
 	mut total := vgc_mark_workers_cfg
+	if vgc_mark_wide && !vgc_mark_workers_env {
+		live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
+		if live >= total {
+			total = vgc_mark_wide_total(total, live, vgc_stop_weighed_cpus(vgc_mark_last_work_ns,
+				vgc_mark_par_min_ns))
+		}
+	}
 	// One marker per vgc_mark_par_min_ns of the previous mark's work: a 3 ms
 	// mark gets three markers, a 10 ms one the configured count. The whole
 	// pool on a small mark is CPU for nothing — each marker's time is the
@@ -2606,6 +2613,26 @@ fn vgc_mark_plan() int {
 		return 1
 	}
 	return vgc_pool_ensure(total)
+}
+
+// vgc_mark_wide_total answers the markers a stop may field when it holds `live`
+// mutators and the box leaves `free` CPUs (vgc_stop_weighed_cpus: the held
+// mutators' CPUs count as free; 0 on a busy box or below the line): the
+// configured `cfg`, or one per free CPU up to one per held mutator plus the
+// collector, at most vgc_max_markers. The stop holds every mutator, so their
+// cores would idle through the mark: 28 xlsx parses in one process marked 8 GB
+// of parse results in a 650-920 ms stop with the eight configured markers and
+// 410 ms with sixteen (cx-examples#403). The previous mark's work still bounds
+// the count (vgc_mark_plan: one marker per vgc_mark_par_min_ns of it).
+fn vgc_mark_wide_total(cfg int, live int, free int) int {
+	mut n := live + 1
+	if free < n {
+		n = free
+	}
+	if n > vgc_max_markers {
+		n = vgc_max_markers
+	}
+	return if n > cfg { n } else { cfg }
 }
 
 // Grow the pool to total - 1 threads (the collector is the other one), before

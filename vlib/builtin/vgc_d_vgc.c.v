@@ -971,7 +971,12 @@ fn vgc_one_thread_term(marked u64) u64 {
 // nothing from the heap, and never register, so suspension never targets them.
 // VGC_MARK_WORKERS (count; 0 or 1 = one marker; default min(ncpu, 8)) and
 // VGC_MARK_PAR_MIN_US (default 1000) override.
-const vgc_max_markers = 16
+const vgc_max_markers = 32
+// VGC_MARK_WORKERS unset: a stop that holds more mutators than the configured
+// markers may field one marker per held mutator's CPU (vgc_mark_wide_total).
+// VGC_MARK_WIDE=0 keeps the configured count.
+__global vgc_mark_wide = true
+__global vgc_mark_workers_env = false
 
 __global vgc_mark_workers_cfg = int(-1)
 // -1 = decide at init
@@ -1268,7 +1273,7 @@ __global vgc_mark_lost_cm = false
 // vgc_box_busy) the walks stay serial; VGC_WALK_LOAD_GATE=0 lifts that for
 // measurement.
 const vgc_walk_chunk = u32(32)
-const vgc_walk_sum_len = 256
+const vgc_walk_sum_len = vgc_max_markers * 16
 const vgc_walk_tag_none = u8(0)
 const vgc_walk_tag_recycle = u8(1)
 const vgc_walk_tag_relink = u8(2)
@@ -2218,7 +2223,12 @@ pub fn vgc_init() {
 		mv := C.atoll(mw_env)
 		if mv >= 0 {
 			mw = int(mv)
+			vgc_mark_workers_env = true
 		}
+	}
+	mwide_env := C.getenv(c'VGC_MARK_WIDE')
+	if mwide_env != unsafe { nil } {
+		vgc_mark_wide = C.atoll(mwide_env) != 0
 	}
 	if mw > vgc_max_markers {
 		mw = vgc_max_markers

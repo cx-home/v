@@ -449,6 +449,44 @@ pub fn vgc_mark_cpu_plan_selftest() u32 {
 	return rc
 }
 
+// vgc_mark_wide_selftest — cx-examples#403. A stop that holds more mutators
+// than the configured markers fields one marker per CPU the box leaves free, up
+// to one per held mutator plus the collector and at most vgc_max_markers; a
+// busy box (0 free), a stop of few mutators and a box of few CPUs keep the
+// configured count. Driven by bench/parallel-alloc/vgc_mark_wide_test.v.
+// 0 = ok; n = the failed case.
+pub fn vgc_mark_wide_selftest() u32 {
+	// 28 parses on 28 free CPUs: 28 markers, not the configured 8
+	if vgc_mark_wide_total(8, 28, 28) != 28 {
+		return 1
+	}
+	// one per held mutator plus the collector
+	if vgc_mark_wide_total(8, 12, 28) != 13 {
+		return 2
+	}
+	// the box's other load takes CPUs away
+	if vgc_mark_wide_total(8, 28, 20) != 20 {
+		return 3
+	}
+	// a busy box, or under the line: the configured count
+	if vgc_mark_wide_total(8, 28, 0) != 8 {
+		return 4
+	}
+	// a stop of four mutators keeps eight
+	if vgc_mark_wide_total(8, 4, 28) != 8 {
+		return 5
+	}
+	// never past vgc_max_markers
+	if vgc_mark_wide_total(8, 100, 128) != vgc_max_markers {
+		return 6
+	}
+	// the per-worker sums hold every marker
+	if vgc_walk_sum_len < vgc_max_markers * 16 {
+		return 7
+	}
+	return 0
+}
+
 // vgc_uaf_foreign_selftest — cx-private#2011. The passive UAF oracle
 // (vgc_uaf_check_buf) bounds an address by [vgc_arena_lo, vgc_arena_hi), the
 // span of the arenas. On Linux glibc's per-thread malloc arenas are mmaps that
