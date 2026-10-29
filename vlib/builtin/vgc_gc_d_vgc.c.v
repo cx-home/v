@@ -316,8 +316,10 @@ fn vgc_gc_start() {
 		}
 	}
 
-	// Disable write barrier (cx-home/v#15: the permanent regime stays)
-	vgc_wb_set(vgc_perm_on * 2)
+	// Disable write barrier (cx-home/v#15: the permanent regime stays;
+	// cx-home/v#56: the young regime's cards are read and cleared)
+	vgc_young_end()
+	vgc_wb_set(vgc_wb_regime())
 
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
@@ -977,7 +979,7 @@ fn vgc_rescan_walk(w int, n int) {
 				mut dirty := C.vgc_atomic_load_u32(&span.dirty) != 0
 					|| C.vgc_atomic_load_u32(&span.born) != 0
 				if span.perm != 0 && span.perm_bits != unsafe { nil } && !span.noscan {
-					if vgc_perm_cards_take(span) {
+					if vgc_cards_take(span) {
 						dirty = true
 					}
 					// cx-home/v#15: a permanent span. Dirtied since the last stop: its
@@ -1084,27 +1086,77 @@ fn vgc_rescan_plan() int {
 	return vgc_pool_ensure(total)
 }
 
-// vgc_perm_cards_take reads and clears the cards of a permanent span's pages
-// (STW): true when a store landed in the span since the last stop.
-fn vgc_perm_cards_take(span &VGC_Span) bool {
-	if vgc_perm_cards == unsafe { nil } || span.base < vgc_perm_lo {
+// vgc_cards_take reads and clears the cards of a span's pages (STW): true
+// when a store landed in the span since the last stop (cx-home/v#15, v#56).
+fn vgc_cards_take(span &VGC_Span) bool {
+	ai := vgc_find_arena(span.base)
+	if ai < 0 {
 		return false
 	}
-	first := (span.base - vgc_perm_lo) / vgc_page_size
+	a := unsafe { &vgc_heap.arenas[ai] }
+	if a.cards == unsafe { nil } {
+		return false
+	}
+	first := (span.base - a.base) / vgc_page_size
+	n := a.size / vgc_page_size
 	mut any := false
 	for k in 0 .. usize(span.npages) {
 		pg := first + k
-		if pg >= vgc_perm_cards_n {
+		if pg >= n {
 			break
 		}
-		if unsafe { vgc_perm_cards[pg] } != 0 {
+		if unsafe { a.cards[pg] } != 0 {
 			any = true
 			unsafe {
-				vgc_perm_cards[pg] = 0
+				a.cards[pg] = 0
 			}
 		}
 	}
 	return any
+}
+
+// vgc_cards_count counts the set cards of every published arena.
+fn vgc_cards_count() u64 {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	mut n := u64(0)
+	for i in 0 .. nar {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if a.cards == unsafe { nil } {
+			continue
+		}
+		for pg in 0 .. a.size / vgc_page_size {
+			if unsafe { a.cards[pg] } != 0 {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// vgc_cards_clear clears every arena's cards (STW).
+fn vgc_cards_clear() {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	for i in 0 .. nar {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if a.cards != unsafe { nil } {
+			unsafe { C.memset(a.cards, 0, a.size / vgc_page_size) }
+		}
+	}
+}
+
+// vgc_young_end runs at the end of a full cycle, STW (cx-home/v#56 step 1,
+// the young regime's doc at vgc_young_mode): the cycle traced every object,
+// so the cards are counted for the trace and cleared; from the first cycle on
+// the regime is armed, and vgc_wb_set opens the gate over the arenas.
+fn vgc_young_end() {
+	if vgc_young_mode == 0 {
+		return
+	}
+	if vgc_gctrace >= 2 {
+		vgc_young_cards_last = vgc_cards_count()
+	}
+	vgc_cards_clear()
+	vgc_young_on = 1
 }
 
 // vgc_scan_perm_obj scans one object's words as vgc_scan_range does (every
@@ -1325,20 +1377,9 @@ fn vgc_perm_promote() {
 		}
 		vgc_perm_lo = lo
 		vgc_perm_hi = hi
-		// the card table over the range, before the length that opens the gate
-		if hi > lo {
-			ncards := (hi - lo) / vgc_page_size + 1
-			if ncards > vgc_perm_cards_n || vgc_perm_cards == unsafe { nil } {
-				vgc_perm_cards = unsafe { &u8(C.vgc_os_alloc(ncards)) }
-				vgc_perm_cards_n = if vgc_perm_cards != unsafe { nil } { ncards } else { 0 }
-			}
-			if vgc_perm_cards != unsafe { nil } {
-				unsafe { C.memset(vgc_perm_cards, 0, ncards) }
-			}
-		}
-		vgc_perm_len = if vgc_perm_cards != unsafe { nil } { hi - lo } else { 0 }
-		vgc_wb_lo = vgc_perm_lo
-		vgc_wb_len = vgc_perm_len
+		// the gate's range in the permanent regime alone (vgc_wb_set, at this
+		// stop's end); the cards are the arenas' own (VGC_Arena.cards)
+		vgc_perm_len = hi - lo
 		// the page bitmap over the range (a promotion that widened the range
 		// takes a fresh one; the old is left to the OS at exit — promotions are
 		// one or two per process)
@@ -1559,7 +1600,8 @@ fn vgc_gc_start_concurrent() {
 		1
 	})
 	vgc_mark_work_from_cpu_at(mcpu0, mwait0, mcpu1, mwait1)
-	vgc_wb_set(vgc_perm_on * 2) // cx-home/v#15: the permanent regime stays
+	vgc_young_end()
+	vgc_wb_set(vgc_wb_regime()) // cx-home/v#15: the permanent regime stays
 
 	marked := vgc_count_marked()
 	vgc_ph[6] = C.vgc_now_ns()
@@ -1692,6 +1734,10 @@ fn vgc_gctrace_emit() {
 				C.vgc_gctrace_perm(u64(vgc_heap.gc_cycle), vgc_perm_spans, vgc_perm_bytes / 1024,
 					vgc_cm_rescan_spans, vgc_cm_rescan_objs, vgc_perm_young_objs, vgc_perm_rescan_ns / 1000,
 					vgc_cm_verify_missed, u64(if vgc_perm_promoted_cycle == vgc_heap.gc_cycle { 1 } else { 0 }))
+			}
+			// cx-home/v#56 step 1: the young regime's cards at the cycle's end
+			if vgc_young_on != 0 {
+				C.vgc_gctrace_young(u64(vgc_heap.gc_cycle), vgc_young_cards_last)
 			}
 			// cx-private#1910: the concurrent cycle's shape — the two stops, the
 			// middle, the termination re-scan's spans/objects and time
@@ -3226,13 +3272,19 @@ pub fn vgc_wb_store(obj voidptr) {
 			return
 		}
 		if (mode & 1) == 0 {
-			// the permanent regime alone: the page's card, set when not set
-			// (vgc_perm_cards doc); the stop reads it as the span's dirty bit
+			// the permanent or the young regime alone: the page's card in its
+			// arena's table, set when not set (vgc_young_mode doc); the stop
+			// reads it as the span's dirty bit
 			addr := usize(obj)
-			if addr < vgc_perm_lo || addr - vgc_perm_lo >= vgc_perm_len || vgc_perm_cards == unsafe { nil } {
+			ai := vgc_find_arena(addr)
+			if ai < 0 {
 				return
 			}
-			card := unsafe { &u8(voidptr(usize(vgc_perm_cards) + (addr - vgc_perm_lo) / vgc_page_size)) }
+			a := unsafe { &vgc_heap.arenas[ai] }
+			if a.cards == unsafe { nil } {
+				return
+			}
+			card := unsafe { &u8(voidptr(usize(a.cards) + (addr - a.base) / vgc_page_size)) }
 			if unsafe { *card } == 0 {
 				_ = C.vgc_atomic_fetch_or_u8(card, 1)
 			}

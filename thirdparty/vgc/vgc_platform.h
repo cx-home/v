@@ -2622,6 +2622,15 @@ static void vgc_gctrace_perm(uint64_t cycle, uint64_t spans, uint64_t kb, uint64
     vgc__ws("\n");
 }
 
+// VGC_GCTRACE=2 young-regime line (cx-home/v#56 step 1): the cards the full
+// cycle found set at its end (every pointer store into the heap since the
+// last stop, by page), read and cleared there.
+static void vgc_gctrace_young(uint64_t cycle, uint64_t cards) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] young cards="); vgc__wdec(cards);
+    vgc__ws("\n");
+}
+
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
 // object holds a pointer to an ALLOCATED-but-UNMARKED object that sweep is about
 // to reclaim — i.e. the mark did not reach closure. `kind`: 0 = referrer is a
