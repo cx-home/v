@@ -99,7 +99,10 @@ fn vgc_gc_start() {
 		// no barrier, so it must not be promoted)
 		promote := vgc_perm_mode != 0
 			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
-		if !promote && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
+		// cx-home/v#56 step 2: a minor cycle stops the world; the concurrent
+		// cycle is a full one
+		vgc_minor_this_cycle = vgc_minor_plan(promote)
+		if !promote && !vgc_minor_this_cycle && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
 			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
 			vgc_gc_start_concurrent()
@@ -176,9 +179,14 @@ fn vgc_gc_start() {
 	// latency per cycle, not N.
 	vgc_stw_stop(self_idx)
 
-	// Clear mark bits on all spans (prepare for new cycle)
+	// Clear mark bits on all spans (prepare for new cycle); a minor cycle keeps
+	// them — every marked object is old (cx-home/v#56 step 2)
 	vgc_ph[0] = C.vgc_now_ns()
-	vgc_clear_mark_bits()
+	if vgc_minor_this_cycle {
+		vgc_span_meta_promote_pending()
+	} else {
+		vgc_clear_mark_bits()
+	}
 	vgc_ph[1] = C.vgc_now_ns()
 	vgc_watch_snapshot(0) // STAGE 0: post-clear (expect found+in_use+alloc, mark=0)
 
@@ -266,6 +274,9 @@ fn vgc_gc_start() {
 			vgc_rescan_nworkers_cur = 1
 			vgc_perm_rescan_ns = C.vgc_now_ns() - t_rescan
 		}
+		if vgc_minor_this_cycle {
+			vgc_minor_cards()
+		}
 	}
 	vgc_roots_par_n = 1
 
@@ -311,14 +322,22 @@ fn vgc_gc_start() {
 			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
 			vgc_perm_promote()
 		}
-		if vgc_perm_on != 0 {
+		if vgc_perm_on != 0 || vgc_minor_this_cycle {
 			vgc_cm_verify(self_idx)
 		}
 	}
 
 	// Disable write barrier (cx-home/v#15: the permanent regime stays;
-	// cx-home/v#56: the young regime's cards are read and cleared)
-	vgc_young_end()
+	// cx-home/v#56: the young regime's cards are read and cleared at a full
+	// cycle's end; a minor cycle took its cards span by span)
+	if vgc_minor_this_cycle {
+		vgc_minor_count++
+		vgc_minor_cycles++
+	} else {
+		vgc_young_end()
+		vgc_minor_count = 0
+	}
+	C.vgc_atomic_store_u32(&vgc_force_full, 0)
 	vgc_wb_set(vgc_wb_regime())
 
 	// Compute live bytes from mark bits
@@ -1159,6 +1178,68 @@ fn vgc_young_end() {
 	vgc_young_on = 1
 }
 
+// vgc_minor_plan decides whether the cycle about to start is minor
+// (cx-home/v#56 step 2; the doc at vgc_young_minors).
+fn vgc_minor_plan(promote bool) bool {
+	if vgc_young_on == 0 || vgc_young_minors <= 0 || promote || vgc_watch_addr != 0 {
+		return false
+	}
+	if C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
+		return false
+	}
+	if vgc_minor_count >= u64(vgc_young_minors) {
+		return false
+	}
+	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
+	if vgc_full_marked > 0 && marked >= 2 * vgc_full_marked {
+		return false
+	}
+	return true
+}
+
+// vgc_minor_cards scans, on the collecting thread, the old objects of every
+// span a card was set in since the last stop (STW, cx-home/v#56 step 2): an
+// old object's pointer to a young one lies in a page whose card the barrier
+// set, and the young object is shaded like a root's referent. The cards are
+// read and cleared (vgc_cards_take); a span the permanent rescan already took
+// reads clean here, and a span without pointers has its cards dropped.
+fn vgc_minor_cards() {
+	mut spans := u64(0)
+	mut objs := u64(0)
+	nsp := vgc_heap.nspans
+	for i in 0 .. nsp {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use {
+			continue
+		}
+		if !vgc_cards_take(span) {
+			continue
+		}
+		if span.noscan || span.alloc_bits == unsafe { nil } || span.mark_bits == unsafe { nil }
+			|| span.elem_size == 0 {
+			continue
+		}
+		spans++
+		nbytes := (span.nelems + 7) / 8
+		for b in 0 .. nbytes {
+			mut sel := unsafe { span.alloc_bits[b] & span.mark_bits[b] }
+			for sel != 0 {
+				bi := C.vgc_ctz8(sel)
+				sel &= sel - 1
+				idx := b * 8 + u32(bi)
+				if idx >= span.nelems {
+					break
+				}
+				lo := span.base + usize(idx) * usize(span.elem_size)
+				vgc_scan_range(lo, lo + usize(span.elem_size), 0)
+				objs++
+			}
+		}
+	}
+	vgc_minor_last_spans = spans
+	vgc_minor_last_objs = objs
+}
+
 // vgc_scan_perm_obj scans one object's words as vgc_scan_range does (every
 // heap pointer shaded) and reports whether any of them refers to an allocated
 // object outside the permanent generation (cx-home/v#15).
@@ -1497,6 +1578,7 @@ fn vgc_gc_start_concurrent() {
 	}
 	vgc_gc_owner = C.vgc_get_cache_idx()
 	vgc_cm_this_cycle = true
+	vgc_minor_this_cycle = false
 	vgc_gc_t0 = C.vgc_now_ns() // the pacer's cycle cost (#71): the whole cycle, middle included
 	vgc_gc_cpu_t0 = C.vgc_thread_cpu_ns() // cx-home/v#42: the cost in CPU time
 	vgc_gc_wait_cpu = 0
@@ -1601,9 +1683,12 @@ fn vgc_gc_start_concurrent() {
 	})
 	vgc_mark_work_from_cpu_at(mcpu0, mwait0, mcpu1, mwait1)
 	vgc_young_end()
+	vgc_minor_count = 0 // cx-home/v#56 step 2: a concurrent cycle is a full one
+	C.vgc_atomic_store_u32(&vgc_force_full, 0)
 	vgc_wb_set(vgc_wb_regime()) // cx-home/v#15: the permanent regime stays
 
 	marked := vgc_count_marked()
+	vgc_full_marked = marked
 	vgc_ph[6] = C.vgc_now_ns()
 	vgc_mark_adapt(marked)
 	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
@@ -1736,7 +1821,11 @@ fn vgc_gctrace_emit() {
 					vgc_cm_verify_missed, u64(if vgc_perm_promoted_cycle == vgc_heap.gc_cycle { 1 } else { 0 }))
 			}
 			// cx-home/v#56 step 1: the young regime's cards at the cycle's end
-			if vgc_young_on != 0 {
+			if vgc_minor_this_cycle {
+				// cx-home/v#56 step 2: the minor cycle's shape
+				C.vgc_gctrace_minor(u64(vgc_heap.gc_cycle), vgc_minor_count, vgc_minor_last_spans,
+					vgc_minor_last_objs, vgc_cm_verify_missed)
+			} else if vgc_young_on != 0 {
 				C.vgc_gctrace_young(u64(vgc_heap.gc_cycle), vgc_young_cards_last)
 			}
 			// cx-private#1910: the concurrent cycle's shape — the two stops, the

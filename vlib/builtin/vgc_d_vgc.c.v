@@ -118,6 +118,7 @@ fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64)
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
 fn C.vgc_gctrace_young(cycle u64, cards u64) // VGC_GCTRACE=2 young-regime line (cx-home/v#56 step 1)
+fn C.vgc_gctrace_minor(cycle u64, n u64, spans u64, objs u64, missed u64) // VGC_GCTRACE=2 minor-cycle line (cx-home/v#56 step 2)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -1112,6 +1113,31 @@ __global vgc_young_mode = int(0)
 __global vgc_young_on = u32(0)
 // the cards the last full cycle found set (VGC_GCTRACE=2)
 __global vgc_young_cards_last = u64(0)
+// cx-home/v#56 step 2: the minor cycle. Under the young regime, once the first
+// full cycle has armed it (vgc_young_on), a cycle the pacer triggers is minor:
+// the mark bits stay (every object the last cycle marked is old and stays
+// marked: sticky marks), the roots are scanned as usual, and the pointers old
+// objects hold to young ones are found through the cards — every span a card
+// was set in since the last stop has its old objects (allocated and marked)
+// scanned (vgc_minor_cards) — then the grey set drains; the sweep frees what
+// is allocated and unmarked, the young garbage only, and a young object that
+// survived is marked, which is its promotion. A minor cycle stops the world.
+// A full cycle (every mark bit cleared, every card cleared at its end) runs
+// when vgc_young_minors minor cycles have run since the last one
+// (VGC_YOUNG_MINORS, default 8, 0 = no minor cycle), when the marked set has
+// doubled since the last full cycle, when a promotion into the permanent
+// generation is due, while an address is watched, and on an explicit
+// gc_collect (vgc_force_full). -d vgc_cm_verify re-marks from zero after a
+// minor cycle and counts the objects it missed (missed= on the VGC_GCTRACE=2
+// minor line, vgc_cm_verify_missed_count).
+__global vgc_young_minors = int(8)
+__global vgc_minor_this_cycle = false
+__global vgc_minor_count = u64(0)
+__global vgc_minor_cycles = u64(0)
+__global vgc_full_marked = u64(0)
+__global vgc_minor_last_spans = u64(0)
+__global vgc_minor_last_objs = u64(0)
+__global vgc_force_full = u32(0)
 // the barrier's arena hint (vgc_wb_store's fast path): the index + 1 of the
 // arena the gate's low end lies in, 0 none, stored by vgc_wb_set (STW). An
 // arena's entry never moves and its base, size and cards never change once
@@ -1151,6 +1177,18 @@ fn vgc_wb_set(mode u32) {
 @[inline]
 fn vgc_wb_regime() u32 {
 	return vgc_perm_on * 2 + vgc_young_on * 4
+}
+
+// vgc_minor_cycles_count reports the minor cycles run so far (cx-home/v#56
+// step 2; 0 with the young regime off).
+pub fn vgc_minor_cycles_count() u64 {
+	return vgc_minor_cycles
+}
+
+// vgc_cm_verify_missed_count reports the objects -d vgc_cm_verify found
+// unmarked after a cycle, in all (0 under other builds).
+pub fn vgc_cm_verify_missed_count() u64 {
+	return vgc_cm_verify_missed
 }
 
 // vgc_card_dirty reports whether the card of the page p lies in is set
@@ -2388,6 +2426,14 @@ pub fn vgc_init() {
 			yv := C.atoll(young_env)
 			if yv >= 0 && yv <= 1 {
 				vgc_young_mode = int(yv)
+			}
+		}
+		// cx-home/v#56 step 2: minor cycles between two full cycles (0 = none)
+		minors_env := C.getenv(c'VGC_YOUNG_MINORS')
+		if minors_env != unsafe { nil } {
+			mv := C.atoll(minors_env)
+			if mv >= 0 && mv <= 1000 {
+				vgc_young_minors = int(mv)
 			}
 		}
 	} $else {
@@ -5718,6 +5764,9 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 // vgc_gc_start's phase CAS makes this a no-op; the caller's retry loop then either
 // benefits from that concurrent cycle or forces another.
 fn vgc_force_collect() {
+	// an explicit collection is a full cycle (cx-home/v#56 step 2); beside a
+	// cycle in flight the flag holds for the next one
+	C.vgc_atomic_store_u32(&vgc_force_full, 1)
 	$if vgc_concurrent ? {
 		// cx-private#1910: a forced collection beside a cycle in flight waits
 		// for that cycle (its sweep is the reclaim the caller is after) instead

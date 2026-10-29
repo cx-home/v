@@ -2631,6 +2631,19 @@ static void vgc_gctrace_young(uint64_t cycle, uint64_t cards) {
     vgc__ws("\n");
 }
 
+// VGC_GCTRACE=2 minor-cycle line (cx-home/v#56 step 2): the minor cycles since
+// the last full one (this one included), the spans a card was set in and the
+// old objects scanned through them, and -d vgc_cm_verify's missed count in all
+// (0 under other builds).
+static void vgc_gctrace_minor(uint64_t cycle, uint64_t n, uint64_t spans, uint64_t objs, uint64_t missed) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] minor n="); vgc__wdec(n);
+    vgc__ws(" card_spans="); vgc__wdec(spans);
+    vgc__ws(" old_objs="); vgc__wdec(objs);
+    vgc__ws(" missed="); vgc__wdec(missed);
+    vgc__ws("\n");
+}
+
 // Mark-closure verifier report (DEBUG, -d vgc_verify only): a MARKED (live)
 // object holds a pointer to an ALLOCATED-but-UNMARKED object that sweep is about
 // to reclaim — i.e. the mark did not reach closure. `kind`: 0 = referrer is a
