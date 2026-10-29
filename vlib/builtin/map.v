@@ -591,7 +591,7 @@ fn (mut m map) set(key voidptr, value voidptr) {
 		pkey := unsafe { m.key_values.key(kv_index) }
 		if m.key_eq_fn(key, pkey) {
 			$if vgc_concurrent ? {
-				vgc_wb_store(m.key_values.values) // concurrent-mark barrier: value overwrite into heap buffer
+				C.vgc_wb_gate(m.key_values.values) // concurrent-mark barrier: value overwrite into heap buffer
 			}
 			unsafe {
 				pval := m.key_values.value(kv_index)
@@ -606,8 +606,8 @@ fn (mut m map) set(key voidptr, value voidptr) {
 	$if vgc_concurrent ? {
 		// concurrent-mark barrier: a new key/value (each possibly pointer-bearing) is
 		// written into the heap key/value buffers below, with no codegen-visible store.
-		vgc_wb_store(m.key_values.keys)
-		vgc_wb_store(m.key_values.values)
+		C.vgc_wb_gate(m.key_values.keys)
+		C.vgc_wb_gate(m.key_values.values)
 	}
 	unsafe {
 		pkey := m.key_values.key(kv_index)

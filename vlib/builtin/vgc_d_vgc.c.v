@@ -79,6 +79,15 @@ fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own regi
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
+// cx-home/v#56 step 1: cgen's inline store gate (vlib/v/gen/c/cgen.v, held equal
+// to thirdparty/vgc/vgc_native.h's by vgc_native_header_test.v) — the range test
+// and the card window inline, vgc_wb_store entered only for a clear card or an
+// address outside the window. The builtin bulk mutators (array and map element
+// stores, the grown buffers, the duplicated bytes) store through it like
+// codegen's stores do: json-codec 1 KB x100,000 under the young regime made
+// 30.7 M calls into vgc_wb_store, 17.2 M of them from these mutators onto a
+// card already set (measure/bin/collector-epic/count36.out).
+fn C.vgc_wb_gate(p voidptr)
 // cx-home/v#28: the stop-the-world is two passes over the slots — request a
 // suspend of every straggler (a mach thread_suspend, a signal, a SuspendThread),
 // then settle each (wait for its ack / capture its register file) — so the
@@ -6286,7 +6295,7 @@ fn vgc_realloc(old_ptr voidptr, new_size usize) voidptr {
 		// realloc-based grow (array ensure_cap via realloc, map DenseArray.expand,
 		// string builders, ...). new_ptr is scannable here (noscan path skips dirty).
 		$if vgc_concurrent ? {
-			vgc_wb_store(new_ptr)
+			C.vgc_wb_gate(new_ptr)
 		}
 		unsafe { C.memcpy(new_ptr, old_ptr, copy_size) }
 		// #1605: a grown SCAN object must not expose the recycled slot's stale
@@ -6784,7 +6793,7 @@ fn vgc_memdup_typed(src voidptr, n isize, ptrmap u64, ptr_words u8) voidptr {
 	mem := vgc_malloc_typed_opts(usize(n), ptrmap, ptr_words, false)
 	if mem != unsafe { nil } {
 		$if vgc_concurrent ? {
-			vgc_wb_store(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
+			C.vgc_wb_gate(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
 		}
 		unsafe { C.memcpy(mem, src, n) }
 	}
@@ -6800,7 +6809,7 @@ fn vgc_memdup(src voidptr, n isize) voidptr {
 	mem := vgc_malloc_typed_opts(usize(n), 0, 0, false)
 	if mem != unsafe { nil } {
 		$if vgc_concurrent ? {
-			vgc_wb_store(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
+			C.vgc_wb_gate(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
 		}
 		unsafe { C.memcpy(mem, src, n) }
 	}
