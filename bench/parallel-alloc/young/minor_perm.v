@@ -53,15 +53,15 @@ fn main() {
 	}
 	vgc_set_permanent()
 	gc_collect() // the promotion: the kept cells are permanent, the dropped slots free
-	mut spans := map[usize]bool{}
+	mut spans := map[u64]bool{}
 	for i in 0 .. ncells {
-		spans[vgc_find_span_addr(kept[i])] = true
+		spans[u64(vgc_find_span_addr(kept[i]))] = true
 	}
 	mut cells := []&Cell{len: ncells, init: unsafe { nil }}
 	mut same := 0
 	for i in 0 .. ncells {
 		cells[i] = mk_cell()
-		if vgc_find_span_addr(cells[i]) in spans {
+		if u64(vgc_find_span_addr(cells[i])) in spans {
 			same++
 		}
 	}
