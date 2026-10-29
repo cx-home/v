@@ -2068,7 +2068,7 @@ fn vgc_roots_stacks_slice(slot int, n int) {
 	for i < vgc_heap.ncaches {
 		cache := unsafe { vgc_cache(i) }
 		if cache.registered && cache.stack_lo > 0 && cache.stack_hi > cache.stack_lo {
-			vgc_scan_range(cache.stack_lo, cache.stack_hi, slot)
+			vgc_scan_stack_range(cache.stack_lo, cache.stack_hi, slot)
 		}
 		i += n
 	}
@@ -2175,7 +2175,7 @@ fn vgc_mark_roots() {
 				vgc_rd_base = cache.stack_hi
 				vgc_rd_own = i == C.vgc_get_cache_idx()
 			}
-			vgc_scan_range(cache.stack_lo, cache.stack_hi, 0)
+			vgc_scan_stack_range(cache.stack_lo, cache.stack_hi, 0)
 			$if vgc_rootdiag ? {
 				vgc_rd_cat = 0
 				vgc_rd_base = 0
@@ -2307,7 +2307,8 @@ fn vgc_scan_touched(lo usize, hi usize, w int) {
 }
 
 // Scan a memory range conservatively, looking for pointers into the GC heap.
-// Each word-aligned value that looks like a heap pointer is treated as a root.
+// Each word-aligned value that looks like a heap pointer is treated as a root
+// (a thread stack is scanned at every byte offset: vgc_scan_stack_range).
 // Translated from Go's scanblock() with conservative pointer finding.
 // `w` is the marker's slot (0 = the collector; cx-home/v#16): the work buffer
 // a newly greyed object is pushed to.
@@ -2329,6 +2330,36 @@ fn vgc_scan_range(lo usize, hi usize, w int) {
 			}
 		}
 		addr += sizeof(usize)
+	}
+}
+
+// vgc_scan_stack_range scans a thread's stack as vgc_scan_range does, but at
+// every byte offset, not only at word-aligned ones (cx-home/v#60). An optimized
+// build can keep the only reference to a live object at an unaligned stack
+// offset: the option unwrap copies T through an untyped `byte data[sizeof(T)]`,
+// and clang spilled a ?cx.Node's bytes 1..23, which put its element pointer at
+// sp+0x407 (cx-platform-fabric#10). Heap objects and the data segment keep the
+// aligned scan: their pointer fields are typed, so the compiler aligns them.
+// The value is read with memcpy (an unaligned load, defined in C); a value
+// outside the arena bounds is dropped before the call, as vgc_shade's first
+// check would drop it.
+fn vgc_scan_stack_range(lo usize, hi usize, w int) {
+	mut addr := lo
+	for addr + sizeof(usize) <= hi {
+		mut val := usize(0)
+		unsafe { C.memcpy(&val, voidptr(addr), sizeof(usize)) }
+		if val >= vgc_arena_lo && val < vgc_arena_hi {
+			$if vgc_rootdiag ? {
+				if vgc_rd_cat != 0 {
+					vgc_rd_shade_root(addr, val, w)
+				} else {
+					vgc_shade(val, w)
+				}
+			} $else {
+				vgc_shade(val, w)
+			}
+		}
+		addr++
 	}
 }
 
