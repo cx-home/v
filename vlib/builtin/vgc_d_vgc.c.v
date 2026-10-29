@@ -1212,6 +1212,10 @@ const vgc_cm_born_min = u64(4) << 20
 // the last cycle's root scan (suspended registers, data segments, stacks)
 __global vgc_root_last_ns = u64(0)
 __global vgc_mark_local = [vgc_max_markers]usize{}
+// cx-home/v#61 trace: the mach thread port of the thread that last ran each
+// marker slot (set at every phase run and serial drain), read by the dump a pop
+// at nobj 0 prints before the index panic (vgc_work_dump)
+__global vgc_slot_tid = [vgc_max_markers]u64{}
 // each marker's current &VGC_WorkBuf
 __global vgc_mark_go = u32(0)
 // generation the pool waits on

@@ -2907,6 +2907,7 @@ fn vgc_pool_run(phase u32, n int) {
 
 // One thread's share of a phase.
 fn vgc_pool_phase_run(phase u32, slot int, n int) {
+	vgc_slot_tid[slot] = u64(C.vgc_thread_self_port())
 	if phase == vgc_pool_phase_mark {
 		vgc_drain_mark_parallel(slot, n)
 	} else if phase == vgc_pool_phase_clear {
@@ -2979,6 +2980,7 @@ fn vgc_mark_scan_obj(obj_addr usize, w int) {
 
 // Drain the mark work queue on one marker (translated from Go's gcDrain()).
 fn vgc_drain_mark_work(w int) {
+	vgc_slot_tid[w] = u64(C.vgc_thread_self_port())
 	for {
 		obj_addr := vgc_work_get(w)
 		if obj_addr == 0 {
@@ -3153,10 +3155,41 @@ fn vgc_work_get(w int) usize {
 		fb.next = nil
 	}
 	vgc_mark_local[w] = usize(voidptr(fb))
+	if fb.nobj <= 0 {
+		vgc_work_dump(w, fb, 1)
+	}
 	unsafe {
 		fb.nobj--
 		return fb.obj[fb.nobj]
 	}
+}
+
+// cx-home/v#61 trace: a pop that finds nobj 0 prints, one vgc_say line each
+// (tag, value in hex), before the index panic: 6100 the slot, 6101 the buffer,
+// 6102 its nobj, 6103 the slot's recorded thread port, 6104 the popping thread's
+// port, 6105 the pool phase, 6106 the phase's thread count, 6107 the generation
+// (vgc_mark_go), 6108 the pool's thread count, 6109 this cycle's marker count,
+// 610a 1 = the buffer came off the full list, 610b the cycle, 610c every slot
+// whose current buffer is this one, 610d the buffer's next.
+fn vgc_work_dump(w int, buf &VGC_WorkBuf, from_full int) {
+	C.vgc_say(0x6100, u64(w))
+	C.vgc_say(0x6101, u64(voidptr(buf)))
+	C.vgc_say(0x6102, u64(buf.nobj))
+	C.vgc_say(0x6103, vgc_slot_tid[w])
+	C.vgc_say(0x6104, u64(C.vgc_thread_self_port()))
+	C.vgc_say(0x6105, u64(vgc_pool_phase))
+	C.vgc_say(0x6106, u64(vgc_pool_phase_n))
+	C.vgc_say(0x6107, u64(C.vgc_atomic_load_u32(&vgc_mark_go)))
+	C.vgc_say(0x6108, u64(vgc_mark_pool_n))
+	C.vgc_say(0x6109, u64(vgc_mark_nworkers_cur))
+	C.vgc_say(0x610a, u64(from_full))
+	C.vgc_say(0x610b, u64(vgc_heap.gc_cycle))
+	for i in 0 .. vgc_max_markers {
+		if vgc_mark_local[i] == usize(voidptr(buf)) {
+			C.vgc_say(0x610c, u64(i))
+		}
+	}
+	C.vgc_say(0x610d, u64(voidptr(buf.next)))
 }
 
 // Move half of the marker's local buffer (when it holds at least 64 entries)
