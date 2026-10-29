@@ -117,6 +117,7 @@ fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool
 fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
+fn C.vgc_gctrace_young(cycle u64, cards u64) // VGC_GCTRACE=2 young-regime line (cx-home/v#56 step 1)
 fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
@@ -516,6 +517,11 @@ mut:
 	// carving one arena's tail fault its pages in turn, and first touches of one
 	// mapping from many threads serialize in the kernel.
 	owner int
+	// cx-home/v#56 step 1: the arena's card table, one byte per page (the
+	// young regime's doc at vgc_young_mode): out-of-line like the page map,
+	// mmap-zeroed at arena creation, never freed, published by the same
+	// narenas store; nil under the default build (no barrier calls it)
+	cards &u8 = unsafe { nil }
 }
 
 // VGC_WorkBuf is a work buffer for the mark phase.
@@ -1068,18 +1074,53 @@ __global vgc_wb_mode = u32(0)
 __global vgc_wb_lo = usize(0)
 __global vgc_wb_len = usize(0)
 __global vgc_perm_len = usize(0)
-// the card table: one byte per page of [vgc_perm_lo, vgc_perm_lo + len).
-// vgc_wb_store sets the page's card (an atomic byte store when it reads 0: a
-// line sixteen threads wrote on every ring store cost stw_scaling T=16
-// -12..-30 %; set once per stop it stays shared) before and after a pointer
-// store into the range; the stop reads a permanent span's cards as its dirty
-// bit (vgc_perm_cards_take) and clears them. A card of a page no permanent
-// span covers is never read.
-__global vgc_perm_cards = &u8(unsafe { nil })
-__global vgc_perm_cards_n = usize(0)
+// the cards: one byte per page of every arena (VGC_Arena.cards). vgc_wb_store
+// sets the page's card (an atomic byte store when it reads 0: a line sixteen
+// threads wrote on every ring store cost stw_scaling T=16 -12..-30 %; set once
+// per stop it stays shared) before and after a pointer store the gate let
+// through; the stop reads a permanent span's cards as its dirty bit
+// (vgc_cards_take) and clears them. A card of a page no permanent span covers
+// is read only by the young regime below.
+//
+// cx-home/v#56 step 1: the old generation's card barrier (vgc_concurrent
+// only; VGC_YOUNG: 0 = off, the default while no minor cycle consumes the
+// cards, 1 = on). The young generation's minor cycle will trace from the
+// roots, the young objects, and the OLD objects a pointer was stored into
+// since the last stop; the last it learns from the permanent generation's
+// card barrier widened from the permanent range to every arena: from the end
+// of the first cycle on (vgc_young_end, STW) the gate's range is
+// [vgc_arena_lo, vgc_arena_hi) (vgc_wb_set, re-read at every stop), so every
+// pointer store into a heap object — codegen's and the bulk mutators' — sets
+// the card of the page it lands on, in the arena's own table. The soundness
+// argument is the permanent regime's (vgc_wb_store): the card is set before
+// the store, and again after it by the second barrier call, so a mutator
+// frozen between its gate test and its store across the stop that widened
+// the range over its target's arena (an arena mapped since the previous stop
+// holds only objects born since it, young until the stop that makes them old
+// and covers the arena) sets the card the next stop reads; a table is an
+// arena's for the arena's life, never replaced, so no barrier call holds a
+// stale one. A store into a young object sets a card too (the barrier does
+// not know ages: a minor cycle traces young objects whole and reads the cards
+// of the old). A full cycle traces every object and ends with every card
+// clear (vgc_cards_clear); a store in a concurrent middle dirties the span as
+// before (the termination re-scan traces it) and sets no card. The default
+// build and VGC_YOUNG=0 are unchanged: the gate stays the permanent range.
+__global vgc_young_mode = int(0)
+__global vgc_young_on = u32(0)
+// the cards the last full cycle found set (VGC_GCTRACE=2)
+__global vgc_young_cards_last = u64(0)
+// the barrier's arena hint (vgc_wb_store's fast path): the index + 1 of the
+// arena the gate's low end lies in, 0 none, stored by vgc_wb_set (STW). An
+// arena's entry never moves and its base, size and cards never change once
+// published, so a stale hint resolves a store correctly or misses to
+// vgc_find_arena. The interpreter stores into its start-up state (the
+// permanent generation) some 25 M times in json-codec 1 KB x100,000, and the
+// full resolution on every call read +9 % instructions retired and +4 % wall
+// against the flat table's range test (measure/collector-epic-23).
+__global vgc_wb_arena_hint = u32(0)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
-// middle, bit 1 the permanent regime.
+// middle, bit 1 the permanent regime, bit 2 the young regime.
 @[inline]
 fn vgc_wb_set(mode u32) {
 	C.vgc_atomic_store_u32(&vgc_heap.wb_enabled, mode)
@@ -1088,10 +1129,52 @@ fn vgc_wb_set(mode u32) {
 	if (mode & 1) != 0 {
 		vgc_wb_lo = 0
 		vgc_wb_len = ~usize(0)
+	} else if (mode & 4) != 0 {
+		vgc_wb_lo = vgc_arena_lo
+		vgc_wb_len = vgc_arena_hi - vgc_arena_lo
 	} else {
 		vgc_wb_lo = vgc_perm_lo
 		vgc_wb_len = vgc_perm_len
 	}
+	mut hint := 0
+	if (mode & 1) == 0 && vgc_wb_len != 0 {
+		hint = vgc_find_arena(vgc_wb_lo) + 1
+	}
+	C.vgc_atomic_store_u32(&vgc_wb_arena_hint, u32(hint))
+}
+
+// vgc_wb_regime is the barrier mode outside a concurrent middle: the
+// permanent regime's bit and the young regime's.
+@[inline]
+fn vgc_wb_regime() u32 {
+	return vgc_perm_on * 2 + vgc_young_on * 4
+}
+
+// vgc_card_dirty reports whether the card of the page p lies in is set
+// (cx-home/v#56 step 1): a pointer was stored into that page since the last
+// stop. False outside the arenas and under the default build.
+pub fn vgc_card_dirty(p voidptr) bool {
+	mut dirty := false
+	$if vgc_concurrent ? {
+		addr := usize(p)
+		ai := vgc_find_arena(addr)
+		if ai >= 0 {
+			a := unsafe { &vgc_heap.arenas[ai] }
+			if a.cards != unsafe { nil } {
+				dirty = unsafe { a.cards[(addr - a.base) / vgc_page_size] } != 0
+			}
+		}
+	}
+	return dirty
+}
+
+// vgc_cards_dirty counts the set cards of every arena (cx-home/v#56 step 1).
+pub fn vgc_cards_dirty() u64 {
+	mut n := u64(0)
+	$if vgc_concurrent ? {
+		n = vgc_cards_count()
+	}
+	return n
 }
 // the verifier's full re-mark clears to zero (every object traced)
 __global vgc_perm_clear_zero = false
@@ -2064,7 +2147,7 @@ fn vgc_atfork_child() {
 	C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 	// cx-home/v#15: the permanent generation survives the fork (the heap is
 	// the parent's copy), so its barrier regime stays on
-	vgc_wb_set(if vgc_perm_on != 0 { u32(2) } else { u32(0) })
+	vgc_wb_set(vgc_wb_regime())
 	C.vgc_atomic_store_u32(&vgc_heap.work_lock, 0)
 	vgc_gc_owner = -1
 	// The peers did not survive the fork: their slots are unregistered (their
@@ -2287,8 +2370,17 @@ pub fn vgc_init() {
 				vgc_perm_cycle = u64(pc)
 			}
 		}
+		// cx-home/v#56 step 1: the young regime (the old generation's card barrier)
+		young_env := C.getenv(c'VGC_YOUNG')
+		if young_env != unsafe { nil } {
+			yv := C.atoll(young_env)
+			if yv >= 0 && yv <= 1 {
+				vgc_young_mode = int(yv)
+			}
+		}
 	} $else {
 		vgc_perm_mode = 0
+		vgc_young_mode = 0
 	}
 	ww_env := C.getenv(c'VGC_WALK_WORKERS')
 	if ww_env != unsafe { nil } {
@@ -4856,11 +4948,23 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }, false
 		}
+		// cx-home/v#56 step 1: the arena's cards, one byte per page
+		mut cmem := &u8(unsafe { nil })
+		$if vgc_concurrent ? {
+			cmem = unsafe { &u8(C.vgc_os_alloc(nmap)) }
+			if cmem == unsafe { nil } {
+				C.vgc_os_free(psmem, usize(sizeof(voidptr)) * nmap)
+				C.vgc_os_free(mem, asize)
+				C.vgc_mutex_unlock(&vgc_heap.lock)
+				return unsafe { nil }, false
+			}
+		}
 		unsafe {
 			vgc_heap.arenas[arena_idx].base = usize(mem)
 			vgc_heap.arenas[arena_idx].size = asize
 			vgc_heap.arenas[arena_idx].used = nbytes
 			vgc_heap.arenas[arena_idx].page_span = &&VGC_Span(psmem)
+			vgc_heap.arenas[arena_idx].cards = cmem
 			vgc_heap.arenas[arena_idx].owner = 0
 		}
 		if vgc_arena_owner_on && asize == vgc_arena_size {
@@ -6678,8 +6782,10 @@ fn vgc_memdup_noscan(src voidptr, n isize) voidptr {
 // Span lookup (find which span owns an address) - O(1) via address map
 // ============================================================
 
-fn vgc_find_span(ptr voidptr) &VGC_Span {
-	addr := usize(ptr)
+// vgc_find_arena resolves addr to the index of the arena it lies in, or -1
+// (the arena resolution of vgc_find_span, which the card barrier shares —
+// cx-home/v#56 step 1).
+fn vgc_find_arena(addr usize) int {
 	// The addr_map is a COARSE 1GB-granularity hint (VGC_ADDR_SHIFT=30) but arenas
 	// are only 64MB (vgc_arena_size), so up to 16 arenas share one chunk and each
 	// new arena's vgc_addr_map_register OVERWRITES the chunk's single entry. The
@@ -6715,9 +6821,15 @@ fn vgc_find_span(ptr voidptr) &VGC_Span {
 				break
 			}
 		}
-		if arena_idx < 0 {
-			return unsafe { nil }
-		}
+	}
+	return arena_idx
+}
+
+fn vgc_find_span(ptr voidptr) &VGC_Span {
+	addr := usize(ptr)
+	arena_idx := vgc_find_arena(addr)
+	if arena_idx < 0 {
+		return unsafe { nil }
 	}
 	a := unsafe { &vgc_heap.arenas[arena_idx] }
 	page_idx := (addr - a.base) / vgc_page_size
