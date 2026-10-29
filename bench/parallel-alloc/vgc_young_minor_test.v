@@ -132,3 +132,36 @@ fn test_the_verifier_counts_no_miss_over_the_permanent_spans() {
 	assert r.output.all_after('minors=').int() > 0, r.output
 	assert r.output.all_after('missed=').int() == 0, r.output
 }
+
+// cx-home/v#56 step 2: the full cycle's goal bounds the minors. young/budget.v
+// keeps a ring of sixteen 256 KB batches and replaces one a step, so every
+// batch born since the last stop is live at the next one and promoted by a
+// minor cycle, then dead — before the budget the minors ran to the cap of
+// eight each time (vgc_full_marked was set only at a concurrent cycle's end)
+// and the sticky marked set carried the peak heap to several times the
+// regime-off peak; with it the peak stays within half again of the regime
+// off's and no run of minors reaches the cap.
+fn test_the_full_cycles_goal_bounds_the_minors() {
+	exe := build('young/budget.v', '')
+	defer {
+		os.rm(exe) or {}
+	}
+	off := os.execute('VGC_GCTRACE=2 STEPS=400 ${os.quoted_path(exe)}')
+	assert off.exit_code == 0, off.output
+	d0 := done_line(off.output)
+	assert d0.contains(' bad=0 '), off.output
+	assert d0.contains(' minors=0 '), off.output
+	peak0 := d0.all_after('peak_mb=').all_before(' ').int()
+	assert peak0 > 0, off.output
+	r := os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 STEPS=400 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	d := done_line(r.output)
+	assert d.contains(' bad=0 '), r.output
+	assert d.all_after('minors=').all_before(' ').int() > 0, 'no minor cycle ran:\n${r.output}'
+	assert d.all_after('goal_mb=').int() > 0, r.output
+	peak := d.all_after('peak_mb=').all_before(' ').int()
+	assert peak * 2 <= peak0 * 3, 'the minors carried the peak heap to ${peak} MB against ${peak0} MB with the regime off:\n${r.output}'
+	ml := minor_lines(r.output)
+	assert ml.len > 0, r.output
+	assert ml.all(it.all_after('minor n=').all_before(' ').int() < 8), 'a run of minors reached the cap:\n${r.output}'
+}

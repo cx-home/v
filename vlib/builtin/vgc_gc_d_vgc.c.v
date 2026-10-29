@@ -1197,6 +1197,12 @@ fn vgc_minor_plan(promote bool) bool {
 	if vgc_full_marked > 0 && marked >= 2 * vgc_full_marked {
 		return false
 	}
+	// the budget: the minors run inside the last full cycle's goal — once the
+	// promotions have carried the sticky marked set up to that goal (its
+	// headroom consumed) the next cycle is full (vgc_full_goal, vgc_update_trigger)
+	if vgc_full_goal > 0 && marked >= vgc_full_goal {
+		return false
+	}
 	return true
 }
 
@@ -4431,6 +4437,15 @@ fn vgc_update_trigger() {
 	}
 	if goal < marked + min_budget {
 		goal = marked + min_budget
+	}
+	// cx-home/v#56 step 2: a full cycle records its marked set and its goal —
+	// the bound of the minors that follow (vgc_minor_plan: full once the sticky
+	// marked set reaches the goal). The stop-the-world full sets vgc_full_marked
+	// here (before this only the concurrent cycle did, so the "marked doubled"
+	// full never ran under the default regime).
+	if !vgc_minor_this_cycle {
+		vgc_full_marked = marked
+		vgc_full_goal = goal
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 	// cx-home/v#56: the per-thread accounting flush follows the budget when
