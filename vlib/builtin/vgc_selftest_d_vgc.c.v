@@ -449,6 +449,109 @@ pub fn vgc_mark_cpu_plan_selftest() u32 {
 	return rc
 }
 
+// vgc_arena_owner_selftest — cx-examples#403. A new span comes off the tail of
+// an arena no other live thread carves (vgc_arena_pick), on a table of four
+// 64-page arenas: one thread carves first fit; a live thread's arena is passed
+// over and a free one claimed (the claimer's previous arena released); an
+// exited thread's arena is claimed; only another live thread's tail left maps
+// a new arena below the ceiling and is carved at it; the rule off is first fit.
+// Driven by bench/parallel-alloc/vgc_arena_owner_test.v. 0 = ok; n = the case.
+__global vgc_arena_selftest_exited = int(0)
+
+fn vgc_arena_selftest_live(o int) bool {
+	return o >= 1 && o <= 4 && o != vgc_arena_selftest_exited
+}
+
+pub fn vgc_arena_owner_selftest() u32 {
+	sz := usize(64) * vgc_page_size
+	vgc_arena_selftest_exited = 0
+	mut t := [4]VGC_Arena{}
+	for i in 0 .. 4 {
+		t[i].base = usize(i + 1) * sz
+		t[i].size = sz
+	}
+	pg := usize(vgc_page_size)
+	// one thread (owner 1 or none everywhere): first fit, as before
+	t[0].used = sz
+	if vgc_arena_pick(pg, 1, 4, &t[0], 1024, vgc_arena_selftest_live) != 1 || t[1].owner != 1 {
+		return 1
+	}
+	// thread 2 (live) passes over thread 1's arena 1 and claims arena 2
+	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live) != 2 || t[2].owner != 2 {
+		return 2
+	}
+	// thread 2's next carve stays in its own arena even with arena 1 first
+	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live) != 2 {
+		return 3
+	}
+	// thread 2 claims arena 3 once arena 2 is full, releasing arena 2
+	t[2].used = sz
+	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live) != 3 || t[3].owner != 2
+		|| t[2].owner != 0 {
+		return 4
+	}
+	// thread 1 exits; thread 3 claims its arena 1
+	vgc_arena_selftest_exited = 1
+	if vgc_arena_pick(pg, 3, 4, &t[0], 1024, vgc_arena_selftest_live) != 1 || t[1].owner != 3 {
+		return 5
+	}
+	// thread 4: every tail left is a live thread's (1: thread 3, 3: thread 2) — map a new arena
+	if vgc_arena_pick(pg, 4, 4, &t[0], 1024, vgc_arena_selftest_live) != -1 {
+		return 6
+	}
+	// ... unless the table is at the ceiling: the first tail with room
+	if vgc_arena_pick(pg, 4, 4, &t[0], 5, vgc_arena_selftest_live) != 1 || t[1].owner != 3 {
+		return 7
+	}
+	// the rule off (me 0): first fit across owners
+	if vgc_arena_pick(pg, 0, 4, &t[0], 1024, vgc_arena_selftest_live) != 1 {
+		return 8
+	}
+	// a request no tail holds
+	if vgc_arena_pick(sz + pg, 0, 4, &t[0], 1024, vgc_arena_selftest_live) != -1 {
+		return 9
+	}
+	return 0
+}
+
+// vgc_mark_wide_selftest — cx-examples#403. A stop that holds more mutators
+// than the configured markers fields one marker per CPU the box leaves free, up
+// to one per held mutator plus the collector and at most vgc_max_markers; a
+// busy box (0 free), a stop of few mutators and a box of few CPUs keep the
+// configured count. Driven by bench/parallel-alloc/vgc_mark_wide_test.v.
+// 0 = ok; n = the failed case.
+pub fn vgc_mark_wide_selftest() u32 {
+	// 28 parses on 28 free CPUs: 28 markers, not the configured 8
+	if vgc_mark_wide_total(8, 28, 28) != 28 {
+		return 1
+	}
+	// one per held mutator plus the collector
+	if vgc_mark_wide_total(8, 12, 28) != 13 {
+		return 2
+	}
+	// the box's other load takes CPUs away
+	if vgc_mark_wide_total(8, 28, 20) != 20 {
+		return 3
+	}
+	// a busy box, or under the line: the configured count
+	if vgc_mark_wide_total(8, 28, 0) != 8 {
+		return 4
+	}
+	// a stop of four mutators keeps eight
+	if vgc_mark_wide_total(8, 4, 28) != 8 {
+		return 5
+	}
+	// never past vgc_max_markers
+	if vgc_mark_wide_total(8, 100, 128) != vgc_max_markers {
+		return 6
+	}
+	// the per-worker sums hold every marker
+	if vgc_walk_sum_len < vgc_max_markers * 16 {
+		return 7
+	}
+	return 0
+}
+
 // vgc_uaf_foreign_selftest — cx-private#2011. The passive UAF oracle
 // (vgc_uaf_check_buf) bounds an address by [vgc_arena_lo, vgc_arena_hi), the
 // span of the arenas. On Linux glibc's per-thread malloc arenas are mmaps that
