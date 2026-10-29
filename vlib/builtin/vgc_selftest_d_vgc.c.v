@@ -454,7 +454,9 @@ pub fn vgc_mark_cpu_plan_selftest() u32 {
 // 64-page arenas: one thread carves first fit; a live thread's arena is passed
 // over and a free one claimed (the claimer's previous arena released); an
 // exited thread's arena is claimed; only another live thread's tail left maps
-// a new arena below the ceiling and is carved at it; the rule off is first fit.
+// a new arena below the ceiling and is carved at it; the rule off is first fit;
+// an owner that carved none of its tail in this completed cycle or the last
+// holds it no more (cases 10-15).
 // Driven by bench/parallel-alloc/vgc_arena_owner_test.v. 0 = ok; n = the case.
 __global vgc_arena_selftest_exited = int(0)
 
@@ -473,43 +475,83 @@ pub fn vgc_arena_owner_selftest() u32 {
 	pg := usize(vgc_page_size)
 	// one thread (owner 1 or none everywhere): first fit, as before
 	t[0].used = sz
-	if vgc_arena_pick(pg, 1, 4, &t[0], 1024, vgc_arena_selftest_live) != 1 || t[1].owner != 1 {
+	if vgc_arena_pick(pg, 1, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != 1 || t[1].owner != 1 {
 		return 1
 	}
 	// thread 2 (live) passes over thread 1's arena 1 and claims arena 2
-	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live) != 2 || t[2].owner != 2 {
+	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != 2 || t[2].owner != 2 {
 		return 2
 	}
 	// thread 2's next carve stays in its own arena even with arena 1 first
-	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live) != 2 {
+	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != 2 {
 		return 3
 	}
 	// thread 2 claims arena 3 once arena 2 is full, releasing arena 2
 	t[2].used = sz
-	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live) != 3 || t[3].owner != 2
+	if vgc_arena_pick(pg, 2, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != 3 || t[3].owner != 2
 		|| t[2].owner != 0 {
 		return 4
 	}
 	// thread 1 exits; thread 3 claims its arena 1
 	vgc_arena_selftest_exited = 1
-	if vgc_arena_pick(pg, 3, 4, &t[0], 1024, vgc_arena_selftest_live) != 1 || t[1].owner != 3 {
+	if vgc_arena_pick(pg, 3, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != 1 || t[1].owner != 3 {
 		return 5
 	}
 	// thread 4: every tail left is a live thread's (1: thread 3, 3: thread 2) — map a new arena
-	if vgc_arena_pick(pg, 4, 4, &t[0], 1024, vgc_arena_selftest_live) != -1 {
+	if vgc_arena_pick(pg, 4, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != -1 {
 		return 6
 	}
 	// ... unless the table is at the ceiling: the first tail with room
-	if vgc_arena_pick(pg, 4, 4, &t[0], 5, vgc_arena_selftest_live) != 1 || t[1].owner != 3 {
+	if vgc_arena_pick(pg, 4, 4, &t[0], 5, vgc_arena_selftest_live, 10) != 1 || t[1].owner != 3 {
 		return 7
 	}
 	// the rule off (me 0): first fit across owners
-	if vgc_arena_pick(pg, 0, 4, &t[0], 1024, vgc_arena_selftest_live) != 1 {
+	if vgc_arena_pick(pg, 0, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != 1 {
 		return 8
 	}
 	// a request no tail holds
-	if vgc_arena_pick(sz + pg, 0, 4, &t[0], 1024, vgc_arena_selftest_live) != -1 {
+	if vgc_arena_pick(sz + pg, 0, 4, &t[0], 1024, vgc_arena_selftest_live, 10) != -1 {
 		return 9
+	}
+	// an owner holds its tail only while it carves (vgc_arena_owner_cycles = 1):
+	// thread 1 carved arena 0 at start-up (cycle 0) and waits; thread 2 works
+	mut u := [2]VGC_Arena{}
+	for i in 0 .. 2 {
+		u[i].base = usize(i + 1) * sz
+		u[i].size = sz
+	}
+	vgc_arena_selftest_exited = 0
+	u[0].owner = 1
+	u[0].used = pg
+	u[0].carve_cycle = 0
+	u[1].owner = 2
+	u[1].used = sz
+	u[1].carve_cycle = 1
+	// in the next cycle thread 1's carve is the last cycle's: a new arena
+	if vgc_arena_pick(pg, 2, 2, &u[0], 1024, vgc_arena_selftest_live, 1) != -1 || u[0].owner != 1 {
+		return 10
+	}
+	// a cycle later thread 1 carves no more: thread 2 claims arena 0
+	if vgc_arena_pick(pg, 2, 2, &u[0], 1024, vgc_arena_selftest_live, 2) != 0 || u[0].owner != 2
+		|| u[0].carve_cycle != 2 || u[1].owner != 0 {
+		return 11
+	}
+	// thread 1 wakes in the same cycle: thread 2 carved there now
+	if vgc_arena_pick(pg, 1, 2, &u[0], 1024, vgc_arena_selftest_live, 2) != -1 || u[0].owner != 2 {
+		return 12
+	}
+	// thread 2's own carve keeps it: carving at cycle 5 holds it through cycle 6
+	if vgc_arena_pick(pg, 2, 2, &u[0], 1024, vgc_arena_selftest_live, 5) != 0
+		|| u[0].carve_cycle != 5 {
+		return 13
+	}
+	if vgc_arena_pick(pg, 1, 2, &u[0], 1024, vgc_arena_selftest_live, 6) != -1 {
+		return 14
+	}
+	// the rule off (me 0) is first fit and stamps no carve
+	if vgc_arena_pick(pg, 0, 2, &u[0], 1024, vgc_arena_selftest_live, 9) != 0
+		|| u[0].carve_cycle != 5 {
+		return 15
 	}
 	return 0
 }
@@ -594,4 +636,11 @@ pub fn vgc_uaf_foreign_selftest() u32 {
 		return 3
 	}
 	return 0
+}
+
+// vgc_arena_count answers the arenas mapped so far (arenas are never released,
+// so it is the high-water mark the VGC_GCTRACE arenas= field reads).
+// bench/parallel-alloc/vgc_arena_owner_idle_test.v.
+pub fn vgc_arena_count() int {
+	return vgc_heap.narenas
 }

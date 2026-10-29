@@ -7,7 +7,8 @@
 // shared 64 MB mappings spent 26.4 s of system time, in mappings of their own
 // 4.0 s, and 28 xlsx parses in one process read 21-23 s of system time against
 // 1.5-2.2 s for 12. Drives the white-box self-check in module builtin
-// (vgc_arena_owner_selftest: vgc_arena_pick on a table of four arenas).
+// (vgc_arena_owner_selftest: vgc_arena_pick on a table of four arenas, and
+// on two arenas whose owner stopped carving).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_arena_owner_test.v
 module main

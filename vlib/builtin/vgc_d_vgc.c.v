@@ -516,6 +516,9 @@ mut:
 	// carving one arena's tail fault its pages in turn, and first touches of one
 	// mapping from many threads serialize in the kernel.
 	owner int
+	// carve_cycle is the gc_cycle of the owner's last carve from this tail: an
+	// owner holds the tail only while it carves (vgc_arena_owner_cycles).
+	carve_cycle u64
 }
 
 // VGC_WorkBuf is a work buffer for the mark phase.
@@ -1362,6 +1365,15 @@ __global vgc_headroom_per_thread = true
 // xlsx parses in one process read 24 s of system time against 1.5 s for 12.
 // One thread carves exactly as first fit did. VGC_ARENA_OWNER=0 switches it off.
 __global vgc_arena_owner_on = true
+// An owner holds its arena's tail only while it carves: a thread that carved
+// none of it in this completed cycle or the last (vgc_arena_owner_cycles) leaves
+// the tail to the next thread that carves. A thread that carved a few spans at
+// start-up and then only waits on the one working thread held a nearly empty
+// 64 MB arena the working thread mapped around: cx --from=json --to=json on the
+// 300,000-record bench document committed 3 arenas where first fit commits 2.
+// The arena count of one working thread is first fit's
+// (bench/parallel-alloc/vgc_arena_owner_idle_test.v).
+__global vgc_arena_owner_cycles = u64(1)
 // markers this cycle, the collector included
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
@@ -4650,7 +4662,7 @@ fn vgc_span_recycled_ready(mut span VGC_Span, cold bool, npages u32) {
 fn vgc_arena_tail_take(nbytes usize) (usize, int) {
 	me := if vgc_arena_owner_on { C.vgc_get_cache_idx() + 1 } else { 0 }
 	i := vgc_arena_pick(nbytes, me, vgc_heap.narenas, unsafe { &vgc_heap.arenas[0] }, vgc_arena_ceiling(),
-		vgc_arena_owner_live)
+		vgc_arena_owner_live, vgc_heap.gc_cycle)
 	if i < 0 {
 		return 0, -1
 	}
@@ -4663,27 +4675,33 @@ fn vgc_arena_tail_take(nbytes usize) (usize, int) {
 
 // vgc_arena_pick answers the first of the `n` arenas at `arenas` with nbytes of
 // tail left that no other live thread carves (`live` answers whether an owner
-// is a registered thread's cache), and makes `me` (the carving thread's cache
-// index + 1) its owner, releasing the arena it carved before; -1 when none, so
-// a new arena is mapped, unless `n` reached `ceiling`: then the first with room
-// whatever its owner. me 0 (the rule off, or no cache) is first fit.
-fn vgc_arena_pick(nbytes usize, me int, n int, arenas &VGC_Arena, ceiling int, live fn (int) bool) int {
+// is a registered thread's cache; an owner whose last carve is older than
+// vgc_arena_owner_cycles completed cycles before `cycle` carves it no more), and
+// makes `me` (the carving thread's cache index + 1) its owner, releasing the
+// arena it carved before; -1 when none, so a new arena is mapped, unless `n`
+// reached `ceiling`: then the first with room whatever its owner. me 0 (the rule
+// off, or no cache) is first fit.
+fn vgc_arena_pick(nbytes usize, me int, n int, arenas &VGC_Arena, ceiling int, live fn (int) bool, cycle u64) int {
 	mut other := -1
 	for i in 0 .. n {
-		a := unsafe { &arenas[i] }
+		mut a := unsafe { &arenas[i] }
 		if a.used + nbytes > a.size {
 			continue
 		}
-		if me <= 0 || a.owner == me {
+		if me <= 0 {
 			return i
 		}
-		if a.owner != 0 && live(a.owner) {
+		if a.owner == me {
+			a.carve_cycle = cycle
+			return i
+		}
+		if a.owner != 0 && live(a.owner) && a.carve_cycle + vgc_arena_owner_cycles >= cycle {
 			if other < 0 {
 				other = i
 			}
 			continue
 		}
-		vgc_arena_claim(arenas, n, i, me)
+		vgc_arena_claim(arenas, n, i, me, cycle)
 		return i
 	}
 	if other >= 0 && n + 1 >= ceiling {
@@ -4702,9 +4720,9 @@ fn vgc_arena_owner_live(o int) bool {
 }
 
 // vgc_arena_claim makes `me` (cache index + 1) the owner of arena `idx` of the
-// `n` at `arenas` and releases the one it carved before, so its tail serves
-// other threads.
-fn vgc_arena_claim(arenas &VGC_Arena, n int, idx int, me int) {
+// `n` at `arenas`, carving at `cycle`, and releases the one it carved before, so
+// its tail serves other threads.
+fn vgc_arena_claim(arenas &VGC_Arena, n int, idx int, me int, cycle u64) {
 	for j in 0 .. n {
 		if j != idx && unsafe { arenas[j].owner } == me {
 			unsafe {
@@ -4714,6 +4732,7 @@ fn vgc_arena_claim(arenas &VGC_Arena, n int, idx int, me int) {
 	}
 	unsafe {
 		arenas[idx].owner = me
+		arenas[idx].carve_cycle = cycle
 	}
 }
 
@@ -4866,7 +4885,8 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 		if vgc_arena_owner_on && asize == vgc_arena_size {
 			me := C.vgc_get_cache_idx() + 1
 			if me > 0 {
-				vgc_arena_claim(unsafe { &vgc_heap.arenas[0] }, arena_idx + 1, arena_idx, me)
+				vgc_arena_claim(unsafe { &vgc_heap.arenas[0] }, arena_idx + 1, arena_idx, me,
+					vgc_heap.gc_cycle)
 			}
 		}
 		// narenas is NOT bumped here: it is the publication point for this whole
