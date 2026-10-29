@@ -977,6 +977,10 @@ const vgc_max_markers = 32
 // VGC_MARK_WIDE=0 keeps the configured count.
 __global vgc_mark_wide = true
 __global vgc_mark_workers_env = false
+// A concurrent cycle's termination re-scan fields one thread per vgc_rescan_born_per bytes
+// born in its middle, up to the pool it already holds (vgc_rescan_term_n, cx-examples#403).
+// VGC_RESCAN_WIDE=0 keeps the count planned before stop 1.
+__global vgc_rescan_wide = true
 
 __global vgc_mark_workers_cfg = int(-1)
 // -1 = decide at init
@@ -2229,6 +2233,10 @@ pub fn vgc_init() {
 	mwide_env := C.getenv(c'VGC_MARK_WIDE')
 	if mwide_env != unsafe { nil } {
 		vgc_mark_wide = C.atoll(mwide_env) != 0
+	}
+	rwide_env := C.getenv(c'VGC_RESCAN_WIDE')
+	if rwide_env != unsafe { nil } {
+		vgc_rescan_wide = C.atoll(rwide_env) != 0
 	}
 	if mw > vgc_max_markers {
 		mw = vgc_max_markers

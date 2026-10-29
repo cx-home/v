@@ -1040,6 +1040,47 @@ fn vgc_rescan_walk(w int, n int) {
 	}
 }
 
+// vgc_rescan_serial: the re-scan runs on one thread — in a fork child, while an address is
+// watched, and under the diagnostic builds whose shade path writes shared counters.
+fn vgc_rescan_serial() bool {
+	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked || vgc_watch_addr != 0 {
+		return true
+	}
+	$if vgc_rootdiag ? {
+		return true
+	}
+	$if vgc_birthcheck ? {
+		return true
+	}
+	$if vgc_passive ? {
+		return true
+	}
+	return false
+}
+
+// vgc_rescan_born_per is the middle's births one termination re-scan thread takes on
+// (vgc_rescan_term_n).
+const vgc_rescan_born_per = u64(16) * 1024 * 1024
+
+// vgc_rescan_term_n is a concurrent cycle's termination re-scan thread count (cx-examples#403):
+// the count `planned` before stop 1 from the last re-scan's work, widened to one thread per
+// vgc_rescan_born_per of the `born` bytes allocated in the middle (each object born there is
+// re-scanned with the spans the barrier dirtied), up to the `pool` threads already running plus
+// the collector (the pool does not grow inside a stop) and vgc_max_markers. The plan read the
+// last re-scan's ~100 objects; the next cycle, near the end of 28 xlsx parses in one process,
+// re-scanned 8.8 M objects born in a 0.6 s middle on that one thread: a 3.0 s stop.
+fn vgc_rescan_term_n(planned int, born u64, pool int) int {
+	mut n := int(born / vgc_rescan_born_per)
+	mut cap := pool + 1
+	if cap > vgc_max_markers {
+		cap = vgc_max_markers
+	}
+	if n > cap {
+		n = cap
+	}
+	return if n > planned { n } else { planned }
+}
+
 // cx-home/v#52: this cycle's re-scan thread count, planned before stop 1 (the
 // pool grows outside a stop): one thread per quarter of vgc_mark_par_min_ns
 // of the last re-scan's work, up to the marker configuration and the CPUs
@@ -1047,16 +1088,7 @@ fn vgc_rescan_walk(w int, n int) {
 // holds its claim through the join); serial in a fork child and under the
 // diagnostic builds whose shade path writes shared counters.
 fn vgc_rescan_plan() int {
-	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked || vgc_watch_addr != 0 {
-		return 1
-	}
-	$if vgc_rootdiag ? {
-		return 1
-	}
-	$if vgc_birthcheck ? {
-		return 1
-	}
-	$if vgc_passive ? {
+	if vgc_rescan_serial() {
 		return 1
 	}
 	q := vgc_mark_par_min_ns / 4
@@ -1533,6 +1565,9 @@ fn vgc_gc_start_concurrent() {
 		}
 	}
 	vgc_cm_born_last = born
+	if vgc_rescan_wide && !vgc_rescan_serial() && vgc_mark_pool_n > 0 {
+		vgc_rescan_nworkers_cur = vgc_rescan_term_n(vgc_rescan_nworkers_cur, born, vgc_mark_pool_n)
+	}
 	vgc_cm_roots(self_idx)
 	t_rescan := C.vgc_now_ns()
 	rcpu0, _ := vgc_mark_cpu_begin()

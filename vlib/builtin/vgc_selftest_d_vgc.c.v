@@ -552,6 +552,39 @@ pub fn vgc_mark_wide_selftest() u32 {
 	return 0
 }
 
+// vgc_rescan_term_selftest checks vgc_rescan_term_n (cx-examples#403,
+// bench/parallel-alloc/vgc_rescan_term_test.v): a concurrent cycle's termination
+// re-scan fields one thread per vgc_rescan_born_per of the middle's births, up to
+// the pool already running plus the collector, never fewer than its plan.
+pub fn vgc_rescan_term_selftest() u32 {
+	mb := u64(1024 * 1024)
+	// 1.4 GB born in the middle (28 parses): every pool thread and the collector
+	if vgc_rescan_term_n(1, 1400 * mb, 27) != 28 {
+		return 1
+	}
+	// 43 MB born: two threads
+	if vgc_rescan_term_n(1, 43 * mb, 27) != 2 {
+		return 2
+	}
+	// 1 MB born: the plan's one
+	if vgc_rescan_term_n(1, mb, 27) != 1 {
+		return 3
+	}
+	// never under the plan made from the last re-scan's work
+	if vgc_rescan_term_n(6, 32 * mb, 27) != 6 {
+		return 4
+	}
+	// no pool: the collector alone
+	if vgc_rescan_term_n(1, 1400 * mb, 0) != 1 {
+		return 5
+	}
+	// never past vgc_max_markers, whatever the pool
+	if vgc_rescan_term_n(1, 4096 * mb, 100) != vgc_max_markers {
+		return 6
+	}
+	return 0
+}
+
 // vgc_uaf_foreign_selftest — cx-private#2011. The passive UAF oracle
 // (vgc_uaf_check_buf) bounds an address by [vgc_arena_lo, vgc_arena_hi), the
 // span of the arenas. On Linux glibc's per-thread malloc arenas are mmaps that
