@@ -1125,7 +1125,13 @@ __global vgc_young_cards_last = u64(0)
 // A full cycle (every mark bit cleared, every card cleared at its end) runs
 // when vgc_young_minors minor cycles have run since the last one
 // (VGC_YOUNG_MINORS, default 8, 0 = no minor cycle), when the marked set has
-// doubled since the last full cycle, when a promotion into the permanent
+// doubled since the last full cycle, when the sticky marked set has reached
+// the last full cycle's goal (vgc_full_goal: the full cycle runs on the
+// pacer's goal as before the regime and the minors inside its headroom, which
+// the promotions consume; before this a run of minors
+// promoted the working set live at each stop and carried the goal up to the
+// cap of eight: json-codec 1 MB x100 peaked at 33 MB of footprint against
+// 20 MB with the regime off), when a promotion into the permanent
 // generation is due, while an address is watched, and on an explicit
 // gc_collect (vgc_force_full). -d vgc_cm_verify re-marks from zero after a
 // minor cycle and counts the objects it missed (missed= on the VGC_GCTRACE=2
@@ -1135,6 +1141,7 @@ __global vgc_minor_this_cycle = false
 __global vgc_minor_count = u64(0)
 __global vgc_minor_cycles = u64(0)
 __global vgc_full_marked = u64(0)
+__global vgc_full_goal = u64(0)
 __global vgc_minor_last_spans = u64(0)
 __global vgc_minor_last_objs = u64(0)
 __global vgc_force_full = u32(0)
@@ -1183,6 +1190,12 @@ fn vgc_wb_regime() u32 {
 // step 2; 0 with the young regime off).
 pub fn vgc_minor_cycles_count() u64 {
 	return vgc_minor_cycles
+}
+
+// vgc_full_goal_probe reports the last full cycle's goal, the bound of the
+// minor cycles that follow it (cx-home/v#56 step 2; 0 before the first).
+pub fn vgc_full_goal_probe() u64 {
+	return vgc_full_goal
 }
 
 // vgc_cm_verify_missed_count reports the objects -d vgc_cm_verify found
