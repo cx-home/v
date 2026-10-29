@@ -697,6 +697,18 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			if left.is_farray && left.left is ast.Ident && (left.left as ast.Ident).kind == .global {
 				return
 			}
+			// cx-private#1924 cut 2: a fixed array that is a local of this
+			// function (`mut buf := [4]T{}`; `buf[i] = v`) is the C stack, a root
+			// every stop scans, never a heap span: the gate finds nothing to
+			// dirty there. CRun_exec_call_d_small's argument buffer was 520,012
+			// of template-render 5000's 2.76 M executed gates. Not a parameter
+			// (a fixed array argument is the caller's memory, which may be a
+			// heap object), not a mut or shared one (a pointer), not a static
+			// (the data segment: the global rule above), not a closure's
+			// inherited variable (its context lives on the heap).
+			if left.is_farray && g.cm_is_stack_farray(left.left, left.left_type) {
+				return
+			}
 			if g.cm_is_pure_lvalue(left.left) {
 				base := g.expr_string(left.left)
 				if left.is_array {
@@ -730,6 +742,38 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 		}
 		else {}
 	}
+}
+
+// cm_is_stack_farray: a fixed array local to the function being generated,
+// held by value in its C frame (cx-private#1924 cut 2, gen_cm_write_barrier)
+fn (g &Gen) cm_is_stack_farray(e ast.Expr, typ ast.Type) bool {
+	if e !is ast.Ident || typ.is_ptr() || typ.has_flag(.shared_f) {
+		return false
+	}
+	id := e as ast.Ident
+	if id.kind != .variable || e.is_auto_deref_var() || id.is_auto_heap() {
+		return false
+	}
+	if id.obj !is ast.Var {
+		return false
+	}
+	// the flags as the scope resolves the name (cgen's own reading,
+	// resolved_ident_is_auto_heap), and as the ident carries them
+	mut vars := [id.obj as ast.Var]
+	if id.scope != unsafe { nil } {
+		if sv := id.scope.find_var(id.name) {
+			vars << *sv
+		}
+	}
+	for v in vars {
+		// is_auto_heap: an address of it escapes, so cgen allocates it on
+		// the heap and reaches it through a pointer
+		if v.is_arg || v.is_auto_deref || v.is_auto_heap || v.is_static || v.is_inherited
+			|| v.share != .mut_t || v.typ.is_ptr() {
+			return false
+		}
+	}
+	return true
 }
 
 // cm_is_vgc_meta: the collector's metadata structs (vlib/builtin/vgc_d_vgc.c.v),

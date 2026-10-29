@@ -1,0 +1,39 @@
+// cx-private#1924 cut 2: a store into a fixed array that is a local of the
+// function writes the C stack and carries no write-barrier gate; a fixed array
+// reached through a mut parameter or a struct field keeps its gates.
+struct Box {
+mut:
+	items [4]string
+}
+
+@[noinline]
+fn fill_local(s string) int {
+	mut buf := [4]string{}
+	for i in 0 .. 4 {
+		buf[i] = s + i.str()
+	}
+	mut n := 0
+	for q in buf {
+		n += q.len
+	}
+	return n
+}
+
+@[noinline]
+fn fill_param(mut buf [4]string, s string) {
+	buf[0] = s
+}
+
+@[noinline]
+fn fill_field(mut b Box, s string) {
+	b.items[0] = s
+}
+
+fn main() {
+	println(fill_local('ab'))
+	mut arr := [4]string{}
+	fill_param(mut arr, 'cd')
+	mut b := &Box{}
+	fill_field(mut b, 'ef')
+	println(arr[0] + b.items[0])
+}
