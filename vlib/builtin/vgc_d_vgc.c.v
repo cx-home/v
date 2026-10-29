@@ -1112,15 +1112,22 @@ __global vgc_young_mode = int(0)
 __global vgc_young_on = u32(0)
 // the cards the last full cycle found set (VGC_GCTRACE=2)
 __global vgc_young_cards_last = u64(0)
-// the barrier's arena hint (vgc_wb_store's fast path): the index + 1 of the
-// arena the gate's low end lies in, 0 none, stored by vgc_wb_set (STW). An
+// the barrier's card window (the inline gate's and vgc_wb_store's fast path):
+// the arena the gate's low end lies in — its base and size, and its card table
+// biased by its base (vgc_wb_card_tab + (addr >> vgc_page_shift) is the card
+// of addr's page for an addr inside it) — stored by vgc_wb_set (STW); an empty
+// window (len 0) during a concurrent middle and before an arena exists. An
 // arena's entry never moves and its base, size and cards never change once
-// published, so a stale hint resolves a store correctly or misses to
-// vgc_find_arena. The interpreter stores into its start-up state (the
-// permanent generation) some 25 M times in json-codec 1 KB x100,000, and the
-// full resolution on every call read +9 % instructions retired and +4 % wall
-// against the flat table's range test (measure/collector-epic-23).
-__global vgc_wb_arena_hint = u32(0)
+// published, so a stale window resolves a store correctly or misses to
+// vgc_find_arena. The gate reads the card inline (cgen's vgc_wb_gate,
+// vgc_native_wb_gate) and calls vgc_wb_store only for a page whose card is
+// clear or an address outside the window: the interpreter stores into its
+// start-up state (the permanent generation) some 25 M times in json-codec
+// 1 KB x100,000, and a call on every one of them read +6..9 % wall against
+// the flat table (measure/collector-epic-23, -25).
+__global vgc_wb_card_lo = usize(0)
+__global vgc_wb_card_len = usize(0)
+__global vgc_wb_card_tab = usize(0)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime, bit 2 the young regime.
@@ -1139,11 +1146,25 @@ fn vgc_wb_set(mode u32) {
 		vgc_wb_lo = vgc_perm_lo
 		vgc_wb_len = vgc_perm_len
 	}
-	mut hint := 0
+	// the card window: the arena of the gate's low end (none in a middle)
+	mut lo := usize(0)
+	mut len := usize(0)
+	mut tab := usize(0)
 	if (mode & 1) == 0 && vgc_wb_len != 0 {
-		hint = vgc_find_arena(vgc_wb_lo) + 1
+		ai := vgc_find_arena(vgc_wb_lo)
+		if ai >= 0 {
+			a := unsafe { &vgc_heap.arenas[ai] }
+			if a.cards != unsafe { nil } {
+				lo = a.base
+				len = a.size
+				tab = usize(a.cards) - (a.base >> vgc_page_shift)
+			}
+		}
 	}
-	C.vgc_atomic_store_u32(&vgc_wb_arena_hint, u32(hint))
+	vgc_wb_card_len = 0
+	vgc_wb_card_lo = lo
+	vgc_wb_card_tab = tab
+	vgc_wb_card_len = len
 }
 
 // vgc_wb_regime is the barrier mode outside a concurrent middle: the
