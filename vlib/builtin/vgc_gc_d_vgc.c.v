@@ -1005,7 +1005,10 @@ fn vgc_rescan_walk(w int, n int) {
 					// PERMANENT objects are scanned (every other object in it is traced
 					// or swept as usual — scanning a dead one would keep what it points
 					// to; at a concurrent termination every allocated object, as any
-					// dirty span: a black young object mutated in the middle) and
+					// dirty span: a black young object mutated in the middle; at a
+					// minor cycle every allocated and marked object, cx-home/v#56
+					// step 2: an old object beside the permanent ones is not traced
+					// there) and
 					// young_bits re-taken; clean: only the permanent objects young_bits
 					// names (they hold a pointer to a non-permanent object, which only
 					// they keep alive).
@@ -1202,7 +1205,9 @@ fn vgc_minor_plan(promote bool) bool {
 // old object's pointer to a young one lies in a page whose card the barrier
 // set, and the young object is shaded like a root's referent. The cards are
 // read and cleared (vgc_cards_take); a span the permanent rescan already took
-// reads clean here, and a span without pointers has its cards dropped.
+// reads clean here (at a minor cycle that rescan scans a dirty permanent
+// span's old objects beside its permanent ones, vgc_rescan_perm_span), and a
+// span without pointers has its cards dropped.
 fn vgc_minor_cards() {
 	mut spans := u64(0)
 	mut objs := u64(0)
@@ -1289,6 +1294,15 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool, w int) (u64, u64,
 			unsafe { yb[b] }
 		} else if term {
 			unsafe { span.alloc_bits[b] }
+		} else if vgc_minor_this_cycle && span.mark_bits != unsafe { nil } {
+			// cx-home/v#56 step 2: at a minor cycle the span's old objects
+			// outside the generation (allocated into its free slots after the
+			// promotion, marked by a cycle since) are not traced — their
+			// marks are sticky — so every allocated and marked object of a
+			// dirty span is scanned, the permanent ones and the old ones
+			// beside them: a young object such an old object alone holds is
+			// found here, as vgc_minor_cards finds it in any other span
+			unsafe { span.alloc_bits[b] & (pbyte | span.mark_bits[b]) }
 		} else {
 			unsafe { span.alloc_bits[b] } & pbyte
 		}

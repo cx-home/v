@@ -101,3 +101,34 @@ fn test_no_minor_cycle_with_the_regime_off() {
 	assert minor_lines(r.output).len == 0, r.output
 	assert d.all_after('heap_mb=').all_before(' ').int() < 24, r.output
 }
+
+// cx-home/v#56 step 2: an old object outside the permanent generation that
+// lives in a permanent span (allocated into a free slot after the promotion,
+// made old by a full cycle) keeps the young record it alone holds across the
+// minor cycles — the permanent rescan of its dirty span scans it beside the
+// permanent objects (vgc_rescan_perm_span); before the fix only the permanent
+// objects were scanned, the record was swept, and the read-back was torn.
+fn test_an_old_object_in_a_permanent_span_keeps_its_young_record_across_a_minor_cycle() {
+	exe := build('young/minor_perm.v', '')
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 STEPS=4000 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert r.output.contains(' same_span='), r.output
+	assert r.output.all_after('same_span=').int() > 0, 'no new cell took a permanent span:\n${r.output}'
+	assert r.output.all_after('minors=').int() > 0, 'no minor cycle ran:\n${r.output}'
+	assert r.output.contains(' bad=0 '), r.output
+}
+
+fn test_the_verifier_counts_no_miss_over_the_permanent_spans() {
+	exe := build('young/minor_perm.v', '-d vgc_cm_verify')
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 STEPS=4000 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert r.output.contains(' bad=0 '), r.output
+	assert r.output.all_after('minors=').int() > 0, r.output
+	assert r.output.all_after('missed=').int() == 0, r.output
+}
