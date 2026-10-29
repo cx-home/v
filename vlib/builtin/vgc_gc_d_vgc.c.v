@@ -1154,6 +1154,9 @@ fn vgc_young_end() {
 	}
 	if vgc_gctrace >= 2 {
 		vgc_young_cards_last = vgc_cards_count()
+		C.vgc_say(0x5b10, vgc_wb_n_win_clear)
+		C.vgc_say(0x5b11, vgc_wb_n_win_set)
+		C.vgc_say(0x5b12, vgc_wb_n_out)
 	}
 	vgc_cards_clear()
 	vgc_young_on = 1
@@ -3339,7 +3342,13 @@ pub fn vgc_wb_store(obj voidptr) {
 			mut card := &u8(unsafe { nil })
 			if addr - vgc_wb_card_lo < vgc_wb_card_len {
 				card = unsafe { &u8(voidptr(vgc_wb_card_tab + (addr >> vgc_page_shift))) }
+				if unsafe { *card } == 0 {
+					vgc_wb_n_win_clear++
+				} else {
+					vgc_wb_n_win_set++
+				}
 			} else {
+				vgc_wb_n_out++
 				ai := vgc_find_arena(addr)
 				if ai < 0 {
 					return

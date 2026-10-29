@@ -1112,6 +1112,12 @@ __global vgc_young_mode = int(0)
 __global vgc_young_on = u32(0)
 // the cards the last full cycle found set (VGC_GCTRACE=2)
 __global vgc_young_cards_last = u64(0)
+// cx-home/v#56 step 1 count: vgc_wb_store's entries under the young regime —
+// inside the window with the card clear / already set, outside the window
+// (vgc_find_arena); printed at every full cycle's end under VGC_GCTRACE=2
+__global vgc_wb_n_win_clear = u64(0)
+__global vgc_wb_n_win_set = u64(0)
+__global vgc_wb_n_out = u64(0)
 // the barrier's card window (the inline gate's and vgc_wb_store's fast path):
 // the arena the gate's low end lies in — its base and size, and its card table
 // biased by its base (vgc_wb_card_tab + (addr >> vgc_page_shift) is the card
