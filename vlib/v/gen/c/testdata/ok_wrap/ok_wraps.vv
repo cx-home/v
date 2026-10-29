@@ -1,0 +1,71 @@
+// ok_wraps.vv — the shapes a plain value takes into an option or a result
+// (cx-private#1924, ok_wrap_initializer_form_test.v)
+// heap: opt_ref answers the reference it is given
+@[heap]
+struct Point {
+	x int
+	y f64
+	s string
+}
+
+fn opt_int(n int) ?int {
+	if n < 0 {
+		return none
+	}
+	return n * 2
+}
+
+fn res_str(n int) !string {
+	if n < 0 {
+		return error('negative ${n}')
+	}
+	return 'n=${n}'
+}
+
+fn opt_point(n int) ?Point {
+	if n == 0 {
+		return none
+	}
+	return Point{n, f64(n) / 2, 'p${n}'}
+}
+
+fn res_u8(n int) !u8 {
+	if n > 255 {
+		return error('big')
+	}
+	return u8(n)
+}
+
+fn opt_ref(p &Point) ?&Point {
+	return p
+}
+
+fn opt_arr(n int) ?[]int {
+	return []int{len: n, init: index}
+}
+
+fn opt_fixed() ?[3]int {
+	return [1, 2, 3]!
+}
+
+fn res_call(n int) !int {
+	return opt_int(n) or { -1 } + 1
+}
+
+fn main() {
+	println(opt_int(21) or { -1 })
+	println(opt_int(-1) or { -1 })
+	println(res_str(7) or { err.msg() })
+	println(res_str(-7) or { err.msg() })
+	p := opt_point(5) or { Point{} }
+	println('${p.x} ${p.y} ${p.s}')
+	println(opt_point(0) or { Point{s: 'none'} }.s)
+	println(res_u8(200) or { 0 })
+	println(res_u8(300) or { 0 })
+	q := Point{9, 1.5, 'q'}
+	r := opt_ref(&q) or { panic('none') }
+	println(r.s)
+	println(opt_arr(4) or { []int{} })
+	println(opt_fixed() or { [0, 0, 0]! })
+	println(res_call(10) or { -9 })
+}
