@@ -4490,6 +4490,20 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 		unwrapped_expr_typ := g.unwrap_generic(expr_typ)
 		expr_typ_is_option := unwrapped_expr_typ.has_flag(.option)
 		ret_typ_is_option := unwrapped_ret_typ.has_flag(.option)
+		// cx-private#1924: a plain value wrapped into an option or a result is
+		// written by the caller as the initializer form, the header in the
+		// declaration's initializer and the payload stored into .data, not
+		// declared bare and filled by the out-of-line _option_ok/_result_ok:
+		// with no call between them, the zero-store a -ftrivial-auto-var-init
+		// build gives the bare declaration is dead and clang drops it, and the
+		// call and its memcpy go too. The shapes the ok-wrap call handles apart
+		// (a fixed array, a function value, a reference taken or the payload
+		// ref of `&opt`, an option-mut parameter, a generic return) keep it.
+		ok_direct := !unwrapped_expr_typ.has_option_or_result() && !ret_typ.has_flag(.generic)
+			&& !unwrapped_ret_typ.has_flag(.option_mut_param_t)
+			&& !(ret_typ.nr_muls() > expr_typ.nr_muls()) && expr !is ast.PrefixExpr
+			&& final_expr_sym.kind != .array_fixed && final_expr_sym.info !is ast.FnType
+			&& g.table.final_sym(unwrapped_ret_typ.clear_option_and_result()).kind !in [.array_fixed, .function]
 		if ret_typ.has_flag(.generic) {
 			if expr is ast.SelectorExpr && g.cur_concrete_types.len == 0 {
 				// resolve generic struct on selectorExpr inside non-generic function
@@ -4517,7 +4531,13 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 				ret_styp := g.styp(unwrapped_ret_typ).replace('*', '')
 				g.writeln('${ret_styp} ${tmp_var};')
 			} else {
-				g.writeln('${g.styp(unwrapped_ret_typ)} ${tmp_var};')
+				if ok_direct {
+					// cx-private#1924: the header in the initializer, the payload stored below
+					hdr := if ret_typ_is_option { '.state=0' } else { '.is_error=0' }
+					g.writeln('${g.styp(unwrapped_ret_typ)} ${tmp_var} = {${hdr},.err=_const_none__};')
+				} else {
+					g.writeln('${g.styp(unwrapped_ret_typ)} ${tmp_var};')
+				}
 			}
 		}
 		if ret_typ_is_option && expr is ast.PrefixExpr
@@ -4583,7 +4603,11 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 						g.write('builtin___option_ok((${g.styp(final_expr_sym.idx)})')
 					}
 				} else {
-					g.write('builtin___option_ok(&(${styp}[]) { ')
+					if ok_direct {
+						g.write('*(${styp}*)${tmp_var}.data = ')
+					} else {
+						g.write('builtin___option_ok(&(${styp}[]) { ')
+					}
 					if final_expr_sym.info is ast.FnType {
 						final_ret_sym := g.table.final_sym(ret_typ)
 						if final_ret_sym.info is ast.FnType {
@@ -4639,7 +4663,11 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 					g.write('builtin___result_ok((${g.styp(final_expr_sym.idx)})')
 				}
 			} else {
-				g.write('builtin___result_ok(&(${styp}[]) { ')
+				if ok_direct {
+					g.write('*(${styp}*)${tmp_var}.data = ')
+				} else {
+					g.write('builtin___result_ok(&(${styp}[]) { ')
+				}
 				expected_type = ret_typ.clear_flag(.result)
 			}
 		}
@@ -4673,13 +4701,21 @@ fn (mut g Gen) expr_with_tmp_var(expr ast.Expr, expr_typ ast.Type, ret_typ ast.T
 			} else if expr_is_fixed_array_var {
 				g.writeln(', (${option_name}*)(&${tmp_var}), sizeof(${styp}));')
 			} else {
-				g.writeln(' }, (${option_name}*)(&${tmp_var}), sizeof(${styp}));')
+				if ok_direct {
+					g.writeln(';')
+				} else {
+					g.writeln(' }, (${option_name}*)(&${tmp_var}), sizeof(${styp}));')
+				}
 			}
 		} else {
 			if expr_is_fixed_array_var {
 				g.writeln(', (${result_name}*)(&${tmp_var}), sizeof(${styp}));')
 			} else {
-				g.writeln(' }, (${result_name}*)(&${tmp_var}), sizeof(${styp}));')
+				if ok_direct {
+					g.writeln(';')
+				} else {
+					g.writeln(' }, (${result_name}*)(&${tmp_var}), sizeof(${styp}));')
+				}
 			}
 		}
 		g.set_current_pos_as_last_stmt_pos()
