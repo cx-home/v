@@ -3332,21 +3332,24 @@ pub fn vgc_wb_store(obj voidptr) {
 		if (mode & 1) == 0 {
 			// the permanent or the young regime alone: the page's card in its
 			// arena's table, set when not set (vgc_young_mode doc); the stop
-			// reads it as the span's dirty bit. The arena is the hint's
-			// (vgc_wb_arena_hint: one range test) or vgc_find_arena's.
+			// reads it as the span's dirty bit. The card is the window's
+			// (vgc_wb_card_lo: one range test, the inline gate's own) or the
+			// arena's by vgc_find_arena.
 			addr := usize(obj)
-			mut ai := int(C.vgc_atomic_load_u32(&vgc_wb_arena_hint)) - 1
-			if ai < 0 || addr - vgc_heap.arenas[ai].base >= vgc_heap.arenas[ai].size {
-				ai = vgc_find_arena(addr)
+			mut card := &u8(unsafe { nil })
+			if addr - vgc_wb_card_lo < vgc_wb_card_len {
+				card = unsafe { &u8(voidptr(vgc_wb_card_tab + (addr >> vgc_page_shift))) }
+			} else {
+				ai := vgc_find_arena(addr)
 				if ai < 0 {
 					return
 				}
+				a := unsafe { &vgc_heap.arenas[ai] }
+				if a.cards == unsafe { nil } {
+					return
+				}
+				card = unsafe { &u8(voidptr(usize(a.cards) + ((addr - a.base) >> vgc_page_shift))) }
 			}
-			a := unsafe { &vgc_heap.arenas[ai] }
-			if a.cards == unsafe { nil } {
-				return
-			}
-			card := unsafe { &u8(voidptr(usize(a.cards) + (addr - a.base) / vgc_page_size)) }
 			if unsafe { *card } == 0 {
 				_ = C.vgc_atomic_fetch_or_u8(card, 1)
 			}

@@ -23,6 +23,14 @@ fn test_cgen_gate_and_native_gate_test_the_same_range() {
 	// and the same globals
 	assert cgen.contains("'extern size_t vgc_wb_lo; extern size_t vgc_wb_len;'")
 	assert hdr.contains('extern size_t vgc_wb_lo;') && hdr.contains('extern size_t vgc_wb_len;')
+	// cx-home/v#56: the card window's globals, and the gate's page shift is the collector's
+	assert cgen.contains("'extern size_t vgc_wb_card_lo; extern size_t vgc_wb_card_len; extern size_t vgc_wb_card_tab;'")
+	for name in ['vgc_wb_card_lo', 'vgc_wb_card_len', 'vgc_wb_card_tab'] {
+		assert hdr.contains('extern size_t ${name};'), name
+	}
+	assert cg[0].contains('[a >> 13]')
+	gc := os.read_file(os.join_path(vroot, 'vlib', 'builtin', 'vgc_d_vgc.c.v'))!
+	assert gc.contains('const vgc_page_shift = 13')
 }
 
 // an object-file build of a -gc e program (`-o x.o`, the way a runtime is

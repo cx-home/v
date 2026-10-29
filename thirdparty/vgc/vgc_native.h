@@ -82,6 +82,12 @@ void vgc_native_unpin(void* p);
 // promoted, and the whole address space during a concurrent middle.
 extern size_t vgc_wb_lo;
 extern size_t vgc_wb_len;
+// cx-home/v#56: the card window — a store into a page of the arena at
+// [vgc_wb_card_lo, +vgc_wb_card_len) whose card (vgc_wb_card_tab, the arena's
+// card table biased by its base; 8 KB pages) is already set makes no call.
+extern size_t vgc_wb_card_lo;
+extern size_t vgc_wb_card_len;
+extern size_t vgc_wb_card_tab;
 void vgc_wb_store(void* obj);
 #ifndef VGC_WB_UNLIKELY
   #if defined(_MSC_VER) && !defined(__clang__)
@@ -90,7 +96,7 @@ void vgc_wb_store(void* obj);
     #define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)
   #endif
 #endif
-static inline void vgc_native_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_store(p); }
+static inline void vgc_native_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { size_t a = (size_t)(uintptr_t)p; if (a - vgc_wb_card_lo < vgc_wb_card_len && ((const volatile uint8_t*)vgc_wb_card_tab)[a >> 13] != 0) return; vgc_wb_store(p); } }
 
 // 4. blocking regions: gc_safe_region_enter/exit under fixed exported names (a
 // V pub fn is static in an object-file build of the runtime, _VOBJECTFILE).
