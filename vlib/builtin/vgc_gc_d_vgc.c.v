@@ -4360,7 +4360,7 @@ fn vgc_update_trigger() {
 	vgc_gc_last_end = now
 
 	mut extra := marked * gc_percent / 100
-	// one allocating thread: the GOGC term at vgc_one_thread_pct with its grace (cx-home/v#56)
+	// one allocating thread: the GOGC term at vgc_one_thread_pct (cx-home/v#56)
 	if nt <= 1 && vgc_one_thread_small(marked) && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
 		extra = vgc_one_thread_term(marked) * gc_percent / 100
 	}

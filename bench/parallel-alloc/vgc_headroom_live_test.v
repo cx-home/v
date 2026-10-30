@@ -316,11 +316,11 @@ fn test_one_allocating_thread_paces_to_a_quarter_of_its_live_set() {
 	assert quarter <= 1.55, 'one thread at 25 % carved ${quarter:.3f}x over 8 MB live (expected ~1.25x)'
 }
 
-// cx-examples#296, #297: the small heap's grace (vgc_one_thread_grace, 2 MB). The
-// one-thread term is never under half the marked set while that half is under
-// 2 MB: 2 MB live carves the same at 25 % and at 50 % (its term is 1 MB either
-// way), where 8 MB live (the test above) carves less at 25 %.
-fn test_the_one_thread_term_keeps_half_of_a_small_live_set() {
+// cx-home/v#56: the quarter is the term at every small size — the 2 MB grace that
+// held it at half of a small marked set (cx-examples#296, #297) is gone. 2 MB live
+// carves less at 25 % than at 50 %, as 8 MB live (the test above) does, and at
+// most 1.55x its live set.
+fn test_a_small_live_set_paces_to_the_quarter_too() {
 	if os.getenv('VGC_LIVE_CHILD') != '' {
 		return
 	}
@@ -328,8 +328,8 @@ fn test_the_one_thread_term_keeps_half_of_a_small_live_set() {
 	quarter := ratio(band, 'tiny')
 	half := ratio(band + 'VGC_ONE_THREAD_PCT=50 ', 'tiny')
 	println('vgc_headroom_live: 2 MB live, one allocating thread, band held up — ${quarter:.3f}x at 25 %, ${half:.3f}x at 50 %')
-	diff := if quarter > half { quarter - half } else { half - quarter }
-	assert diff <= 0.15, 'under the grace the quarter still paced: ${quarter:.3f}x at 25 % against ${half:.3f}x at 50 %'
+	assert quarter < half, 'one thread at 25 % carved ${quarter:.3f}x over 2 MB live, not less than ${half:.3f}x at 50 %'
+	assert quarter <= 1.55, 'one thread at 25 % carved ${quarter:.3f}x over 2 MB live (expected ~1.25x)'
 }
 
 // cx-home/v#56: the one-thread percentage paces a SMALL heap — one whose marked
