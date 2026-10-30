@@ -3427,8 +3427,87 @@ fn vgc_large_demand_note(npages u32) {
 	unsafe {
 		if C.vgc_atomic_load_u32(&vgc_large_demand[i]) < 2 {
 			C.vgc_atomic_add_u32(&vgc_large_demand[i], 1)
+			if C.vgc_atomic_load_u32(&vgc_large_demand[i]) >= 2 {
+				_ = C.vgc_atomic_fetch_or_u8(&vgc_large_recur_bits[i >> 3], u8(1) << u8(i & 7))
+			}
 		}
 	}
+}
+
+// the recurring large sizes as a bitmap, a bit per page count up to
+// vgc_max_pooled_pages, set at a size's second request (above) and read by
+// vgc_pool_keeps_whole for a pooled run that could still serve a recurring
+// size the request in hand would break (cx-home/v#58: a frame merged with
+// its free neighbour is a run whose own size never recurs, and the second
+// cut's rule — the span's size recurs — let a request over half of it
+// split the run: the writer's 47 MB frames, pooled, were split by its
+// 38 MB frames and every 47 MB request carved an arena while 100-190 MB
+// sat pooled; measure/collector-epic-48, B run 2).
+__global vgc_large_recur_bits = [1025]u8{} // (vgc_max_pooled_pages + 1) bits
+
+// vgc_large_recurs_between answers whether a large size s with lo < s <= hi
+// was asked for more than once.
+fn vgc_large_recurs_between(lo u32, hi u32) bool {
+	mut h := hi
+	if h > u32(vgc_max_pooled_pages) {
+		h = u32(vgc_max_pooled_pages)
+	}
+	if h <= lo {
+		return false
+	}
+	l := lo + 1
+	mut i := int(h >> 3)
+	li := int(l >> 3)
+	for i >= li {
+		mut m := unsafe { vgc_large_recur_bits[i] }
+		if i == int(h >> 3) {
+			b := h & 7
+			if b < 7 {
+				m &= (u8(1) << u8(b + 1)) - 1
+			}
+		}
+		if i == li {
+			m &= ~((u8(1) << u8(l & 7)) - 1)
+		}
+		if m != 0 {
+			return true
+		}
+		i--
+	}
+	return false
+}
+
+// vgc_large_recurs_probe reports vgc_large_recurs_between to a test.
+pub fn vgc_large_recurs_probe(lo u32, hi u32) bool {
+	return vgc_large_recurs_between(lo, hi)
+}
+
+// vgc_large_round rounds a large request of npages, from vgc_large_round_min
+// pages up to the pooled sizes, up to a sixteenth of the power of two above
+// it — 5953, 6007, 6027 and 6071 pages all to 6144 — so a frame that drifts
+// by a few pages a period asks for one size and finds the last period's span
+// (cx-home/v#58: the batch writer's 47 MB part frame grew through those four
+// sizes over 1.5M rows and each size carved an arena while 100-190 MB sat
+// pooled, seven of the run's sixteen arenas; measure/collector-epic-48, B
+// run 2). The rounding is at most a sixteenth of the object, in pages the
+// object never touches (a carved span's pages are untouched until written;
+// a recycled span's were the pool's already).
+const vgc_large_round_min = 256
+
+fn vgc_large_round(npages u32) u32 {
+	if npages < u32(vgc_large_round_min) || npages > u32(vgc_max_pooled_pages) {
+		return npages
+	}
+	mut p := u32(1)
+	for p < npages {
+		p <<= 1
+	}
+	g := p >> 4
+	r := (npages + g - 1) / g * g
+	if r > u32(vgc_max_pooled_pages) {
+		return npages
+	}
+	return r
 }
 
 // vgc_large_size_recurs answers whether a large object of npages was asked
@@ -3469,7 +3548,10 @@ fn vgc_pool_keeps_whole(cand &VGC_Span, n u32, npages u32, cap u32) bool {
 	if cap != 0 && n > cap {
 		return true
 	}
-	return n > npages + u32(vgc_pool_merge_min) && vgc_large_size_recurs(n)
+	// the span's own size recurs (s = n), or a recurring size the request
+	// would break still fits the run (a merged run: cx-home/v#58)
+	return n > npages + u32(vgc_pool_merge_min)
+		&& vgc_large_recurs_between(npages + u32(vgc_pool_merge_min), n)
 }
 
 // vgc_get_free_span_any is the lookup with no split cap: the arena tails are
@@ -6187,7 +6269,8 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 
 // Allocate a large object (> 32KB) with its own span
 fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
-	npages := u32((n + vgc_page_size - 1) / vgc_page_size)
+	// cx-home/v#58: a drifting frame asks for one size (vgc_large_round)
+	npages := vgc_large_round(u32((n + vgc_page_size - 1) / vgc_page_size))
 	vgc_large_demand_note(npages)
 	mut span := vgc_span_alloc(npages)
 	if span == unsafe { nil } {
