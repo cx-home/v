@@ -1139,15 +1139,22 @@ __global vgc_full_goal = u64(0)
 __global vgc_minor_last_spans = u64(0)
 __global vgc_minor_last_objs = u64(0)
 __global vgc_force_full = u32(0)
-// the barrier's arena hint (vgc_wb_store's fast path): the index + 1 of the
-// arena the gate's low end lies in, 0 none, stored by vgc_wb_set (STW). An
+// the barrier's arena hint (vgc_wb_store's fast path): the entry of the
+// arena the gate's low end lies in, nil none, stored by vgc_wb_set (STW). An
 // arena's entry never moves and its base, size and cards never change once
 // published, so a stale hint resolves a store correctly or misses to
-// vgc_find_arena. The interpreter stores into its start-up state (the
-// permanent generation) some 25 M times in json-codec 1 KB x100,000, and the
-// full resolution on every call read +9 % instructions retired and +4 % wall
-// against the flat table's range test (measure/collector-epic-23).
-__global vgc_wb_arena_hint = u32(0)
+// vgc_find_arena (vgc_wb_store_slow). The interpreter stores into its
+// start-up state (the permanent generation) some 25 M times in json-codec
+// 1 KB x100,000, and the full resolution on every call read +9 % instructions
+// retired and +4 % wall against the flat table's range test
+// (measure/collector-epic-23). The hint is the entry's address, not its
+// index (cx-home/v#56, fasta 25,000,000 +2.4 % wall on the stack): an index
+// into vgc_heap.arenas cost the fast path a bounds check with its panic
+// frame (a stack-protected 0x80-byte frame on every call), a second acquire
+// load and two multiplies — 83 instructions against the flat table's 48,
+// and 3.3x the barrier's share of the mutator's samples — where the entry
+// read through a pointer costs one plain load.
+__global vgc_wb_hint = &VGC_Arena(unsafe { nil })
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime, bit 2 the young regime.
@@ -1166,11 +1173,14 @@ fn vgc_wb_set(mode u32) {
 		vgc_wb_lo = vgc_perm_lo
 		vgc_wb_len = vgc_perm_len
 	}
-	mut hint := 0
+	mut hint := &VGC_Arena(unsafe { nil })
 	if (mode & 1) == 0 && vgc_wb_len != 0 {
-		hint = vgc_find_arena(vgc_wb_lo) + 1
+		ai := vgc_find_arena(vgc_wb_lo)
+		if ai >= 0 {
+			hint = unsafe { &vgc_heap.arenas[ai] }
+		}
 	}
-	C.vgc_atomic_store_u32(&vgc_wb_arena_hint, u32(hint))
+	vgc_wb_hint = hint
 }
 
 // vgc_wb_regime is the barrier mode outside a concurrent middle: the

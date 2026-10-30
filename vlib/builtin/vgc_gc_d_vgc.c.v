@@ -3442,23 +3442,17 @@ pub fn vgc_wb_store(obj voidptr) {
 			// the permanent or the young regime alone: the page's card in its
 			// arena's table, set when not set (vgc_young_mode doc); the stop
 			// reads it as the span's dirty bit. The arena is the hint's
-			// (vgc_wb_arena_hint: one range test) or vgc_find_arena's.
+			// (vgc_wb_hint: one plain load and one range test, no index into
+			// vgc_heap.arenas on this path — its bounds check and panic frame
+			// cost fasta 25,000,000 +2.4 % of wall) or, off the hint,
+			// vgc_find_arena's out of line.
 			addr := usize(obj)
-			mut ai := int(C.vgc_atomic_load_u32(&vgc_wb_arena_hint)) - 1
-			if ai < 0 || addr - vgc_heap.arenas[ai].base >= vgc_heap.arenas[ai].size {
-				ai = vgc_find_arena(addr)
-				if ai < 0 {
-					return
-				}
-			}
-			a := unsafe { &vgc_heap.arenas[ai] }
-			if a.cards == unsafe { nil } {
+			h := vgc_wb_hint
+			if h != unsafe { nil } && addr - h.base < h.size {
+				vgc_card_set(h, addr)
 				return
 			}
-			card := unsafe { &u8(voidptr(usize(a.cards) + (addr - a.base) / vgc_page_size)) }
-			if unsafe { *card } == 0 {
-				_ = C.vgc_atomic_fetch_or_u8(card, 1)
-			}
+			vgc_wb_store_slow(addr)
 			return
 		}
 		span := vgc_find_span(obj)
@@ -3471,6 +3465,34 @@ pub fn vgc_wb_store(obj voidptr) {
 				}
 			}
 		}
+	}
+}
+
+// vgc_card_set sets the card of the page addr lies on in arena a's table,
+// when it is not set (the barrier's one idempotent atomic byte store).
+@[inline]
+fn vgc_card_set(a &VGC_Arena, addr usize) {
+	if a.cards == unsafe { nil } {
+		return
+	}
+	card := unsafe { &u8(voidptr(usize(a.cards) + (addr - a.base) / vgc_page_size)) }
+	if unsafe { *card } == 0 {
+		_ = C.vgc_atomic_fetch_or_u8(card, 1)
+	}
+}
+
+// vgc_wb_store_slow is the barrier's path off the hint: the store's arena
+// resolved by vgc_find_arena. Out of line so the fast path carries no frame
+// for it (the indexed read of vgc_heap.arenas has a bounds check whose panic
+// builds its message on the stack).
+@[noinline]
+fn vgc_wb_store_slow(addr usize) {
+	$if vgc_concurrent ? {
+		ai := vgc_find_arena(addr)
+		if ai < 0 {
+			return
+		}
+		vgc_card_set(unsafe { &vgc_heap.arenas[ai] }, addr)
 	}
 }
 
