@@ -526,9 +526,17 @@ mut:
 struct VGC_WorkBuf {
 mut:
 	nobj int
+	// cx-home/v#61 trace: a canary word on each side of the slots, written at
+	// the carve and read by vgc_work_check at every pop and list move — a wild
+	// store into the buffer (the queue's own stores keep nobj in 0..256) is
+	// named by the word it broke, not by the index panic it leads to.
+	lo   u64
 	obj  [256]usize // pointers to mark
+	hi   u64
 	next &VGC_WorkBuf = unsafe { nil }
 }
+
+const vgc_workbuf_canary = u64(0xc0ffee61c0ffee61)
 
 // VGC_Heap is the global heap.
 // Translated from Go's runtime.mheap.
@@ -4303,7 +4311,12 @@ fn vgc_workbuf_carve() &VGC_WorkBuf {
 	}
 	p := vgc_workbuf_cur
 	vgc_workbuf_cur += bsz
-	return unsafe { &VGC_WorkBuf(voidptr(p)) }
+	mut nb := unsafe { &VGC_WorkBuf(voidptr(p)) }
+	unsafe {
+		nb.lo = vgc_workbuf_canary
+		nb.hi = vgc_workbuf_canary
+	}
+	return nb
 }
 
 // Allocate a new span with the given number of pages

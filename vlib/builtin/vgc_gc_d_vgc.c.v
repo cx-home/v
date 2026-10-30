@@ -3092,6 +3092,7 @@ fn vgc_work_put(addr usize, w int) {
 	if buf == unsafe { nil } || buf.nobj >= 256 {
 		C.vgc_mutex_lock(&vgc_heap.work_lock)
 		if buf != unsafe { nil } {
+			vgc_work_check(w, buf, 2)
 			unsafe {
 				buf.next = vgc_heap.work_full
 				vgc_heap.work_full = buf
@@ -3099,6 +3100,7 @@ fn vgc_work_put(addr usize, w int) {
 		}
 		mut nb := vgc_heap.work_empty
 		if nb != unsafe { nil } {
+			vgc_work_check(w, nb, 3)
 			unsafe {
 				vgc_heap.work_empty = nb.next
 			}
@@ -3129,6 +3131,7 @@ fn vgc_work_put(addr usize, w int) {
 fn vgc_work_get(w int) usize {
 	mut buf := unsafe { &VGC_WorkBuf(voidptr(vgc_mark_local[w])) }
 	if buf != unsafe { nil } && buf.nobj > 0 {
+		vgc_work_check(w, buf, 1)
 		unsafe {
 			buf.nobj--
 			return buf.obj[buf.nobj]
@@ -3137,10 +3140,12 @@ fn vgc_work_get(w int) usize {
 	C.vgc_mutex_lock(&vgc_heap.work_lock)
 	mut fb := vgc_heap.work_full
 	if fb != unsafe { nil } {
+		vgc_work_check(w, fb, 4)
 		unsafe {
 			vgc_heap.work_full = fb.next
 		}
 		if buf != unsafe { nil } {
+			vgc_work_check(w, buf, 5)
 			unsafe {
 				buf.next = vgc_heap.work_empty
 				vgc_heap.work_empty = buf
@@ -3192,6 +3197,27 @@ fn vgc_work_dump(w int, buf &VGC_WorkBuf, from_full int) {
 	C.vgc_say(0x610d, u64(voidptr(buf.next)))
 }
 
+// cx-home/v#61 trace: the canaries and the count of a buffer the queue is about
+// to pop from or move, checked at every pop and list move. A broken word or a
+// count outside 0..256 prints 6110 where (1 the local pop, 2 the publish of a
+// full buffer, 3 the take of an empty one, 4 the take of a full one, 5 the
+// return of an empty one, 6 the balance's source, 7 the balance's target, 8 the
+// flush), 6111 the low canary, 6112 the high canary, 6113 nobj, then
+// vgc_work_dump's lines, and aborts — a recurrence names a corruption (a wild
+// store) or a protocol race (two threads on one buffer), not an index.
+@[inline]
+fn vgc_work_check(w int, buf &VGC_WorkBuf, where int) {
+	if buf.lo == vgc_workbuf_canary && buf.hi == vgc_workbuf_canary && buf.nobj >= 0 && buf.nobj <= 256 {
+		return
+	}
+	C.vgc_say(0x6110, u64(where))
+	C.vgc_say(0x6111, buf.lo)
+	C.vgc_say(0x6112, buf.hi)
+	C.vgc_say(0x6113, u64(buf.nobj))
+	vgc_work_dump(w, buf, where)
+	C.abort()
+}
+
 // Move half of the marker's local buffer (when it holds at least 64 entries)
 // into a buffer published on the shared list, for the idle markers.
 fn vgc_work_balance(w int) {
@@ -3212,6 +3238,8 @@ fn vgc_work_balance(w int) {
 		C.vgc_mutex_unlock(&vgc_heap.work_lock)
 		return
 	}
+	vgc_work_check(w, buf, 6)
+	vgc_work_check(w, nb, 7)
 	half := buf.nobj / 2
 	unsafe {
 		for i in 0 .. half {
@@ -3233,6 +3261,7 @@ fn vgc_work_flush_local(w int) {
 		return
 	}
 	C.vgc_mutex_lock(&vgc_heap.work_lock)
+	vgc_work_check(w, buf, 8)
 	if buf.nobj > 0 {
 		unsafe {
 			buf.next = vgc_heap.work_full
