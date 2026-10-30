@@ -238,7 +238,8 @@ fn test_one_allocating_thread_paces_to_twice_the_live_set() {
 	// reads the floors alone (macOS: 2.066x / 3.115x).
 	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
 	one := ratio(band, 'small')
-	one_old := ratio(band + 'VGC_ONE_THREAD_PCT=100 VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
+	one_old := ratio(band +
+		'VGC_ONE_THREAD_PCT=100 VGC_HEADROOM_FLOOR_LO1_MB=4 VGC_HEADROOM_LIVE_PCT=200 ', 'small')
 	println('vgc_headroom_live: 8 MB live, one allocating thread, band held up — ${one:.3f}x (GOGC=100 floor), ${one_old:.3f}x (2 x marked)')
 	assert one <= 2.5, 'one allocating thread carved ${one:.3f}x over 8 MB live (expected ~2x: live + 1 x marked)'
 	assert one < one_old, 'the 1 x marked floor carved ${one:.3f}x, not less than ${one_old:.3f}x'
@@ -317,19 +318,54 @@ fn test_one_allocating_thread_paces_to_a_quarter_of_its_live_set() {
 }
 
 // cx-home/v#56: the quarter is the term at every small size — the 2 MB grace that
-// held it at half of a small marked set (cx-examples#296, #297) is gone. 2 MB live
-// carves less at 25 % than at 50 %, as 8 MB live (the test above) does, and at
-// most 1.55x its live set.
+// held it at half of a small marked set (cx-examples#296, #297) is gone. The term
+// is read directly: young/term.v keeps 2 MB live, runs a full cycle and prints the
+// heap in use after it and the goal that cycle set (vgc_full_goal_probe); the goal
+// less the use is one allocating thread's term. At 25 % it is about a quarter of
+// the use, less than the half at 50 % and the whole at 100 %. (The churn child
+// under the held-up band could not tell the two apart over 2 MB live: the 50 ms
+// stall's own allocation, over 1 MB a cycle, swamped a 0.5-1 MB term — 1.656x at
+// 25 % and at 50 % alike.)
 fn test_a_small_live_set_paces_to_the_quarter_too() {
 	if os.getenv('VGC_LIVE_CHILD') != '' {
 		return
 	}
-	band := 'VGC_PACER_WALL=1 VGC_TEST_COLLECTOR_STALL_US=50000 '
-	quarter := ratio(band, 'tiny')
-	half := ratio(band + 'VGC_ONE_THREAD_PCT=50 ', 'tiny')
-	println('vgc_headroom_live: 2 MB live, one allocating thread, band held up — ${quarter:.3f}x at 25 %, ${half:.3f}x at 50 %')
-	assert quarter < half, 'one thread at 25 % carved ${quarter:.3f}x over 2 MB live, not less than ${half:.3f}x at 50 %'
-	assert quarter <= 1.55, 'one thread at 25 % carved ${quarter:.3f}x over 2 MB live (expected ~1.25x)'
+	exe := build_term()
+	defer {
+		os.rm(exe) or {}
+	}
+	quarter := term_over_use(exe, '')
+	half := term_over_use(exe, 'VGC_ONE_THREAD_PCT=50 ')
+	full := term_over_use(exe, 'VGC_ONE_THREAD_PCT=100 ')
+	println('vgc_headroom_live: 2 MB live, one allocating thread, the term over the use — ${quarter:.3f} at 25 %, ${half:.3f} at 50 %, ${full:.3f} at 100 %')
+	assert half < full, 'one thread at 50 % got a term of ${half:.3f} of 2 MB live, not less than ${full:.3f} at 100 %'
+	assert quarter < half, 'one thread at 25 % got a term of ${quarter:.3f} of 2 MB live, not less than ${half:.3f} at 50 %'
+	assert quarter >= 0.15 && quarter <= 0.40, 'one thread at 25 % got a term of ${quarter:.3f} of 2 MB live (expected ~0.25)'
+}
+
+// build_term compiles young/term.v (`-gc e`) beside the test; term_over_use runs
+// it under env and returns (GOAL - USE) / USE from its line.
+fn build_term() string {
+	src := os.join_path(@DIR, 'young', 'term.v')
+	exe := os.join_path(os.vtmp_dir(), 'vgc_headroom_term_${os.getpid()}')
+	r :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	assert r.exit_code == 0, r.output
+	return exe
+}
+
+fn term_over_use(exe string, env string) f64 {
+	r := os.execute('${env}${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	for l in r.output.split_into_lines() {
+		if l.starts_with('USE=') {
+			use := l.all_after('USE=').all_before(' ').f64()
+			goal := l.all_after('GOAL=').all_before(' ').f64()
+			assert use > 0, l
+			return (goal - use) / use
+		}
+	}
+	panic(r.output)
 }
 
 // cx-home/v#56: the one-thread percentage paces a SMALL heap — one whose marked
