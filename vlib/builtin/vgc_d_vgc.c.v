@@ -161,6 +161,15 @@ const vgc_max_pooled_pages = 8192
 // both merge participants must qualify, so small per-size pools are never
 // depleted from the side either.
 const vgc_pool_merge_min = 16
+// cx-home/v#58: a freed run of this many pages or more joins a COLD pooled
+// neighbour at its free — the run is returned to the OS first (the trim's
+// decommit, two cycles early) so the two states agree and the region is one
+// run. Without it a frame freed beside a trimmed frame stayed a separate hot
+// run until its own trim, and a request the two together would have served
+// carved an arena while 25–176 MB sat pooled in runs under the request
+// (measure/collector-epic-64, the carve lines). 128 pages = 1 MB at 8 KB
+// pages: the frames are thousands of pages, the size-class spans far under.
+const vgc_pool_cold_merge_min = 128
 // Architectural arena-count ceiling: 1024 x 64 MB = 64 GB of heap address
 // capacity (cx #282; was 64 = 4 GB). Cheap to compile in because VGC_Arena no
 // longer embeds its page->span map (see the struct): the static arenas table
@@ -1211,6 +1220,12 @@ pub fn vgc_cm_verify_missed_count() u64 {
 // vgc_card_dirty reports whether the card of the page p lies in is set
 // (cx-home/v#56 step 1): a pointer was stored into that page since the last
 // stop. False outside the arenas and under the default build.
+// vgc_arenas_count reports the arenas carved so far (cx-home/v#58's test:
+// a request the pool serves carves none).
+pub fn vgc_arenas_count() int {
+	return int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+}
+
 pub fn vgc_card_dirty(p voidptr) bool {
 	mut dirty := false
 	$if vgc_concurrent ? {
@@ -4544,12 +4559,14 @@ fn vgc_put_free_span(mut span VGC_Span) {
 		if cur.base > a.base {
 			pidx := (cur.base - a.base) / vgc_page_size - 1
 			mut p := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[pidx]))))) }
-			if p != unsafe { nil } && p.pooled && !p.in_use && p.decommitted == cur.decommitted
-				&& p.npages >= u32(vgc_pool_merge_min) && p.npages <= u32(vgc_max_pooled_pages)
+			if p != unsafe { nil } && p.pooled && !p.in_use
+				&& vgc_pool_states_meet(p, cur) && p.npages >= u32(vgc_pool_merge_min)
+				&& p.npages <= u32(vgc_max_pooled_pages)
 				&& p.base + usize(p.npages) * vgc_page_size == cur.base {
 				if p.pool_gen < gen {
 					gen = p.pool_gen
 				}
+				vgc_pool_go_cold_for(mut cur, p)
 				vgc_pool_unlink(mut p)
 				vgc_span_repoint_pages(arena_idx, cur.base, cur.npages, p)
 				p.npages += cur.npages
@@ -4565,12 +4582,13 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			sidx := (end - a.base) / vgc_page_size
 			if sidx < map_pages {
 				mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[sidx]))))) }
-				if s != unsafe { nil } && s.pooled && !s.in_use && s.decommitted == cur.decommitted
-					&& s.npages >= u32(vgc_pool_merge_min) && s.npages <= u32(vgc_max_pooled_pages)
-					&& s.base == end {
+				if s != unsafe { nil } && s.pooled && !s.in_use
+					&& vgc_pool_states_meet(s, cur) && s.npages >= u32(vgc_pool_merge_min)
+					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end {
 					if s.pool_gen < gen {
 						gen = s.pool_gen
 					}
+					vgc_pool_go_cold_for(mut cur, s)
 					vgc_pool_unlink(mut s)
 					vgc_span_repoint_pages(arena_idx, s.base, s.npages, cur)
 					cur.npages += s.npages
@@ -4581,6 +4599,28 @@ fn vgc_put_free_span(mut span VGC_Span) {
 		}
 	}
 	vgc_pool_push_aged(mut cur, gen)
+}
+
+// vgc_pool_states_meet says whether the pooled neighbour nb can join the run
+// cur being freed: equal decommit states as before, or a cold neighbour
+// beside a hot run of vgc_pool_cold_merge_min pages or more, which
+// vgc_pool_go_cold_for returns to the OS before the merge (cx-home/v#58).
+@[inline]
+fn vgc_pool_states_meet(nb &VGC_Span, cur &VGC_Span) bool {
+	return nb.decommitted == cur.decommitted
+		|| (nb.decommitted && !cur.decommitted && cur.npages >= u32(vgc_pool_cold_merge_min))
+}
+
+// vgc_pool_go_cold_for returns the hot run cur to the OS when the neighbour
+// it is about to absorb is cold, so the merged region is one cold run (its
+// pop recommits it, as every cold span's does). cur is on no pool list here
+// (freshly freed, or the lower neighbour already unlinked), so no pool
+// counter moves; vgc_pool_push_aged files the merged run by its flag.
+fn vgc_pool_go_cold_for(mut cur VGC_Span, nb &VGC_Span) {
+	if nb.decommitted && !cur.decommitted {
+		vgc_pool_decommit_pages(cur.base, usize(cur.npages) * vgc_page_size)
+		cur.decommitted = true
+	}
 }
 
 // vgc_retire_span_desc zeroes an absorbed span descriptor and parks it on the
