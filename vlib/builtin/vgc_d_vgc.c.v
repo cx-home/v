@@ -135,7 +135,7 @@ fn C.vgc_addr_to_arena(addr usize) int
 // Constants (translated from Go's runtime constants)
 // ============================================================
 
-const vgc_page_shift = 13
+const vgc_page_shift = 13 // cgen's inline gate carries it as VGC_WB_PAGE_SHIFT (vgc_wb_card_test.v)
 const vgc_page_size = 8192
 const vgc_max_small_size = u32(32768) // objects > this are "large"
 const vgc_num_classes = 68
@@ -1154,6 +1154,31 @@ __global vgc_force_full = u32(0)
 // full resolution on every call read +9 % instructions retired and +4 % wall
 // against the flat table's range test (measure/collector-epic-23).
 __global vgc_wb_arena_hint = u32(0)
+// cx-home/v#56 lever 5: the generated C's gate reads the card itself. The
+// hint arena as a record the gate can read (cgen's vgc_wb_gate: `struct
+// vgc_wb_hint_t`, the same three fields in the same order): a store the
+// range test let through, into the hint arena, whose page's card is set
+// makes no call — vgc_wb_store would read that card and return — so the
+// interpreter's stores into its start-up state (25 M in json-codec 1 KB
+// x100,000, measure/collector-epic-23) pay the call once per page per stop.
+// An arena's record is written once (its base, size and table never change)
+// and never rewritten, so the one pointer load a gate makes reads a record
+// consistent with itself: a mutator frozen mid-gate across a stop that moved
+// the hint reads the old record or the new, and either resolves its store in
+// that arena correctly or calls the barrier. vgc_wb_hp is nil in a concurrent
+// middle (every store dirties its span through the call, vgc_wb_set(1)) and
+// when the hint arena has no table. vgc_wb_calls counts the calls made under
+// -d vgc_wb_count (vgc_wb_calls_count, the lever's test).
+struct VGC_WbHint {
+mut:
+	base  usize
+	size  usize
+	cards &u8 = unsafe { nil }
+}
+
+__global vgc_wb_hints = [vgc_max_arenas]VGC_WbHint{}
+__global vgc_wb_hp = voidptr(0)
+__global vgc_wb_calls = u64(0)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime, bit 2 the young regime.
@@ -1177,6 +1202,28 @@ fn vgc_wb_set(mode u32) {
 		hint = vgc_find_arena(vgc_wb_lo) + 1
 	}
 	C.vgc_atomic_store_u32(&vgc_wb_arena_hint, u32(hint))
+	// the gate's record of the hint arena (cx-home/v#56 lever 5), nil in a
+	// concurrent middle (hint 0 there) and for an arena without a table
+	mut hp := voidptr(0)
+	if hint > 0 {
+		a := unsafe { &vgc_heap.arenas[hint - 1] }
+		if a.cards != unsafe { nil } {
+			mut rec := unsafe { &vgc_wb_hints[hint - 1] }
+			if rec.cards == unsafe { nil } {
+				rec.base = a.base
+				rec.size = a.size
+				rec.cards = a.cards
+			}
+			hp = voidptr(rec)
+		}
+	}
+	vgc_wb_hp = hp
+}
+
+// vgc_wb_calls_count reports the barrier calls made so far under
+// -d vgc_wb_count (cx-home/v#56 lever 5's test; 0 in every other build).
+pub fn vgc_wb_calls_count() u64 {
+	return C.vgc_atomic_load_u64(&vgc_wb_calls)
 }
 
 // vgc_wb_regime is the barrier mode outside a concurrent middle: the
