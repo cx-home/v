@@ -3432,6 +3432,7 @@ fn vgc_large_demand_note(npages u32) {
 			}
 		}
 	}
+	vgc_large_block_note(npages)
 }
 
 // the recurring large sizes as a bitmap, a bit per page count up to
@@ -3445,10 +3446,89 @@ fn vgc_large_demand_note(npages u32) {
 // sat pooled; measure/collector-epic-48, B run 2).
 __global vgc_large_recur_bits = [1025]u8{} // (vgc_max_pooled_pages + 1) bits
 
+// the granule blocks (vgc_large_round_up's: the sizes that round to one r
+// are (r - g, r]) asked for more than once, a bit at the block's top r, set
+// at the block's second request (vgc_large_block_demand by r, saturates at
+// 2; vgc_large_block_note from vgc_large_demand_note): a batch writer's part
+// frame drifts by a few pages a period (4814, 4841, 4864, 4872 pages at 1.5M
+// rows), so no exact size is asked for twice while its block is asked for
+// every period, and the smaller requests between the periods (2407-3652
+// pages) split the last period's span; the next frame then carves an arena
+// with 100-190 MB pooled (cx-home/v#58, measure/collector-epic-60's carve
+// lines). vgc_large_recurs_between reads the blocks beside the exact sizes,
+// so a pooled run that could still serve the block is kept whole from a
+// request that would break it (vgc_pool_keeps_whole). A size asked for alone
+// in its block counts once, as before: the JSON convert's doubled buffers
+// (385, 769, 1025, 2049, 4097 pages) each sit in a block of their own.
+__global vgc_large_block_demand = [8193]u32{} // by the block's top r
+__global vgc_large_block_bits = [1025]u8{}
+
+// vgc_large_block_lo is the lower bound (exclusive) of the granule block whose
+// top is r: the sizes s with vgc_large_round_up(s) == r are (r - g, r] for g
+// the sixteenth of the power of two at or below r - 1 (a power of two's own
+// block is a sixteenth of the power below it wide).
+fn vgc_large_block_lo(r u32) u32 {
+	if r <= u32(vgc_large_round_min) {
+		return r - 1
+	}
+	mut p := u32(1)
+	for p << 1 <= r - 1 {
+		p <<= 1
+	}
+	return r - (p >> 4)
+}
+
+fn vgc_large_block_note(npages u32) {
+	if npages < u32(vgc_large_round_min) || npages > u32(vgc_max_pooled_pages) {
+		return
+	}
+	i := int(vgc_large_round_up(npages))
+	unsafe {
+		if C.vgc_atomic_load_u32(&vgc_large_block_demand[i]) < 2 {
+			C.vgc_atomic_add_u32(&vgc_large_block_demand[i], 1)
+			if C.vgc_atomic_load_u32(&vgc_large_block_demand[i]) >= 2 {
+				_ = C.vgc_atomic_fetch_or_u8(&vgc_large_block_bits[i >> 3], u8(1) << u8(i & 7))
+			}
+		}
+	}
+}
+
+// vgc_large_block_recurs_between answers whether a granule block asked for
+// more than once holds a size s with lo < s <= hi: a block top r past lo
+// whose block reaches below hi.
+fn vgc_large_block_recurs_between(lo u32, hi u32) bool {
+	mut h := hi
+	if h > u32(vgc_max_pooled_pages) {
+		h = u32(vgc_max_pooled_pages)
+	}
+	if h <= lo {
+		return false
+	}
+	mut top := h + u32(vgc_max_pooled_pages >> 4) // a block is at most that wide
+	if top > u32(vgc_max_pooled_pages) {
+		top = u32(vgc_max_pooled_pages)
+	}
+	mut r := lo + 1
+	for r <= top {
+		m := unsafe { vgc_large_block_bits[r >> 3] }
+		if m == 0 {
+			r = (r | 7) + 1
+			continue
+		}
+		if (m >> u8(r & 7)) & 1 != 0 && vgc_large_block_lo(r) < h {
+			return true
+		}
+		r++
+	}
+	return false
+}
+
 // vgc_large_recurs_between answers whether a large size s with lo < s <= hi
-// was asked for more than once.
+// was asked for more than once, exactly or as a size of its granule block
+// (cx-home/v#58: the drifting frame).
 fn vgc_large_recurs_between(lo u32, hi u32) bool {
 	return vgc_large_bits_between(&vgc_large_recur_bits[0], lo, hi)
+		|| vgc_large_block_recurs_between(lo, hi)
 }
 
 // vgc_large_bits_between answers whether a bit of the page-count bitmap at
@@ -3614,7 +3694,8 @@ fn vgc_pool_keeps_whole(cand &VGC_Span, n u32, npages u32, cap u32) bool {
 		return true
 	}
 	// the span's own size recurs (s = n), or a recurring size the request
-	// would break still fits the run (a merged run: cx-home/v#58)
+	// would break still fits the run (a merged run: cx-home/v#58) — a size
+	// recurs exactly or through its granule block (the drifting frame)
 	return n > npages + u32(vgc_pool_merge_min)
 		&& vgc_large_recurs_between(npages + u32(vgc_pool_merge_min), n)
 }
