@@ -3511,6 +3511,9 @@ fn vgc_write_barrier(new_val voidptr) {
 @[export: 'vgc_wb_store']
 pub fn vgc_wb_store(obj voidptr) {
 	$if vgc_concurrent ? {
+		$if vgc_wb_count ? {
+			C.vgc_atomic_add_u64(&vgc_wb_calls, 1)
+		}
 		mode := C.vgc_atomic_load_u32(&vgc_heap.wb_enabled)
 		if mode == 0 {
 			return
