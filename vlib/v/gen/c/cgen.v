@@ -1330,6 +1330,15 @@ pub fn (mut g Gen) init() {
 			// native header (thirdparty/vgc/vgc_native.h) defines the same way.
 			g.cheaders.writeln('#ifndef VGC_WB_UNLIKELY\n#if defined(_MSC_VER) && !defined(__clang__)\n#define VGC_WB_UNLIKELY(x) (x)\n#else\n#define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)\n#endif\n#endif')
 			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_store(p); }')
+			// cx-home/v#56 lever 3: a store statement's second gate is made only when
+			// a stop ran between its first gate and its store (assign_stmt): the stop
+			// count vgc_wb_epoch read before the first gate, compared after the store.
+			// A volatile read and a compiler fence keep the two reads around the store;
+			// the hazard is this thread's own suspension, so no CPU fence is needed.
+			g.cheaders.writeln('extern size_t vgc_wb_epoch;')
+			g.cheaders.writeln('#if defined(_MSC_VER) && !defined(__clang__)\n#define VGC_WB_CFENCE() _ReadWriteBarrier()\n#else\n#define VGC_WB_CFENCE() __asm__ __volatile__("" ::: "memory")\n#endif')
+			g.cheaders.writeln('static inline size_t vgc_wb_epoch_now(void) { size_t e = *(volatile size_t*)&vgc_wb_epoch; VGC_WB_CFENCE(); return e; }')
+			g.cheaders.writeln('static inline int vgc_wb_epoch_moved(size_t e) { VGC_WB_CFENCE(); return VGC_WB_UNLIKELY(*(volatile size_t*)&vgc_wb_epoch != e); }')
 		}
 		g.cheaders.writeln(c_float_to_unsigned_conversion_functions)
 		if !g.pref.skip_unused || g.table.used_features.safe_int {

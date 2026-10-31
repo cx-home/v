@@ -527,13 +527,14 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 	// historic tentative definition per TU relied on the linker merging common
 	// symbols, which current Apple ld and lld no longer do (duplicate-symbol error).
 	is_bundled_mod := util.should_bundle_module(node.mod)
-	// NATV-18 (cx-home/v#47): vgc_wb_lo / vgc_wb_len are the store gate's range,
+	// NATV-18 (cx-home/v#47): vgc_wb_lo / vgc_wb_len are the store gate's range
+	// (and vgc_wb_epoch the stop count its second gate reads, cx-home/v#56),
 	// declared `extern` in the C headers (cgen's vgc_wb_gate and
 	// thirdparty/vgc/vgc_native.h) for every unit that stores, native ones
 	// included; an object-file build (-o x.o) gave them object-local linkage, and
 	// `static` after the headers' `extern` is a C error (no -gc e object built).
 	is_vgc_abi_global := node.mod == 'builtin'
-		&& node.fields.any(it.name.all_after_last('.') in ['vgc_wb_lo', 'vgc_wb_len'])
+		&& node.fields.any(it.name.all_after_last('.') in ['vgc_wb_lo', 'vgc_wb_len', 'vgc_wb_epoch'])
 	visibility_kw := if g.should_use_object_local_linkage(node.mod) && !is_vgc_abi_global {
 		'static '
 	} else if g.pref.build_mode == .build_module && is_bundled_mod {
