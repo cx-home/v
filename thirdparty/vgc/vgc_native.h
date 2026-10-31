@@ -79,9 +79,16 @@ void vgc_native_unpin(void* p);
 // 3. the store barrier. The test is cgen's vgc_wb_gate (vlib/v/gen/c/cgen.v,
 // held equal by vlib/v/gen/c/vgc_native_header_test.v): [vgc_wb_lo, +vgc_wb_len)
 // is empty when no barrier is needed, the permanent generation's range once
-// promoted, and the whole address space during a concurrent middle.
+// promoted, and the whole address space during a concurrent middle. A store
+// into the hint arena (vgc_wb_hp: the runtime's VGC_WbHint record of the
+// arena the range's low end lies in — base, size, cards — written once per
+// arena, nil in a concurrent middle) whose page's card is set makes no call
+// (cx-home/v#56); the page shift is the runtime's vgc_page_shift.
 extern size_t vgc_wb_lo;
 extern size_t vgc_wb_len;
+struct vgc_wb_hint_t { size_t base; size_t size; unsigned char* cards; };
+extern void* vgc_wb_hp;
+#define VGC_WB_PAGE_SHIFT 13
 void vgc_wb_store(void* obj);
 #ifndef VGC_WB_UNLIKELY
   #if defined(_MSC_VER) && !defined(__clang__)
@@ -90,7 +97,7 @@ void vgc_wb_store(void* obj);
     #define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)
   #endif
 #endif
-static inline void vgc_native_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_store(p); }
+static inline void vgc_native_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { const struct vgc_wb_hint_t* h = (const struct vgc_wb_hint_t*)vgc_wb_hp; if (h != 0 && (size_t)(uintptr_t)p - h->base < h->size && h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return; vgc_wb_store(p); } }
 
 // 4. blocking regions: gc_safe_region_enter/exit under fixed exported names (a
 // V pub fn is static in an object-file build of the runtime, _VOBJECTFILE).

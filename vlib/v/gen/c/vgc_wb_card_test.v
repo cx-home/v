@@ -28,12 +28,12 @@ fn test_the_gate_reads_the_card_before_the_call() {
 	gate := c.split_into_lines().filter(it.starts_with('static inline void vgc_wb_gate(void* p)'))
 	assert gate.len == 1, 'the gate is not emitted once'
 	g := gate[0]
-	assert g.contains('a - vgc_wb_lo < vgc_wb_len'), 'the range test is gone:\n${g}'
-	card := g.index('h->cards[(a - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return;') or { -1 }
+	assert g.contains('(size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len'), 'the range test is gone:\n${g}'
+	card := g.index('h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return;') or { -1 }
 	call := g.index('vgc_wb_store(p);') or { -1 }
 	assert card >= 0, 'the gate does not read the card:\n${g}'
 	assert call > card, 'the call is not after the card read:\n${g}'
-	assert g.contains('h != 0 && a - h->base < h->size &&'), 'the card read is not under the hint\'s range:\n${g}'
+	assert g.contains('h != 0 && (size_t)(uintptr_t)p - h->base < h->size &&'), 'the card read is not under the hint\'s range:\n${g}'
 	built :=
 		os.execute('${os.quoted_path(vexe)} -gc e -o ${os.quoted_path(out)} ${os.quoted_path(src)}')
 	assert built.exit_code == 0, built.output
