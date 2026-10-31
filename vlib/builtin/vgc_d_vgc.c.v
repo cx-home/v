@@ -1215,6 +1215,8 @@ mut:
 __global vgc_wb_hints = [vgc_max_arenas]VGC_WbHint{}
 __global vgc_wb_hp = voidptr(0)
 __global vgc_wb_calls = u64(0)
+// the calls that went off the hint record to vgc_wb_store_slow (lever 6)
+__global vgc_wb_slow_calls = u64(0)
 
 // vgc_wb_set stores the barrier mode (see vgc_wb_store): bit 0 the concurrent
 // middle, bit 1 the permanent regime, bit 2 the young regime.
@@ -1261,6 +1263,13 @@ fn vgc_wb_set(mode u32) {
 // -d vgc_wb_count (cx-home/v#56 lever 5's test; 0 in every other build).
 pub fn vgc_wb_calls_count() u64 {
 	return C.vgc_atomic_load_u64(&vgc_wb_calls)
+}
+
+// vgc_wb_slow_calls_count reports the barrier calls that went off the hint
+// record to vgc_wb_store_slow under -d vgc_wb_count (cx-home/v#56 lever 6's
+// test; 0 in every other build).
+pub fn vgc_wb_slow_calls_count() u64 {
+	return C.vgc_atomic_load_u64(&vgc_wb_slow_calls)
 }
 
 // vgc_wb_regime is the barrier mode outside a concurrent middle: the
