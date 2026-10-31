@@ -803,6 +803,11 @@ fn vgc_safe_cache_drain_stw() {
 // vgc_stw_resume releases the locks vgc_stw_stop took (reverse order), lets the
 // cooperative parkers go and resumes exactly the slots the stop suspended.
 fn vgc_stw_resume(self_idx int) {
+	// cx-home/v#56 lever 3: every mutator is still parked, and every card and
+	// dirty bit this stop cleared (vgc_cards_take, vgc_cards_clear, the rescan,
+	// the promotion) is cleared by now: the stop count the generated C's second
+	// gate compares against moves before any mutator can read it again.
+	vgc_wb_epoch++
 	// Mark + sweep done — release every allocator lock held across the cycle before
 	// resuming, so resumed mutators don't block on them. (Reverse acquisition order.)
 	C.vgc_mutex_unlock(&vgc_spawn_root_lock)

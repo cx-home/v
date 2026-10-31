@@ -1071,12 +1071,18 @@ __global vgc_perm_pages_n = usize(0)
 __global vgc_wb_mode = u32(0)
 __global vgc_wb_lo = usize(0)
 __global vgc_wb_len = usize(0)
+// cx-home/v#56 lever 3 (the store's second gate): the stops counted — bumped
+// once per stop (vgc_stw_resume, every mutator still parked), so a mutator
+// that read it before its first gate knows after its store whether a stop —
+// the only reader and clearer of cards and dirty bits — ran in between; the
+// generated C's second gate (vgc_wb_epoch_moved, cgen) is made only then.
+__global vgc_wb_epoch = usize(0)
 __global vgc_perm_len = usize(0)
 // the cards: one byte per page of every arena (VGC_Arena.cards). vgc_wb_store
 // sets the page's card (an atomic byte store when it reads 0: a line sixteen
 // threads wrote on every ring store cost stw_scaling T=16 -12..-30 %; set once
-// per stop it stays shared) before and after a pointer store the gate let
-// through; the stop reads a permanent span's cards as its dirty bit
+// per stop it stays shared) before a pointer store the gate let through, and
+// after it again only when a stop ran in between (vgc_wb_epoch); the stop reads a permanent span's cards as its dirty bit
 // (vgc_cards_take) and clears them. A card of a page no permanent span covers
 // is read only by the young regime below.
 //

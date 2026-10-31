@@ -1,0 +1,46 @@
+// cx-home/v#56 lever 3: a pointer store's second write-barrier gate is made
+// only when a stop ran between its first gate and the store (the stop count
+// vgc_wb_epoch read before the first gate, compared after the store); a store
+// into a local pointer variable carries no gate and no count.
+struct Node {
+mut:
+	name string
+	next &Node = unsafe { nil }
+}
+
+@[noinline]
+fn link(mut n Node, m &Node, s string) {
+	n.next = m
+	n.name = s
+}
+
+@[noinline]
+fn count(n &Node) int {
+	mut c := 0
+	mut p := unsafe { n }
+	for p != unsafe { nil } {
+		c++
+		p = p.next
+	}
+	return c
+}
+
+fn main() {
+	mut head := &Node{
+		name: 'h'
+	}
+	mut names := []string{}
+	for i in 0 .. 2000 {
+		mut m := &Node{}
+		link(mut m, head, 'n${i}')
+		head = m
+		if i % 500 == 0 {
+			gc_collect()
+		}
+		names << head.name
+	}
+	gc_collect()
+	println(count(head))
+	println(names.len)
+	println(names[1999])
+}

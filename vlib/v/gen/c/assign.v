@@ -800,20 +800,44 @@ fn (mut g Gen) cm_is_vgc_meta(t ast.Type) bool {
 // cycle re-scans the span). Both calls are the same idempotent barrier on the
 // same pure lvalue base, which the store does not change. Declarations
 // (decl_assign) create a fresh var (alloc-black if heap) and need no barrier.
+//
+// cx-home/v#56 lever 3: the second call is made only when a stop ran between
+// the first call and the store — the only time a card or a dirty bit the first
+// call set can have been cleared, since only a stop reads and clears them. The
+// stop count (vgc_wb_epoch, bumped at every stop while every mutator is parked)
+// is read BEFORE the first call (a stop between the read and the first call
+// moves it, so the second call is made — harmless) and compared after the
+// store; equal, the card the first call set still stands. Under the young
+// regime every heap store's gate lets the store through, so this halves the
+// barrier calls of a mutator between stops (fasta 25,000,000: one call per
+// pointer store of the sequence builder instead of two).
 fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 	cm := node_.op != .decl_assign && 'vgc_concurrent' in g.pref.compile_defines
+	mut epoch := ''
 	if cm {
+		pos := g.out.len
 		for i, lx in node_.left {
 			lt := if i < node_.left_types.len { node_.left_types[i] } else { ast.void_type }
 			g.gen_cm_write_barrier(lx, lt)
+		}
+		if g.out.len > pos {
+			// a gate was emitted: the stop count is read before it
+			gates := g.out.cut_to(pos)
+			epoch = g.new_tmp_var()
+			g.writeln('size_t ${epoch} = vgc_wb_epoch_now();')
+			g.write(gates)
 		}
 	}
 	g.assign_stmt_body(node_)
-	if cm {
+	if epoch != '' {
+		g.writeln('if (vgc_wb_epoch_moved(${epoch})) {')
+		g.indent++
 		for i, lx in node_.left {
 			lt := if i < node_.left_types.len { node_.left_types[i] } else { ast.void_type }
 			g.gen_cm_write_barrier(lx, lt)
 		}
+		g.indent--
+		g.writeln('}')
 	}
 }
 
