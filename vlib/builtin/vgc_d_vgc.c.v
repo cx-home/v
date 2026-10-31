@@ -3585,6 +3585,17 @@ pub fn vgc_large_recurs_probe(lo u32, hi u32) bool {
 	return vgc_large_recurs_between(lo, hi)
 }
 
+// vgc_span_probe reports the span holding p to a test: its pages, whether it
+// was born as a large object's span (VGC_Span.large_born) and whether it is
+// pooled now; 0 and false outside the spans.
+pub fn vgc_span_probe(p voidptr) (u32, bool, bool) {
+	span := vgc_find_span(p)
+	if span == unsafe { nil } {
+		return 0, false, false
+	}
+	return span.npages, span.large_born, span.pooled
+}
+
 // vgc_large_round rounds a large request of npages, from vgc_large_round_min
 // pages up to the pooled sizes, up to a sixteenth of the power of two at or
 // below it — 5953, 6007, 6027 and 6071 pages all to 6144 — so a frame that
