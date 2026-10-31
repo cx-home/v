@@ -3820,7 +3820,16 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 		o = o.next
 	}
 	// No tail and nothing else fits: the kept span is split before a new
-	// arena is carved (cx-home/v#58).
+	// arena is carved (cx-home/v#58) — unless the request is small beside it
+	// (vgc_pool_small_leaves_whole): then the carve serves it, and the new
+	// arena's tail the small requests after it, while the run stays whole for
+	// its next period. Split, the run served one small request and the next
+	// period's frame carved an arena anyway (measure/collector-epic-71, the
+	// carve lines: 6144-page frames carved beside 5,968–5,984-page cold runs,
+	// a 6144-page run less a 160–176-page piece, three times in one run).
+	if kept != unsafe { nil } && vgc_pool_small_leaves_whole(kept, npages) {
+		return unsafe { nil }, false
+	}
 	if kept != unsafe { nil } {
 		cold := kept.decommitted
 		if vgc_gctrace >= 3 {
@@ -3832,6 +3841,17 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 		return kept, cold
 	}
 	return unsafe { nil }, false
+}
+
+// vgc_pool_small_leaves_whole says whether a request leaves a kept run (a
+// pooled run holding a recurring size, vgc_pool_keeps_whole) whole when no
+// tail and nothing else serves it: a request of an eighth of the run or
+// less does — the arena carved for it serves the small requests after it
+// from its tail, so the run is there for its next period; a larger request
+// splits the run as before (a carve for it would hold little tail).
+@[inline]
+fn vgc_pool_small_leaves_whole(kept &VGC_Span, npages u32) bool {
+	return npages * 8 <= kept.npages
 }
 
 // vgc_pool_best_fit answers the smallest pooled span past npages that a
