@@ -3448,6 +3448,13 @@ __global vgc_large_recur_bits = [1025]u8{} // (vgc_max_pooled_pages + 1) bits
 // vgc_large_recurs_between answers whether a large size s with lo < s <= hi
 // was asked for more than once.
 fn vgc_large_recurs_between(lo u32, hi u32) bool {
+	return vgc_large_bits_between(&vgc_large_recur_bits[0], lo, hi)
+}
+
+// vgc_large_bits_between answers whether a bit of the page-count bitmap at
+// bits is set for a size s with lo < s <= hi (the bitmaps run to
+// vgc_max_pooled_pages).
+fn vgc_large_bits_between(bits &u8, lo u32, hi u32) bool {
 	mut h := hi
 	if h > u32(vgc_max_pooled_pages) {
 		h = u32(vgc_max_pooled_pages)
@@ -3459,7 +3466,7 @@ fn vgc_large_recurs_between(lo u32, hi u32) bool {
 	mut i := int(h >> 3)
 	li := int(l >> 3)
 	for i >= li {
-		mut m := unsafe { vgc_large_recur_bits[i] }
+		mut m := unsafe { bits[i] }
 		if i == int(h >> 3) {
 			b := h & 7
 			if b < 7 {
@@ -3477,29 +3484,57 @@ fn vgc_large_recurs_between(lo u32, hi u32) bool {
 	return false
 }
 
+// the large sizes asked for at least once, exact pages, a bit per page count
+// up to vgc_max_pooled_pages (set under vgc_large_round's request): the drift
+// signal — a request is rounded only when ANOTHER size of its granule block
+// was asked for before (cx-home/v#58).
+__global vgc_large_seen_bits = [1025]u8{}
+
 // vgc_large_recurs_probe reports vgc_large_recurs_between to a test.
 pub fn vgc_large_recurs_probe(lo u32, hi u32) bool {
 	return vgc_large_recurs_between(lo, hi)
 }
 
 // vgc_large_round rounds a large request of npages, from vgc_large_round_min
-// pages up to the pooled sizes, up to a sixteenth of the power of two above
-// it — 5953, 6007, 6027 and 6071 pages all to 6144 — so a frame that drifts
-// by a few pages a period asks for one size and finds the last period's span
-// (cx-home/v#58: the batch writer's 47 MB part frame grew through those four
-// sizes over 1.5M rows and each size carved an arena while 100-190 MB sat
-// pooled, seven of the run's sixteen arenas; measure/collector-epic-48, B
-// run 2). The rounding is at most a sixteenth of the object, in pages the
-// object never touches (a carved span's pages are untouched until written;
-// a recycled span's were the pool's already).
+// pages up to the pooled sizes, up to a sixteenth of the power of two at or
+// below it — 5953, 6007, 6027 and 6071 pages all to 6144 — so a frame that
+// drifts by a few pages a period asks for one size and finds the last
+// period's span (cx-home/v#58: the batch writer's 47 MB part frame grew
+// through those four sizes over 1.5M rows and each size carved an arena
+// while 100-190 MB sat pooled, seven of the run's sixteen arenas;
+// measure/collector-epic-48, B run 2). The granule is the sixteenth of the
+// power of two AT OR BELOW the request, so the rounding is under a sixteenth
+// of the object: a page over a power of two (an array doubled, plus its
+// header: 4097 pages) rounds by a sixteenth of that power (to 4352), not of
+// the next (4608). The pages added are pages the object never touches (a
+// carved span's pages are untouched until written; a recycled span's were
+// the pool's already). A request is rounded only once the drift shows:
+// when ANOTHER size of its granule block (the sizes that round to the same
+// r) was asked for before (vgc_large_seen_bits) — a size the program asks
+// for alone, or again and again, stays exact (its pooled span serves its
+// next request as it is), so a program whose large requests never drift
+// allocates as it did without the rounding: the 300,000-record JSON
+// convert's doubled buffers (385, 769, 1025, 2049, 4097 pages: an array
+// doubled, plus its header) rounded to 400, 800, 1152, 2304 and 4608 took
+// enough of the arena tails that the 4097-page buffer and the 3498-page one
+// beside it no longer shared an arena, and the fifth arena's carve ran a
+// collection the convert on the exact sizes never reached
+// (measure/collector-epic-52: 4 arenas against 2, 8 cycles against 7). The
+// drift case pays one carve: its first period is exact, the second rounds
+// and carves, the third on finds the second's span. And the rounding never
+// costs an arena: a rounded size that no pooled span and no arena tail
+// serves falls back to the exact size before an arena is carved
+// (vgc_span_alloc_floor).
 const vgc_large_round_min = 256
 
-fn vgc_large_round(npages u32) u32 {
+// vgc_large_round_up is the rounding itself, with no regard to what was asked
+// for before.
+fn vgc_large_round_up(npages u32) u32 {
 	if npages < u32(vgc_large_round_min) || npages > u32(vgc_max_pooled_pages) {
 		return npages
 	}
 	mut p := u32(1)
-	for p < npages {
+	for p << 1 <= npages {
 		p <<= 1
 	}
 	g := p >> 4
@@ -3508,6 +3543,36 @@ fn vgc_large_round(npages u32) u32 {
 		return npages
 	}
 	return r
+}
+
+// vgc_large_round notes the exact request and answers its rounded size when
+// another size of its granule block was asked for before, else the request.
+fn vgc_large_round(npages u32) u32 {
+	r := vgc_large_round_up(npages)
+	if r == npages {
+		return npages
+	}
+	mut p := u32(1)
+	for p << 1 <= npages {
+		p <<= 1
+	}
+	g := p >> 4
+	lo := r - g // the block is (r - g, r]
+	seen := vgc_large_bits_between(&vgc_large_seen_bits[0], lo, npages - 1)
+		|| vgc_large_bits_between(&vgc_large_seen_bits[0], npages, r)
+	unsafe {
+		_ = C.vgc_atomic_fetch_or_u8(&vgc_large_seen_bits[npages >> 3], u8(1) << u8(npages & 7))
+	}
+	if seen {
+		return r
+	}
+	return npages
+}
+
+// vgc_large_round_probe reports vgc_large_round_up (the rounding itself) to a
+// test.
+pub fn vgc_large_round_probe(npages u32) u32 {
+	return vgc_large_round_up(npages)
 }
 
 // vgc_large_size_recurs answers whether a large object of npages was asked
@@ -4980,16 +5045,25 @@ fn vgc_arena_ceiling() int {
 }
 
 fn vgc_span_alloc(npages u32) &VGC_Span {
+	return vgc_span_alloc_floor(npages, 0)
+}
+
+// vgc_span_alloc_floor is vgc_span_alloc for a request rounded up from floor
+// pages (cx-home/v#58, vgc_large_round; floor 0 = not rounded): the rounded
+// size is looked for first, in the pool and then the arena tails, and when
+// neither serves it the exact size is looked for the same way before an
+// arena is carved — the rounding never costs an arena.
+fn vgc_span_alloc_floor(npages u32, floor u32) &VGC_Span {
 	// Each wait lets one collection's sweep refill the pool; collections can run
 	// back to back (an explicit gc_collect loop on a 2-vCPU box), so a few waits
 	// are allowed before the carve goes ahead regardless.
 	for _ in 0 .. 4 {
-		span, waited := vgc_span_alloc_once(npages, true)
+		span, waited := vgc_span_alloc_once(npages, floor, true)
 		if !waited {
 			return span
 		}
 	}
-	last, _ := vgc_span_alloc_once(npages, false)
+	last, _ := vgc_span_alloc_once(npages, floor, false)
 	return last
 }
 
@@ -5025,10 +5099,18 @@ fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int) {
 
 // vgc_span_alloc_once answers the span, and whether it returned nil because it
 // waited for a collection in flight instead of carving (may_wait only).
-fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
+fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool) {
+	mut npages := npages_in
 	// First try to reuse a free span (cx-private#1910: this thread's stash first)
-	mut recycled, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
-	nbytes := usize(npages) * vgc_page_size
+	mut recycled, mut cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
+	if recycled == unsafe { nil } && floor != 0 && floor < npages {
+		// cx-home/v#58: a pooled span of the exact size, under the rounded one
+		recycled, cold = vgc_get_free_span_cached(C.vgc_get_cache_idx(), floor)
+		if recycled != unsafe { nil } {
+			npages = floor
+		}
+	}
+	mut nbytes := usize(npages) * vgc_page_size
 	if recycled != unsafe { nil } {
 		vgc_span_recycled_ready(mut recycled, cold, npages)
 		return recycled, false
@@ -5044,13 +5126,32 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 		// taken before the heap lock (vgc_span_split's order), so the heap
 		// lock is dropped for the lookup and the tails are read again after.
 		C.vgc_mutex_unlock(&vgc_heap.lock)
-		mut any, cold_any := vgc_get_free_span_any(npages)
+		mut any, mut cold_any := vgc_get_free_span_any(npages)
+		if any == unsafe { nil } && floor != 0 && floor < npages {
+			any, cold_any = vgc_get_free_span_any(floor)
+			if any != unsafe { nil } {
+				npages = floor
+			}
+		}
 		if any != unsafe { nil } {
 			vgc_span_recycled_ready(mut any, cold_any, npages)
 			return any, false
 		}
 		C.vgc_mutex_lock(&vgc_heap.lock)
 		base, arena_idx = vgc_arena_tail_take(nbytes)
+		if base == 0 && floor != 0 && floor < npages {
+			// cx-home/v#58: the rounding never costs an arena — the exact size
+			// takes a tail the rounded size missed; when no tail holds either,
+			// the fresh arena's carve is the rounded size (the span the next
+			// period's drifted request finds)
+			nbytes = usize(floor) * vgc_page_size
+			base, arena_idx = vgc_arena_tail_take(nbytes)
+			if base != 0 {
+				npages = floor
+			} else {
+				nbytes = usize(npages) * vgc_page_size
+			}
+		}
 	}
 	if vgc_gctrace >= 3 && base != 0 {
 		vgc_gctrace_carve_emit(npages, 0, arena_idx)
@@ -6269,10 +6370,13 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 
 // Allocate a large object (> 32KB) with its own span
 fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
-	// cx-home/v#58: a drifting frame asks for one size (vgc_large_round)
-	npages := vgc_large_round(u32((n + vgc_page_size - 1) / vgc_page_size))
+	// cx-home/v#58: a drifting frame asks for one size (vgc_large_round); the
+	// exact size is the floor the rounded request falls back to before it
+	// would carve an arena (vgc_span_alloc_floor)
+	exact := u32((n + vgc_page_size - 1) / vgc_page_size)
+	npages := vgc_large_round(exact)
 	vgc_large_demand_note(npages)
-	mut span := vgc_span_alloc(npages)
+	mut span := vgc_span_alloc_floor(npages, exact)
 	if span == unsafe { nil } {
 		// Reclaim + retry before OOM (see vgc_collect_and_retry_span).
 		// MUST mirror vgc_collect_and_retry_span: after force_collect, WAIT for any
@@ -6292,7 +6396,7 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 			for C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_off {
 				C.vgc_atomic_fence()
 			}
-			span = vgc_span_alloc(npages)
+			span = vgc_span_alloc_floor(npages, exact)
 			if span != unsafe { nil } {
 				break
 			}
