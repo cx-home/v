@@ -2,6 +2,7 @@
 // only when a stop ran between its first gate and the store (the stop count
 // vgc_wb_epoch read before the first gate, compared after the store); a store
 // into a local pointer variable carries no gate and no count.
+@[heap]
 struct Node {
 mut:
 	name string
