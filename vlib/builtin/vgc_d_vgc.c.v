@@ -3677,9 +3677,23 @@ pub fn vgc_large_round_probe(npages u32) u32 {
 }
 
 // vgc_large_size_recurs answers whether a large object of npages was asked
-// for more than once.
+// for more than once: by its exact size (vgc_large_demand), or by its size
+// as the top of a granule block asked for more than once (cx-home/v#58: a
+// drifting frame rounded to its block's top, 4760 -> 4864 pages, is asked for
+// once by that size — the exact sizes are the ones seen — while its block is
+// asked for every period; read by the exact count alone its pooled run was
+// not large_born, and the first request under the split cap broke it:
+// vgc_frame_block_kept_whole_test.v). A size inside the block that is not its
+// top cannot serve the block's rounded requests, so it recurs by its exact
+// count alone.
 fn vgc_large_size_recurs(npages u32) bool {
-	return unsafe { C.vgc_atomic_load_u32(&vgc_large_demand[vgc_large_demand_idx(npages)]) >= 2 }
+	if unsafe { C.vgc_atomic_load_u32(&vgc_large_demand[vgc_large_demand_idx(npages)]) >= 2 } {
+		return true
+	}
+	if npages > u32(vgc_max_pooled_pages) || vgc_large_round_up(npages) != npages {
+		return false
+	}
+	return unsafe { (vgc_large_block_bits[npages >> 3] >> u8(npages & 7)) & 1 != 0 }
 }
 
 fn vgc_pool_split_cap(npages u32) u32 {
