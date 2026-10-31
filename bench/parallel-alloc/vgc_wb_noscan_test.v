@@ -40,7 +40,7 @@ fn test_a_store_into_a_no_scan_buffer_sets_no_card_and_a_pointer_push_does() {
 	r := os.execute('VGC_YOUNG=1 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	assert r.output.contains('noscan=true ptrs_noscan=false'), r.output
-	assert r.output.contains('done sum=14 v=1'), r.output
+	assert r.output.contains('done sum=11 v=1'), r.output
 	for name in cleans {
 		assert dirty_of(r.output, name) == 0, '${name} set a card on a no-scan buffer:\n${r.output}'
 	}

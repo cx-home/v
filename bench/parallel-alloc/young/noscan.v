@@ -45,5 +45,5 @@ fn main() {
 	report('u8-grow', small.data) // the grown buffer: the copy into it sets no card
 	ptrs << mk(1)
 	report('ptr-push', ptrs.data)
-	println('done sum=${bytes[0] + bytes[1] + small[8192]} v=${ptrs[0].v}')
+	println('done sum=${bytes[0] + bytes[1] + small[8192]} v=${ptrs[0].v}') // 9 + 2 + u8(8192) = 11
 }
