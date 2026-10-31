@@ -3493,9 +3493,12 @@ fn vgc_large_block_note(npages u32) {
 	}
 }
 
-// vgc_large_block_recurs_between answers whether a granule block asked for
-// more than once holds a size s with lo < s <= hi: a block top r past lo
-// whose block reaches below hi.
+// vgc_large_block_recurs_between answers whether a size s with lo < s <= hi
+// was asked for (vgc_large_seen_bits) in a granule block asked for more than
+// once: a block top r past lo whose block reaches below hi, and a size seen
+// inside both the block and (lo, hi] — the frame's own size, asked for twice
+// and alone in its block, recurs for the runs that hold it and for no range
+// past it (vgc_frame_drift_reuse_test.v's 6401-page frame against 7100).
 fn vgc_large_block_recurs_between(lo u32, hi u32) bool {
 	mut h := hi
 	if h > u32(vgc_max_pooled_pages) {
@@ -3515,8 +3518,15 @@ fn vgc_large_block_recurs_between(lo u32, hi u32) bool {
 			r = (r | 7) + 1
 			continue
 		}
-		if (m >> u8(r & 7)) & 1 != 0 && vgc_large_block_lo(r) < h {
-			return true
+		if (m >> u8(r & 7)) & 1 != 0 {
+			blo := vgc_large_block_lo(r)
+			if blo < h {
+				slo := if blo > lo { blo } else { lo }
+				shi := if r < h { r } else { h }
+				if vgc_large_bits_between(&vgc_large_seen_bits[0], slo, shi) {
+					return true
+				}
+			}
 		}
 		r++
 	}

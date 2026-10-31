@@ -10,8 +10,8 @@
 // vgc_large_demand_note (vgc_large_block_demand over vgc_large_round_up's
 // block) and read by vgc_large_recurs_between beside the exact sizes.
 //
-// The shape: a 4700-page frame held (the first period's size: its block is
-// seen), a 4760-page frame dropped — rounded to 4864 pages (the drift shows)
+// The shape (pages of 8 KB; the array's header adds one to each): a 4700-page
+// frame held (the first period's size: its block is seen), a 4760-page frame dropped — rounded to 4864 pages (the drift shows)
 // and carved from the tail — a 1 MB separator held so nothing merges with it,
 // then a collection: the pooled run is 4864 pages and its block was asked
 // for twice. Then a 2957-page request (over half the run: the split cap does
@@ -27,7 +27,7 @@
 module main
 
 const mb = 1024 * 1024
-const page = 4096
+const page = 8192 // vgc's page
 
 @[noinline]
 fn fill(n int) []u8 {
@@ -51,6 +51,7 @@ fn test_a_frame_of_a_recurring_block_is_kept_whole() {
 	gc_collect() // the 4864-page run is pooled
 	assert vgc_large_recurs_probe(4000, 4864), 'the block (4608, 4864] was asked for twice (4700, then 4760 rounded to 4864) and does not recur'
 	assert !vgc_large_recurs_probe(4000, 4600), 'no size under the block recurs'
+	assert !vgc_large_recurs_probe(4864, 6000), 'no size past the block recurs'
 	use0 := gc_memory_use()
 	over_half := fill(2957 * page) // over half the run: the split cap alone does not keep it
 	use1 := gc_memory_use()
