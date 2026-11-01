@@ -4241,6 +4241,23 @@ pub fn vgc_limit_selftest() u32 {
 	return 0
 }
 
+// vgc_pace_one_thread says whether this cycle paces as ONE allocating thread (the quarter,
+// vgc_one_thread_pct; cx-home/v#56): nt, the threads stamped as allocating this cycle
+// (vgc_alloc_threads, ~1 MB each), is at most one, and so is acct, the threads that allocated
+// vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), except on the first
+// collection, whose cycle is the program's start-up (cx-core-code#123). cx-home/v#62: the stamp
+// alone read 20 mutators as one thread, because the quarter's budget (marked/4, ~1.4 MB on a
+// 5.4 MB live set) split 20 ways keeps every worker under the 1 MB stamp: template-render on 20
+// mutators paced ~1,500 of 1,852 cycles at goal = marked + ~1.5 MB, a stop every ~1.5 MB of
+// allocation. Several allocating threads keep GOGC=100, as the doc at vgc_one_thread_pct says;
+// the stamp still decides the per-thread scaling (cx-home/v#16, cx-private#1916).
+fn vgc_pace_one_thread(nt int, acct int, cycle u64) bool {
+	if nt > 1 {
+		return false
+	}
+	return cycle == 0 || acct <= 1
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -4262,6 +4279,8 @@ fn vgc_update_trigger() {
 	if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
 		nt = vgc_alloc_threads()
 	}
+	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
+	one := vgc_pace_one_thread(nt, vgc_acct_threads, u64(vgc_heap.gc_cycle))
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
 		// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's
 		// GOGC=100 goal, clamp(1 x marked, vgc_headroom_floor_lo1, live_floor),
@@ -4275,7 +4294,7 @@ fn vgc_update_trigger() {
 		// after the cx-private#1910 cycle-cost work).
 		mut f := marked * 2
 		mut lo := vgc_headroom_floor_lo
-		if nt <= 1 {
+		if one {
 			lo = vgc_headroom_floor_lo1
 			if vgc_one_thread_small(marked) {
 				f = vgc_one_thread_term(marked)
@@ -4369,10 +4388,10 @@ fn vgc_update_trigger() {
 		}
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
-			if nt <= 1 && vgc_one_thread_small(marked) {
-				one := vgc_one_thread_term(marked)
-				if one < live_cap {
-					live_cap = one
+			if one && vgc_one_thread_small(marked) {
+				term := vgc_one_thread_term(marked)
+				if term < live_cap {
+					live_cap = term
 				}
 			}
 			mut floor := afloor
@@ -4423,7 +4442,7 @@ fn vgc_update_trigger() {
 
 	mut extra := marked * gc_percent / 100
 	// one allocating thread: the GOGC term at vgc_one_thread_pct (cx-home/v#56)
-	if nt <= 1 && vgc_one_thread_small(marked) && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
+	if one && vgc_one_thread_small(marked) && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
 		extra = vgc_one_thread_term(marked) * gc_percent / 100
 	}
 	if extra < vgc_headroom {
