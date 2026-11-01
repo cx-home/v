@@ -1,9 +1,10 @@
 // vgc_frame_drift_reuse_test.v — a large object's request is rounded up to a
 // sixteenth of the power of two at or below it (vgc_large_round, from 256
 // pages: under a sixteenth of the object) once another size of its granule
-// block was asked for before — the drift signal; a size asked for alone or
-// again stays exact — so a frame that grows by a few pages a period asks for
-// one size from its second period on and takes the last period's pooled span; and a pooled run that still holds a
+// block was asked for before — the drift signal; a size under the quarter
+// arena asked for alone or again stays exact, a frame request (the quarter
+// or more, vgc_frame_pages) rounds from its first — so a frame that grows by
+// a few pages a period asks for one size and takes the last period's pooled span; and a pooled run that still holds a
 // recurring size — a frame merged with its free neighbour — is kept whole
 // from a smaller request as the frame's own span is (vgc_pool_keeps_whole
 // through vgc_large_recurs_between). cx-home/v#58's expectation: "freed
@@ -39,7 +40,7 @@ fn drop_frame(n int) int {
 // bytes (gc_memory_use, the arena bytes carved) grow by those page counts (a
 // small span of the test's own may be carved beside them, never the rounding's
 // 127 pages): the process is fresh, so neither is served from the pool.
-fn test_a_first_size_is_carved_exact_and_its_neighbour_rounds() {
+fn test_a_frame_size_rounds_from_its_first_request_and_its_neighbour_with_it() {
 	page := 8192
 	n1 := 3841 * page
 	use0 := gc_memory_use()
@@ -51,7 +52,7 @@ fn test_a_first_size_is_carved_exact_and_its_neighbour_rounds() {
 	println('vgc_frame_drift_reuse: the 3841-page request took ${(use1 - use0) / usize(page)} pages, its 3854-page neighbour ${(use2 - use1) / usize(page)}')
 	took1 := (use1 - use0) / usize(page)
 	took2 := (use2 - use1) / usize(page)
-	assert took1 >= 3841 && took1 < 3841 + 64, 'the first size of a block is carved exact: ${took1} pages, not 3841 (a small span of the test\'s own may land beside it, never the 127 pages of the rounding)'
+	assert took1 >= 3968 && took1 < 3968 + 64, 'the first request of a frame size is carved rounded, to the block\'s top: ${took1} pages, not 3968 (a small span of the test\'s own may land beside it)'
 	assert took2 >= 3968 && took2 < 3968 + 64, 'a neighbour in the block rounds to the block\'s top: ${took2} pages, not 3968'
 	assert a.len == n1 && b.len == n2
 }
@@ -118,7 +119,7 @@ fn test_a_large_request_rounds_to_a_sixteenth_of_the_power_of_two_at_or_below_it
 // with its free neighbour is a size that never recurs, and the second cut
 // kept only a span whose own size did.
 fn test_a_run_holding_a_recurring_size_is_kept_for_it() {
-	n := 50 * mb // 6400 pages of 8 KB + the array's header: 6401 pages
+	n := 50 * mb // 6400 pages of 8 KB + the array's header: 6401 pages, a frame request rounded to 6656 from the first
 	assert drop_frame(n) == n
 	gc_collect()
 	assert drop_frame(n) == n // the size recurs
@@ -127,10 +128,10 @@ fn test_a_run_holding_a_recurring_size_is_kept_for_it() {
 	assert drop_frame(once) == once // asked for once: does not recur
 	gc_collect()
 	req := u32(5120 + 16) // the 40 MB request plus the merge floor
-	assert vgc_large_recurs_probe(req, 6401), 'the 50 MB frame (6401 pages) does not recur for a 40 MB request against a run of its size'
+	assert vgc_large_recurs_probe(req, 6656), 'the 50 MB frame (6401 pages, rounded to 6656) does not recur for a 40 MB request against a run of its size'
 	assert vgc_large_recurs_probe(req, 7000), 'the 50 MB frame does not recur for a 40 MB request against a run of 7000 pages that holds it'
-	assert !vgc_large_recurs_probe(6145, 6400), 'a run of 6400 pages holds no recurring size past the drift case\'s frames (6017 exact, then 6144)'
-	assert !vgc_large_recurs_probe(6401, 7100), 'a request of the frame\'s own size leaves no recurring size the run is kept for'
-	assert !vgc_large_recurs_probe(6401, 7169), 'the 56 MB frame (7169 pages), asked for once, must not recur'
+	assert !vgc_large_recurs_probe(6145, 6400), "a run of 6400 pages holds no recurring size past the drift case's frames (6144)"
+	assert !vgc_large_recurs_probe(6657, 7100), "a request of the frame's own size leaves no recurring size the run is kept for"
+	assert !vgc_large_recurs_probe(6657, 7424), 'the 56 MB frame (7169 pages, rounded to 7424), asked for once, must not recur'
 	assert !vgc_large_recurs_probe(0, 255), 'no size under the rounding floor recurs here'
 }

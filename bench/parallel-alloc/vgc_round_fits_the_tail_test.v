@@ -7,7 +7,19 @@
 // fifth arena's carve ran a collection the convert on the exact sizes never
 // reached (measure/collector-epic-52: 4 arenas against 2, 8 cycles against 7).
 // The fallback reads the arena tails of the request's kind: a frame request's
-// (a quarter arena or more, vgc_frame_pages) are the frame arenas' tails.
+// (a quarter arena or more, vgc_frame_pages; rounded from its first request)
+// are the frame arenas' tails, once the kinds have begun (vgc_frames_begun:
+// at the first recurring frame size).
+//
+// The shape (pages of 8 KB; the array's header adds one to each): the kinds
+// begun by a 2047-page frame asked for twice (its frame arena holds the
+// 2048-page run at its base and a 6144-page tail), a 2100-page frame held
+// from that tail (2101 pages, rounded to 2176: 3968 pages of tail left),
+// then a 3900-page frame: 3901 pages, rounded to 4096, which no tail holds
+// and the pool does not serve; its exact size fits the tail, so no arena is
+// carved and the committed bytes grow by the exact request (plus the tail's
+// sliver after it, 67 pages: the carve takes a remainder too small to serve),
+// under the rounded one. Its own process (a fresh heap).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_round_fits_the_tail_test.v
 module main
@@ -23,44 +35,40 @@ fn fill(n int) []u8 {
 	return b
 }
 
+// frames_begin asks for a 2047-page frame (2,048 pages with the header, the
+// quarter) twice and drops both: the frame arenas begin at the first
+// recurring frame size (cx-home/v#58, vgc_frames_begun) — the first drop is
+// plain, the second opens a frame arena with a 2048-page run pooled at its
+// base and a 6144-page tail.
 @[noinline]
-fn drop_frame(n int) int {
-	return fill(n).len
+fn frames_begin() {
+	for _ in 0 .. 2 {
+		assert fill(2047 * page).len == 2047 * page
+		gc_collect()
+	}
+	assert vgc_frames_probe(), 'the frame arenas have not begun after a frame size asked for twice'
 }
 
-// A 5900-page frame is asked for once and dropped (the drift signal for the
-// block (5888, 6144]), a 2200-page buffer held after it spends its arena's
-// tail (its block (2176, 2304] is its own: the 2060-page objects below stay
-// exact); then 2060-page objects are held until one opens an arena — the
-// frame's run is split down and spent, and the new arena holds 6131 pages
-// of tail. A 6080-page request, a neighbour of the 5900, rounds to 6144,
-// which no tail serves; its exact size fits the tail: no arena is carved,
-// and the committed bytes grow by the exact request, under the rounded one.
-// Every request here is a quarter arena or more (cx-home/v#58,
-// vgc_frame_pages), so all of it is the frame arenas: a smaller object
-// would open a plain arena, whose tail serves no frame request.
 fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
-	assert drop_frame(5900 * page) == 5900 * page
-	tail := fill(2200 * page) // held: the frame's arena has no tail left
-	gc_collect()
-	mut held := [][]u8{}
-	mut opened := false
-	for _ in 0 .. 40 {
-		a0 := vgc_arena_count()
-		held << fill(2060 * page)
-		if vgc_arena_count() > a0 {
-			opened = true
-			break
-		}
-	}
-	assert opened, 'no 2060-page object opened an arena in 40 tries'
-	arenas := vgc_arena_count()
+	frames_begin()
+	first :=
+		fill(2100 * page) // 2101 pages, rounded to 2176: the frame arena's tail, 3968 pages left
+	fi, ff := vgc_arena_probe(first.data)
+	assert fi >= 0 && ff, 'the 2100-page frame is not in a frame arena: arena ${fi} frames=${ff}'
+	fp, _, _ := vgc_span_probe(first.data)
+	assert fp == 2176, 'the 2100-page frame\'s span is not its rounded size: ${fp} pages, not 2176'
+	arenas0 := vgc_arena_count()
 	use0 := gc_memory_use()
-	big := fill(6080 * page)
+	second :=
+		fill(3900 * page) // 3901 pages, rounded to 4096: no tail holds it; its exact size fits the 3968-page tail
+	arenas1 := vgc_arena_count()
 	use1 := gc_memory_use()
-	took := (use1 - use0) / page
-	println('vgc_round_fits_the_tail: ${held.len} objects of 2060 pages opened arena ${arenas}; the 6080-page request took ${took} pages of tail, arenas ${vgc_arena_count()} (${tail.len})')
-	assert vgc_arena_count() == arenas, 'the 6080-page request (rounded to 6144) carved an arena though its exact size fit the 6131-page tail'
-	assert took >= 6080 && took < 6144, 'the request took ${took} pages, not its exact 6080 under the rounded 6144'
-	assert big.len == 6080 * page
+	si, sf := vgc_arena_probe(second.data)
+	sp, _, _ := vgc_span_probe(second.data)
+	grew := (use1 - use0) / usize(page)
+	println('vgc_round_fits_the_tail: the 3900-page frame (3901 pages, rounded to 4096) took a ${sp}-page span in arena ${si} (the 2100-page frame\'s: ${fi}), committed grew by ${grew} pages, arenas ${arenas0} -> ${arenas1} (${first.len} ${second.len})')
+	assert arenas1 == arenas0, 'the rounded request carved an arena while its exact size fit a tail: ${arenas0} -> ${arenas1}'
+	assert si == fi && sf, 'the exact size did not take the frame arena\'s tail: arena ${si} frames=${sf}'
+	assert sp >= 3901 && sp < 4096, 'the request did not fall back to its exact size: ${sp} pages, not 3901 plus the tail\'s sliver (under the rounded 4096)'
+	assert grew >= 3901 && grew < 4096, 'the committed bytes did not grow by the exact request: ${grew} pages, not 3901 plus the tail\'s sliver'
 }

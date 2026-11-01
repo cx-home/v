@@ -3514,6 +3514,9 @@ fn vgc_large_demand_note(npages u32) {
 			C.vgc_atomic_add_u32(&vgc_large_demand[i], 1)
 			if C.vgc_atomic_load_u32(&vgc_large_demand[i]) >= 2 {
 				_ = C.vgc_atomic_fetch_or_u8(&vgc_large_recur_bits[i >> 3], u8(1) << u8(i & 7))
+				if vgc_frame_request(npages) {
+					C.vgc_atomic_store_u32(&vgc_frames_begun, 1) // the first recurring frame size: the frame arenas begin
+				}
 			}
 		}
 	}
@@ -3738,6 +3741,28 @@ fn vgc_frame_request(npages u32) bool {
 	return npages >= vgc_frame_pages
 }
 
+// vgc_frames_begun: the frame arenas begin at the first recurring frame size
+// (cx-home/v#58). A frame asked for once — a JSON document's buffer (the
+// 300,000-record convert's 2,326-page document read 4 arenas against 2 with
+// the kinds from the first frame on: the buffer carved its own arena, and
+// the buffers after it a plain one; measure/collector-epic-76), a batch
+// writer's first request of each size — is placed plain, and the kinds
+// begin once a size of a quarter arena or more is asked for again
+// (vgc_large_demand_note): a frame arena exists for the frames that come
+// back. Until then the heap is one world, and a frame's tail serves the
+// buffers after it as before the kinds.
+__global vgc_frames_begun = u32(0)
+
+@[inline]
+fn vgc_frames_on() bool {
+	return unsafe { C.vgc_atomic_load_u32(&vgc_frames_begun) != 0 }
+}
+
+// vgc_frames_probe reports to a test whether the frame arenas have begun.
+pub fn vgc_frames_probe() bool {
+	return vgc_frames_on()
+}
+
 // vgc_span_frames answers whether the span lies in a frame arena.
 fn vgc_span_frames(s &VGC_Span) bool {
 	i := vgc_arena_of(s.base)
@@ -3795,6 +3820,14 @@ fn vgc_large_round_up(npages u32) u32 {
 
 // vgc_large_round notes the exact request and answers its rounded size when
 // another size of its granule block was asked for before, else the request.
+// A frame request (vgc_frame_pages) rounds from its first request: a frame's
+// size drifts every period, so its first period's span, carved exact, served
+// the second period's rounded request by 50–191 pages short and every frame
+// carved twice — 4,814 then 4,864 pages, 5,953 then 6,144 (cx-home/v#58,
+// measure/collector-epic-76, the carve lines); rounded from the first, the
+// first period's span is the size the later periods ask for. The slack is
+// under a sixteenth of the frame, untouched, and the exact size stays the
+// floor a tail serves before an arena is carved (vgc_span_alloc_floor).
 fn vgc_large_round(npages u32) u32 {
 	r := vgc_large_round_up(npages)
 	if r == npages {
@@ -3811,7 +3844,7 @@ fn vgc_large_round(npages u32) u32 {
 	unsafe {
 		_ = C.vgc_atomic_fetch_or_u8(&vgc_large_seen_bits[npages >> 3], u8(1) << u8(npages & 7))
 	}
-	if seen {
+	if seen || vgc_frame_request(npages) {
 		return r
 	}
 	return npages
@@ -5462,8 +5495,9 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 	mut npages := npages_in
 	// cx-home/v#58: the request's arena kind, by the size asked for (the
 	// rounded one when rounded): a frame request is served by frame arenas
-	// only, the rest by plain ones
-	frames := vgc_frame_request(npages_in)
+	// only, the rest by plain ones — once a frame size recurs
+	// (vgc_frames_begun); before that every request is plain
+	frames := vgc_frame_request(npages_in) && vgc_frames_on()
 	// First try to reuse a free span (cx-private#1910: this thread's stash first)
 	mut recycled, mut cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages, frames)
 	if recycled == unsafe { nil } && floor != 0 && floor < npages {

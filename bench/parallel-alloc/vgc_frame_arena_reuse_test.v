@@ -61,7 +61,11 @@ fn scrub_stack() {
 
 fn test_a_frame_takes_its_run_in_place_past_the_buffers_between_the_periods() {
 	n := 5000 * page
-	key := drop_frame(n) // period 1's frame, dropped
+	_ =
+		drop_frame(n) // period 0: the size asked for once is plain; the frame arenas begin at its second request (vgc_frames_begun)
+	scrub_stack()
+	gc_collect()
+	key := drop_frame(n) // period 1's frame, dropped: the first in a frame arena
 	arenas1 := vgc_arenas_count()
 	mut bufs := [][]u8{cap: 16} // never grown: a grown list's old block kept the dropped buffers' addresses
 	hold(mut bufs, 1000 * page) // the period's buffers after the frame, held
