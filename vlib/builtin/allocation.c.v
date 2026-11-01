@@ -701,6 +701,23 @@ pub fn gc_total_allocated() u64 {
 	}
 }
 
+// gc_thread_allocated returns the MONOTONE count of bytes the CALLING thread has allocated
+// since it started (cx-home/v#62): another thread's allocation never moves it, and reading it
+// touches only this thread's slot. A meter of this thread's own work — the evaluator's
+// dead-stack scrub asks whether its own thread allocated a quarter megabyte since its last
+// scrub — reads this one; gc_total_allocated is every thread's and walks every slot. Under
+// Boehm and on a thread vgc does not know it is the process-wide count (GC_get_total_bytes,
+// gc_total_allocated); 0 with no collector.
+pub fn gc_thread_allocated() u64 {
+	$if vgc ? {
+		return vgc_thread_allocated()
+	} $else $if gcboehm ? {
+		return u64(C.GC_get_total_bytes())
+	} $else {
+		return 0
+	}
+}
+
 // gc_memory_use returns the total memory use in bytes by all allocated blocks.
 pub fn gc_memory_use() usize {
 	$if vgc ? {
