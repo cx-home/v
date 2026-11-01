@@ -4224,23 +4224,35 @@ pub fn vgc_limit_selftest() u32 {
 }
 
 // vgc_pace_one_thread says whether this cycle paces as ONE allocating thread (the quarter,
-// vgc_one_thread_pct; cx-home/v#56): nt, the threads stamped as allocating this cycle
-// (vgc_alloc_threads, ~1 MB each), is at most one, and so is acct, the threads that allocated
-// vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), or prev, that count
-// at the stop before, except on the first collection, whose cycle is the program's start-up
-// (cx-core-code#123). One cycle of two such threads after a one-thread cycle is a hand-over
-// (json-codec k=1: the driver hands the work to its one worker, and that cycle's GOGC=100 goal
-// of 5 MB held the run's peak at 15.2 MB against 12.3), not two allocating threads. cx-home/v#62: the stamp
-// alone read 20 mutators as one thread, because the quarter's budget (marked/4, ~1.4 MB on a
-// 5.4 MB live set) split 20 ways keeps every worker under the 1 MB stamp: template-render on 20
-// mutators paced ~1,500 of 1,852 cycles at goal = marked + ~1.5 MB, a stop every ~1.5 MB of
-// allocation. Several allocating threads keep GOGC=100, as the doc at vgc_one_thread_pct says;
-// the stamp still decides the per-thread scaling (cx-home/v#16, cx-private#1916).
-fn vgc_pace_one_thread(nt int, acct int, prev int, cycle u64) bool {
+// vgc_one_thread_pct; cx-home/v#56). nt, the threads stamped as allocating this cycle
+// (vgc_alloc_threads, ~1 MB each), over one means several. Otherwise acct, the threads that
+// allocated vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), and prev,
+// that count at the stop before, decide when they agree (both at most one: one; both over one:
+// several); one reading on the other side keeps was_one, the previous cycle's answer. The first
+// collection, whose cycle is the program's start-up (cx-core-code#123), is one.
+// cx-home/v#62: the stamp alone read 20 mutators as one thread, because the quarter's budget
+// (marked/4, ~1.4 MB on a 5.4 MB live set) split 20 ways keeps every worker under the 1 MB
+// stamp: template-render on 20 mutators paced ~1,500 of 1,852 cycles at goal = marked + ~1.5 MB.
+// A single reading flips on a passing state: json-codec at k=1 read its driver and its one
+// worker over 64 KB in the one cycle of the hand-over (a 5 MB goal: the peak 12.3 -> 15.2 MB),
+// and a back-to-back stop under 20 mutators reads few threads over 64 KB (template-render's
+// headroom 256 MB -> 1.4 MB in one cycle). Several allocating threads keep GOGC=100, as the doc
+// at vgc_one_thread_pct says; the stamp still decides the per-thread scaling (cx-home/v#16,
+// cx-private#1916).
+fn vgc_pace_one_thread(nt int, acct int, prev int, was_one bool, cycle u64) bool {
+	if cycle == 0 {
+		return true
+	}
 	if nt > 1 {
 		return false
 	}
-	return cycle == 0 || acct <= 1 || prev <= 1
+	if acct <= 1 && prev <= 1 {
+		return true
+	}
+	if acct > 1 && prev > 1 {
+		return false
+	}
+	return was_one
 }
 
 fn vgc_update_trigger() {
@@ -4265,7 +4277,9 @@ fn vgc_update_trigger() {
 		nt = vgc_alloc_threads()
 	}
 	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
-	one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev, u64(vgc_heap.gc_cycle))
+	one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev, vgc_paced_one,
+		u64(vgc_heap.gc_cycle))
+	vgc_paced_one = one
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
 		// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's
 		// GOGC=100 goal, clamp(1 x marked, vgc_headroom_floor_lo1, live_floor),
