@@ -4277,6 +4277,23 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, was_one bool, cycle u64) bool
 	return was_one
 }
 
+// vgc_pace_answer is the cycle's pacing answer (cx-home/v#62): `counts_one`, the one-thread
+// answer of the 64 KB count and the ~1 MB stamp (vgc_pace_one_thread), or a marked set under the
+// several-thread floor (vgc_headroom_floor_lo, 4 MB) while the stamp counts at most one (`nt`).
+// Under that floor the several-thread base is the floor itself, not 2 x marked, so a server's k
+// handlers — each under the stamp on a sub-MB marked set, several only to the 64 KB count — ran
+// a 4-5 MB goal on < 1 MB marked: hello-http k=12 C=256 418 cycles against the head's 3,028 at
+// the one-thread goal, +1.5-3 MB of resident peak, http-json-echo k=1 +3.3 MB (misc-epic-59).
+// Its cycles are cheap (a sub-MB mark). A marked set at the floor or above keeps the counts'
+// answer: template-render and json-codec at k=16..28 (5-14 MB marked, every worker under the
+// stamp) pace as several, the change that took template-render k=20 from 3.2 to 0.67 s.
+fn vgc_pace_answer(counts_one bool, nt int, marked u64) bool {
+	if counts_one {
+		return true
+	}
+	return nt <= 1 && marked < vgc_headroom_floor_lo
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -4298,10 +4315,13 @@ fn vgc_update_trigger() {
 	if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
 		nt = vgc_alloc_threads()
 	}
-	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
-	one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev, vgc_paced_one,
+	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread); a
+	// marked set under the several-thread floor paces as one while the stamp counts at most
+	// one (vgc_pace_answer)
+	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev, vgc_paced_one,
 		u64(vgc_heap.gc_cycle))
-	vgc_paced_one = one
+	vgc_paced_one = counts_one
+	one := vgc_pace_answer(counts_one, nt, marked)
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
 		// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's
 		// GOGC=100 goal, clamp(1 x marked, vgc_headroom_floor_lo1, live_floor),

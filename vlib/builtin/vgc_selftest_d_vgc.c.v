@@ -762,3 +762,28 @@ pub fn vgc_pace_one_thread_selftest() u32 {
 	}
 	return 0
 }
+
+// vgc_pace_answer_selftest (cx-home/v#62): a marked set under the several-thread floor paces as
+// one thread while the stamp counts at most one. 0 = pass, else the failing check.
+pub fn vgc_pace_answer_selftest() u32 {
+	lo := vgc_headroom_floor_lo
+	kb := u64(1024)
+	// a server's k handlers: several to the 64 KB count, none stamped, a sub-MB marked set: one
+	if !vgc_pace_answer(vgc_pace_one_thread(0, 12, 12, false, 500), 0, 700 * kb)
+		|| !vgc_pace_answer(vgc_pace_one_thread(1, 12, 12, false, 500), 1, lo - kb) {
+		return 1
+	}
+	// template-render on 20 mutators (5.7 MB marked, none stamped): several
+	if vgc_pace_answer(vgc_pace_one_thread(0, 20, 20, true, 500), 0, 5700 * kb) || vgc_pace_answer(false, 1, lo) {
+		return 2
+	}
+	// several stamped: several, whatever the marked set
+	if vgc_pace_answer(vgc_pace_one_thread(3, 3, 3, true, 500), 3, 700 * kb) {
+		return 3
+	}
+	// one by the counts: one, whatever the marked set
+	if !vgc_pace_answer(true, 1, 100 * lo) || !vgc_pace_answer(vgc_pace_one_thread(1, 1, 1, false, 500), 1, 100 * lo) {
+		return 4
+	}
+	return 0
+}
