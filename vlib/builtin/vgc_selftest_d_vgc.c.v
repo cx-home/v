@@ -710,3 +710,34 @@ pub fn vgc_uaf_foreign_selftest() u32 {
 pub fn vgc_arena_count() int {
 	return vgc_heap.narenas
 }
+
+// vgc_pace_one_thread_selftest — cx-home/v#62. A cycle paces as one allocating thread (the
+// quarter) only when at most one thread is stamped as allocating (~1 MB this cycle) AND at most
+// one allocated 64 KB or more since the last stop; the first collection (start-up) paces as one
+// thread whatever the count. template-render on 20 mutators read 0-1 stamped threads every cycle
+// (the quarter's ~1.4 MB budget split 20 ways) and paced ~1,500 of 1,852 cycles at the quarter.
+// Driven by bench/parallel-alloc/vgc_pace_one_thread_test.v. 0 = ok; n = the failed case.
+pub fn vgc_pace_one_thread_selftest() u32 {
+	// 20 mutators each over 64 KB, none stamped: several threads, not one
+	if vgc_pace_one_thread(0, 20, 500) || vgc_pace_one_thread(1, 20, 500) {
+		return 1
+	}
+	// two over 64 KB: several
+	if vgc_pace_one_thread(1, 2, 500) {
+		return 2
+	}
+	// one thread by both counts, or an idle cycle: one
+	if !vgc_pace_one_thread(1, 1, 500) || !vgc_pace_one_thread(0, 0, 500)
+		|| !vgc_pace_one_thread(0, 1, 500) {
+		return 3
+	}
+	// several stamped: several, whatever the 64 KB count
+	if vgc_pace_one_thread(4, 4, 500) || vgc_pace_one_thread(2, 0, 500) {
+		return 4
+	}
+	// the first collection is start-up: one, whatever the 64 KB count
+	if !vgc_pace_one_thread(1, 3, 0) {
+		return 5
+	}
+	return 0
+}
