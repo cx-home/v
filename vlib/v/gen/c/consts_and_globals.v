@@ -535,7 +535,7 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 	// included; an object-file build (-o x.o) gave them object-local linkage, and
 	// `static` after the headers' `extern` is a C error (no -gc e object built).
 	is_vgc_abi_global := node.mod == 'builtin'
-		&& node.fields.any(it.name.all_after_last('.') in ['vgc_wb_lo', 'vgc_wb_len', 'vgc_wb_epoch', 'vgc_wb_hp'])
+		&& node.fields.any(it.name.all_after_last('.') in ['vgc_wb_lo', 'vgc_wb_len', 'vgc_wb_epoch', 'vgc_wb_hp', 'vgc_young_lo', 'vgc_young_len'])
 	visibility_kw := if g.should_use_object_local_linkage(node.mod) && !is_vgc_abi_global {
 		'static '
 	} else if g.pref.build_mode == .build_module && is_bundled_mod {

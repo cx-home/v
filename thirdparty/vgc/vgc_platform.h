@@ -455,6 +455,14 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void* vgc_os_alloc(size_t size) {
       return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   }
+  // cx-home/v#56 lever 7: the nursery's address range, reserved untouched and
+  // committed an arena at a time as its bump advances (vgc_nursery_alloc).
+  static inline void* vgc_os_reserve(size_t size) {
+      return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+  }
+  static inline int vgc_os_commit(void* ptr, size_t size) {
+      return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
+  }
   static inline void vgc_os_free(void* ptr, size_t size) {
       (void)size;
       VirtualFree(ptr, 0, MEM_RELEASE);
@@ -504,6 +512,20 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void* vgc_os_alloc(size_t size) {
       void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       return (p == MAP_FAILED) ? NULL : p;
+  }
+  // cx-home/v#56 lever 7: the nursery's address range, reserved untouched
+  // (PROT_NONE, no swap accounted) and committed an arena at a time as its
+  // bump advances (vgc_nursery_alloc): a fixed mapping over the reserved part.
+  #ifndef MAP_NORESERVE
+    #define MAP_NORESERVE 0
+  #endif
+  static inline void* vgc_os_reserve(size_t size) {
+      void* p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      return (p == MAP_FAILED) ? NULL : p;
+  }
+  static inline int vgc_os_commit(void* ptr, size_t size) {
+      void* q = mmap(ptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      return q != MAP_FAILED;
   }
   static inline void vgc_os_free(void* ptr, size_t size) {
       munmap(ptr, size);

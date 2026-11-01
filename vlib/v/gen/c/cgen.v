@@ -1326,6 +1326,12 @@ pub fn (mut g Gen) init() {
 			// the page's card), the whole address space during a concurrent middle
 			// (the span-dirtying barrier as before), and empty otherwise.
 			g.cheaders.writeln('extern size_t vgc_wb_lo; extern size_t vgc_wb_len;')
+			// cx-home/v#56 lever 7: the young range — the nursery above the bump the
+			// last stop read (builtin's vgc_young_lo / vgc_young_len; the doc at
+			// vgc_nursery_base): a store into a span carved since that stop lands
+			// in an object the minor cycle traces whole, so the gate's first test
+			// makes no call for it, before the range and the card are read.
+			g.cheaders.writeln('extern size_t vgc_young_lo; extern size_t vgc_young_len;')
 			// cx-home/v#22: msvc has no __builtin_expect; the hint is a macro the
 			// native header (thirdparty/vgc/vgc_native.h) defines the same way.
 			g.cheaders.writeln('#ifndef VGC_WB_UNLIKELY\n#if defined(_MSC_VER) && !defined(__clang__)\n#define VGC_WB_UNLIKELY(x) (x)\n#else\n#define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)\n#endif\n#endif')
@@ -1338,7 +1344,7 @@ pub fn (mut g Gen) init() {
 			g.cheaders.writeln('struct vgc_wb_hint_t { size_t base; size_t size; unsigned char* cards; };')
 			g.cheaders.writeln('extern void* vgc_wb_hp;')
 			g.cheaders.writeln('#define VGC_WB_PAGE_SHIFT 13')
-			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { const struct vgc_wb_hint_t* h = (const struct vgc_wb_hint_t*)vgc_wb_hp; if (h != 0 && (size_t)(uintptr_t)p - h->base < h->size && h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return; vgc_wb_store(p); } }')
+			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { const struct vgc_wb_hint_t* h = (const struct vgc_wb_hint_t*)vgc_wb_hp; if (h != 0 && (size_t)(uintptr_t)p - h->base < h->size && h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return; vgc_wb_store(p); } }')
 			// cx-home/v#56 lever 3: a store statement's second gate is made only when
 			// a stop ran between its first gate and its store (assign_stmt): the stop
 			// count vgc_wb_epoch read before the first gate, compared after the store.

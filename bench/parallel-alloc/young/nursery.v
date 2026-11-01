@@ -5,13 +5,16 @@
 // their size class, then N records are allocated from fresh spans and
 // chained by N-1 stores into them: under the lever every one of those
 // records' page cards reads clean after the stores (the gate's first test
-// skips the young range before the hint record and the card are read) and
-// the stores count no call (-d vgc_wb_count, vgc_wb_calls_count); without
-// it every page's card is set — the record's own init store called the
-// barrier once per page, and the chain's stores read that card inline. A
-// store of the chain's head into an OLD record still sets its card, and
-// the chain survives a minor cycle through that old record alone (the card
-// scanned). Prints `dirty=<k>/<N> calls=<young+chain>/<old>
+// skips the young range before the hint record and the card are read: the
+// records' init stores set no card either) and the chain's stores count no
+// call (-d vgc_wb_count, vgc_wb_calls_count; the pushes into the lists call
+// the barrier directly, array.v, and are counted before); without it every
+// page's card is set — the record's own init store called the barrier once
+// per page, and the chain's stores read that card inline. A store of the
+// chain's head into an OLD record still sets its card, and the chain
+// survives a minor cycle through that old record alone (the card scanned).
+// Prints `dirty=<k>/<N> calls=<chain>/<old>
+// fresh=<records in the nursery>/<N>
 // setup_minors=<n> minors=<n> old_card=<bool> bad=<k> chain=<n>/<N>`.
 module main
 
@@ -44,6 +47,34 @@ fn young(n int, base int) []&Rec {
 		ys << make(base + i)
 	}
 	return ys
+}
+
+// warm fills the free slots the sweep left in the records' size class, and
+// the span the bump was in at the stop: records are made until one lies in
+// the young range (a span carved since the stop), so every record made after
+// it is young in a fresh span
+@[noinline]
+fn warm_up() []&Rec {
+	mut ws := []&Rec{cap: 8192}
+	for ws.len < 8192 {
+		r := make(-1000000 - ws.len)
+		ws << r
+		if vgc_is_young(r) {
+			break
+		}
+	}
+	return ws
+}
+
+@[noinline]
+fn in_nursery(ys []&Rec) int {
+	mut k := 0
+	for y in ys {
+		if vgc_is_young(y) {
+			k++
+		}
+	}
+	return k
 }
 
 // chain stores, into every record but the first, the record before it:
@@ -90,13 +121,19 @@ fn scrub_stack() {
 
 fn main() {
 	n := 20000
+	ballast := []u8{len: 8 * 1024 * 1024} // held: the pacer's goal sits MBs above the batch, no cycle inside it
 	mut old := make(-1) // born before the cycle: old at the stores
 	gc_collect() // the first full cycle: the young regime armed, the gate over the arenas
 	m0 := vgc_minor_cycles_count()
-	c0 := vgc_wb_calls_count()
-	mut warm := young(5000, -1000000) // the free slots the sweep left in the size class
+	mut warm := warm_up() // the free slots the sweep left in the size class, until a fresh span
 	mut ys := young(n, 0) // fresh spans: young
+	fresh := in_nursery(ys)
 	setup_minors := vgc_minor_cycles_count() - m0
+	ylo, ylen := vgc_young_range()
+	first_rec := usize(ys[0])
+	last_rec := usize(ys[n - 1])
+	// the pushes into the lists above call the barrier directly (array.v)
+	c0 := vgc_wb_calls_count()
 	chain(ys)
 	c1 := vgc_wb_calls_count()
 	dirty := dirty_pages(ys)
@@ -125,5 +162,5 @@ fn main() {
 		cnt++
 		p = p.a
 	}
-	println('dirty=${dirty}/${n} calls=${c1 - c0}/${c2 - c1} setup_minors=${setup_minors} minors=${vgc_minor_cycles_count() - m1} old_card=${old_card} bad=${bad} chain=${cnt}/${n} steps=${steps} last=${g.v} warm=${warm.len}')
+	println('dirty=${dirty}/${n} calls=${c1 - c0}/${c2 - c1} setup_minors=${setup_minors} minors=${vgc_minor_cycles_count() - m1} old_card=${old_card} bad=${bad} chain=${cnt}/${n} fresh=${fresh}/${n} range=${ylo}+${ylen} first=${first_rec} last_rec=${last_rec} steps=${steps} last=${g.v} warm=${warm.len} ballast=${ballast.len}')
 }
