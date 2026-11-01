@@ -57,7 +57,9 @@ fn test_a_freed_run_joins_its_cold_neighbour() {
 	gc_collect()
 	gc_collect() // the trim has returned it to the OS (vgc_pool_trim_age = 2)
 	arenas0 := vgc_arenas_count()
-	assert arenas0 == 1, 'the two frames and the separator did not fit one arena: ${arenas0}'
+	// the two frames share a frame arena (cx-home/v#58, vgc_frame_pages: a
+	// request of a quarter arena or more), the separator the plain one
+	assert arenas0 == 2, 'the two frames did not fit one frame arena beside the plain one: ${arenas0}'
 	lower = []u8{}
 	scrub_stack()
 	gc_collect() // the lower run is freed beside the cold run: one 6000-page cold run
