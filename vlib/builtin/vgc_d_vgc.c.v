@@ -6853,8 +6853,10 @@ __global vgc_acct_flush_div = u64(16)
 // the threads that allocated vgc_acct_flush_min or more between the last two
 // stops (counted at the stop's fold of their deltas)
 __global vgc_acct_threads = int(0)
-// cx-home/v#62: vgc_acct_threads of the stop before (vgc_pace_one_thread)
+// cx-home/v#62: vgc_acct_threads of the stop before, and the previous cycle's pacing answer
+// (vgc_pace_one_thread; a program starts as one thread)
 __global vgc_acct_threads_prev = int(0)
+__global vgc_paced_one = true
 const vgc_acct_flush_min = u64(64) * 1024
 
 // Hot-path allocation accounting. Bumps THIS thread's private deltas; flushes to
