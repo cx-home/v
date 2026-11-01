@@ -114,7 +114,7 @@ fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the 
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64) // VGC_GCTRACE=3 carve line (cx-home/v#58)
-fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash
+fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash, 3 a kept run's tail
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
 fn C.vgc_gctrace_young(cycle u64, cards u64) // VGC_GCTRACE=2 young-regime line (cx-home/v#56 step 1)
@@ -3381,6 +3381,44 @@ fn vgc_span_split(mut span VGC_Span, want u32) bool {
 	return true
 }
 
+// vgc_span_split_tail takes `want` pages off the END of `span` (pooled,
+// already unlinked) under a fresh descriptor and pools the shrunk span
+// again under its own trim clock — the run's base and its cold state stay
+// as they were, so a kept run nibbled by small requests (cx-home/v#58,
+// vgc_pool_kept_tail) is the run its next period finds. The tail inherits
+// the decommit state (the caller recommits it, vgc_span_pop_finish). Same
+// locks as vgc_span_split. Returns nil, the span pooled whole again, when
+// no descriptor can be obtained: the caller carves then.
+fn vgc_span_split_tail(mut span VGC_Span, want u32) &VGC_Span {
+	gen := span.pool_gen
+	rem := span.npages - want
+	tail_base := span.base + usize(rem) * vgc_page_size
+	arena_idx := vgc_arena_of(tail_base)
+	if rem == 0 || arena_idx < 0 {
+		vgc_pool_push_aged(mut span, gen)
+		return unsafe { nil }
+	}
+	C.vgc_mutex_lock(&vgc_heap.lock)
+	mut tspan := vgc_new_span_desc()
+	C.vgc_mutex_unlock(&vgc_heap.lock)
+	if tspan == unsafe { nil } {
+		vgc_pool_push_aged(mut span, gen)
+		return unsafe { nil }
+	}
+	unsafe {
+		tslot := tspan.slot // the allspans slot survives the reset (cx-home/v#15)
+		C.memset(tspan, 0, sizeof(VGC_Span))
+		tspan.slot = tslot
+		tspan.base = tail_base
+		tspan.npages = want
+		tspan.decommitted = span.decommitted
+	}
+	vgc_span_repoint_pages(arena_idx, tail_base, want, tspan)
+	span.npages = rem
+	vgc_pool_push_aged(mut span, gen)
+	return tspan
+}
+
 // Try to get a recycled span from the free list: exact fit first, then best-fit
 // (smallest sufficient) with a split, then the oversized list (cx #360). A miss
 // here is the ONLY path that carves fresh arena space, so serving varied page
@@ -3827,8 +3865,28 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 	// period's frame carved an arena anyway (measure/collector-epic-71, the
 	// carve lines: 6144-page frames carved beside 5,968–5,984-page cold runs,
 	// a 6144-page run less a 160–176-page piece, three times in one run).
+	// A small request takes a kept run's TAIL instead of a new arena when the
+	// run's remainder still holds every recurring size it is kept for
+	// (vgc_pool_kept_tail): a page off a 5,956-page run leaves 5,955 for the
+	// 5,953-page frame. Left whole, the carve served it and 1- and 20-page
+	// requests carved five of a writer run's twelve arenas beside 5,956–8,192-
+	// page cold runs (measure/collector-epic-72, run G-3's carve lines).
 	if kept != unsafe { nil } && vgc_pool_small_leaves_whole(kept, npages) {
-		return unsafe { nil }, false
+		mut host := vgc_pool_kept_tail(npages)
+		if host == unsafe { nil } {
+			return unsafe { nil }, false
+		}
+		cold := host.decommitted
+		if vgc_gctrace >= 3 {
+			C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(host.npages), u64(cap), 3)
+		}
+		vgc_pool_unlink(mut host)
+		mut tail := vgc_span_split_tail(mut host, npages)
+		if tail == unsafe { nil } {
+			return unsafe { nil }, false // no descriptor: the run is back whole; carve
+		}
+		vgc_span_pop_finish(mut tail)
+		return tail, cold
 	}
 	if kept != unsafe { nil } {
 		cold := kept.decommitted
@@ -3846,12 +3904,39 @@ fn vgc_get_free_span_locked(npages u32, cap u32) (&VGC_Span, bool) {
 // vgc_pool_small_leaves_whole says whether a request leaves a kept run (a
 // pooled run holding a recurring size, vgc_pool_keeps_whole) whole when no
 // tail and nothing else serves it: a request of an eighth of the run or
-// less does — the arena carved for it serves the small requests after it
-// from its tail, so the run is there for its next period; a larger request
-// splits the run as before (a carve for it would hold little tail).
+// less does — it takes the tail of a kept run with room past its recurring
+// sizes (vgc_pool_kept_tail), else the arena carved for it serves the small
+// requests after it from its tail, so the run is there for its next period;
+// a larger request splits the run as before (a carve for it would hold
+// little tail).
 @[inline]
 fn vgc_pool_small_leaves_whole(kept &VGC_Span, npages u32) bool {
 	return npages * 8 <= kept.npages
+}
+
+// vgc_pool_kept_tail answers the smallest kept run (vgc_pool_keeps_whole,
+// no tail: cap 0) whose tail serves a small request of npages
+// (vgc_pool_small_leaves_whole) and whose remainder still holds every
+// recurring size the run is kept for — no size between the remainder and
+// the run's length recurs (vgc_large_recurs_between) — or nil when every
+// kept run would be broken by the request: then the caller carves. A kept
+// run exactly its recurring size is passed over for the next one up with
+// room (a merged run, or a frame beside a freed buffer), so one run's
+// slack is spent before a new arena is.
+fn vgc_pool_kept_tail(npages u32) &VGC_Span {
+	mut n := vgc_pool_first_at_least(npages + 1)
+	for n != 0 && n <= u32(vgc_max_pooled_pages) {
+		mut cand := vgc_heap.free_spans[n]
+		if cand == unsafe { nil } {
+			cand = vgc_heap.free_spans_cold[n]
+		}
+		if cand != unsafe { nil } && vgc_pool_keeps_whole(cand, n, npages, 0)
+			&& vgc_pool_small_leaves_whole(cand, npages) && !vgc_large_recurs_between(n - npages, n) {
+			return cand
+		}
+		n = vgc_pool_first_at_least(n + 1)
+	}
+	return unsafe { nil }
 }
 
 // vgc_pool_best_fit answers the smallest pooled span past npages that a
