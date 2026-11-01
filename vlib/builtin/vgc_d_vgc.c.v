@@ -964,6 +964,35 @@ fn vgc_one_thread_term(marked u64) u64 {
 	return t
 }
 
+// vgc_adaptive_floor_base is the adaptive floor's base (vgc_update_trigger, cx-home/v#14) before
+// the live floor's clamp, for a cycle that paces as ONE allocating thread or not (`one`,
+// vgc_pace_one_thread) with `nt` threads stamped at ~1 MB (vgc_alloc_threads). One thread: its
+// term under the live floor (vgc_one_thread_term), else 2 x marked, at least
+// vgc_headroom_floor_lo1. Several: 2 x marked, at least vgc_headroom_floor_lo (4 MB) when the
+// stamp counts several — the base the per-thread scaling multiplies — and at least
+// vgc_headroom_floor_lo1 when only the 64 KB count does (cx-home/v#62): a server's k handlers
+// each allocate under the stamp on a sub-MB marked set, and the flat 4 MB floor there held
+// hello-http k=12 at a 4-5 MB goal on a < 1 MB marked set (418 cycles against 3,028 at the
+// one-thread floor, +1.5-3 MB of resident peak; misc-epic-59). A marked set of 2 MB or more is
+// above both floors, so a batch program on k mutators (template-render, json-codec at k=16..28:
+// 5-14 MB marked) keeps 2 x marked.
+fn vgc_adaptive_floor_base(marked u64, one bool, nt int) u64 {
+	mut f := marked * 2
+	mut lo := vgc_headroom_floor_lo
+	if one {
+		lo = vgc_headroom_floor_lo1
+		if vgc_one_thread_small(marked) {
+			f = vgc_one_thread_term(marked)
+		}
+	} else if nt <= 1 {
+		lo = vgc_headroom_floor_lo1
+	}
+	if f < lo {
+		f = lo
+	}
+	return f
+}
+
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
 // collector's fixed per-cycle costs gone (v#15) a cycle costs ~0.3 ms per MB
 // marked on one thread, and under eight allocating threads a 10 ms mark every

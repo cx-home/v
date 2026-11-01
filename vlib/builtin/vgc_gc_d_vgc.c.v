@@ -4291,17 +4291,9 @@ fn vgc_update_trigger() {
 		// the base the per-thread scaling multiplies (integrator ruling
 		// 2026-10-11T08:19:47Z: that scaling is bounded by the live set only
 		// after the cx-private#1910 cycle-cost work).
-		mut f := marked * 2
-		mut lo := vgc_headroom_floor_lo
-		if one {
-			lo = vgc_headroom_floor_lo1
-			if vgc_one_thread_small(marked) {
-				f = vgc_one_thread_term(marked)
-			}
-		}
-		if f < lo {
-			f = lo
-		}
+		// cx-home/v#62: several threads by the 64 KB count alone (nt <= 1) keep the
+		// one-thread floor under 2 x marked (vgc_adaptive_floor_base)
+		f := vgc_adaptive_floor_base(marked, one, nt)
 		if f < afloor {
 			afloor = f
 		}

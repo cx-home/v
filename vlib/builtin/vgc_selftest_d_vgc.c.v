@@ -756,3 +756,37 @@ pub fn vgc_pace_one_thread_selftest() u32 {
 	}
 	return 0
 }
+
+// vgc_adaptive_floor_selftest (cx-home/v#62): the adaptive floor's base by the pacing answer and
+// the ~1 MB stamp. 0 = pass, else the failing check.
+pub fn vgc_adaptive_floor_selftest() u32 {
+	lo := vgc_headroom_floor_lo
+	lo1 := vgc_headroom_floor_lo1
+	mb := u64(1024 * 1024)
+	// several by the 64 KB count only, a sub-MB marked set (a server's k handlers): 2 x marked,
+	// not the 4 MB floor
+	if vgc_adaptive_floor_base(mb / 2, false, 1) != (if mb > lo1 { mb } else { lo1 }) {
+		return 1
+	}
+	if vgc_adaptive_floor_base(mb / 2, false, 0) != vgc_adaptive_floor_base(mb / 2, false, 1) {
+		return 2
+	}
+	// several stamped: the 4 MB floor the per-thread scaling multiplies
+	if vgc_adaptive_floor_base(mb / 2, false, 4) != lo {
+		return 3
+	}
+	// one thread on a small marked set: its term, at least lo1
+	t := vgc_one_thread_term(mb / 2)
+	if vgc_adaptive_floor_base(mb / 2, true, 1) != (if t > lo1 { t } else { lo1 }) {
+		return 4
+	}
+	// a batch marked set (6 MB) on several threads by either count: 2 x marked
+	if vgc_adaptive_floor_base(6 * mb, false, 1) != 12 * mb || vgc_adaptive_floor_base(6 * mb, false, 20) != 12 * mb {
+		return 5
+	}
+	// a tiny marked set on several threads by the 64 KB count: never under lo1
+	if vgc_adaptive_floor_base(64 * 1024, false, 1) != (if 128 * 1024 > lo1 { u64(128 * 1024) } else { lo1 }) {
+		return 6
+	}
+	return 0
+}
