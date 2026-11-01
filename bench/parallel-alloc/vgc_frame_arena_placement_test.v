@@ -6,7 +6,8 @@
 // vgc_pool_at in vlib/builtin/vgc_d_vgc.c.v; vgc_arena_probe reports an
 // address's arena and its kind). The quarter is the line: 2,047 pages plus
 // the array's header page is a frame request, 2,046 plus one is not. Its own
-// process (a fresh heap).
+// process (a fresh heap). The kinds begin at the first recurring frame size
+// (vgc_frames_begun): a 2047-page frame asked for twice first.
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_frame_arena_placement_test.v
 module main
@@ -22,7 +23,22 @@ fn fill(n int) []u8 {
 	return b
 }
 
+// frames_begin asks for a 2047-page frame (2,048 pages with the header, the
+// quarter) twice and drops both: the frame arenas begin at the first
+// recurring frame size (cx-home/v#58, vgc_frames_begun) — the first drop is
+// plain, the second opens a frame arena with a 2048-page run pooled at its
+// base and a 6144-page tail.
+@[noinline]
+fn frames_begin() {
+	for _ in 0 .. 2 {
+		assert fill(2047 * page).len == 2047 * page
+		gc_collect()
+	}
+	assert vgc_frames_probe(), 'the frame arenas have not begun after a frame size asked for twice'
+}
+
 fn test_a_frame_and_a_buffer_never_share_an_arena() {
+	frames_begin()
 	frame := fill(3000 * page)
 	fi, ff := vgc_arena_probe(frame.data)
 	assert fi >= 0 && ff, 'the 3000-page frame is not in a frame arena: arena ${fi} frames=${ff}'

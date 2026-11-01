@@ -18,7 +18,10 @@
 // separator) cannot hold it, so on 14dfcca7f — the hot run and the cold run
 // apart, 3000 and 2900 pages — it carves a second arena; now the merged
 // 5900-page cold run serves it and the arena count holds. Its own process (a fresh
-// heap: one arena).
+// heap: one arena). The kinds begin at the first recurring frame size
+// (vgc_frames_begun): a 2047-page frame asked for twice first, whose
+// 2048-page run — kept for its size, joining nothing — sits below the two
+// frames in their frame arena.
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_cold_neighbour_merge_test.v
 module main
@@ -49,8 +52,23 @@ fn scrub_stack() {
 	}
 }
 
+// frames_begin asks for a 2047-page frame (2,048 pages with the header, the
+// quarter) twice and drops both: the frame arenas begin at the first
+// recurring frame size (cx-home/v#58, vgc_frames_begun) — the first drop is
+// plain, the second opens a frame arena with a 2048-page run pooled at its
+// base and a 6144-page tail.
+@[noinline]
+fn frames_begin() {
+	for _ in 0 .. 2 {
+		assert fill(2047 * page).len == 2047 * page
+		gc_collect()
+	}
+	assert vgc_frames_probe(), 'the frame arenas have not begun after a frame size asked for twice'
+}
+
 fn test_a_freed_run_joins_its_cold_neighbour() {
-	mut lower := fill(3000 * page) // held: the lower frame
+	frames_begin()
+	mut lower := fill(3000 * page) // held: the lower frame, in the frame arena's tail
 	assert drop_frame(2900 * page) == 2900 * page // the upper frame, dropped (its own size: the two runs merge)
 	sep := fill(mb) // held: nothing merges with the upper frame's run from above
 	scrub_stack()

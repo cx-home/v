@@ -11,11 +11,15 @@
 // 5,953-page run, 4,864 off the 6,724 one, 3,072 off the 7,246 one kept for
 // the 6,144-page frame, then the 6,144 frame carved).
 //
-// The shape (pages of 8 KB; the array's header adds one to each; every
-// request a frame's, vgc_frame_pages, so the frames share frame arenas and
-// no smaller span sits between them): period 1 holds a 6144-page frame (its
-// own frame arena), a 4864-page one and a 2382-page one after it (a second
-// frame arena: 4865 + 2383 of 8192); all three dropped and collected.
+// The shape (pages of 8 KB; the array's header adds one to each, and a
+// frame request rounds to a sixteenth of the power of two below it from its
+// first request: 6400, 5120 and 2432 pages; every request a frame's,
+// vgc_frame_pages, so the frames share frame arenas and no smaller span
+// sits between them; the kinds begin at the first recurring frame size,
+// vgc_frames_begun, so period 0 asks for the three sizes once, plain):
+// period 1 holds a 6144-page frame (its own frame arena), a 4864-page one
+// and a 2382-page one after it (a second frame arena: 5120 + 2432 of 8192);
+// all three dropped and collected.
 // Period 2 asks for the three sizes in the same order: each takes its own
 // run (the sizes now recur). Dropped and collected again, period 3 asks in
 // another order — 4864 first, then 6144, then 2382. On a98e5e6dc the
@@ -76,6 +80,11 @@ fn period(order []int) (usize, usize, usize) {
 }
 
 fn test_a_recurring_run_keeps_its_size_and_the_next_period_takes_it_in_place() {
+	_, _, _ =
+		period([6144, 4864, 2382]) // period 0: each size asked for once, plain; the frame arenas begin at the second request
+	scrub_stack()
+	gc_collect()
+	gc_collect()
 	k6, k4, k2 := period([6144, 4864, 2382])
 	a6, f6 := vgc_arena_probe(voidptr(k6 ^ mask))
 	a4, f4 := vgc_arena_probe(voidptr(k4 ^ mask))
@@ -94,8 +103,8 @@ fn test_a_recurring_run_keeps_its_size_and_the_next_period_takes_it_in_place() {
 	p4, born4, pooled4 := vgc_span_probe(voidptr(k4 ^ mask))
 	p2, born2, pooled2 := vgc_span_probe(voidptr(k2 ^ mask))
 	println('vgc_recurring_run_keeps_its_size: after the second period the 4864-page run reads ${p4} pages (born=${born4} pooled=${pooled4}), the 2382-page one ${p2} (born=${born2} pooled=${pooled2}), arenas ${vgc_arenas_count()}')
-	assert pooled4 && born4 && p4 == 4865, 'the 4864-page frame\'s run did not keep its size: ${p4} pages (pooled=${pooled4})'
-	assert pooled2 && born2 && p2 == 2383, 'the 2382-page frame\'s run did not keep its size: ${p2} pages (pooled=${pooled2})'
+	assert pooled4 && born4 && p4 == 5120, 'the 4864-page frame\'s run did not keep its size: ${p4} pages (pooled=${pooled4}), not 5120 (4865 rounded)'
+	assert pooled2 && born2 && p2 == 2432, 'the 2382-page frame\'s run did not keep its size: ${p2} pages (pooled=${pooled2}), not 2432 (2383 rounded)'
 	k6c, k4c, k2c := period([4864, 6144, 2382]) // the third period, in another order
 	arenas3 := vgc_arenas_count()
 	println('vgc_recurring_run_keeps_its_size: the third period (4864, 6144, 2382) reads in place ${k4c == k4} ${k6c == k6} ${k2c == k2}, arenas ${arenas1} -> ${arenas3}')
