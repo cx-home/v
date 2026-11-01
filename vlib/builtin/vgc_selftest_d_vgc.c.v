@@ -718,40 +718,47 @@ pub fn vgc_arena_count() int {
 }
 
 // vgc_pace_one_thread_selftest — cx-home/v#62. A cycle paces as one allocating thread (the
-// quarter) only when at most one thread is stamped as allocating (~1 MB this cycle) AND at most
-// one allocated 64 KB or more since the last stop, in this cycle or the one before; the first
-// collection (start-up) paces as one thread whatever the count. template-render on 20 mutators
-// read 0-1 stamped threads every cycle (the quarter's ~1.4 MB budget split 20 ways) and paced
-// ~1,500 of 1,852 cycles at the quarter. json-codec at k=1 read its driver and its one worker
-// both over 64 KB in ONE cycle (the hand-over of the work): that cycle's GOGC=100 goal of 5 MB
-// raised the run's peak from 12.3 to 15.2 MB (misc-epic-56/-57) — one cycle of two is the
-// start-up's, not two allocating threads.
+// quarter) only while at most one thread is stamped as allocating (~1 MB this cycle); then the
+// count of threads that allocated 64 KB or more since the last stop decides, and it changes the
+// answer only when this stop's count and the stop before's agree — one reading on the other side
+// keeps the previous cycle's answer. The first collection (start-up) paces as one thread.
+// template-render on 20 mutators read 0-1 stamped threads every cycle (the quarter's ~1.4 MB
+// budget split 20 ways) and paced ~1,500 of 1,852 cycles at the quarter. json-codec at k=1 read
+// its driver and its one worker both over 64 KB in ONE cycle (the hand-over of the work): that
+// cycle's GOGC=100 goal of 5 MB raised the run's peak from 12.3 to 15.2 MB (misc-epic-56/-57).
+// Under 20 mutators a back-to-back stop reads few threads over 64 KB: template-render's cycle 73
+// dropped from a 256 MB headroom to the quarter's 1.4 MB (misc-epic-56's trace).
 // Driven by bench/parallel-alloc/vgc_pace_one_thread_test.v. 0 = ok; n = the failed case.
+// Arguments: nt, acct, prev (the stop before's acct), was_one (the previous cycle's answer), cycle.
 pub fn vgc_pace_one_thread_selftest() u32 {
-	// 20 mutators each over 64 KB two cycles running, none stamped: several threads, not one
-	if vgc_pace_one_thread(0, 20, 20, 500) || vgc_pace_one_thread(1, 20, 20, 500) {
+	// 20 mutators over 64 KB two stops running, none stamped: several, whatever came before
+	if vgc_pace_one_thread(0, 20, 20, true, 500) || vgc_pace_one_thread(1, 20, 20, false, 500) {
 		return 1
 	}
-	// two over 64 KB two cycles running: several
-	if vgc_pace_one_thread(1, 2, 2, 500) {
+	// two over 64 KB two stops running: several
+	if vgc_pace_one_thread(1, 2, 2, true, 500) {
 		return 2
 	}
-	// one thread by both counts, or an idle cycle: one
-	if !vgc_pace_one_thread(1, 1, 1, 500) || !vgc_pace_one_thread(0, 0, 0, 500)
-		|| !vgc_pace_one_thread(0, 1, 2, 500) {
+	// one thread by both counts two stops running, or idle: one, whatever came before
+	if !vgc_pace_one_thread(1, 1, 1, false, 500) || !vgc_pace_one_thread(0, 0, 0, false, 500)
+		|| !vgc_pace_one_thread(0, 1, 0, false, 500) {
 		return 3
 	}
 	// several stamped: several, whatever the 64 KB counts
-	if vgc_pace_one_thread(4, 4, 4, 500) || vgc_pace_one_thread(2, 0, 0, 500) {
+	if vgc_pace_one_thread(4, 4, 4, true, 500) || vgc_pace_one_thread(2, 0, 0, true, 500) {
 		return 4
 	}
 	// the first collection is start-up: one, whatever the 64 KB counts
-	if !vgc_pace_one_thread(1, 3, 3, 0) {
+	if !vgc_pace_one_thread(1, 3, 3, false, 0) {
 		return 5
 	}
-	// one cycle with two over 64 KB after a one-thread cycle (k=1's hand-over): one
-	if !vgc_pace_one_thread(1, 2, 1, 500) || !vgc_pace_one_thread(0, 20, 0, 500) {
+	// one stop with two over 64 KB after a one-thread cycle (k=1's hand-over): still one
+	if !vgc_pace_one_thread(1, 2, 1, true, 500) || !vgc_pace_one_thread(0, 20, 0, true, 500) {
 		return 6
+	}
+	// one stop with few over 64 KB after several (a back-to-back stop under 20 mutators): still several
+	if vgc_pace_one_thread(0, 0, 20, false, 500) || vgc_pace_one_thread(1, 1, 20, false, 500) {
+		return 7
 	}
 	return 0
 }
