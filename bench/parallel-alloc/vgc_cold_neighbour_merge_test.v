@@ -6,16 +6,18 @@
 // and a request the two together would have served carved an arena while
 // 25–176 MB sat pooled (measure/collector-epic-64, the carve lines).
 //
-// The shape (pages of 8 KB; the array's header adds one to each): two
-// 3000-page frames held, carved from the tail one above the other, then a
+// The shape (pages of 8 KB; the array's header adds one to each): a
+// 3000-page frame and a 2900-page one above it, carved from the tail (two
+// sizes asked for once each: a run of a recurring size keeps its size and
+// joins nothing, vgc_pool_keeps_size), then a
 // 1 MB separator held so the upper frame merges with nothing above it. The
 // upper frame is dropped and four collections run: the trim returns its run
 // to the OS after two (vgc_pool_trim_age). Then the lower frame is dropped
 // and a collection runs: its run is freed beside the cold run. A 5500-page
 // request follows: the arena's tail (8192 pages less the two frames and the
 // separator) cannot hold it, so on 14dfcca7f — the hot run and the cold run
-// apart, 3000 pages each — it carves a second arena; now the merged 6000-page
-// cold run serves it and the arena count holds. Its own process (a fresh
+// apart, 3000 and 2900 pages — it carves a second arena; now the merged
+// 5900-page cold run serves it and the arena count holds. Its own process (a fresh
 // heap: one arena).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_cold_neighbour_merge_test.v
@@ -49,7 +51,7 @@ fn scrub_stack() {
 
 fn test_a_freed_run_joins_its_cold_neighbour() {
 	mut lower := fill(3000 * page) // held: the lower frame
-	assert drop_frame(3000 * page) == 3000 * page // the upper frame, dropped
+	assert drop_frame(2900 * page) == 2900 * page // the upper frame, dropped (its own size: the two runs merge)
 	sep := fill(mb) // held: nothing merges with the upper frame's run from above
 	scrub_stack()
 	gc_collect() // the upper run is pooled, hot
@@ -62,9 +64,10 @@ fn test_a_freed_run_joins_its_cold_neighbour() {
 	assert arenas0 == 2, 'the two frames did not fit one frame arena beside the plain one: ${arenas0}'
 	lower = []u8{}
 	scrub_stack()
-	gc_collect() // the lower run is freed beside the cold run: one 6000-page cold run
-	big := fill(5500 * page) // takes the merged run; apart, the two runs are 3000 pages each and the tail is short of it
+	gc_collect() // the lower run is freed beside the cold run: one 5900-page cold run
+	big :=
+		fill(5500 * page) // takes the merged run; apart, the two runs are 3000 and 2900 pages and the tail is short of it
 	arenas1 := vgc_arenas_count()
-	println('vgc_cold_neighbour_merge: arenas ${arenas0} -> ${arenas1} after a 5500-page request beside a freed 3000-page run and a cold 3000-page run (${sep.len} ${big.len} ${lower.len})')
+	println('vgc_cold_neighbour_merge: arenas ${arenas0} -> ${arenas1} after a 5500-page request beside a freed 3000-page run and a cold 2900-page run (${sep.len} ${big.len} ${lower.len})')
 	assert arenas1 == arenas0, 'the 5500-page request carved an arena: the freed run did not join its cold neighbour (${arenas0} -> ${arenas1})'
 }

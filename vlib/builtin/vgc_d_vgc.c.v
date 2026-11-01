@@ -3443,6 +3443,33 @@ fn vgc_get_free_span(npages u32, frames bool) (&VGC_Span, bool) {
 	return span, cold
 }
 
+// vgc_pool_keeps_size says whether a pooled run keeps its size through the
+// pool's merges (cx-home/v#58): a frame's span (a frame arena's large object,
+// vgc_span_frames) whose size recurs (vgc_large_size_recurs: asked for more
+// than once, exactly or as its granule block's top) joins no freed neighbour
+// and no idle-run coalesce (vgc_put_free_span, vgc_pool_defrag), so the next
+// period's request of that size finds it whole by its exact size and takes
+// it in place. Merged, a frame's run became a run of a size nothing asks for
+// (7,246 and 6,724 pages from the writer's 4,864- and 2,382-page frames
+// beside each other) that the period's frames, arriving smallest first,
+// split in a different order every period — 2,432 off the 5,953 run, 4,864
+// off the 6,724 one, 3,072 off the 7,246 one kept for the 6,144 frame —
+// until a size found no run and carved (measure/collector-epic-74, G-1's
+// cycles 172 and 228: the arena count climbed 8 -> 12 over the run). A run
+// of a size asked for once merges as before: a request larger than any one
+// dead run is served by their join (vgc_cold_neighbour_merge_test.v). The
+// frag gate's collection (vgc_pool_defrag with no age: a request that would
+// carve an arena while the pool covers it) merges the kept runs too — the
+// arena is dearer than the size's next request finding its run split; the
+// idle-run coalesce (aged) leaves them. A plain arena's runs merge as
+// before: its recurring buffers are many and small, and a growing request
+// between them needs their join (vgc_frame_arena_reuse_test.v's buffers).
+@[inline]
+fn vgc_pool_keeps_size(s &VGC_Span) bool {
+	return s.large_born && s.npages <= u32(vgc_max_pooled_pages) && vgc_span_frames(s)
+		&& vgc_large_size_recurs(s.npages)
+}
+
 // vgc_pool_split_cap is the largest pooled LARGE-OBJECT span (VGC_Span.large_born:
 // a large object of a size asked for more than once, vgc_large_demand) a
 // request of npages may split while an arena tail can serve it: twice the
@@ -4709,6 +4736,9 @@ fn vgc_put_free_span(mut span VGC_Span) {
 	// so does a cold region grown by frees. The sized-list tail walk already
 	// tolerates an old-gen span re-entering at the head (see vgc_pool_trim).
 	mut gen := u32(vgc_heap.gc_cycle)
+	// a frame's run of a recurring size keeps its size (cx-home/v#58): it
+	// joins no neighbour, and none joins it (vgc_pool_keeps_size)
+	keep := vgc_pool_keeps_size(cur)
 	arena_idx := vgc_arena_of(span.base)
 	if arena_idx >= 0 {
 		a := unsafe { &vgc_heap.arenas[arena_idx] }
@@ -4723,6 +4753,7 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			if p != unsafe { nil } && p.pooled && !p.in_use
 				&& vgc_pool_states_meet(p, cur) && p.npages >= u32(vgc_pool_merge_min)
 				&& p.npages <= u32(vgc_max_pooled_pages)
+				&& !keep && !vgc_pool_keeps_size(p)
 				&& p.base + usize(p.npages) * vgc_page_size == cur.base {
 				if p.pool_gen < gen {
 					gen = p.pool_gen
@@ -4745,7 +4776,8 @@ fn vgc_put_free_span(mut span VGC_Span) {
 				mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[sidx]))))) }
 				if s != unsafe { nil } && s.pooled && !s.in_use
 					&& vgc_pool_states_meet(s, cur) && s.npages >= u32(vgc_pool_merge_min)
-					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end {
+					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end
+					&& !keep && !vgc_pool_keeps_size(s) {
 					if s.pool_gen < gen {
 						gen = s.pool_gen
 					}
@@ -5128,7 +5160,8 @@ fn vgc_pool_defrag(min_age u32) u64 {
 				p++
 				continue
 			}
-			if !s.pooled || s.in_use || cyc - s.pool_gen < min_age {
+			if !s.pooled || s.in_use || cyc - s.pool_gen < min_age
+				|| (min_age > 0 && vgc_pool_keeps_size(s)) {
 				p += usize(s.npages)
 				continue
 			}
@@ -5141,7 +5174,8 @@ fn vgc_pool_defrag(min_age u32) u64 {
 					|| q.base != a.base + q_idx * vgc_page_size
 					|| s.npages + q.npages > u32(vgc_max_pooled_pages)
 					|| cyc - q.pool_gen < min_age
-					|| (min_age > 0 && s.decommitted != q.decommitted) {
+					|| (min_age > 0 && s.decommitted != q.decommitted)
+					|| (min_age > 0 && vgc_pool_keeps_size(q)) {
 					break
 				}
 				if !merged {
