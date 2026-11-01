@@ -1530,6 +1530,44 @@ fn vgc_perm_promote() {
 // one did not is a missed pointer: a store the barrier did not cover. Reports
 // 0x1910 (the count) and 0x1911/0x1912 (the first eight objects' address and
 // element size); the union of both marks stays, so the run remains sound.
+// -d vgc_cm_verify, cx-home/v#56's diagnosis: the first missed object is
+// watched from the next cycle on — every vgc_shade call naming a word inside
+// it reports (0x1915: the word, 0x1916: the span's state as the call saw it,
+// bit 0 in_use, 1 the alloc bit, 2 the mark bit before, 3 inflight, 4
+// sweep_gen == gc_cycle, 5 the verifier's re-mark (0: the cycle's own mark),
+// 6 more than one marker, 7 the span noscan; 0x1917: its span's base and
+// elem size), so the cycle's root scan and the verifier's are compared on
+// the one word: whether the cycle's scan presents it at all, and what state
+// turned it away.
+__global vgc_cmv_watch_lo = usize(0)
+__global vgc_cmv_watch_hi = usize(0)
+__global vgc_cmv_in_verify = u32(0)
+__global vgc_cmv_pinned = u32(0)
+
+// vgc_cm_verify_watch sets the watch to the whole span holding p (a test
+// program's hook: the worker's scratch buffer's span, every slot of it);
+// a no-op outside -d vgc_cm_verify.
+@[markused]
+pub fn vgc_cm_verify_watch(p voidptr) {
+	$if vgc_cm_verify ? {
+		if vgc_cmv_pinned != 0 {
+			return // a miss pinned the watch to its span
+		}
+		span := vgc_find_span(p)
+		if span == unsafe { nil } || span.npages == 0 {
+			return
+		}
+		lo := span.base
+		hi := span.base + usize(span.npages) * vgc_page_size
+		if lo != vgc_cmv_watch_lo || hi != vgc_cmv_watch_hi {
+			vgc_cmv_watch_lo = lo
+			vgc_cmv_watch_hi = hi
+			C.vgc_say(0x1914, u64(lo))
+			C.vgc_say(0x1913, u64(hi))
+		}
+	}
+}
+
 fn vgc_cm_verify(self_idx int) {
 	$if vgc_cm_verify ? {
 		nsp := vgc_heap.nspans
@@ -1551,8 +1589,10 @@ fn vgc_cm_verify(self_idx int) {
 		vgc_perm_clear_zero = false
 		saved_n := vgc_mark_nworkers_cur
 		vgc_mark_nworkers_cur = 1
+		vgc_cmv_in_verify = 1
 		vgc_cm_roots(self_idx)
 		vgc_drain_mark_work(0)
+		vgc_cmv_in_verify = 0
 		vgc_mark_nworkers_cur = saved_n
 		mut missed := u64(0)
 		for i in 0 .. nsp {
@@ -1571,6 +1611,14 @@ fn vgc_cm_verify(self_idx int) {
 							if missed < 8 {
 								C.vgc_say(0x1911, u64(span.base + usize(u32(b) * 8 + u32(bit)) * usize(span.elem_size)))
 								C.vgc_say(0x1912, u64(span.elem_size))
+							}
+							if vgc_cmv_pinned == 0 {
+								// the first miss pins the watch to its span, every slot of it
+								vgc_cmv_pinned = 1
+								vgc_cmv_watch_lo = span.base
+								vgc_cmv_watch_hi = span.base + usize(span.npages) * vgc_page_size
+								C.vgc_say(0x1914, u64(vgc_cmv_watch_lo))
+								C.vgc_say(0x1913, u64(vgc_cmv_watch_hi))
 							}
 							missed++
 						}
@@ -2530,6 +2578,43 @@ fn vgc_shade(addr usize, w int) {
 		return
 	}
 	span := vgc_find_span(voidptr(addr))
+	$if vgc_cm_verify ? {
+		if vgc_cmv_watch_hi != 0 && addr >= vgc_cmv_watch_lo && addr < vgc_cmv_watch_hi {
+			C.vgc_say(0x1915, u64(addr))
+			if span == unsafe { nil } {
+				C.vgc_say(0x1916, u64(0x100) | u64(vgc_cmv_in_verify) << 5)
+			} else {
+				oi := u32((addr - span.base) / usize(span.elem_size))
+				mut st := u64(0)
+				if span.in_use {
+					st |= 1
+				}
+				if span.alloc_bits != unsafe { nil } && oi < span.nelems
+					&& C.vgc_bitmap_get(span.alloc_bits, oi) != 0 {
+					st |= 2
+				}
+				if span.mark_bits != unsafe { nil } && oi < span.nelems
+					&& C.vgc_bitmap_get(span.mark_bits, oi) != 0 {
+					st |= 4
+				}
+				if C.vgc_atomic_load_u32(&span.inflight) != 0 {
+					st |= 8
+				}
+				if span.sweep_gen == u32(vgc_heap.gc_cycle) {
+					st |= 16
+				}
+				st |= u64(vgc_cmv_in_verify) << 5
+				if vgc_mark_nworkers_cur > 1 {
+					st |= 64
+				}
+				if span.noscan {
+					st |= 128
+				}
+				C.vgc_say(0x1916, st)
+				C.vgc_say(0x1917, u64(span.base) | u64(span.elem_size) << 48)
+			}
+		}
+	}
 	if span == unsafe { nil } || !span.in_use {
 		return
 	}
@@ -2625,6 +2710,15 @@ fn vgc_rd_shade_root(addr usize, val usize, w int) {
 	cat := vgc_rd_cat
 	b0 := vgc_rd_bytes
 	o0 := vgc_rd_objs
+	$if vgc_cm_verify ? {
+		if vgc_cmv_watch_hi != 0 && val >= vgc_cmv_watch_lo && val < vgc_cmv_watch_hi {
+			// the root word naming a watched address: its kind (vgc_rd_cat), own
+			// stack or not, the verifier's pass or the cycle's, and the word's
+			// offset below the stack top
+			C.vgc_say(0x1918, u64(cat) | u64(if vgc_rd_own { 1 } else { 0 }) << 8 | u64(vgc_cmv_in_verify) << 9)
+			C.vgc_say(0x1919, u64(if cat >= 10 { vgc_rd_base - addr } else { addr }))
+		}
+	}
 	vgc_shade(val, w)
 	vgc_rd_cat = 0
 	vgc_drain_mark_work(w)
