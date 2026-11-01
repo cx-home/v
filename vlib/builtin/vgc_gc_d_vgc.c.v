@@ -2742,63 +2742,103 @@ fn vgc_stop_weighed_cpus(work u64, line u64) int {
 	if !vgc_stop_weigh {
 		return 0
 	}
-	n := u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
-	if n <= 1 || work * n < line {
+	n := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
+	if !vgc_stop_weighs(work, line, n) {
 		return 0
 	}
 	if C.vgc_box_busy(vgc_walk_ncpu) != 0 {
 		return 0
 	}
-	return C.vgc_box_free_cpus(vgc_walk_ncpu, int(n))
+	return C.vgc_box_free_cpus(vgc_walk_ncpu, n)
+}
+
+// vgc_stop_weighs: does a stop that holds `held` mutators weigh its work by
+// them — more than one held, and the work times the held threads at the line.
+@[inline]
+fn vgc_stop_weighs(work u64, line u64, held int) bool {
+	return held > 1 && work * u64(held) >= line
 }
 
 fn vgc_mark_plan() int {
 	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked {
 		return 1
 	}
+	live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
+	free := vgc_stop_weighed_cpus(vgc_mark_last_work_ns, vgc_mark_par_min_ns)
+	total := vgc_mark_plan_count(vgc_mark_workers_cfg, vgc_mark_last_work_ns, vgc_mark_par_min_ns,
+		live, free, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target)
+	if total <= 1 {
+		return 1
+	}
+	return vgc_pool_ensure(total)
+}
+
+// vgc_mark_plan_count answers the markers a stop fields (before the pool is
+// grown): `cfg` configured, the previous mark's `work` against the pool's
+// `line` (vgc_mark_par_min_ns), the `live` mutators the stop holds, the `free`
+// CPUs vgc_stop_weighed_cpus leaves the stop (0 when the work times the held
+// mutators stays below the line, or on a busy box), `wide` (vgc_mark_wide_total)
+// and the back-off's `target` (vgc_mark_adapt; 0 = none).
+//
+// One marker per `line` of the previous mark's work: a 3 ms mark gets three
+// markers, a 10 ms one the configured count. The whole pool on a small mark is
+// CPU for nothing — each marker's time is the mark's wall time, mostly
+// idle-spinning on an emptied grey set. line = 0 (VGC_MARK_PAR_MIN_US=0)
+// forces the configured count (and is no divisor: x86 traps on it, arm64
+// reads 0 and would never engage the pool).
+//
+// cx-home/v#56: a stop that holds several mutators (free >= 2) engages the
+// pool with a floor of markers. cx-home/v#62: that floor held only BELOW the
+// line, so a mark of 1-2 ms got one marker while every held mutator waited —
+// and a parallel mark's work reads n x its wall, so a stop that once crossed
+// the line stayed on one marker: template-render on 20 mutators (code.md §7.3)
+// ran 1,172 of 1,738 cycles on one marker (1.3 ms mean mark, 4.7 s of stops in
+// a 5.8 s run, 6.0 s wall against Python's 0.87 s). The floor now holds on
+// both sides of the line, and grows with the held mutators: a quarter of them,
+// at least four (vgc_mark_held_floor), at most the free CPUs.
+fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide bool, target int) int {
+	if cfg <= 1 {
+		return 1
+	}
 	mut floor := 1
-	if vgc_mark_last_work_ns < vgc_mark_par_min_ns {
-		// cx-home/v#56: below the line, a stop that holds several mutators
-		// (vgc_stop_weighed_cpus) still engages the pool when its mark's work times
-		// the threads it holds reaches the line, four markers at the floor
-		free := vgc_stop_weighed_cpus(vgc_mark_last_work_ns, vgc_mark_par_min_ns)
-		if free < 2 {
-			return 1
-		}
-		floor = if free < 4 { free } else { 4 }
+	if free >= 2 {
+		floor = vgc_mark_held_floor(live, free)
+	} else if work < line {
+		return 1
 	}
-	mut total := vgc_mark_workers_cfg
-	if vgc_mark_wide && !vgc_mark_workers_env {
-		live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
-		if live >= total {
-			total = vgc_mark_wide_total(total, live, vgc_stop_weighed_cpus(vgc_mark_last_work_ns,
-				vgc_mark_par_min_ns))
-		}
+	mut total := cfg
+	if wide && live >= total {
+		total = vgc_mark_wide_total(total, live, free)
 	}
-	// One marker per vgc_mark_par_min_ns of the previous mark's work: a 3 ms
-	// mark gets three markers, a 10 ms one the configured count. The whole
-	// pool on a small mark is CPU for nothing — each marker's time is the
-	// mark's wall time, mostly idle-spinning on an emptied grey set.
-	// VGC_MARK_PAR_MIN_US=0 forces the configured count (and is no divisor:
-	// x86 traps on it, arm64 reads 0 and would never engage the pool).
-	mut by_work := if vgc_mark_par_min_ns == 0 {
-		total
-	} else {
-		int(vgc_mark_last_work_ns / vgc_mark_par_min_ns)
-	}
+	mut by_work := if line == 0 { total } else { int(work / line) }
 	if by_work < floor {
 		by_work = floor
 	}
 	if by_work < total {
 		total = by_work
 	}
-	if vgc_mark_n_target > 0 && vgc_mark_n_target < total {
-		total = vgc_mark_n_target
+	if target > 0 && target < total {
+		total = target
 	}
-	if total <= 1 {
-		return 1
+	return if total < 1 { 1 } else { total }
+}
+
+// vgc_mark_held_floor (cx-home/v#62): the markers a stop that holds `live`
+// mutators fields at least, given `free` CPUs: a quarter of the held mutators
+// (Go's background mark takes a quarter of its Ps), at least four, at most the
+// free CPUs and vgc_max_markers.
+fn vgc_mark_held_floor(live int, free int) int {
+	mut n := live / 4
+	if n < 4 {
+		n = 4
 	}
-	return vgc_pool_ensure(total)
+	if n > free {
+		n = free
+	}
+	if n > vgc_max_markers {
+		n = vgc_max_markers
+	}
+	return n
 }
 
 // vgc_mark_wide_total answers the markers a stop may field when it holds `live`
