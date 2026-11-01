@@ -359,11 +359,13 @@ fn vgc_gc_start() {
 				acct_threads++
 			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_flushed += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
 			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
 		}
 	}
+	vgc_acct_threads_prev = vgc_acct_threads
 	vgc_acct_threads = acct_threads
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
 
@@ -1733,11 +1735,13 @@ fn vgc_gc_start_concurrent() {
 				acct_threads++
 			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_flushed += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
 			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
 		}
 	}
+	vgc_acct_threads_prev = vgc_acct_threads
 	vgc_acct_threads = acct_threads
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
 
@@ -4244,18 +4248,21 @@ pub fn vgc_limit_selftest() u32 {
 // vgc_pace_one_thread says whether this cycle paces as ONE allocating thread (the quarter,
 // vgc_one_thread_pct; cx-home/v#56): nt, the threads stamped as allocating this cycle
 // (vgc_alloc_threads, ~1 MB each), is at most one, and so is acct, the threads that allocated
-// vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), except on the first
-// collection, whose cycle is the program's start-up (cx-core-code#123). cx-home/v#62: the stamp
+// vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), or prev, that count
+// at the stop before, except on the first collection, whose cycle is the program's start-up
+// (cx-core-code#123). One cycle of two such threads after a one-thread cycle is a hand-over
+// (json-codec k=1: the driver hands the work to its one worker, and that cycle's GOGC=100 goal
+// of 5 MB held the run's peak at 15.2 MB against 12.3), not two allocating threads. cx-home/v#62: the stamp
 // alone read 20 mutators as one thread, because the quarter's budget (marked/4, ~1.4 MB on a
 // 5.4 MB live set) split 20 ways keeps every worker under the 1 MB stamp: template-render on 20
 // mutators paced ~1,500 of 1,852 cycles at goal = marked + ~1.5 MB, a stop every ~1.5 MB of
 // allocation. Several allocating threads keep GOGC=100, as the doc at vgc_one_thread_pct says;
 // the stamp still decides the per-thread scaling (cx-home/v#16, cx-private#1916).
-fn vgc_pace_one_thread(nt int, acct int, cycle u64) bool {
+fn vgc_pace_one_thread(nt int, acct int, prev int, cycle u64) bool {
 	if nt > 1 {
 		return false
 	}
-	return cycle == 0 || acct <= 1
+	return cycle == 0 || acct <= 1 || prev <= 1
 }
 
 fn vgc_update_trigger() {
@@ -4280,7 +4287,7 @@ fn vgc_update_trigger() {
 		nt = vgc_alloc_threads()
 	}
 	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
-	one := vgc_pace_one_thread(nt, vgc_acct_threads, u64(vgc_heap.gc_cycle))
+	one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev, u64(vgc_heap.gc_cycle))
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
 		// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's
 		// GOGC=100 goal, clamp(1 x marked, vgc_headroom_floor_lo1, live_floor),
@@ -4561,6 +4568,17 @@ fn vgc_total_allocated() u64 {
 		all += unsafe { vgc_cache(ci).alloc_delta }
 	}
 	return all
+}
+
+// vgc_thread_allocated is the bytes the calling thread has allocated since it registered: its
+// flushed share plus its un-flushed delta, both in its own slot (gc_thread_allocated,
+// cx-home/v#62). A thread with no slot reads the process-wide count.
+fn vgc_thread_allocated() u64 {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 {
+		return vgc_total_allocated()
+	}
+	return unsafe { vgc_cache(idx).alloc_flushed + vgc_cache(idx).alloc_delta }
 }
 
 fn vgc_heap_usage() (usize, usize, usize, usize, usize) {
