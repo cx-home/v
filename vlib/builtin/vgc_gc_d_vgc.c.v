@@ -3228,6 +3228,33 @@ fn vgc_mark_scan_obj(obj_addr usize, w int) {
 		return
 	}
 	obj_size := usize(span.elem_size)
+	$if vgc_cm_verify ? {
+		// the holder of a watched word: the grey object whose words name a
+		// watched address (0x191a its address, 0x191b its span's permanence —
+		// bit 0 the span holds permanent objects, bit 1 this object is one —
+		// with the class index and the pass, 0x191c the word's offset)
+		if vgc_cmv_watch_hi != 0 {
+			mut a := obj_addr & ~(usize(sizeof(usize)) - 1)
+			for a + sizeof(usize) <= obj_addr + obj_size {
+				val := unsafe { *(&usize(voidptr(a))) }
+				if val >= vgc_cmv_watch_lo && val < vgc_cmv_watch_hi {
+					oi := u32((obj_addr - span.base) / usize(span.elem_size))
+					mut pf := u64(0)
+					if span.perm != 0 {
+						pf |= 1
+					}
+					if span.perm_bits != unsafe { nil } && oi < span.nelems
+						&& C.vgc_bitmap_get(span.perm_bits, oi) != 0 {
+						pf |= 2
+					}
+					C.vgc_say(0x191a, u64(obj_addr))
+					C.vgc_say(0x191b, pf | u64(span.class_idx) << 8 | u64(vgc_cmv_in_verify) << 16 | u64(span.elem_size) << 24)
+					C.vgc_say(0x191c, u64(a - obj_addr))
+				}
+				a += sizeof(usize)
+			}
+		}
+	}
 	vgc_scan_range(obj_addr, obj_addr + obj_size, w)
 }
 
