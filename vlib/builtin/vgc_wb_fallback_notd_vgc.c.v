@@ -15,3 +15,9 @@ module builtin
 @[markused]
 fn vgc_wb_store(obj voidptr) {
 }
+
+// vgc_wb_store_into is the bulk mutators' call (array.v, map.v; cx-home/v#56
+// lever 7 gates it on the young range under vgc): the same no-op here.
+@[markused]
+fn vgc_wb_store_into(obj voidptr) {
+}

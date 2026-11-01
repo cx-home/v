@@ -44,6 +44,8 @@ fn C.vgc_atomic_fence()
 fn C.vgc_cpu_pause()
 fn C.vgc_os_alloc(size usize) voidptr
 fn C.vgc_os_free(ptr voidptr, size usize)
+fn C.vgc_os_reserve(size usize) voidptr // cx-home/v#56 lever 7: the nursery's range
+fn C.vgc_os_commit(ptr voidptr, size usize) int
 fn C.vgc_os_decommit(ptr voidptr, size usize)
 fn C.vgc_os_page() usize
 fn C.vgc_os_recommit(ptr voidptr, size usize) // undo decommit before reuse (cx #360)
@@ -526,6 +528,10 @@ mut:
 	// mmap-zeroed at arena creation, never freed, published by the same
 	// narenas store; nil under the default build (no barrier calls it)
 	cards &u8 = unsafe { nil }
+	// cx-home/v#56 lever 7: a nursery arena — a chunk of the nursery's reserved
+	// range, carved by vgc_nursery_alloc's bump alone: its tail serves no other
+	// request (vgc_arena_pick passes it over)
+	nursery bool
 }
 
 // VGC_WorkBuf is a work buffer for the mark phase.
@@ -1069,6 +1075,36 @@ __global vgc_perm_pages_n = usize(0)
 // after it, the whole address space during a concurrent middle (vgc_wb_set).
 // vgc_wb_mode mirrors vgc_heap.wb_enabled for vgc_wb_store's own test.
 __global vgc_wb_mode = u32(0)
+// cx-home/v#56 lever 7: the nursery. Under the young regime (VGC_YOUNG=1) a
+// class span — the small objects' spans, where the pointer stores land — is
+// carved from a bump over one reserved address range (vgc_nursery_reserve, 16
+// GB of PROT_NONE at vgc_init; vgc_nursery_alloc), committed an arena at a
+// time: the nursery arenas are ordinary arenas (page map, cards, the address
+// map) placed in the range in address order, so every span carved since the
+// last stop lies in [vgc_young_lo, vgc_nursery_end) — above the bump the stop
+// read (vgc_wb_set: vgc_young_lo = the bump, vgc_young_len = the range above
+// it; 0 in a concurrent middle and with no nursery). A span handed out since
+// the last stop holds only young objects, and a minor cycle traces young
+// objects whole (the cards are read for the OLD objects alone,
+// vgc_minor_cards), so a store into such a span needs no card: the generated
+// C's gate (cgen vgc_wb_gate, the native header's vgc_native_wb_gate) tests
+// the young range first and makes no call for a store into it — before, a
+// store outside the hint arena called the barrier every time (the records of
+// a fresh batch: two calls per record, bench/parallel-alloc/young/nursery.v),
+// a store inside read ~10 instructions. A mutator frozen between that test
+// and its store across a stop stores into an object the stop made old: its
+// second gate (vgc_wb_epoch, lever 3) calls the barrier after the store and
+// sets the card. The bump moves only forward; a freed nursery span is pooled
+// as every span is and serves later requests below the bump (old spans:
+// the barrier applies). The nursery is exhausted at 16 GB of carves: class
+// spans come off the general arenas again from then on.
+__global vgc_nursery_base = usize(0)
+__global vgc_nursery_end = usize(0)
+__global vgc_nursery_next = usize(0) // the next chunk's address
+__global vgc_nursery_cur = int(-1) // the arena the bump is in
+__global vgc_young_lo = usize(0)
+__global vgc_young_len = usize(0)
+const vgc_nursery_reserve = usize(16) * 1024 * 1024 * 1024
 __global vgc_wb_lo = usize(0)
 __global vgc_wb_len = usize(0)
 // cx-home/v#56 lever 3 (the store's second gate): the stops counted — bumped
@@ -1204,6 +1240,19 @@ fn vgc_wb_set(mode u32) {
 		hint = vgc_find_arena(vgc_wb_lo) + 1
 	}
 	C.vgc_atomic_store_u32(&vgc_wb_arena_hint, u32(hint))
+	// cx-home/v#56 lever 7: the young range — the nursery above its bump as
+	// of this stop; empty in a concurrent middle (every store dirties its
+	// span there) and without a nursery
+	if (mode & 1) != 0 || vgc_nursery_base == 0 {
+		vgc_young_len = 0
+	} else {
+		mut bump := vgc_nursery_next
+		if vgc_nursery_cur >= 0 {
+			bump = vgc_heap.arenas[vgc_nursery_cur].base + vgc_heap.arenas[vgc_nursery_cur].used
+		}
+		vgc_young_lo = bump
+		vgc_young_len = vgc_nursery_end - bump
+	}
 	// the gate's record of the hint arena (cx-home/v#56 lever 5), nil in a
 	// concurrent middle (hint 0 there) and for an arena without a table
 	mut hp := voidptr(0)
@@ -1220,6 +1269,40 @@ fn vgc_wb_set(mode u32) {
 		}
 	}
 	vgc_wb_hp = hp
+}
+
+// vgc_wb_store_into is the bulk mutators' barrier call — array.v's element
+// stores and the grow copy, vgc_memdup's fresh object — the young range first
+// (cx-home/v#56 lever 7), as the generated C's gate tests it: a store into an
+// object of a span carved since the last stop needs no card (the doc at
+// vgc_nursery_base), and the value stored at these sites is in hand before
+// the test, so a stop between the test and the store finds it on the
+// mutator's stack and marks it — the store then lands an old pointer in an
+// old object. Then vgc_wb_store as before.
+@[inline]
+pub fn vgc_wb_store_into(obj voidptr) {
+	if usize(obj) - vgc_young_lo < vgc_young_len {
+		return
+	}
+	vgc_wb_store(obj)
+}
+
+// vgc_in_nursery reports whether p lies in the nursery's range (cx-home/v#56
+// lever 7's test: a record of a fresh span); false without a nursery.
+pub fn vgc_in_nursery(p voidptr) bool {
+	return vgc_nursery_base != 0 && usize(p) - vgc_nursery_base < vgc_nursery_reserve
+}
+
+// vgc_is_young reports whether p lies in the gate's young range (cx-home/v#56
+// lever 7's test): a span carved from the nursery since the last stop.
+pub fn vgc_is_young(p voidptr) bool {
+	return usize(p) - vgc_young_lo < vgc_young_len
+}
+
+// vgc_young_range reports the gate's young range to a test (cx-home/v#56
+// lever 7): its low end and its length as of the last stop.
+pub fn vgc_young_range() (usize, usize) {
+	return vgc_young_lo, vgc_young_len
 }
 
 // vgc_wb_calls_count reports the barrier calls made so far under
@@ -2496,6 +2579,10 @@ pub fn vgc_init() {
 			if yv >= 0 && yv <= 1 {
 				vgc_young_mode = int(yv)
 			}
+		}
+		// cx-home/v#56 lever 7: the nursery's range, under the young regime
+		if vgc_young_mode == 1 {
+			vgc_nursery_reserve_range()
 		}
 		// cx-home/v#56 step 2: minor cycles between two full cycles (0 = none)
 		minors_env := C.getenv(c'VGC_YOUNG_MINORS')
@@ -4892,7 +4979,7 @@ fn vgc_arena_pick(nbytes usize, me int, n int, arenas &VGC_Arena, ceiling int, l
 	mut other := -1
 	for i in 0 .. n {
 		mut a := unsafe { &arenas[i] }
-		if a.used + nbytes > a.size {
+		if a.used + nbytes > a.size || a.nursery {
 			continue
 		}
 		if me <= 0 {
@@ -5252,6 +5339,117 @@ fn vgc_span_alloc_once(npages u32, may_wait bool) (&VGC_Span, bool) {
 	return span, false
 }
 
+// vgc_nursery_reserve_range reserves the nursery's address range at vgc_init
+// (cx-home/v#56 lever 7; the doc at vgc_nursery_base): nothing is committed
+// until the bump reaches it. A failed reservation leaves the nursery off.
+fn vgc_nursery_reserve_range() {
+	mem := C.vgc_os_reserve(vgc_nursery_reserve)
+	if mem == unsafe { nil } {
+		return
+	}
+	vgc_nursery_base = usize(mem)
+	vgc_nursery_end = vgc_nursery_base + vgc_nursery_reserve
+	vgc_nursery_next = vgc_nursery_base
+}
+
+// vgc_nursery_alloc carves a span of npages from the nursery's bump
+// (cx-home/v#56 lever 7): the current nursery arena's tail, or the next chunk
+// of the range committed and published as an arena (the page map, the cards
+// and the address map as vgc_span_alloc_once's carve does; narenas stored
+// RELEASE last). The span is published as a carve is: in_use false, in
+// flight, its pages pointed at it. Nil when the range is spent or no arena,
+// map or descriptor can be had: the caller carves from the general arenas.
+fn vgc_nursery_alloc(npages u32) &VGC_Span {
+	nbytes := usize(npages) * vgc_page_size
+	C.vgc_mutex_lock(&vgc_heap.lock)
+	mut idx := vgc_nursery_cur
+	mut new_arena := false
+	if idx < 0 || vgc_heap.arenas[idx].used + nbytes > vgc_heap.arenas[idx].size {
+		if vgc_nursery_next + vgc_arena_size > vgc_nursery_end
+			|| vgc_heap.narenas >= vgc_arena_ceiling() {
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			return unsafe { nil }
+		}
+		mem := voidptr(vgc_nursery_next)
+		if C.vgc_os_commit(mem, vgc_arena_size) == 0 {
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			return unsafe { nil }
+		}
+		nmap := vgc_arena_size / vgc_page_size
+		psmem := C.vgc_os_alloc(usize(sizeof(voidptr)) * nmap)
+		if psmem == unsafe { nil } {
+			C.vgc_mutex_unlock(&vgc_heap.lock)
+			return unsafe { nil }
+		}
+		mut cmem := &u8(unsafe { nil })
+		$if vgc_concurrent ? {
+			cmem = unsafe { &u8(C.vgc_os_alloc(nmap)) }
+			if cmem == unsafe { nil } {
+				C.vgc_os_free(psmem, usize(sizeof(voidptr)) * nmap)
+				C.vgc_mutex_unlock(&vgc_heap.lock)
+				return unsafe { nil }
+			}
+		}
+		idx = vgc_heap.narenas
+		unsafe {
+			vgc_heap.arenas[idx].base = usize(mem)
+			vgc_heap.arenas[idx].size = vgc_arena_size
+			vgc_heap.arenas[idx].used = 0
+			vgc_heap.arenas[idx].page_span = &&VGC_Span(psmem)
+			vgc_heap.arenas[idx].cards = cmem
+			vgc_heap.arenas[idx].owner = 0
+			vgc_heap.arenas[idx].nursery = true
+		}
+		vgc_nursery_next += vgc_arena_size
+		vgc_nursery_cur = idx
+		new_arena = true
+		C.vgc_addr_map_register(usize(mem), vgc_arena_size, idx)
+		if vgc_arena_lo == 0 || usize(mem) < vgc_arena_lo {
+			vgc_arena_lo = usize(mem)
+		}
+		if usize(mem) + vgc_arena_size > vgc_arena_hi {
+			vgc_arena_hi = usize(mem) + vgc_arena_size
+		}
+		if vgc_gctrace >= 3 {
+			vgc_gctrace_carve_emit(npages, 1, idx)
+		}
+	}
+	base := vgc_heap.arenas[idx].base + vgc_heap.arenas[idx].used
+	unsafe {
+		vgc_heap.arenas[idx].used += nbytes
+	}
+	span := vgc_new_span_desc()
+	if span == unsafe { nil } {
+		unsafe {
+			vgc_heap.arenas[idx].used -= nbytes
+		}
+		if new_arena {
+			unsafe {
+				C.vgc_atomic_store_u32(&u32(voidptr(&vgc_heap.narenas)), u32(idx + 1))
+			}
+		}
+		C.vgc_mutex_unlock(&vgc_heap.lock)
+		return unsafe { nil }
+	}
+	unsafe {
+		slot := span.slot
+		C.memset(span, 0, sizeof(VGC_Span))
+		span.slot = slot
+		span.base = base
+		span.npages = npages
+		span.sweep_gen = u32(vgc_heap.gc_cycle)
+		C.vgc_atomic_store_u32(&span.inflight, 1)
+	}
+	vgc_span_repoint_pages(idx, base, npages, span)
+	if new_arena {
+		unsafe {
+			C.vgc_atomic_store_u32(&u32(voidptr(&vgc_heap.narenas)), u32(idx + 1))
+		}
+	}
+	C.vgc_mutex_unlock(&vgc_heap.lock)
+	return span
+}
+
 // Initialize a span for a specific size class
 fn vgc_span_init(mut span VGC_Span, class_idx u8, noscan bool) {
 	size := C.vgc_get_class_size(int(class_idx))
@@ -5590,7 +5788,14 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	class_idx := u8(span_class / 2)
 	noscan := (span_class % 2) == 1
 	npages := C.vgc_get_class_npages(int(class_idx))
-	new_span := vgc_span_alloc(npages)
+	// cx-home/v#56 lever 7: from the nursery's bump while there is one
+	mut new_span := &VGC_Span(unsafe { nil })
+	if vgc_nursery_base != 0 {
+		new_span = vgc_nursery_alloc(npages)
+	}
+	if new_span == unsafe { nil } {
+		new_span = vgc_span_alloc(npages)
+	}
 	if new_span == unsafe { nil } {
 		return unsafe { nil }
 	}
@@ -6881,7 +7086,7 @@ fn vgc_memdup_typed(src voidptr, n isize, ptrmap u64, ptr_words u8) voidptr {
 	mem := vgc_malloc_typed_opts(usize(n), ptrmap, ptr_words, false)
 	if mem != unsafe { nil } {
 		$if vgc_concurrent ? {
-			vgc_wb_store(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
+			vgc_wb_store_into(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
 		}
 		unsafe { C.memcpy(mem, src, n) }
 	}
@@ -6897,7 +7102,7 @@ fn vgc_memdup(src voidptr, n isize) voidptr {
 	mem := vgc_malloc_typed_opts(usize(n), 0, 0, false)
 	if mem != unsafe { nil } {
 		$if vgc_concurrent ? {
-			vgc_wb_store(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
+			vgc_wb_store_into(mem) // concurrent-mark barrier: dup'd bytes may hold pointers
 		}
 		unsafe { C.memcpy(mem, src, n) }
 	}
