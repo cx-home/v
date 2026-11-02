@@ -1818,10 +1818,14 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024, vgc_idle_defrag_merged_kb)
-	// cx-home/v#62: the cycle's pacing answer and its inputs — the threads the ~1 MB stamp counted,
-	// the threads over 64 KB at this stop and the stop before, one thread or several
-	C.fprintf(C.stderr, c'[gc %llu] pace nt=%d acct=%d prev=%d one=%d\n', C.vgc_ull(u64(vgc_heap.gc_cycle)),
-		vgc_trace_pace_nt, vgc_acct_threads, vgc_acct_threads_prev, int(vgc_trace_pace_one))
+	// cx-home/v#62: at VGC_GCTRACE=2, the cycle's pacing answer and its inputs — the threads the
+	// ~1 MB stamp counted, the threads over 64 KB at this stop and the stop before, the live
+	// mutators, one thread or several (level 1 keeps one line per collection)
+	if vgc_gctrace >= 2 {
+		C.fprintf(C.stderr, c'[gc %llu] pace nt=%d acct=%d prev=%d live=%u one=%d\n',
+			C.vgc_ull(u64(vgc_heap.gc_cycle)), vgc_trace_pace_nt, vgc_acct_threads, vgc_acct_threads_prev,
+			C.vgc_atomic_load_u32(&vgc_heap.live_threads), int(vgc_trace_pace_one))
+	}
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
 		// bytes the root scan walked and the spans the clear/sweep walks visited.
