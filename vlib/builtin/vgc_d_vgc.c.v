@@ -3465,17 +3465,27 @@ fn vgc_get_free_span(npages u32, frames bool) (&VGC_Span, bool) {
 // frag gate's collection (vgc_pool_defrag with no age: a request that would
 // carve an arena while the pool covers it) merges the kept runs too — the
 // arena is dearer than the size's next request finding its run split; the
-// idle-run coalesce (aged) leaves them. A run of a frame's size keeps its
+// idle-run coalesce (aged) leaves them. A run of a recurring size keeps its
 // size wherever it lies: a frame's first period is plain (the kinds begin at
 // a size's second request, vgc_span_alloc_once), and the second period takes
-// that run in place (vgc_frame_takes_the_plain_pool_test.v). A plain arena's
-// smaller runs merge as before: its recurring buffers are many and small,
-// and a growing request between them needs their join
-// (vgc_frame_arena_reuse_test.v's buffers).
+// that run in place (vgc_frame_takes_the_plain_pool_test.v). And every
+// recurring large size from the rounding's floor up (vgc_large_round_min,
+// 256 pages) keeps its size, not the frames alone: the writer's 1,156–1,920-
+// page buffers recur every period under the quarter, and merged with their
+// freed neighbours their runs were gone by the next period — the request
+// found no run of its length and, the plain tails spent, split the smallest
+// kept frame run as the plain world's last resort (measure/collector-epic-78,
+// G-1's split lines: 1,536, 1,920, 1,156, 1,408 and 1,856 pages off the
+// 2,432-page run, 19 times between cycles 125 and 297), and the frames
+// cascaded through the kept runs to a carve of the largest once a period
+// (6,144 pages at cycles 238, 266 and 299). Kept, each buffer takes its own
+// run in place (vgc_recurring_plain_run_keeps_its_size_test.v). The runs
+// under the floor merge as before: their requests are many and a growing one
+// between them needs their join.
 @[inline]
 fn vgc_pool_keeps_size(s &VGC_Span) bool {
-	return s.large_born && s.npages <= u32(vgc_max_pooled_pages) && vgc_frame_request(s.npages)
-		&& vgc_large_size_recurs(s.npages)
+	return s.large_born && s.npages >= u32(vgc_large_round_min)
+		&& s.npages <= u32(vgc_max_pooled_pages) && vgc_large_size_recurs(s.npages)
 }
 
 // vgc_pool_split_cap is the largest pooled LARGE-OBJECT span (VGC_Span.large_born:
@@ -5574,9 +5584,18 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		// carved a frame arena beside a hot plain run of 5,872 pages, and its
 		// 4,864-, 6,144- and 5,120-page frames beside plain cold runs of
 		// 6,168–6,293 pages (measure/collector-epic-77, G-1's carve lines at
-		// cycles 117, 154, 321 and 399). A plain tail stays the plain
-		// requests' (vgc_arena_pick): a frame placed in one would hand its run
-		// to them.
+		// cycles 117, 154, 321 and 399). And with no plain run of its length
+		// either, it takes a plain TAIL before an arena is carved — the rounded
+		// size, then the exact one, after its own kind's tail at the exact size
+		// (vgc_round_fits_the_tail_test.v): the 300,000-record JSON convert's
+		// two recurring frames (the 2,326-page document's second request, its
+		// first live; the 3,584-page output buffer) carved a frame arena each
+		// beside plain tails of 3,840–4,991 pages, 4 arenas against 2
+		// (measure/collector-epic-78, the convert's carve lines). The frame
+		// arenas open once the plain tails are spent, and a frame placed in a
+		// plain tail keeps its run for its size there (vgc_pool_keeps_size),
+		// where the next period's request finds it (the plain pool above);
+		// vgc_frame_takes_the_plain_tail_test.v.
 		C.vgc_mutex_unlock(&vgc_heap.lock)
 		mut plain, mut cold_plain := vgc_get_free_span_any(npages, false)
 		if plain == unsafe { nil } && floor != 0 && floor < npages {
@@ -5591,6 +5610,18 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		}
 		C.vgc_mutex_lock(&vgc_heap.lock)
 		base, arena_idx = vgc_arena_tail_take(nbytes, frames)
+		if base == 0 {
+			base, arena_idx = vgc_arena_tail_take(nbytes, false)
+			if base == 0 && floor != 0 && floor < npages {
+				nbytes = usize(floor) * vgc_page_size
+				base, arena_idx = vgc_arena_tail_take(nbytes, false)
+				if base != 0 {
+					npages = floor
+				} else {
+					nbytes = usize(npages) * vgc_page_size
+				}
+			}
+		}
 	}
 	if vgc_gctrace >= 3 && base != 0 {
 		vgc_gctrace_carve_emit(npages, 0, arena_idx)

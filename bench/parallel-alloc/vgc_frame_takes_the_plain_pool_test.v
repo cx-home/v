@@ -55,7 +55,8 @@ fn test_a_recurring_frame_takes_its_first_period_run_in_place_and_a_once_asked_f
 	a0, f0 := vgc_arena_probe(voidptr(key0 ^ mask))
 	assert a0 >= 0 && !f0, 'the first period\'s frame is not plain: arena ${a0} frames=${f0}'
 	scrub_stack()
-	gc_collect() // its run is pooled, plain
+	gc_collect()
+	gc_collect() // its run is pooled, plain (the second collection: the sweep done)
 	arenas0 := vgc_arenas_count()
 	again :=
 		fill(n) // period 1: the size recurs (the kinds begin) — nothing of its kind, the plain pool holds its run
