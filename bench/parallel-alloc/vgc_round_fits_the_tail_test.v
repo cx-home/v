@@ -19,7 +19,9 @@
 // and the 2100-page frame again (2101 pages, rounded to 2176: nothing of its
 // kind, nothing of its size pooled, no plain tail — a frame arena of its own), the
 // 2048-page frame asked for again from that arena's tail (3968 pages of tail
-// left), then a 3900-page frame asked for once (plain, held) and again: 3901
+// left), then a 3900-page frame asked for once (plain, held; a plain arena
+// of its own — the frame tail would not keep the frames' room past it,
+// vgc_frame_tail_past_room) and again: 3901
 // pages, rounded to 4096, which no frame tail holds and the pool does not
 // serve; its exact size fits the tail, so no arena is carved and the
 // committed bytes grow by the exact request (plus the tail's sliver after it,
@@ -76,7 +78,7 @@ fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	line := fill(2047 * page) // 2048 pages, recurring: the frame arena's tail, 3968 pages left
 	li, lf := vgc_arena_probe(line.data)
 	assert li == fi && lf, 'the 2048-page frame did not take the frame arena\'s tail: arena ${li} frames=${lf}'
-	once := fill(3900 * page) // asked for once: plain, held
+	once := fill(3900 * page) // asked for once: plain, held — a plain arena of its own: the frame tail left after it (67 pages) would not hold the largest recurring frame (vgc_frame_tail_past_room), so the mirror rule leaves the tail to the frames
 	arenas0 := vgc_arena_count()
 	use0 := gc_memory_use()
 	second :=

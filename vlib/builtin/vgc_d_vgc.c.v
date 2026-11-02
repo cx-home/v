@@ -114,7 +114,7 @@ fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs searc
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
-fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64) // VGC_GCTRACE=3 carve line (cx-home/v#58)
+fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64, phot u64, pcold u64, ptail u64, fhot u64, fcold u64, ftail u64) // VGC_GCTRACE=3 carve line (cx-home/v#58); the pool and the tails by arena kind at its end
 fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash, 3 a kept run's tail
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
@@ -3468,24 +3468,20 @@ fn vgc_get_free_span(npages u32, frames bool) (&VGC_Span, bool) {
 // idle-run coalesce (aged) leaves them. A run of a recurring size keeps its
 // size wherever it lies: a frame's first period is plain (the kinds begin at
 // a size's second request, vgc_span_alloc_once), and the second period takes
-// that run in place (vgc_frame_takes_the_plain_pool_test.v). And every
-// recurring large size from the rounding's floor up (vgc_large_round_min,
-// 256 pages) keeps its size, not the frames alone: the writer's 1,156–1,920-
-// page buffers recur every period under the quarter, and merged with their
-// freed neighbours their runs were gone by the next period — the request
-// found no run of its length and, the plain tails spent, split the smallest
-// kept frame run as the plain world's last resort (measure/collector-epic-78,
-// G-1's split lines: 1,536, 1,920, 1,156, 1,408 and 1,856 pages off the
-// 2,432-page run, 19 times between cycles 125 and 297), and the frames
-// cascaded through the kept runs to a carve of the largest once a period
-// (6,144 pages at cycles 238, 266 and 299). Kept, each buffer takes its own
-// run in place (vgc_recurring_plain_run_keeps_its_size_test.v). The runs
-// under the floor merge as before: their requests are many and a growing one
-// between them needs their join.
+// that run in place (vgc_frame_takes_the_plain_pool_test.v). A plain arena's
+// smaller runs merge as before: its recurring buffers are many and small,
+// and a growing request between them needs their join
+// (vgc_frame_arena_reuse_test.v's buffers). Keeping every recurring size
+// from the rounding's floor up (57a28b0e6) starved the plain requests it
+// meant to serve: the kept runs of 1,156–1,856 pages served nothing larger,
+// and the writer's 1,920-page request carved an arena with the pool at
+// 74 MB and no plain run of its length (measure/collector-epic-79, G-1's
+// carve at cycle 174) — 3 arenas more than the frames-only rule on two runs
+// of three.
 @[inline]
 fn vgc_pool_keeps_size(s &VGC_Span) bool {
-	return s.large_born && s.npages >= u32(vgc_large_round_min)
-		&& s.npages <= u32(vgc_max_pooled_pages) && vgc_large_size_recurs(s.npages)
+	return s.large_born && s.npages <= u32(vgc_max_pooled_pages) && vgc_frame_request(s.npages)
+		&& vgc_large_size_recurs(s.npages)
 }
 
 // vgc_pool_split_cap is the largest pooled LARGE-OBJECT span (VGC_Span.large_born:
@@ -5366,6 +5362,36 @@ fn vgc_span_recycled_ready(mut span VGC_Span, cold bool, npages u32) {
 // vgc_arena_tail_take bumps the arena vgc_arena_pick names and answers the
 // carve's base and arena, or 0 and -1: the caller maps a new arena rather than
 // carve another thread's tail. vgc_heap.lock held.
+// vgc_frame_tail_past_room carves nbytes for a PLAIN request off a frame
+// arena's tail that keeps the frames' room after it — the largest recurring
+// frame size (vgc_large_size_recurs from vgc_frame_pages up) still fits the
+// tail left — and answers 0 when no frame tail has that much (cx-home/v#58,
+// the mirror rule in vgc_span_alloc_once). Under the heap lock. The owner
+// rule (vgc_arena_pick) is not applied: this is the last resort before an
+// arena is carved, taken once in a period.
+fn vgc_frame_tail_past_room(nbytes usize) (usize, int) {
+	mut room := u32(0)
+	for n := u32(vgc_max_pooled_pages); n >= vgc_frame_pages; n-- {
+		if vgc_large_size_recurs(n) {
+			room = n
+			break
+		}
+	}
+	need := nbytes + usize(room) * vgc_page_size
+	for i in 0 .. vgc_heap.narenas {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if !a.frames || a.size > vgc_arena_size || a.used + need > a.size {
+			continue
+		}
+		base := a.base + a.used
+		unsafe {
+			vgc_heap.arenas[i].used += nbytes
+		}
+		return base, i
+	}
+	return 0, -1
+}
+
 fn vgc_arena_tail_take(nbytes usize, frames bool) (usize, int) {
 	me := if vgc_arena_owner_on { C.vgc_get_cache_idx() + 1 } else { 0 }
 	i := vgc_arena_pick(nbytes, me, vgc_heap.narenas, unsafe { &vgc_heap.arenas[0] },
@@ -5483,7 +5509,79 @@ fn vgc_span_alloc_floor(npages u32, floor u32) &VGC_Span {
 // vgc_gctrace_carve_emit writes the VGC_GCTRACE=3 carve line (cx-home/v#58's
 // diagnostic): a request the pool did not serve, with the pool's bytes and
 // its largest hot, cold and oversized spans in pages. vgc_heap.lock held.
-fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int) {
+// VGC_PoolKinds is the pool read by arena kind for the VGC_GCTRACE=3 carve
+// line (cx-home/v#58): the largest hot and cold run of the plain and of the
+// frame kind, in pages (vgc_gctrace_kinds_snapshot, under the pool lock), and
+// the largest plain and frame arena tail (read at the emit, under the heap
+// lock). A reading that says which world carved and what it passed over.
+struct VGC_PoolKinds {
+mut:
+	phot  u32
+	pcold u32
+	fhot  u32
+	fcold u32
+}
+
+// vgc_gctrace_kinds_snapshot walks the pool's populated sizes from the top
+// under the pool lock and names the largest run of each kind, hot and cold;
+// called with no heap lock held (the pool lock comes before it).
+fn vgc_gctrace_kinds_snapshot() VGC_PoolKinds {
+	mut k := VGC_PoolKinds{}
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	for w := 128; w >= 0; w-- {
+		for b := 63; b >= 0; b-- {
+			bit := u64(1) << u64(b)
+			n := (u32(w) << 6) + u32(b)
+			if n == 0 || n > u32(vgc_max_pooled_pages) {
+				continue
+			}
+			if vgc_pool_hot_bits[w] & bit != 0 {
+				if k.phot == 0
+					&& vgc_pool_first_of_kind(vgc_heap.free_spans[n], false) != unsafe { nil } {
+					k.phot = n
+				}
+				if k.fhot == 0
+					&& vgc_pool_first_of_kind(vgc_heap.free_spans[n], true) != unsafe { nil } {
+					k.fhot = n
+				}
+			}
+			if vgc_pool_cold_bits[w] & bit != 0 {
+				if k.pcold == 0
+					&& vgc_pool_first_of_kind(vgc_heap.free_spans_cold[n], false) != unsafe { nil } {
+					k.pcold = n
+				}
+				if k.fcold == 0
+					&& vgc_pool_first_of_kind(vgc_heap.free_spans_cold[n], true) != unsafe { nil } {
+					k.fcold = n
+				}
+			}
+			if k.phot != 0 && k.pcold != 0 && k.fhot != 0 && k.fcold != 0 {
+				C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+				return k
+			}
+		}
+	}
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	return k
+}
+
+fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int, kinds VGC_PoolKinds) {
+	mut ptail := u32(0)
+	mut ftail := u32(0)
+	for i in 0 .. vgc_heap.narenas {
+		a := unsafe { &vgc_heap.arenas[i] }
+		if a.size > vgc_arena_size || a.used > a.size {
+			continue
+		}
+		t := u32((a.size - a.used) / vgc_page_size)
+		if a.frames {
+			if t > ftail {
+				ftail = t
+			}
+		} else if t > ptail {
+			ptail = t
+		}
+	}
 	mut hot := u32(0)
 	mut cold := u32(0)
 	for w := 128; w >= 0; w-- {
@@ -5507,13 +5605,16 @@ fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int) {
 	}
 	C.vgc_gctrace_carve(u64(vgc_heap.gc_cycle), u64(npages), u64(new_arena), u64(arena_idx),
 		C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) / 1024,
-		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes) / 1024, u64(hot), u64(cold), u64(over))
+		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes) / 1024, u64(hot), u64(cold), u64(over),
+		u64(kinds.phot), u64(kinds.pcold), u64(ptail), u64(kinds.fhot), u64(kinds.fcold),
+		u64(ftail))
 }
 
 // vgc_span_alloc_once answers the span, and whether it returned nil because it
 // waited for a collection in flight instead of carving (may_wait only).
 fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool) {
 	mut npages := npages_in
+	mut kinds := VGC_PoolKinds{} // VGC_GCTRACE=3: the pool by kind at the carve (zeros: the first tail served it)
 	// cx-home/v#58: the request's arena kind, by the size asked for (the
 	// rounded one when rounded): a frame request is served by frame arenas
 	// only, the rest by plain ones — once a frame size recurs
@@ -5559,6 +5660,10 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		if any != unsafe { nil } {
 			vgc_span_recycled_ready(mut any, cold_any, npages)
 			return any, false
+		}
+		if vgc_gctrace >= 3 {
+			kinds =
+				vgc_gctrace_kinds_snapshot() // the pool lock alone: before the heap lock (its order)
 		}
 		C.vgc_mutex_lock(&vgc_heap.lock)
 		base, arena_idx = vgc_arena_tail_take(nbytes, frames)
@@ -5623,8 +5728,36 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			}
 		}
 	}
+	if base == 0 && !frames && npages_in >= u32(vgc_large_round_min) {
+		// cx-home/v#58: the mirror of the frames' rule above — a plain request
+		// from the rounding's floor up with no plain run of its length and no
+		// plain tail takes a FRAME tail before an arena is carved (the
+		// rounded size, then the exact one). The 300,000-record JSON convert's
+		// 3,584-page output buffer (asked for once: plain) carved a fourth
+		// arena beside a frame arena's 12,032-page tail, and the batch
+		// writer's 1,920-page buffer its eighth beside frame tails
+		// (measure/collector-epic-79, the convert's and G-1's carve lines).
+		// Under the floor a plain request still carves a plain arena: its
+		// kind is many and small, and a frame arena's tail is the frames'
+		// growth (vgc_frame_arena_placement_test.v) — so the plain request
+		// takes only the room past the frames': the tail left after it still
+		// holds the largest recurring frame size (vgc_frame_tail_past_room;
+		// vgc_round_fits_the_tail_test.v's once-asked 3900-page buffer leaves
+		// the 3968-page tail to the frame's exact size);
+		// vgc_plain_takes_the_frame_tail_test.v.
+		base, arena_idx = vgc_frame_tail_past_room(nbytes)
+		if base == 0 && floor != 0 && floor < npages {
+			nbytes = usize(floor) * vgc_page_size
+			base, arena_idx = vgc_frame_tail_past_room(nbytes)
+			if base != 0 {
+				npages = floor
+			} else {
+				nbytes = usize(npages) * vgc_page_size
+			}
+		}
+	}
 	if vgc_gctrace >= 3 && base != 0 {
-		vgc_gctrace_carve_emit(npages, 0, arena_idx)
+		vgc_gctrace_carve_emit(npages, 0, arena_idx, kinds)
 	}
 	if base != 0 && npages <= u32(vgc_max_pooled_pages) {
 		// An in-arena carve of a pooled size: the pool held no span covering
@@ -5718,7 +5851,7 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		new_arena = true
 		base = usize(mem)
 		if vgc_gctrace >= 3 {
-			vgc_gctrace_carve_emit(npages, 1, arena_idx)
+			vgc_gctrace_carve_emit(npages, 1, arena_idx, kinds)
 		}
 		// Register in address map for O(1) lookup
 		C.vgc_addr_map_register(usize(mem), asize, arena_idx)
