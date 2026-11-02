@@ -6764,13 +6764,25 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	class_idx := u8(span_class / 2)
 	noscan := (span_class % 2) == 1
 	npages := C.vgc_get_class_npages(int(class_idx))
-	// cx-home/v#56 lever 7: from the nursery's bump while there is one
-	mut new_span := &VGC_Span(unsafe { nil })
-	if vgc_nursery_base != 0 {
-		new_span = vgc_nursery_alloc(npages)
-	}
-	if new_span == unsafe { nil } {
-		new_span = vgc_span_alloc(npages)
+	// cx-home/v#56 lever 7: a pooled span of the class's pages first — it
+	// lies below the bump, where the barrier applies as before — and the
+	// nursery's fresh carve serves a pool miss while the range lasts. The
+	// nursery first, a churning program's freed spans came back round only
+	// once the 16 GB range was spent: binary-trees 18 read 10.4–10.6 GB of
+	// peak RSS against 0.5 on the stack's collector (measure/collector-epic-75,
+	// the F rows). Pooled first, the committed bytes level off at the working
+	// set and the young range covers the spans a growing heap carves
+	// (young/pool_first.v, vgc_nursery_pool_first_test.v).
+	mut new_span, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
+	if new_span != unsafe { nil } {
+		vgc_span_recycled_ready(mut new_span, cold, npages)
+	} else {
+		if vgc_nursery_base != 0 {
+			new_span = vgc_nursery_alloc(npages)
+		}
+		if new_span == unsafe { nil } {
+			new_span = vgc_span_alloc(npages)
+		}
 	}
 	if new_span == unsafe { nil } {
 		return unsafe { nil }
