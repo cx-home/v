@@ -2770,7 +2770,8 @@ fn vgc_mark_plan() int {
 	live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
 	free := vgc_stop_weighed_cpus(vgc_mark_last_work_ns, vgc_mark_par_min_ns)
 	total := vgc_mark_plan_count(vgc_mark_workers_cfg, vgc_mark_last_work_ns, vgc_mark_par_min_ns,
-		live, free, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target)
+		live, free, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target,
+		C.vgc_atomic_load_u64(&vgc_heap.heap_marked))
 	if total <= 1 {
 		return 1
 	}
@@ -2799,16 +2800,30 @@ fn vgc_mark_plan() int {
 // ran 1,172 of 1,738 cycles on one marker (1.3 ms mean mark, 4.7 s of stops in
 // a 5.8 s run, 6.0 s wall against Python's 0.87 s). The floor now holds on
 // both sides of the line, and grows with the held mutators: a quarter of them,
-// at least four (vgc_mark_held_floor), at most the free CPUs.
-fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide bool, target int) int {
+// at least four (vgc_mark_held_floor), at most the free CPUs — for a marked set
+// at or over the several-thread floor (`marked` against vgc_headroom_floor_lo,
+// 4 MB, the line vgc_pace_answer draws). Under it a stop plans as cx-home/v#56
+// did (four markers at most under the line, one per ms over it): a server's k
+// handlers hold ~k threads over a sub-MB mark of ~50-100 us, whose work times
+// the held threads crosses the line, and the quarter fielded seven markers at
+// k=28 where four did — the pool grown and woken every stop for a mark one
+// marker finishes (hello-http k=28 C=256: peak +1.4-5.0 MB over the head, CPU
+// per request 32-34 us against 28-30, misc-epic-65). template-render and
+// json-codec at k=16..28 mark 5-14 MB and keep the quarter.
+fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide bool, target int, marked u64) int {
 	if cfg <= 1 {
 		return 1
 	}
 	mut floor := 1
-	if free >= 2 {
+	if free >= 2 && marked >= vgc_headroom_floor_lo {
 		floor = vgc_mark_held_floor(live, free)
 	} else if work < line {
-		return 1
+		// under the several-thread floor (`marked`, a server's sub-MB mark) the stop
+		// plans as cx-home/v#56 did: a held stop under the line, four markers at most
+		if free < 2 {
+			return 1
+		}
+		floor = if free < 4 { free } else { 4 }
 	}
 	mut total := cfg
 	if wide && live >= total {
