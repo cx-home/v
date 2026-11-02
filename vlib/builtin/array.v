@@ -171,6 +171,11 @@ fn (mut a array) clone_shallow_to_cap(new_cap int) {
 	total_size := u64(new_cap) * u64(a.element_size)
 	new_data := a.alloc_array_data_like_uninit(total_size)
 	copy_size := u64(a.len) * u64(a.element_size)
+	if !use_noscan_data && total_size > copy_size {
+		// cx-home/v#56: the slack of a scanned buffer holds no stale word (as
+		// ensure_cap's)
+		unsafe { vmemset(&u8(new_data) + copy_size, 0, total_size - copy_size) }
+	}
 	if a.data != unsafe { nil } && copy_size > 0 {
 		unsafe { vmemcpy(new_data, a.data, copy_size) }
 	}
@@ -450,8 +455,19 @@ pub fn (mut a array) ensure_cap(required int) {
 			vgc_wb_store_into(new_data) // concurrent-mark barrier: existing elements copied into the grown buffer
 		}
 	}
+	used := u64(a.len) * u64(a.element_size)
+	if !use_noscan_data && new_size > used {
+		// cx-home/v#56: a scanned buffer's words are read as pointers, and a
+		// non-zero-filling allocation is one its caller writes whole
+		// (vgc_malloc_typed_opts); the slack past the list's length is written
+		// by no one until a push reaches it, so it kept the span's last
+		// occupant's pointers — a from-zero trace of the buffer (the
+		// concurrent-mark verifier's) read a dead scratch list's words as live
+		// objects the cycle had missed (vgc_regrown_slack_zero_test.v)
+		unsafe { vmemset(&u8(new_data) + used, 0, new_size - used) }
+	}
 	if a.data != unsafe { nil } {
-		unsafe { vmemcpy(new_data, a.data, u64(a.len) * u64(a.element_size)) }
+		unsafe { vmemcpy(new_data, a.data, used) }
 		// TODO: the old data may be leaked when no GC is used (ref-counting?)
 		if a.flags.has(.noslices) && !a.flags.has(.is_slice) && !a.buffer_has_slices() {
 			unsafe {
