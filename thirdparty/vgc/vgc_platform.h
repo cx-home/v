@@ -2518,7 +2518,8 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
 // VGC_GCTRACE=3 carve line (cx-home/v#58): a request the pool did not serve.
 static void vgc_gctrace_carve(uint64_t cycle, uint64_t npages, uint64_t new_arena, uint64_t arena_idx,
                               uint64_t pool_kb, uint64_t trimmed_kb, uint64_t hot_max, uint64_t cold_max,
-                              uint64_t over_max) {
+                              uint64_t over_max, uint64_t phot, uint64_t pcold, uint64_t ptail,
+                              uint64_t fhot, uint64_t fcold, uint64_t ftail) {
     vgc__ws("[carve "); vgc__wdec(cycle);
     vgc__ws("] npages="); vgc__wdec(npages);
     vgc__ws(" new="); vgc__wdec(new_arena);
@@ -2528,6 +2529,12 @@ static void vgc_gctrace_carve(uint64_t cycle, uint64_t npages, uint64_t new_aren
     vgc__ws("KB hotmax="); vgc__wdec(hot_max);
     vgc__ws(" coldmax="); vgc__wdec(cold_max);
     vgc__ws(" overmax="); vgc__wdec(over_max);
+    vgc__ws(" phot="); vgc__wdec(phot);
+    vgc__ws(" pcold="); vgc__wdec(pcold);
+    vgc__ws(" ptail="); vgc__wdec(ptail);
+    vgc__ws(" fhot="); vgc__wdec(fhot);
+    vgc__ws(" fcold="); vgc__wdec(fcold);
+    vgc__ws(" ftail="); vgc__wdec(ftail);
     vgc__ws("\n");
 }
 static void vgc_gctrace_split(uint64_t cycle, uint64_t npages, uint64_t from_pages, uint64_t cap, uint64_t kind) {

@@ -62,9 +62,10 @@ fn test_a_frame_and_a_buffer_never_share_an_arena() {
 		fill(3000 * page) // the size recurs, nothing of it pooled, no plain tail holds it: a frame arena
 	fi, ff := vgc_arena_probe(frame.data)
 	assert fi >= 0 && ff, 'the recurring 3000-page frame is not in a frame arena: arena ${fi} frames=${ff}'
-	buf := fill(400 * page) // the buffer after the frame: a plain arena, not the frame's tail
+	buf :=
+		fill(200 * page) // the buffer after the frame, under the rounding's floor: a plain arena, not the frame's tail (from the floor up, with no plain tail, it lies in the frame tail: vgc_plain_takes_the_frame_tail_test.v)
 	bi, bf := vgc_arena_probe(buf.data)
-	assert bi >= 0 && !bf, 'the 400-page buffer is in a frame arena: arena ${bi} frames=${bf}'
+	assert bi >= 0 && !bf, 'the 200-page buffer is in a frame arena: arena ${bi} frames=${bf}'
 	assert bi != fi, 'the buffer shares the frame\'s arena ${fi}'
 	line := fill(2047 * page) // 2,048 pages with the header: a frame request
 	li, lf := vgc_arena_probe(line.data)
