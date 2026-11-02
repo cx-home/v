@@ -204,9 +204,13 @@ fn __new_array(mylen int, cap int, elm_size int) array {
 	cap_ := if cap < mylen { mylen } else { cap }
 	total_size := u64(cap_) * u64(elm_size)
 	mut data := unsafe { nil }
-	if cap_ > 0 && mylen == 0 {
-		data = alloc_array_data_uninit(total_size)
-	} else if cap_ > 0 {
+	if cap_ > 0 {
+		// cx-home/v#56: a scanned buffer is zeroed whole, its capacity too — a
+		// cap-only list's slack is written by no one until a push reaches it,
+		// and the words a scan reads there are the span's last occupant's
+		// (perm_gen_w's old.list, 8,201 slots: the verifier's stale word at
+		// offset 30,192); a noscan list keeps its uninitialised capacity
+		// (__new_array_noscan)
 		data = alloc_array_data(total_size)
 	}
 	// vgc conservative-retention contract (cx #657): zero-cap arrays keep a real
@@ -244,10 +248,8 @@ fn __new_array_with_default(mylen int, cap int, elm_size int, val voidptr) array
 	//    -> total_size == 0 -> malloc(0) -> panic;
 	//    to avoid it, just allocate a single byte
 	total_size := u64(cap_) * u64(elm_size)
-	if cap_ > 0 && mylen == 0 {
-		arr.data = alloc_array_data_uninit(total_size)
-	} else if cap_ > 0 {
-		arr.data = alloc_array_data(total_size)
+	if cap_ > 0 {
+		arr.data = alloc_array_data(total_size) // zeroed whole, its capacity too (cx-home/v#56; __new_array)
 	}
 	// vgc conservative-retention contract (cx #657) — see __new_array.
 	$if vgc ? {
