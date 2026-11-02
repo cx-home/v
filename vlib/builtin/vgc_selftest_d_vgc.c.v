@@ -732,7 +732,8 @@ pub fn vgc_arena_count() int {
 
 // vgc_pace_one_thread_selftest — cx-home/v#62. A cycle paces as one allocating thread (the
 // quarter) only while at most one thread is stamped as allocating (~1 MB this cycle); then the
-// count of threads that allocated 64 KB or more since the last stop decides, and it changes the
+// count of threads that allocated 64 KB or more since the last stop decides: several when it
+// reaches half the live mutators (and two or more), one when it does not, and it changes the
 // answer only when this stop's count and the stop before's agree — one reading on the other side
 // keeps the previous cycle's answer. The first collection (start-up) paces as one thread.
 // template-render on 20 mutators read 0-1 stamped threads every cycle (the quarter's ~1.4 MB
@@ -742,60 +743,65 @@ pub fn vgc_arena_count() int {
 // Under 20 mutators a back-to-back stop reads few threads over 64 KB: template-render's cycle 73
 // dropped from a 256 MB headroom to the quarter's 1.4 MB (misc-epic-56's trace).
 // Driven by bench/parallel-alloc/vgc_pace_one_thread_test.v. 0 = ok; n = the failed case.
-// Arguments: nt, acct, prev (the stop before's acct), was_one (the previous cycle's answer), cycle.
+// Arguments: nt, acct, prev (the stop before's acct), live (the live mutators), was_one (the
+// previous cycle's answer), cycle.
 pub fn vgc_pace_one_thread_selftest() u32 {
-	// 20 mutators over 64 KB two stops running, none stamped: several, whatever came before
-	if vgc_pace_one_thread(0, 20, 20, true, 500) || vgc_pace_one_thread(1, 20, 20, false, 500) {
+	// 20 of 22 mutators over 64 KB two stops running, none stamped: several, whatever came before
+	if vgc_pace_one_thread(0, 20, 20, 22, true, 500) || vgc_pace_one_thread(1, 20, 20, 22, false, 500) {
 		return 1
 	}
-	// two over 64 KB two stops running: several
-	if vgc_pace_one_thread(1, 2, 2, true, 500) {
+	// two of three over 64 KB two stops running: several
+	if vgc_pace_one_thread(1, 2, 2, 3, true, 500) {
 		return 2
 	}
 	// one thread by both counts two stops running, or idle: one, whatever came before
-	if !vgc_pace_one_thread(1, 1, 1, false, 500) || !vgc_pace_one_thread(0, 0, 0, false, 500)
-		|| !vgc_pace_one_thread(0, 1, 0, false, 500) {
+	if !vgc_pace_one_thread(1, 1, 1, 3, false, 500) || !vgc_pace_one_thread(0, 0, 0, 3, false, 500)
+		|| !vgc_pace_one_thread(0, 1, 0, 3, false, 500) || !vgc_pace_one_thread(0, 1, 1, 2, false, 500) {
 		return 3
 	}
 	// several stamped: several, whatever the 64 KB counts
-	if vgc_pace_one_thread(4, 4, 4, true, 500) || vgc_pace_one_thread(2, 0, 0, true, 500) {
+	if vgc_pace_one_thread(4, 4, 4, 6, true, 500) || vgc_pace_one_thread(2, 0, 0, 87, true, 500) {
 		return 4
 	}
 	// the first collection is start-up: one, whatever the 64 KB counts
-	if !vgc_pace_one_thread(1, 3, 3, false, 0) {
+	if !vgc_pace_one_thread(1, 3, 3, 5, false, 0) {
 		return 5
 	}
 	// one stop with two over 64 KB after a one-thread cycle (k=1's hand-over): still one
-	if !vgc_pace_one_thread(1, 2, 1, true, 500) || !vgc_pace_one_thread(0, 20, 0, true, 500) {
+	if !vgc_pace_one_thread(1, 2, 1, 3, true, 500) || !vgc_pace_one_thread(0, 20, 0, 22, true, 500) {
 		return 6
 	}
 	// one stop with few over 64 KB after several (a back-to-back stop under 20 mutators): still several
-	if vgc_pace_one_thread(0, 0, 20, false, 500) || vgc_pace_one_thread(1, 1, 20, false, 500) {
+	if vgc_pace_one_thread(0, 0, 20, 22, false, 500) || vgc_pace_one_thread(1, 1, 20, 22, false, 500) {
 		return 7
 	}
 	return 0
 }
 
-// vgc_pace_answer_selftest (cx-home/v#62): a marked set under the several-thread floor paces as
-// one thread while the stamp counts at most one. 0 = pass, else the failing check.
+// vgc_pace_answer_selftest (cx-home/v#62): the 64 KB count paces as several only when it reaches
+// half the live mutators at this stop and the stop before. A server holds every thread it runs
+// (87 at http-json-echo k=28 C=256) and only a few of them cross 64 KB between stops (VGC_GCTRACE
+// pace lines: at most 7 of 87, 3 of 39, 2 of 15, 2 of 6): one thread, whatever its marked set and
+// whatever the cycle before answered — a reading that flipped one cycle to several no longer
+// locks it in. A batch runs its k workers over 64 KB every cycle (k of k+2 threads): several.
+// 0 = pass, else the failing check. Driven by bench/parallel-alloc/vgc_pace_answer_test.v.
 pub fn vgc_pace_answer_selftest() u32 {
-	lo := vgc_headroom_floor_lo
-	kb := u64(1024)
-	// a server's k handlers: several to the 64 KB count, none stamped, a sub-MB marked set: one
-	if !vgc_pace_answer(vgc_pace_one_thread(0, 12, 12, false, 500), 0, 700 * kb)
-		|| !vgc_pace_answer(vgc_pace_one_thread(1, 12, 12, false, 500), 1, lo - kb) {
+	// server readings, two stops running, after a cycle that answered several: one
+	if !vgc_pace_one_thread(0, 7, 7, 87, false, 500) || !vgc_pace_one_thread(1, 3, 3, 39, false, 500)
+		|| !vgc_pace_one_thread(0, 2, 2, 15, false, 500) || !vgc_pace_one_thread(1, 2, 2, 6, false, 500) {
 		return 1
 	}
-	// template-render on 20 mutators (5.7 MB marked, none stamped): several
-	if vgc_pace_answer(vgc_pace_one_thread(0, 20, 20, true, 500), 0, 5700 * kb) || vgc_pace_answer(false, 1, lo) {
+	// one burst over half on a server pacing as one, at this stop or the stop before: still one
+	if !vgc_pace_one_thread(0, 7, 50, 87, true, 500) || !vgc_pace_one_thread(0, 50, 7, 87, true, 500) {
 		return 2
 	}
-	// several stamped: several, whatever the marked set
-	if vgc_pace_answer(vgc_pace_one_thread(3, 3, 3, true, 500), 3, 700 * kb) {
+	// batch workers k of k+2, two stops running: several, at k = 1 (two of three), 16, 20, 28
+	if vgc_pace_one_thread(0, 2, 2, 3, true, 500) || vgc_pace_one_thread(0, 16, 16, 18, true, 500)
+		|| vgc_pace_one_thread(1, 20, 20, 22, true, 500) || vgc_pace_one_thread(0, 28, 28, 30, true, 500) {
 		return 3
 	}
-	// one by the counts: one, whatever the marked set
-	if !vgc_pace_answer(true, 1, 100 * lo) || !vgc_pace_answer(vgc_pace_one_thread(1, 1, 1, false, 500), 1, 100 * lo) {
+	// exactly half (and two or more) counts as several; one under half does not
+	if vgc_pace_one_thread(0, 3, 3, 6, true, 500) || !vgc_pace_one_thread(0, 2, 2, 5, false, 500) {
 		return 4
 	}
 	return 0
