@@ -12,8 +12,11 @@
 // that come back.
 //
 // The shape (pages of 8 KB; the array's header adds one to each): a
-// 3000-page frame and a 400-page buffer after it, in one plain arena; then
-// the 3000-page frame asked for again: a frame arena of its own.
+// 3000-page frame and a 400-page buffer after it, in one plain arena, then a
+// once-asked buffer held that cuts the plain tail to 2700 pages — short of
+// the frame (a frame takes a plain tail before an arena is carved) and still
+// holding the 2500-page frame asked for once at the end; then the 3000-page
+// frame asked for again: a frame arena of its own.
 // Its own process (a fresh heap).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_frames_begin_at_recurrence_test.v
@@ -39,7 +42,17 @@ fn test_a_frame_asked_for_once_is_plain_and_the_kinds_begin_at_its_second_reques
 	bi, bf := vgc_arena_probe(buf.data)
 	assert bi == fi && !bf, 'the buffer after a once-asked frame did not share its arena: ${bi} vs ${fi} frames=${bf}'
 	assert !vgc_frames_probe(), 'the frame arenas have begun on a frame asked for once'
-	again := fill(3000 * page) // the size recurs: the frame arenas begin
+	// the plain tail cut to 2700 pages, held: short of the 3000-page frame (a
+	// frame takes a plain tail before a carve) and still holding the 2500-page
+	// one below; one arena so far, its carved bytes the committed ones
+	assert vgc_arenas_count() == 1, 'more than one arena before the tail is cut: ${vgc_arenas_count()}'
+	tail := 8192 - int(gc_memory_use() / usize(page))
+	assert tail > 2700 + 64, 'the first arena\'s tail is already short: ${tail} pages'
+	spent :=
+		fill((tail - 2701) * page) // tail - 2700 pages with the header; asked for once: plain, held
+	si, sf := vgc_arena_probe(spent.data)
+	assert si == fi && !sf, 'the ${tail - 2700}-page buffer did not take the plain tail: arena ${si} frames=${sf}, not ${fi}'
+	again := fill(3000 * page) // the size recurs: the frame arenas begin — no plain tail holds it
 	ai, af := vgc_arena_probe(again.data)
 	assert vgc_frames_probe(), 'the frame arenas have not begun at the second request of a frame size'
 	assert ai >= 0 && af && ai != fi, 'the recurring frame is not in a frame arena of its own: arena ${ai} frames=${af} (the plain one: ${fi})'
@@ -47,5 +60,5 @@ fn test_a_frame_asked_for_once_is_plain_and_the_kinds_begin_at_its_second_reques
 		fill(2500 * page) // a frame size asked for once after the kinds began: plain, the plain arena's tail (the kind is the size's own recurrence)
 	oi, of := vgc_arena_probe(once.data)
 	assert oi == fi && !of, 'a frame asked for once after the kinds began is not in the plain arena ${fi}: arena ${oi} frames=${of}'
-	println('vgc_frames_begin_at_recurrence: the once-asked frame in plain arena ${fi} with its buffer and the once-asked 2500-page frame, the recurring one in frame arena ${ai}, arenas ${vgc_arenas_count()} (${first.len} ${buf.len} ${again.len} ${once.len})')
+	println('vgc_frames_begin_at_recurrence: the once-asked frame in plain arena ${fi} with its buffer and the once-asked 2500-page frame, the recurring one in frame arena ${ai}, arenas ${vgc_arenas_count()} (${first.len} ${buf.len} ${spent.len} ${again.len} ${once.len})')
 }

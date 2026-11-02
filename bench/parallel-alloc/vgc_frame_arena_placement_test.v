@@ -8,8 +8,10 @@
 // the array's header page is a frame request, 2,046 plus one is not. Its own
 // process (a fresh heap). The kinds are a size's own recurrence: a frame size
 // asked for once is plain, and its second request — with its first run held,
-// nothing pooled of its size — opens a frame arena (vgc_span_alloc_once); a
-// 2047-page frame asked for twice first begins them (vgc_frames_begun).
+// nothing pooled of its size, no plain tail holding it (a frame takes a plain
+// tail before an arena is carved; the once-asked 2900-page frame spends it) —
+// opens a frame arena (vgc_span_alloc_once); a 2047-page frame asked for
+// twice first begins them (vgc_frames_begun).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_frame_arena_placement_test.v
 module main
@@ -44,7 +46,20 @@ fn test_a_frame_and_a_buffer_never_share_an_arena() {
 	first := fill(3000 * page) // asked for once: plain, held
 	oi, of := vgc_arena_probe(first.data)
 	assert oi >= 0 && !of, 'the 3000-page frame asked for once is in a frame arena: arena ${oi} frames=${of}'
-	frame := fill(3000 * page) // the size recurs, nothing of it pooled: a frame arena
+	// the plain tail spent (a frame takes a plain tail before a carve): one
+	// arena so far, its carved bytes the committed ones; a once-asked buffer
+	// of the tail less 64 pages, held, leaves a tail no frame fits
+	assert vgc_arenas_count() == 1, 'more than one arena before the tail is spent: ${vgc_arenas_count()}'
+	tail := 8192 - int(gc_memory_use() / usize(page))
+	mut spent := []u8{}
+	if tail > 2048 + 64 {
+		spent =
+			fill((tail - 65) * page) // tail - 64 pages with the header; asked for once: plain, held
+		si, sf := vgc_arena_probe(spent.data)
+		assert si == oi && !sf, 'the once-asked ${tail - 64}-page buffer did not take the plain tail: arena ${si} frames=${sf}, not ${oi}'
+	}
+	frame :=
+		fill(3000 * page) // the size recurs, nothing of it pooled, no plain tail holds it: a frame arena
 	fi, ff := vgc_arena_probe(frame.data)
 	assert fi >= 0 && ff, 'the recurring 3000-page frame is not in a frame arena: arena ${fi} frames=${ff}'
 	buf := fill(400 * page) // the buffer after the frame: a plain arena, not the frame's tail
@@ -57,5 +72,5 @@ fn test_a_frame_and_a_buffer_never_share_an_arena() {
 	under := fill(2046 * page) // 2,047 pages with the header: a plain one
 	ui, uf := vgc_arena_probe(under.data)
 	assert !uf, 'the 2047-page request is in a frame arena: arena ${ui}'
-	println('vgc_frame_arena_placement: the once-asked frame in arena ${oi}, the recurring one in ${fi}, buffer in ${bi}, the quarter line in ${li}, under it in ${ui}, arenas ${vgc_arenas_count()} (${first.len} ${frame.len} ${buf.len} ${line.len} ${under.len})')
+	println('vgc_frame_arena_placement: the once-asked frame in arena ${oi}, the recurring one in ${fi}, buffer in ${bi}, the quarter line in ${li}, under it in ${ui}, arenas ${vgc_arenas_count()} (${first.len} ${spent.len} ${frame.len} ${buf.len} ${line.len} ${under.len})')
 }

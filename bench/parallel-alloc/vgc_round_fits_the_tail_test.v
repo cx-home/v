@@ -13,8 +13,11 @@
 //
 // The shape (pages of 8 KB; the array's header adds one to each): the kinds
 // begun by a 2047-page frame asked for twice, a 2100-page frame asked for
-// once (plain, held) and again (2101 pages, rounded to 2176: nothing of its
-// kind, nothing of its size pooled — a frame arena of its own), the
+// once (plain, held), a once-asked buffer of the plain tail less 64 pages
+// (held: the plain tail spent — a frame takes a plain tail before an arena
+// is carved)
+// and the 2100-page frame again (2101 pages, rounded to 2176: nothing of its
+// kind, nothing of its size pooled, no plain tail — a frame arena of its own), the
 // 2048-page frame asked for again from that arena's tail (3968 pages of tail
 // left), then a 3900-page frame asked for once (plain, held) and again: 3901
 // pages, rounded to 4096, which no frame tail holds and the pool does not
@@ -54,6 +57,16 @@ fn frames_begin() {
 fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	frames_begin()
 	held := fill(2100 * page) // asked for once: plain, held
+	// the plain tail spent (a frame takes a plain tail before a carve): one
+	// arena so far, its carved bytes the committed ones; a once-asked buffer
+	// of the tail less 64 pages, held, leaves a tail no frame fits
+	assert vgc_arena_count() == 1, 'more than one arena before the tail is spent: ${vgc_arena_count()}'
+	tail := 8192 - int(gc_memory_use() / usize(page))
+	mut spent := []u8{}
+	if tail > 2048 + 64 {
+		spent =
+			fill((tail - 65) * page) // tail - 64 pages with the header; asked for once: plain, held
+	}
 	first :=
 		fill(2100 * page) // 2101 pages, rounded to 2176; the size recurs, nothing of it pooled: a frame arena of its own
 	fi, ff := vgc_arena_probe(first.data)
@@ -73,7 +86,7 @@ fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	si, sf := vgc_arena_probe(second.data)
 	sp, _, _ := vgc_span_probe(second.data)
 	grew := (use1 - use0) / usize(page)
-	println('vgc_round_fits_the_tail: the 3900-page frame (3901 pages, rounded to 4096) took a ${sp}-page span in arena ${si} (the 2100-page frame\'s: ${fi}), committed grew by ${grew} pages, arenas ${arenas0} -> ${arenas1} (${held.len} ${first.len} ${line.len} ${once.len} ${second.len})')
+	println('vgc_round_fits_the_tail: the 3900-page frame (3901 pages, rounded to 4096) took a ${sp}-page span in arena ${si} (the 2100-page frame\'s: ${fi}), committed grew by ${grew} pages, arenas ${arenas0} -> ${arenas1} (${held.len} ${spent.len} ${first.len} ${line.len} ${once.len} ${second.len})')
 	assert arenas1 == arenas0, 'the rounded request carved an arena while its exact size fit a tail: ${arenas0} -> ${arenas1}'
 	assert si == fi && sf, 'the exact size did not take the frame arena\'s tail: arena ${si} frames=${sf}'
 	assert sp >= 3901 && sp < 4096, 'the request did not fall back to its exact size: ${sp} pages, not 3901 plus the tail\'s sliver (under the rounded 4096)'
