@@ -2067,6 +2067,27 @@ pub fn vgc_birth_span_of(p voidptr) usize {
 
 // vgc_find_span_addr: the current descriptor address for `p` (0 = none).
 @[markused]
+// vgc_noscan_probe reports to a test whether the span holding p is a noscan
+// span (cx-home/v#56: the verifier's missed words lay in a scanned buffer of
+// a map's metas shape).
+pub fn vgc_noscan_probe(p voidptr) bool {
+	sp := vgc_find_span(p)
+	return sp != unsafe { nil } && sp.noscan
+}
+
+// vgc_map_metas_noscan_probe reports to a test whether a map's metas lie in
+// a noscan span; m is the address of the map value.
+pub fn vgc_map_metas_noscan_probe(m voidptr) bool {
+	mm := unsafe { &map(m) }
+	return vgc_noscan_probe(mm.metas)
+}
+
+// vgc_map_metas_addr_probe reports to a test the address of a map's metas.
+pub fn vgc_map_metas_addr_probe(m voidptr) usize {
+	mm := unsafe { &map(m) }
+	return usize(mm.metas)
+}
+
 pub fn vgc_find_span_addr(p voidptr) usize {
 	sp := vgc_find_span(p)
 	if sp == unsafe { nil } {
