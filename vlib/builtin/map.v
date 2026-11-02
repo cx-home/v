@@ -674,7 +674,7 @@ pub fn (mut m map) reserve(n u32) {
 fn (mut m map) cached_rehash(old_cap u32) {
 	old_metas := m.metas
 	metasize := int(sizeof(u32) * (m.even_index + 2 + m.extra_metas))
-	m.metas = unsafe { &u32(vcalloc(metasize)) }
+	m.metas = unsafe { &u32(vcalloc_noscan(metasize)) } // the metas hold no pointer: noscan, as at new_map (cx-home/v#56)
 	old_extra_metas := m.extra_metas
 	for i := u32(0); i <= old_cap + old_extra_metas; i += 2 {
 		if unsafe { old_metas[i] } == 0 {
