@@ -12,15 +12,19 @@
 // frames did every period (measure/collector-epic-73, the carve lines).
 //
 // The shape (pages of 8 KB; the array's header adds one to each): a
-// 5000-page frame, two 1000-page buffers after it, the frame dropped and
-// collected (its run pooled), a 1500-page buffer held (more than the arena's
-// tail: on 404be8c46 it splits the frame's run), then the next period's
-// frame: it takes the first frame's run in place. Four more periods, each
-// dropping the buffer of two periods back (the last frame dropped already:
-// every frame is dropped at once, its address kept off the stack's roots),
-// collecting and holding a drifting buffer (1600 to 1900 pages): every frame
-// takes the run in place and the arena count holds from the first frame
-// on. Its own process (a fresh heap).
+// 5000-page frame asked for once (plain), dropped and collected; asked for
+// again it takes that plain run in place (the kinds are a size's own
+// recurrence, and a frame with nothing of its kind takes a plain pooled run
+// before a carve); two 1000-page buffers after it, the frame dropped and
+// collected (its run pooled, plain), a 1500-page buffer held (more than the
+// arena's tail: the plain world's last resort splits the run), then the
+// next period's frame: nothing of its kind and no plain run of its length —
+// the first in a frame arena. Four more periods, each dropping the buffer of
+// two periods back (the last frame dropped already: every frame is dropped
+// at once, its address kept off the stack's roots), collecting and holding a
+// drifting buffer (1600 to 1900 pages): every frame takes the frame arena's
+// run in place and the arena count holds from that frame on. Its own
+// process (a fresh heap).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_frame_arena_reuse_test.v
 module main
@@ -61,22 +65,25 @@ fn scrub_stack() {
 
 fn test_a_frame_takes_its_run_in_place_past_the_buffers_between_the_periods() {
 	n := 5000 * page
-	_ =
-		drop_frame(n) // period 0: the size asked for once is plain; the frame arenas begin at its second request (vgc_frames_begun)
+	key0 :=
+		drop_frame(n) // period 0: the size asked for once is plain (the kinds are a size's own recurrence)
 	scrub_stack()
 	gc_collect()
-	key := drop_frame(n) // period 1's frame, dropped: the first in a frame arena
-	arenas1 := vgc_arenas_count()
+	key1 :=
+		drop_frame(n) // period 1's frame: nothing of its kind, its first run pooled plain — taken in place (vgc_frame_takes_the_plain_pool_test.v)
+	assert key1 == key0, 'the second period\'s frame did not take the first\'s plain run in place: ${key1 ^ mask} vs ${key0 ^ mask}'
 	mut bufs := [][]u8{cap: 16} // never grown: a grown list's old block kept the dropped buffers' addresses
 	hold(mut bufs, 1000 * page) // the period's buffers after the frame, held
 	hold(mut bufs, 1000 * page)
 	scrub_stack()
-	gc_collect() // the frame's run is pooled
-	hold(mut bufs, 1500 * page) // between the periods: more than any tail left
-	key2 := drop_frame(n) // period 2's frame
-	println('vgc_frame_arena_reuse: period 2 frame at ${key2 ^ mask} vs run ${key ^ mask}, arenas ${arenas1} -> ${vgc_arenas_count()}')
-	assert key2 == key, 'the second period\'s frame did not take the first\'s run in place: ${key2 ^ mask} vs ${key ^ mask}'
-	assert vgc_arenas_count() == arenas1, 'the arena count moved over the second period: ${arenas1} -> ${vgc_arenas_count()}'
+	gc_collect() // the frame's run is pooled, plain
+	hold(mut bufs, 1500 * page) // between the periods: more than any tail left — the plain world's last resort splits the run
+	key :=
+		drop_frame(n) // period 2's frame: nothing of its kind, no plain run of its length — the first in a frame arena
+	ki, kf := vgc_arena_probe(voidptr(key ^ mask))
+	assert ki >= 0 && kf, 'the third period\'s frame is not in a frame arena: arena ${ki} frames=${kf}'
+	arenas1 := vgc_arenas_count()
+	println('vgc_frame_arena_reuse: period 1 frame in place at ${key1 ^ mask}; period 2 frame in frame arena ${ki} at ${key ^ mask}, arenas ${arenas1}')
 	for p in 3 .. 7 {
 		bufs[p - 3] = []u8{} // the buffer of two periods back drops
 		scrub_stack()
@@ -86,5 +93,5 @@ fn test_a_frame_takes_its_run_in_place_past_the_buffers_between_the_periods() {
 		assert kp == key, 'period ${p}\'s frame did not take the run in place: ${kp ^ mask} vs ${key ^ mask}'
 		assert vgc_arenas_count() == arenas1, 'the arena count moved at period ${p}: ${arenas1} -> ${vgc_arenas_count()} (${bufs.len} buffers)'
 	}
-	println('vgc_frame_arena_reuse: six periods in place, arenas ${vgc_arenas_count()} (${bufs.len} buffers)')
+	println('vgc_frame_arena_reuse: five periods in place in the frame arena, arenas ${vgc_arenas_count()} (${bufs.len} buffers)')
 }

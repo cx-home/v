@@ -28,8 +28,11 @@
 // fitting, splits the 6144-page run instead; the 6144 request then splits
 // the 7248-page run, and the 2382 request finds the two remainders (1280
 // and 1103 pages) short of it and carves a third arena. Now every frame
-// takes the run its size left, in place, and the arena count holds at two.
-// Its own process (a fresh heap).
+// takes the run its size left, in place, and the arena count holds at two
+// — period 0's two plain arenas: period 1 takes period 0's runs in place
+// there (a frame with nothing of its kind takes a plain pooled run before a
+// carve), and a run of a recurring frame size keeps its size wherever it
+// lies. Its own process (a fresh heap).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_recurring_run_keeps_its_size_test.v
 module main
@@ -89,8 +92,12 @@ fn test_a_recurring_run_keeps_its_size_and_the_next_period_takes_it_in_place() {
 	a6, f6 := vgc_arena_probe(voidptr(k6 ^ mask))
 	a4, f4 := vgc_arena_probe(voidptr(k4 ^ mask))
 	a2, f2 := vgc_arena_probe(voidptr(k2 ^ mask))
-	assert f6 && f4 && f2, 'a frame is not in a frame arena: ${f6} ${f4} ${f2}'
-	assert a4 == a2 && a6 != a4, 'the 4864- and 2382-page frames do not share a frame arena of their own: ${a6} ${a4} ${a2}'
+	// period 1 takes period 0's plain runs in place (a frame with nothing of
+	// its kind takes a plain pooled run before a carve): the frames lie in
+	// the plain arenas, and a run of a recurring frame size keeps its size
+	// there too
+	assert !f6 && !f4 && !f2, 'a frame is in a frame arena while its first run sat pooled plain: ${f6} ${f4} ${f2}'
+	assert a4 == a2 && a6 != a4, 'the 4864- and 2382-page frames do not share an arena of their own: ${a6} ${a4} ${a2}'
 	arenas1 := vgc_arenas_count()
 	scrub_stack()
 	gc_collect()

@@ -79,6 +79,7 @@ fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own regi
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
+
 // cx-home/v#28: the stop-the-world is two passes over the slots — request a
 // suspend of every straggler (a mach thread_suspend, a signal, a SuspendThread),
 // then settle each (wait for its ack / capture its register file) — so the
@@ -634,10 +635,10 @@ mut:
 	// between would strand main's TLS index on a nil chunk. The
 	// table is not a root (vgc_os_alloc memory is outside the arenas); the
 	// chunks are scanned to ncaches by vgc_mark_roots, as the fixed array was.
-	ncaches       int // high-water mark of slots ever used
-	live_threads  u32 // atomic-ish (guarded by cache_lock): currently-registered mutators
-	free_head_p1  int // reclaimed slots, threaded through VGC_Cache.next_free_p1 (index+1; 0 = none); reused before growing ncaches
-	cache_lock    u32
+	ncaches      int // high-water mark of slots ever used
+	live_threads u32 // atomic-ish (guarded by cache_lock): currently-registered mutators
+	free_head_p1 int // reclaimed slots, threaded through VGC_Cache.next_free_p1 (index+1; 0 = none); reused before growing ncaches
+	cache_lock   u32
 	// GC state
 	gc_phase   u32 // atomic: current GC phase
 	gc_enabled u32 // atomic: 1 = GC enabled
@@ -1053,7 +1054,8 @@ __global vgc_cm_cut_last = false
 // vgc_wb_store; see vgc_perm_promote for the soundness argument). A later
 // vgc_set_permanent promotes the live set of that cycle on top.
 __global vgc_perm_mode = int(1)
-__global vgc_perm_cycle = u64(0) // 0: no automatic promotion (vgc_set_permanent only)
+__global vgc_perm_cycle = u64(0)
+// 0: no automatic promotion (vgc_set_permanent only)
 __global vgc_perm_on = u32(0)
 __global vgc_perm_request = false
 __global vgc_perm_spans = u64(0)
@@ -1254,6 +1256,7 @@ pub fn vgc_cards_dirty() u64 {
 	}
 	return n
 }
+
 // the verifier's full re-mark clears to zero (every object traced)
 __global vgc_perm_clear_zero = false
 // the perm_bits slab: 272-byte buffers (perm_bits + young_bits), bump-carved,
@@ -1365,6 +1368,7 @@ fn vgc_perm_cand_drop() {
 		vgc_perm_epoch = false
 	}
 }
+
 const vgc_cm_born_flush = u64(256) * 1024
 const vgc_cm_born_min = u64(4) << 20
 // the last cycle's root scan (suspended registers, data segments, stacks)
@@ -3461,12 +3465,16 @@ fn vgc_get_free_span(npages u32, frames bool) (&VGC_Span, bool) {
 // frag gate's collection (vgc_pool_defrag with no age: a request that would
 // carve an arena while the pool covers it) merges the kept runs too — the
 // arena is dearer than the size's next request finding its run split; the
-// idle-run coalesce (aged) leaves them. A plain arena's runs merge as
-// before: its recurring buffers are many and small, and a growing request
-// between them needs their join (vgc_frame_arena_reuse_test.v's buffers).
+// idle-run coalesce (aged) leaves them. A run of a frame's size keeps its
+// size wherever it lies: a frame's first period is plain (the kinds begin at
+// a size's second request, vgc_span_alloc_once), and the second period takes
+// that run in place (vgc_frame_takes_the_plain_pool_test.v). A plain arena's
+// smaller runs merge as before: its recurring buffers are many and small,
+// and a growing request between them needs their join
+// (vgc_frame_arena_reuse_test.v's buffers).
 @[inline]
 fn vgc_pool_keeps_size(s &VGC_Span) bool {
-	return s.large_born && s.npages <= u32(vgc_max_pooled_pages) && vgc_span_frames(s)
+	return s.large_born && s.npages <= u32(vgc_max_pooled_pages) && vgc_frame_request(s.npages)
 		&& vgc_large_size_recurs(s.npages)
 }
 
@@ -3498,7 +3506,8 @@ fn vgc_pool_keeps_size(s &VGC_Span) bool {
 // size asked for once — never asks for a size again, and a span kept whole
 // for it only sent the smaller requests to the arena tails while the pool
 // idled (convert.json_300k: 2 -> 4 arenas, 24 MB pooled at the carves).
-__global vgc_large_demand = [8193]u32{} // vgc_max_pooled_pages + 1 entries
+__global vgc_large_demand = [8193]u32{}
+// vgc_max_pooled_pages + 1 entries
 
 fn vgc_large_demand_idx(npages u32) int {
 	if npages > u32(vgc_max_pooled_pages) {
@@ -3532,7 +3541,8 @@ fn vgc_large_demand_note(npages u32) {
 // split the run: the writer's 47 MB frames, pooled, were split by its
 // 38 MB frames and every 47 MB request carved an arena while 100-190 MB
 // sat pooled; measure/collector-epic-48, B run 2).
-__global vgc_large_recur_bits = [1025]u8{} // (vgc_max_pooled_pages + 1) bits
+__global vgc_large_recur_bits = [1025]u8{}
+// (vgc_max_pooled_pages + 1) bits
 
 // the granule blocks (vgc_large_round_up's: the sizes that round to one r
 // are (r - g, r]) asked for more than once, a bit at the block's top r, set
@@ -3548,7 +3558,8 @@ __global vgc_large_recur_bits = [1025]u8{} // (vgc_max_pooled_pages + 1) bits
 // request that would break it (vgc_pool_keeps_whole). A size asked for alone
 // in its block counts once, as before: the JSON convert's doubled buffers
 // (385, 769, 1025, 2049, 4097 pages) each sit in a block of their own.
-__global vgc_large_block_demand = [8193]u32{} // by the block's top r
+__global vgc_large_block_demand = [8193]u32{}
+// by the block's top r
 __global vgc_large_block_bits = [1025]u8{}
 
 // vgc_large_block_lo is the lower bound (exclusive) of the granule block whose
@@ -3959,7 +3970,8 @@ fn vgc_get_free_span_locked(npages u32, cap u32, frames bool) (&VGC_Span, bool) 
 		if cand != unsafe { nil } {
 			cold := cand.decommitted
 			if vgc_gctrace >= 3 {
-				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages), u64(cap), 0)
+				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages),
+					u64(cap), 0)
 			}
 			vgc_pool_unlink(mut cand)
 			vgc_span_split(mut cand, npages)
@@ -4161,7 +4173,8 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32, frames bool) (&VGC_Span, 
 				break
 			}
 			if vgc_gctrace >= 3 {
-				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages), u64(cap), 2)
+				C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(cand.npages),
+					u64(cap), 2)
 			}
 			vgc_pool_unlink(mut cand)
 			vgc_span_split(mut cand, npages)
@@ -4783,9 +4796,8 @@ fn vgc_put_free_span(mut span VGC_Span) {
 		if cur.base > a.base {
 			pidx := (cur.base - a.base) / vgc_page_size - 1
 			mut p := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[pidx]))))) }
-			if p != unsafe { nil } && p.pooled && !p.in_use
-				&& vgc_pool_states_meet(p, cur) && p.npages >= u32(vgc_pool_merge_min)
-				&& p.npages <= u32(vgc_max_pooled_pages)
+			if p != unsafe { nil } && p.pooled && !p.in_use && vgc_pool_states_meet(p, cur)
+				&& p.npages >= u32(vgc_pool_merge_min) && p.npages <= u32(vgc_max_pooled_pages)
 				&& !keep && !vgc_pool_keeps_size(p)
 				&& p.base + usize(p.npages) * vgc_page_size == cur.base {
 				if p.pool_gen < gen {
@@ -4807,10 +4819,9 @@ fn vgc_put_free_span(mut span VGC_Span) {
 			sidx := (end - a.base) / vgc_page_size
 			if sidx < map_pages {
 				mut s := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[sidx]))))) }
-				if s != unsafe { nil } && s.pooled && !s.in_use
-					&& vgc_pool_states_meet(s, cur) && s.npages >= u32(vgc_pool_merge_min)
-					&& s.npages <= u32(vgc_max_pooled_pages) && s.base == end
-					&& !keep && !vgc_pool_keeps_size(s) {
+				if s != unsafe { nil } && s.pooled && !s.in_use && vgc_pool_states_meet(s, cur)
+					&& s.npages >= u32(vgc_pool_merge_min) && s.npages <= u32(vgc_max_pooled_pages)
+					&& s.base == end && !keep && !vgc_pool_keeps_size(s) {
 					if s.pool_gen < gen {
 						gen = s.pool_gen
 					}
@@ -5347,8 +5358,8 @@ fn vgc_span_recycled_ready(mut span VGC_Span, cold bool, npages u32) {
 // carve another thread's tail. vgc_heap.lock held.
 fn vgc_arena_tail_take(nbytes usize, frames bool) (usize, int) {
 	me := if vgc_arena_owner_on { C.vgc_get_cache_idx() + 1 } else { 0 }
-	i := vgc_arena_pick(nbytes, me, vgc_heap.narenas, unsafe { &vgc_heap.arenas[0] }, vgc_arena_ceiling(),
-		vgc_arena_owner_live, vgc_heap.gc_cycle, frames)
+	i := vgc_arena_pick(nbytes, me, vgc_heap.narenas, unsafe { &vgc_heap.arenas[0] },
+		vgc_arena_ceiling(), vgc_arena_owner_live, vgc_heap.gc_cycle, frames)
 	if i < 0 {
 		return 0, -1
 	}
@@ -5485,8 +5496,8 @@ fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int) {
 		o = o.next
 	}
 	C.vgc_gctrace_carve(u64(vgc_heap.gc_cycle), u64(npages), u64(new_arena), u64(arena_idx),
-		C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) / 1024, C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes) / 1024,
-		u64(hot), u64(cold), u64(over))
+		C.vgc_atomic_load_u64(&vgc_heap.pool_bytes) / 1024,
+		C.vgc_atomic_load_u64(&vgc_heap.pool_trimmed_bytes) / 1024, u64(hot), u64(cold), u64(over))
 }
 
 // vgc_span_alloc_once answers the span, and whether it returned nil because it
@@ -5497,7 +5508,12 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 	// rounded one when rounded): a frame request is served by frame arenas
 	// only, the rest by plain ones — once a frame size recurs
 	// (vgc_frames_begun); before that every request is plain
-	frames := vgc_frame_request(npages_in) && vgc_frames_on()
+	// — a frame size asked for once is plain whenever it is asked for: the
+	// 300,000-record JSON convert's 3,498-page output buffer, asked for once
+	// after its 2,326-page document recurred (the input and the output), carved
+	// a frame arena beside a plain tail of 3,840 pages (measure/collector-epic-77,
+	// the convert's carve lines) — so the kind is the size's own recurrence
+	frames := vgc_frame_request(npages_in) && vgc_large_size_recurs(npages_in)
 	// First try to reuse a free span (cx-private#1910: this thread's stash first)
 	mut recycled, mut cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages, frames)
 	if recycled == unsafe { nil } && floor != 0 && floor < npages {
@@ -5549,6 +5565,32 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 				nbytes = usize(npages) * vgc_page_size
 			}
 		}
+	}
+	if base == 0 && frames {
+		// cx-home/v#58: a frame with nothing of its kind takes a plain pooled
+		// run before an arena is carved — its own first period's run (the size
+		// was plain until it recurred), or a merged cold run of the plain
+		// world. Served by its kind alone, the writer's 2,304-page frame
+		// carved a frame arena beside a hot plain run of 5,872 pages, and its
+		// 4,864-, 6,144- and 5,120-page frames beside plain cold runs of
+		// 6,168–6,293 pages (measure/collector-epic-77, G-1's carve lines at
+		// cycles 117, 154, 321 and 399). A plain tail stays the plain
+		// requests' (vgc_arena_pick): a frame placed in one would hand its run
+		// to them.
+		C.vgc_mutex_unlock(&vgc_heap.lock)
+		mut plain, mut cold_plain := vgc_get_free_span_any(npages, false)
+		if plain == unsafe { nil } && floor != 0 && floor < npages {
+			plain, cold_plain = vgc_get_free_span_any(floor, false)
+			if plain != unsafe { nil } {
+				npages = floor
+			}
+		}
+		if plain != unsafe { nil } {
+			vgc_span_recycled_ready(mut plain, cold_plain, npages)
+			return plain, false
+		}
+		C.vgc_mutex_lock(&vgc_heap.lock)
+		base, arena_idx = vgc_arena_tail_take(nbytes, frames)
 	}
 	if vgc_gctrace >= 3 && base != 0 {
 		vgc_gctrace_carve_emit(npages, 0, arena_idx)
@@ -5718,7 +5760,8 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 	// thread's stash, so the refill keeps its one lock take per batch
 	// (cx-home/v#40; vgc_span_stash_split_test). A stashed span's state:
 	// in_use false, pooled false, on no list, not in flight (VGC_Cache.tpool).
-	if arena_idx >= 0 && npages <= u32(vgc_tpool_max_pages) && vgc_pool_first_at_least(npages + 1) != 0 {
+	if arena_idx >= 0 && npages <= u32(vgc_tpool_max_pages)
+		&& vgc_pool_first_at_least(npages + 1) != 0 {
 		ci := C.vgc_get_cache_idx()
 		if ci >= 0 && ci < vgc_heap.ncaches {
 			mut c := unsafe { vgc_cache(ci) }
@@ -6482,7 +6525,8 @@ const vgc_acct_flush = u64(1) << 20
 // fixed 1 MB, n threads could hold n MB the pacer had not seen: four csv workers
 // against a 1 MB budget carved ~400 spans past the goal before a collection
 // (17.5 MB peak against one worker's 14.0). VGC_ACCT_FLUSH_DIV=0 keeps 1 MB.
-__global vgc_acct_flush_cur = u64(1048576) // vgc_acct_flush (a plain cast: a const or a shift leaves the global untyped in files checked before this one)
+__global vgc_acct_flush_cur = u64(1048576)
+// vgc_acct_flush (a plain cast: a const or a shift leaves the global untyped in files checked before this one)
 __global vgc_acct_flush_div = u64(16)
 // the threads that allocated vgc_acct_flush_min or more between the last two
 // stops (counted at the stop's fold of their deltas)
@@ -6571,8 +6615,8 @@ fn vgc_maybe_gc() {
 					// cx-home/v#51: the trampoline's frame lands on zeroed stack
 					C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo,
 						vgc_cache(ci).stack_limit_hi)
-					C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo,
-						&vgc_cache(ci).stack_hi, vgc_cache(ci).stack_base)
+					C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
+						vgc_cache(ci).stack_base)
 				}
 			} else {
 				vgc_gc_start()
@@ -7028,14 +7072,17 @@ fn vgc_free(ptr voidptr) {
 		// slot out of that cycle's garbage, which the free already accounted.
 		if span.perm != 0 && span.perm_bits != unsafe { nil } {
 			unsafe {
-				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + usize(obj_idx >> 3))), ~mask)
-				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + 136 + usize(obj_idx >> 3))), ~mask)
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) +
+					usize(obj_idx >> 3))), ~mask)
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_bits) + 136 +
+					usize(obj_idx >> 3))), ~mask)
 			}
 		}
 		// a freed candidate leaves the epoch: the slot's next occupant is born after it
 		if span.perm_cand != unsafe { nil } {
 			unsafe {
-				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_cand) + usize(obj_idx >> 3))), ~mask)
+				_ = C.vgc_atomic_fetch_and_u8(&u8(voidptr(usize(span.perm_cand) +
+					usize(obj_idx >> 3))), ~mask)
 			}
 		}
 	}
@@ -7589,10 +7636,9 @@ fn vgc_safe_region_enter() {
 	}
 	vgc_safe_cache_flush(cache_idx)
 	unsafe {
-		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe,
-			&vgc_cache(cache_idx).stack_lo, &vgc_cache(cache_idx).stack_hi,
-			vgc_cache(cache_idx).stack_base, &vgc_cache(cache_idx).safe_regs[0],
-			vgc_safe_spill_words)
+		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe, &vgc_cache(cache_idx).stack_lo,
+			&vgc_cache(cache_idx).stack_hi, vgc_cache(cache_idx).stack_base,
+			&vgc_cache(cache_idx).safe_regs[0], vgc_safe_spill_words)
 	}
 }
 
