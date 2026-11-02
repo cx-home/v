@@ -759,8 +759,8 @@ pub fn vgc_pace_one_thread_selftest() u32 {
 		|| !vgc_pace_one_thread(0, 1, 0, 3, false, 500) || !vgc_pace_one_thread(0, 1, 1, 2, false, 500) {
 		return 3
 	}
-	// several stamped: several, whatever the 64 KB counts
-	if vgc_pace_one_thread(4, 4, 4, 6, true, 500) || vgc_pace_one_thread(2, 0, 0, 87, true, 500) {
+	// several stamped (two or more, half the live mutators or more): several, whatever the 64 KB counts
+	if vgc_pace_one_thread(4, 4, 4, 6, true, 500) || vgc_pace_one_thread(2, 0, 0, 3, true, 500) {
 		return 4
 	}
 	// the first collection is start-up: one, whatever the 64 KB counts
@@ -779,7 +779,8 @@ pub fn vgc_pace_one_thread_selftest() u32 {
 }
 
 // vgc_pace_answer_selftest (cx-home/v#62): the 64 KB count paces as several only when it reaches
-// half the live mutators at this stop and the stop before. A server holds every thread it runs
+// half the live mutators at this stop and the stop before; the ~1 MB stamp only at half the live
+// mutators too. A server holds every thread it runs
 // (87 at http-json-echo k=28 C=256) and only a few of them cross 64 KB between stops (VGC_GCTRACE
 // pace lines: at most 7 of 87, 3 of 39, 2 of 15, 2 of 6): one thread, whatever its marked set and
 // whatever the cycle before answered — a reading that flipped one cycle to several no longer
@@ -803,6 +804,13 @@ pub fn vgc_pace_answer_selftest() u32 {
 	// exactly half (and two or more) counts as several; one under half does not
 	if vgc_pace_one_thread(0, 3, 3, 6, true, 500) || !vgc_pace_one_thread(0, 2, 2, 5, false, 500) {
 		return 4
+	}
+	// a server's few handlers over the ~1 MB stamp (3-4 of 87 at http-json-echo k=28 under a
+	// several-thread goal, P6's trace): the stamp too reads several only at half the live
+	// mutators, so it does not hold a server at several either
+	if !vgc_pace_one_thread(3, 3, 0, 87, true, 500) || !vgc_pace_one_thread(4, 7, 6, 87, false, 500)
+		|| vgc_pace_one_thread(2, 0, 0, 4, true, 500) {
+		return 5
 	}
 	return 0
 }
