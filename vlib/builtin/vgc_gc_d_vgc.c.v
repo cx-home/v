@@ -359,6 +359,7 @@ fn vgc_gc_start() {
 				acct_threads++
 			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_flushed += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
 			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
@@ -1733,6 +1734,7 @@ fn vgc_gc_start_concurrent() {
 				acct_threads++
 			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
+			vgc_cache(ci).alloc_flushed += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_delta = 0
 			vgc_cache(ci).gen_bytes = 0
 			vgc_cache(ci).live_delta = 0
@@ -4480,6 +4482,17 @@ fn vgc_total_allocated() u64 {
 		all += unsafe { vgc_cache(ci).alloc_delta }
 	}
 	return all
+}
+
+// vgc_thread_allocated is the bytes the calling thread has allocated since it registered: its
+// flushed share plus its un-flushed delta, both in its own slot (gc_thread_allocated,
+// cx-home/v#62). A thread with no slot reads the process-wide count.
+fn vgc_thread_allocated() u64 {
+	idx := C.vgc_get_cache_idx()
+	if idx < 0 {
+		return vgc_total_allocated()
+	}
+	return unsafe { vgc_cache(idx).alloc_flushed + vgc_cache(idx).alloc_delta }
 }
 
 fn vgc_heap_usage() (usize, usize, usize, usize, usize) {

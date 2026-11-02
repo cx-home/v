@@ -395,6 +395,10 @@ mut:
 	// the collector reads/resets all slots under STW.
 	live_delta  i64 // un-flushed (allocated - freed) bytes by this thread
 	alloc_delta u64 // un-flushed total-allocated bytes by this thread
+	// cx-home/v#62: the bytes of this thread's alloc_delta already flushed into total_alloc,
+	// so alloc_flushed + alloc_delta is this thread's monotone count (gc_thread_allocated);
+	// written by the owner at its flush and by the collector at a stop, as alloc_delta is
+	alloc_flushed u64
 	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
 	gen_bytes   u64 // flushed bytes this thread allocated since the last stop (alloc_gen's ~1 MB)
 	// cx-private#1910: bytes of the objects this thread's alloc-black hook marked
@@ -2650,6 +2654,7 @@ fn vgc_register_thread_opt(wait bool) bool {
 		vgc_cache(idx).stopped = 0
 		vgc_cache(idx).live_delta = 0
 		vgc_cache(idx).alloc_delta = 0
+		vgc_cache(idx).alloc_flushed = 0
 		vgc_cache(idx).gen_bytes = 0
 		vgc_cache(idx).next_free_p1 = 0
 		vgc_cache(idx).cov_safe = false
@@ -5931,6 +5936,7 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 				C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-ld))
 			}
 			C.vgc_atomic_add_u64(&vgc_heap.total_alloc, vgc_cache(cache_idx).alloc_delta)
+			vgc_cache(cache_idx).alloc_flushed += vgc_cache(cache_idx).alloc_delta
 			vgc_cache(cache_idx).live_delta = 0
 			vgc_cache(cache_idx).alloc_delta = 0
 		}
