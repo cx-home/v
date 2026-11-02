@@ -7,9 +7,10 @@
 // 25–176 MB sat pooled (measure/collector-epic-64, the carve lines).
 //
 // The shape (pages of 8 KB; the array's header adds one to each): a
-// 3000-page frame and a 2900-page one above it, carved from the tail (two
-// sizes asked for once each: a run of a recurring size keeps its size and
-// joins nothing, vgc_pool_keeps_size), then a
+// 3000-page frame and a 2900-page one above it, carved from the first
+// arena's tail (two sizes asked for once each, so plain — the kind is a
+// size's own recurrence — and merging: a run of a recurring frame size
+// keeps its size and joins nothing, vgc_pool_keeps_size), then a
 // 1 MB separator held so the upper frame merges with nothing above it. The
 // upper frame is dropped and four collections run: the trim returns its run
 // to the OS after two (vgc_pool_trim_age). Then the lower frame is dropped
@@ -18,10 +19,7 @@
 // separator) cannot hold it, so on 14dfcca7f — the hot run and the cold run
 // apart, 3000 and 2900 pages — it carves a second arena; now the merged
 // 5900-page cold run serves it and the arena count holds. Its own process (a fresh
-// heap: one arena). The kinds begin at the first recurring frame size
-// (vgc_frames_begun): a 2047-page frame asked for twice first, whose
-// 2048-page run — kept for its size, joining nothing — sits below the two
-// frames in their frame arena.
+// heap: one arena).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_cold_neighbour_merge_test.v
 module main
@@ -52,34 +50,22 @@ fn scrub_stack() {
 	}
 }
 
-// frames_begin asks for a 2047-page frame (2,048 pages with the header, the
-// quarter) twice and drops both: the frame arenas begin at the first
-// recurring frame size (cx-home/v#58, vgc_frames_begun) — the first drop is
-// plain, the second opens a frame arena with a 2048-page run pooled at its
-// base and a 6144-page tail.
-@[noinline]
-fn frames_begin() {
-	for _ in 0 .. 2 {
-		assert fill(2047 * page).len == 2047 * page
-		gc_collect()
-	}
-	assert vgc_frames_probe(), 'the frame arenas have not begun after a frame size asked for twice'
-}
-
 fn test_a_freed_run_joins_its_cold_neighbour() {
-	frames_begin()
-	mut lower := fill(3000 * page) // held: the lower frame, in the frame arena's tail
-	assert drop_frame(2900 * page) == 2900 * page // the upper frame, dropped (its own size: the two runs merge)
+	mut lower :=
+		fill(3000 * page) // held: the lower frame, asked for once (plain), from the first arena's tail
+	assert drop_frame(2900 * page) == 2900 * page // the upper frame, dropped (its own size, asked for once: the two runs merge)
 	sep := fill(mb) // held: nothing merges with the upper frame's run from above
+	assert drop_frame(60 * page) == 60 * page // a 61-page run pooled past the separator: the small requests between the collections split it, not the cold run (a plain arena's cold run is any request's; in a frame arena no small request reached it)
 	scrub_stack()
 	gc_collect() // the upper run is pooled, hot
 	gc_collect()
 	gc_collect()
 	gc_collect() // the trim has returned it to the OS (vgc_pool_trim_age = 2)
 	arenas0 := vgc_arenas_count()
-	// the two frames share a frame arena (cx-home/v#58, vgc_frame_pages: a
-	// request of a quarter arena or more), the separator the plain one
-	assert arenas0 == 2, 'the two frames did not fit one frame arena beside the plain one: ${arenas0}'
+	// the two frames and the separator sit in the first arena: the frames,
+	// asked for once each, are plain (cx-home/v#58: the kind is a size's own
+	// recurrence)
+	assert arenas0 == 1, 'the two frames and the separator did not fit the first arena: ${arenas0}'
 	lower = []u8{}
 	scrub_stack()
 	gc_collect() // the lower run is freed beside the cold run: one 5900-page cold run
