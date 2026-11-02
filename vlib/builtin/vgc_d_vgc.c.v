@@ -6833,6 +6833,9 @@ __global vgc_acct_threads = int(0)
 // (vgc_pace_one_thread; a program starts as one thread)
 __global vgc_acct_threads_prev = int(0)
 __global vgc_paced_one = true
+// cx-home/v#62: the last cycle's pacing answer and stamp count, for VGC_GCTRACE's pace line
+__global vgc_trace_pace_nt = int(0)
+__global vgc_trace_pace_one = true
 const vgc_acct_flush_min = u64(64) * 1024
 
 // Hot-path allocation accounting. Bumps THIS thread's private deltas; flushes to
