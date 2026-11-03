@@ -1241,6 +1241,18 @@ pub fn vgc_arenas_count() int {
 	return int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 }
 
+// vgc_carved_probe reports the bytes carved from the arenas so far — the
+// arena space the heap has touched, which an arena never gives back (cx-home/v#65's
+// evidence: the pages a thread per request strands, against the inline run's).
+// A diagnostic read for a quiet heap.
+pub fn vgc_carved_probe() u64 {
+	mut carved := u64(0)
+	for i in 0 .. vgc_arenas_count() {
+		carved += u64(unsafe { vgc_heap.arenas[i].used })
+	}
+	return carved
+}
+
 pub fn vgc_card_dirty(p voidptr) bool {
 	mut dirty := false
 	$if vgc_concurrent ? {
@@ -2849,9 +2861,10 @@ fn vgc_native_abi_1() int {
 }
 
 // vgc_thread_exit_cb is invoked (via a pthread-key destructor, see
-// vgc_platform.h) when a registered thread exits. It marks the cache slot
-// unregistered so stop-the-world no longer waits on a dead thread, and
-// reclaims the slot for reuse. If a collection is mid-stop, the exiting
+// vgc_platform.h) when a registered thread exits. It gives the thread's stash
+// and cached spans back (cx-home/v#65), marks the cache slot unregistered so
+// stop-the-world no longer waits on a dead thread, and reclaims the slot for
+// reuse. If a collection is mid-stop, the exiting
 // thread counts as already-stopped (it has no more roots).
 @[export: 'vgc_thread_exit_cb']
 fn vgc_thread_exit_cb(idx int) {
@@ -2870,6 +2883,17 @@ fn vgc_thread_exit_cb(idx int) {
 		mut xc := unsafe { vgc_cache(idx) }
 		vgc_tpool_drain_slot(mut xc)
 		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	}
+	// cx-home/v#65: the cached spans go to the other threads next, still
+	// before cache_lock and while the slot is this thread's — each class's
+	// central lock is taken for one push, as a thread entering a safe region
+	// takes it (vgc_safe_cache_flush); the collector holds every central lock
+	// across its cycle, so an exit that meets a cycle waits for it, suspended
+	// like an allocating thread. No quarantine of the stack's stale words
+	// (vgc_safe_cache_quarantine): the thread is gone a moment later, so a
+	// stale word roots a slot's next occupant for one cycle at most.
+	if vgc_cache(idx).registered {
+		vgc_cache_spans_release(idx)
 	}
 	C.vgc_mutex_lock(&vgc_heap.cache_lock)
 	if !vgc_cache(idx).registered {
@@ -7964,6 +7988,25 @@ fn vgc_safe_cache_flush(cache_idx int) {
 	}
 	c.flush_gen = gen
 	vgc_safe_cache_quarantine(cache_idx)
+	vgc_cache_spans_release(cache_idx)
+}
+
+// vgc_cache_spans_release hands the spans a cache holds to the other threads:
+// each span with free slots onto its class's central.partial list, where the
+// next refill of that class (any thread's) takes it; a full span dropped (it
+// stays in allspans and the sweep returns it to circulation). The body of
+// vgc_safe_cache_flush (its locking argument above), read at a thread's exit
+// too (cx-home/v#65): the exit callback drained the stash and released the
+// slot, and the next registration cleared the slot's span pointers, so every
+// span the dead thread had touched — a fresh 8 KB span per size class, a few
+// objects in — stayed in use and out of every cache until a sweep relinked
+// it, and the pacer saw nothing to collect for (a short thread's garbage is
+// a few KB; the spans it strands 25–85 KB): a program spawning a thread per
+// request read 85 MB resident after 1,000 threads and 145 MB after 5,000,
+// against 3.6 MB for the same work inline. Caller: the slot's owner, the
+// slot still registered (only the owner writes its alloc[] outside a stop).
+fn vgc_cache_spans_release(cache_idx int) {
+	mut c := unsafe { vgc_cache(cache_idx) }
 	for sc in 0 .. 136 {
 		if unsafe { c.alloc[sc] } == unsafe { nil } {
 			continue
