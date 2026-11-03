@@ -115,7 +115,7 @@ fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the 
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64, phot u64, pcold u64, ptail u64, fhot u64, fcold u64, ftail u64) // VGC_GCTRACE=3 carve line (cx-home/v#58); the pool and the tails by arena kind at its end
-fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash, 3 a kept run's tail
+fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash, 3 a kept run's tail, 4 a plain kept run's tail for a small request
 fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan_us u64, rescan_spans u64, rescan_objs u64, missed u64, born_kb u64, cut u64) // VGC_GCTRACE=2 concurrent-cycle line (cx-private#1910)
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
 fn C.vgc_gctrace_young(cycle u64, cards u64) // VGC_GCTRACE=2 young-regime line (cx-home/v#56 step 1)
@@ -4010,6 +4010,41 @@ fn vgc_get_free_span_any(npages u32, kind u8) (&VGC_Span, bool) {
 	return span, cold
 }
 
+// vgc_get_plain_kept_tail serves a SMALL request with nothing of its kind
+// from a plain kept run's tail (cx-home/v#58): the smallest plain run kept
+// whole for a recurring size whose remainder still holds every size it is
+// kept for (vgc_pool_kept_tail, the small world's own rule), its tail split
+// off under a fresh descriptor (vgc_span_split_tail: the run's base and its
+// cold state stay, so the next period finds it). Nothing else of the plain
+// pool is split for a small request — the best fit off a large run cut the
+// writer's free pages into pieces no buffer fits (da91821df6). nil when no
+// kept run has a tail to give: the caller takes a plain arena's tail, then
+// carves.
+fn vgc_get_plain_kept_tail(npages u32) (&VGC_Span, bool) {
+	if npages == 0 {
+		return unsafe { nil }, false
+	}
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	mut host := vgc_pool_kept_tail(npages, vgc_kind_plain)
+	if host == unsafe { nil } {
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+		return unsafe { nil }, false
+	}
+	cold := host.decommitted
+	if vgc_gctrace >= 3 {
+		C.vgc_gctrace_split(u64(vgc_heap.gc_cycle), u64(npages), u64(host.npages), 0, 4)
+	}
+	vgc_pool_unlink(mut host)
+	mut tail := vgc_span_split_tail(mut host, npages)
+	if tail == unsafe { nil } {
+		C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+		return unsafe { nil }, false // no descriptor: the run is back whole; carve
+	}
+	vgc_span_pop_finish(mut tail)
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	return tail, cold
+}
+
 // The pool lookup proper, under free_spans_lock (cx-private#1910: shared by the
 // locked path above and the stash refill below). Only spans of the request's
 // arena kind are answered (frames; cx-home/v#58).
@@ -5823,6 +5858,32 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 				nbytes = usize(npages) * vgc_page_size
 			}
 		}
+	}
+	if base == 0 && kind == vgc_kind_small {
+		// cx-home/v#58: a small request with nothing of its kind — no small
+		// tail, no small pooled span, no small kept run with a tail to give —
+		// takes a PLAIN kept run's tail before an arena is carved, when the
+		// run's remainder still holds every recurring size it is kept for
+		// (vgc_get_plain_kept_tail: the small world's own kept-tail rule read
+		// across the kinds), then a plain arena's tail. Served by its kind
+		// alone, the batch writer's 1-, 30-, 65- and 87-page requests carved
+		// three small arenas a run beside plain cold runs of 6,464–8,181
+		// pages and plain tails of 219–1,648 pages (measure/collector-epic-82,
+		// the G runs' carve lines at cycles 96, 126, 200, 208, 265, 414 and
+		// 436): a small arena is 64 MB resident as touched; the piece off a
+		// kept run's tail is the run's slack past its recurring sizes, and
+		// the run is the one its next period finds. The plain pool's other
+		// spans are never split for a small request (the best fit off a
+		// large run cut the writer's free pages into pieces no buffer fits;
+		// da91821df6). vgc_small_request_takes_plain_tail_test.v.
+		C.vgc_mutex_unlock(&vgc_heap.lock)
+		mut ptail, mut cold_ptail := vgc_get_plain_kept_tail(npages)
+		if ptail != unsafe { nil } {
+			vgc_span_recycled_ready(mut ptail, cold_ptail, npages)
+			return ptail, false
+		}
+		C.vgc_mutex_lock(&vgc_heap.lock)
+		base, arena_idx = vgc_arena_tail_take(nbytes, vgc_kind_plain)
 	}
 	if vgc_gctrace >= 3 && base != 0 {
 		vgc_gctrace_carve_emit(npages, 0, arena_idx, kinds)
