@@ -98,12 +98,13 @@ fn vgc_gc_start() {
 		// (an object born in a concurrent middle is filled after the stop with
 		// no barrier, so it must not be promoted)
 		promote := vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request)
+			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle)
+			|| vgc_perm_request)
 		// cx-home/v#56 step 2: a minor cycle stops the world; the concurrent
 		// cycle is a full one
 		vgc_minor_this_cycle = vgc_minor_plan(promote)
-		if !promote && !vgc_minor_this_cycle && (vgc_cm_mode == 1 || (vgc_cm_mode == 2 && vgc_cm_backoff == 0
-			&& vgc_mark_last_work_ns >= vgc_cm_min_ns
+		if !promote && !vgc_minor_this_cycle && (vgc_cm_mode == 1
+			|| (vgc_cm_mode == 2 && vgc_cm_backoff == 0 && vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
 			vgc_gc_start_concurrent()
 			return
@@ -319,7 +320,8 @@ fn vgc_gc_start() {
 	$if vgc_concurrent ? {
 		// cx-home/v#15: the promotion cycle, and the verifier's full re-mark
 		if vgc_perm_mode != 0
-			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle) || vgc_perm_request) {
+			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle)
+			|| vgc_perm_request) {
 			vgc_perm_promote()
 		}
 		if vgc_perm_on != 0 || vgc_minor_this_cycle {
@@ -1216,14 +1218,22 @@ fn vgc_minor_plan(promote bool) bool {
 // vgc_minor_next answers, at a cycle's end (vgc_update_trigger, the minor
 // count of this cycle already in), whether the NEXT cycle runs inside the
 // full cycle's headroom: a minor by the plan vgc_minor_plan makes at its
-// start — the same tests, less the ones only that start knows (a due
-// promotion, a watched address) — or the full that closes a run of minors
-// (the count reached). Then the next trigger is one share of that headroom
-// (lever 8, cx-home/v#56): the full that closes the run collects after its
-// share too, else the young garbage fills the heap from the last minor to
-// the full goal (young/wave.v: eight minors at 62 MB, then 83 MB of heap
-// before the full at 108). A full the live set's growth forces (the sticky
-// marked set doubled since the last full, or past its goal) keeps the
+// start — less the tests only that start knows (a due promotion, a watched
+// address) — or the full that closes a run of minors, whatever closes it
+// (the count reached, or the marked set past twice the last full's or past
+// its goal). Then the next trigger is one share of that headroom (lever 8,
+// cx-home/v#56): the full that closes the run collects after its share too,
+// else the young garbage fills the heap from the last minor to the full goal
+// (young/wave.v: eight minors at 62 MB, then 83 MB of heap before the full
+// at 108). The growth tests of vgc_minor_plan are not repeated here: a
+// minor's marked set is not a live-set measurement (the young spans the
+// cards reach are kept whole until the full), so a full they force runs at
+// the minors' marked set plus one share, and ITS marked set — the live set —
+// sets the pacer's goal. Before, that full kept the pacer's goal over the
+// minors' marked set: binary-trees 18 read 361 MB marked after its eighth
+// minor at 108 MB live, a goal of 723 MB, and carved five arenas before the
+// full (measure/collector-epic-84, the F trace; vgc_young_closing_full_test.v).
+// A full after a full (the regime off, or no full goal yet) keeps the
 // pacer's goal.
 fn vgc_minor_next(marked u64) bool {
 	if vgc_young_on == 0 || vgc_young_minors <= 0 || vgc_watch_addr != 0 {
@@ -1232,10 +1242,7 @@ fn vgc_minor_next(marked u64) bool {
 	if C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
 		return false
 	}
-	if vgc_full_marked > 0 && marked >= 2 * vgc_full_marked {
-		return false
-	}
-	if vgc_full_goal == 0 || marked >= vgc_full_goal {
+	if vgc_full_goal == 0 || vgc_full_goal <= vgc_full_marked {
 		return false
 	}
 	return true
@@ -1308,7 +1315,8 @@ fn vgc_scan_perm_obj(lo usize, hi usize, w int) bool {
 			|| C.vgc_bitmap_get(sp.alloc_bits, idx) == 0 {
 			continue
 		}
-		if sp.perm != 0 && sp.perm_bits != unsafe { nil } && C.vgc_bitmap_get(sp.perm_bits, idx) != 0 {
+		if sp.perm != 0 && sp.perm_bits != unsafe { nil }
+			&& C.vgc_bitmap_get(sp.perm_bits, idx) != 0 {
 			continue // a permanent object: black already
 		}
 		young = true
@@ -1378,7 +1386,8 @@ fn vgc_rescan_perm_span(span &VGC_Span, dirty bool, term bool, w int) (u64, u64,
 				yb[b] = nyb
 			}
 		}
-	}	return spans, objs, young
+	}
+	return spans, objs, young
 }
 
 // The roots, as both stops take them: the suspended threads' registers and
@@ -1581,7 +1590,7 @@ __global vgc_cmv_pinned = u32(0)
 pub fn vgc_cm_verify_watch(p voidptr) {
 	$if vgc_cm_verify ? {
 		if vgc_cmv_pinned != 0 {
-			return // a miss pinned the watch to its span
+			return
 		}
 		span := vgc_find_span(p)
 		if span == unsafe { nil } || span.npages == 0 {
@@ -1610,7 +1619,8 @@ fn vgc_cm_verify(self_idx int) {
 			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
 				continue
 			}
-			unsafe { C.memcpy(voidptr(usize(side) + usize(i) * 136), span.mark_bits, (span.nelems + 7) / 8) }
+			unsafe { C.memcpy(voidptr(usize(side) + usize(i) * 136), span.mark_bits, (span.nelems +
+				7) / 8) }
 		}
 		// cx-home/v#15: from zero — the permanent objects are traced too, so a
 		// pointer stored into one that no barrier dirtied shows as a miss
@@ -1639,7 +1649,8 @@ fn vgc_cm_verify(self_idx int) {
 					for bit in 0 .. 8 {
 						if (miss & (u8(1) << u32(bit))) != 0 {
 							if missed < 8 {
-								C.vgc_say(0x1911, u64(span.base + usize(u32(b) * 8 + u32(bit)) * usize(span.elem_size)))
+								C.vgc_say(0x1911, u64(span.base + usize(u32(b) * 8 +
+									u32(bit)) * usize(span.elem_size)))
 								C.vgc_say(0x1912, u64(span.elem_size))
 							}
 							if vgc_cmv_pinned == 0 {
@@ -1932,8 +1943,12 @@ fn vgc_gctrace_emit() {
 			// cx-home/v#15: the permanent generation's share of the cycle
 			if vgc_perm_on != 0 {
 				C.vgc_gctrace_perm(u64(vgc_heap.gc_cycle), vgc_perm_spans, vgc_perm_bytes / 1024,
-					vgc_cm_rescan_spans, vgc_cm_rescan_objs, vgc_perm_young_objs, vgc_perm_rescan_ns / 1000,
-					vgc_cm_verify_missed, u64(if vgc_perm_promoted_cycle == vgc_heap.gc_cycle { 1 } else { 0 }))
+					vgc_cm_rescan_spans, vgc_cm_rescan_objs, vgc_perm_young_objs,
+					vgc_perm_rescan_ns / 1000, vgc_cm_verify_missed, u64(if vgc_perm_promoted_cycle == vgc_heap.gc_cycle {
+					1
+				} else {
+					0
+				}))
 			}
 			// cx-home/v#56 step 1: the young regime's cards at the cycle's end
 			if vgc_minor_this_cycle {
@@ -1946,9 +1961,10 @@ fn vgc_gctrace_emit() {
 			// cx-private#1910: the concurrent cycle's shape — the two stops, the
 			// middle, the termination re-scan's spans/objects and time
 			if vgc_cm_this_cycle {
-				C.vgc_gctrace_cm(u64(vgc_heap.gc_cycle), vgc_cm_stop1_ns / 1000, vgc_cm_middle_ns / 1000,
-				vgc_cm_stop2_ns / 1000, vgc_cm_rescan_ns / 1000, vgc_cm_rescan_spans, vgc_cm_rescan_objs,
-					vgc_cm_verify_missed, vgc_cm_born_last / 1024, u64(if vgc_cm_cut_last { 1 } else { 0 }))
+				C.vgc_gctrace_cm(u64(vgc_heap.gc_cycle), vgc_cm_stop1_ns / 1000,
+					vgc_cm_middle_ns / 1000, vgc_cm_stop2_ns / 1000, vgc_cm_rescan_ns / 1000,
+					vgc_cm_rescan_spans, vgc_cm_rescan_objs, vgc_cm_verify_missed,
+					vgc_cm_born_last / 1024, u64(if vgc_cm_cut_last { 1 } else { 0 }))
 			}
 		}
 	}
@@ -2490,7 +2506,8 @@ fn vgc_scan_data_range(lo usize, hi usize, worker int) {
 		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0]!
 	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
 		usize(voidptr(&vgc_workbuf_end)) + w, usize(voidptr(&vgc_perm_lo)) + w,
-		usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0]!
+		
+			usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0]!
 	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
 	// vgc_platform.h): the arena address maps, the chunk tables and the
 	// touched-page cache — VGC_STATIC_TABLES (5) of them, from slot 7.
@@ -2510,8 +2527,22 @@ fn vgc_scan_data_range(lo usize, hi usize, worker int) {
 	// stack bounds, cycle numbers and parked flags, written only under
 	// -d vgc_spcheck, never a reference.
 	spchk_len := usize(vgc_spchk_slots) * w
-	own_los := [usize(voidptr(&vgc_spchk_lo[0])), usize(voidptr(&vgc_spchk_hi[0])), usize(voidptr(&vgc_spchk_cyc[0])), usize(voidptr(&vgc_spchk_parked[0])), usize(voidptr(&vgc_ph[0])), usize(voidptr(&vgc_walk_sum[0])), usize(voidptr(&vgc_pool_hot_bits[0])), usize(voidptr(&vgc_pool_cold_bits[0])), usize(voidptr(&vgc_gc_t0)), usize(voidptr(&vgc_gc_last_end)), usize(voidptr(&vgc_gc_cpu_t0)), usize(voidptr(&vgc_gc_wait_cpu)), usize(voidptr(&vgc_gate_last_pause)), usize(voidptr(&vgc_gate_last_interval)), usize(voidptr(&vgc_stw_last_pause_ns)), usize(voidptr(&vgc_perm_rescan_ns)), usize(voidptr(&vgc_root_last_ns)), usize(voidptr(&vgc_mark_last_ns)), usize(voidptr(&vgc_mark_last_work_ns)), usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)), usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)), usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)), usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns))]!
-	own_lens := [spchk_len, spchk_len, spchk_len, spchk_len, usize(8) * w, usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w, w]!
+	own_los := [usize(voidptr(&vgc_spchk_lo[0])), usize(voidptr(&vgc_spchk_hi[0])),
+		usize(voidptr(&vgc_spchk_cyc[0])), usize(voidptr(&vgc_spchk_parked[0])),
+		usize(voidptr(&vgc_ph[0])), usize(voidptr(&vgc_walk_sum[0])),
+		usize(voidptr(&vgc_pool_hot_bits[0])), usize(voidptr(&vgc_pool_cold_bits[0])),
+		usize(voidptr(&vgc_gc_t0)), usize(voidptr(&vgc_gc_last_end)), usize(voidptr(&vgc_gc_cpu_t0)),
+		usize(voidptr(&vgc_gc_wait_cpu)), usize(voidptr(&vgc_gate_last_pause)),
+		usize(voidptr(&vgc_gate_last_interval)), usize(voidptr(&vgc_stw_last_pause_ns)),
+		usize(voidptr(&vgc_perm_rescan_ns)), usize(voidptr(&vgc_root_last_ns)),
+		usize(voidptr(&vgc_mark_last_ns)), usize(voidptr(&vgc_mark_last_work_ns)),
+		usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)),
+		usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)),
+		usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)),
+		usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns))]!
+	own_lens := [spchk_len, spchk_len, spchk_len, spchk_len, usize(8) * w,
+		usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w,
+		w, w, w, w, w, w, w, w, w, w]!
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur
@@ -2757,7 +2788,8 @@ fn vgc_rd_shade_root(addr usize, val usize, w int) {
 			// the root word naming a watched address: its kind (vgc_rd_cat), own
 			// stack or not, the verifier's pass or the cycle's, and the word's
 			// offset below the stack top
-			C.vgc_say(0x1918, u64(cat) | u64(if vgc_rd_own { 1 } else { 0 }) << 8 | u64(vgc_cmv_in_verify) << 9)
+			C.vgc_say(0x1918,
+				u64(cat) | u64(if vgc_rd_own { 1 } else { 0 }) << 8 | u64(vgc_cmv_in_verify) << 9)
 			C.vgc_say(0x1919, u64(if cat >= 10 { vgc_rd_base - addr } else { addr }))
 		}
 	}
@@ -2777,8 +2809,12 @@ fn vgc_rd_shade_root(addr usize, val usize, w int) {
 		vgc_rd_top_off = off
 	}
 	if got >= vgc_rd_min {
-		C.vgc_rd_report(vgc_heap.gc_cycle, cat, addr, off, val, got, vgc_rd_objs - o0,
-			if cat >= 10 && vgc_rd_own { 1 } else { 0 })
+		C.vgc_rd_report(vgc_heap.gc_cycle, cat, addr, off, val, got, vgc_rd_objs - o0, if cat >= 10
+			&& vgc_rd_own {
+			1
+		} else {
+			0
+		})
 	}
 }
 
@@ -3180,7 +3216,11 @@ fn vgc_mark_adapt(marked u64) {
 	}
 	if vgc_mark_nworkers_cur <= 1 {
 		if cm {
-			vgc_mark_rate1_cm = if vgc_mark_rate1_cm == 0 { rate } else { (vgc_mark_rate1_cm * 7 + rate) / 8 }
+			vgc_mark_rate1_cm = if vgc_mark_rate1_cm == 0 {
+				rate
+			} else {
+				(vgc_mark_rate1_cm * 7 + rate) / 8
+			}
 		} else {
 			vgc_mark_rate1 = if vgc_mark_rate1 == 0 { rate } else { (vgc_mark_rate1 * 7 + rate) / 8 }
 		}
@@ -3351,7 +3391,8 @@ fn vgc_mark_scan_obj(obj_addr usize, w int) {
 						pf |= 2
 					}
 					C.vgc_say(0x191a, u64(obj_addr))
-					C.vgc_say(0x191b, pf | u64(span.class_idx) << 8 | u64(vgc_cmv_in_verify) << 16 | u64(span.elem_size) << 24)
+					C.vgc_say(0x191b,
+						pf | u64(span.class_idx) << 8 | u64(vgc_cmv_in_verify) << 16 | u64(span.elem_size) << 24)
 					C.vgc_say(0x191c, u64(a - obj_addr))
 				}
 				a += sizeof(usize)
@@ -4743,9 +4784,8 @@ fn vgc_update_trigger() {
 	// (vgc_gate_last_pause / _interval, the overhead band above) doubles the next
 	// budget, up to the live set itself (shift 4); a cycle under 1/8 of it halves it
 	// back; a goal under the limit again resets it.
-	vgc_limit_shift = vgc_limit_step(vgc_limit_shift, vgc_cpu_limit
-		&& goal < marked + marked / 16 && !vgc_headroom_pinned, vgc_gate_last_pause,
-		vgc_gate_last_interval, vgc_cpu_limit_div)
+	vgc_limit_shift = vgc_limit_step(vgc_limit_shift, vgc_cpu_limit && goal < marked + marked / 16
+		&& !vgc_headroom_pinned, vgc_gate_last_pause, vgc_gate_last_interval, vgc_cpu_limit_div)
 	mut min_budget := (marked / 16) << vgc_limit_shift
 	if min_budget < hr_min {
 		min_budget = hr_min
@@ -4764,8 +4804,8 @@ fn vgc_update_trigger() {
 	}
 	// cx-home/v#56 lever 8: when the next cycle runs inside the full cycle's
 	// headroom (vgc_minor_next: a minor by the plan vgc_minor_plan makes at
-	// its start, or the full that closes the run of minors), its trigger is
-	// its share of that headroom — the minors share (full goal - full
+	// its start, or the full that closes the run of minors — whatever closes
+	// it), its trigger is its share of that headroom — the minors share (full goal - full
 	// marked) by allocation, at least hr_min each — not the full goal: a
 	// minor at twice the sticky marked set let the young garbage fill the
 	// heap to that goal between two stops (binary-trees 18 after its stretch
@@ -4870,8 +4910,7 @@ pub fn vgc_cache_layout() string {
 	for ci in 0 .. C.vgc_ncache_chunks() {
 		chunks << '0x${u64(usize(C.vgc_cache_chunk(ci))).hex()}'
 	}
-	return 'chunks=${chunks.join(',')} slots=${vgc_cache_chunk_slots} rec=${sizeof(VGC_Cache)} alloc=${__offsetof(VGC_Cache,
-		alloc)} tiny=${__offsetof(VGC_Cache, tiny)} safe_regs=${__offsetof(VGC_Cache, safe_regs)} ncaches=${vgc_heap.ncaches}'
+	return 'chunks=${chunks.join(',')} slots=${vgc_cache_chunk_slots} rec=${sizeof(VGC_Cache)} alloc=${__offsetof(VGC_Cache, alloc)} tiny=${__offsetof(VGC_Cache, tiny)} safe_regs=${__offsetof(VGC_Cache, safe_regs)} ncaches=${vgc_heap.ncaches}'
 }
 
 // the mask on the addresses vgc_orphan_holders keeps (no user-space address)
@@ -4945,8 +4984,8 @@ pub fn vgc_orphan_holders(known []usize, size u32) string {
 				}
 				h := span.base + usize(idx) * usize(span.elem_size)
 				n0 := hs.len
-				vgc_holders_in(mut hs, if span.has_ptrmap { 'heap-p' } else { 'heap-c' }, h,
-					h + usize(span.elem_size), h, o, size)
+				vgc_holders_in(mut hs, if span.has_ptrmap { 'heap-p' } else { 'heap-c' }, h, h +
+					usize(span.elem_size), h, o, size)
 				if hs.len > n0 && objs.len < 4 {
 					objs << (h ^ vgc_oh_mask)
 					osz << span.elem_size
@@ -4958,7 +4997,11 @@ pub fn vgc_orphan_holders(known []usize, size u32) string {
 			h := hm ^ vgc_oh_mask
 			vgc_root_holders(mut hs, '0x${u64(h).hex()}<', h, osz[j])
 		}
-		out << '0x${u64(o).hex()} b0=${first} b8=${pay} [${vgc_orphan_state(o)}] by ${if hs.len == 0 { 'nothing' } else { hs.join(',') }}'
+		out << '0x${u64(o).hex()} b0=${first} b8=${pay} [${vgc_orphan_state(o)}] by ${if hs.len == 0 {
+			'nothing'
+		} else {
+			hs.join(',')
+		}}'
 	}
 	return out.join('; ')
 }
@@ -4993,7 +5036,15 @@ fn vgc_orphan_state(o usize) string {
 			tiny << '${i}'
 		}
 	}
-	return 'm=${m} sg=${span.sweep_gen}/${vgc_heap.gc_cycle} if=${C.vgc_atomic_load_u32(&span.inflight)} oc=${span.on_central} ac=${span.alloc_count}/${span.nelems} c=${if cached.len == 0 { '-' } else { cached.join('+') }}${if tiny.len == 0 { '' } else { ' t=' + tiny.join('+') }}'
+	return 'm=${m} sg=${span.sweep_gen}/${vgc_heap.gc_cycle} if=${C.vgc_atomic_load_u32(&span.inflight)} oc=${span.on_central} ac=${span.alloc_count}/${span.nelems} c=${if cached.len == 0 {
+		'-'
+	} else {
+		cached.join('+')
+	}}${if tiny.len == 0 {
+		''
+	} else {
+		' t=' + tiny.join('+')
+	}}'
 }
 
 // vgc_root_holders appends the root words (data segments, cache slots, suspend
