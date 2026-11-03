@@ -5,7 +5,10 @@
 // The pool coalesces a freed span only with neighbours of at least
 // vgc_pool_merge_min pages, so a heap that held many size-class objects and
 // dropped them pools tens of MB as one- and two-page spans: adjacent, free,
-// and unusable for a request of a few hundred pages. vgc_span_alloc then
+// and unusable for a request of a few hundred pages — a request under the
+// rounding's floor (256 pages), a small one, served by the small arenas
+// where the size-class spans lie (decision 98 (a); a request from the floor
+// up takes nothing of a small arena). vgc_span_alloc then
 // carved a fresh 64 MB arena beside them, which is never released — the
 // json-codec workload's peak stepped by those pages depending on where in the
 // run the emitter's growing buffer met the fragmented pool.
@@ -16,14 +19,15 @@
 // a run, and the arenas' carved bytes (gc_memory_use) grow by no more than the
 // one request the first arena's unused tail holds. Measured: 25,214,976 bytes
 // carved for the six requests on 950e84b1e7 (a second arena), 4,202,496 with
-// the defrag (the tail; one arena).
+// the defrag (the tail; one arena) — with 4 MB requests, before the small
+// kind; the shape holds with 200-page ones.
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_pool_defrag_test.v
 module main
 
 const small = 1024
 const small_bytes = 48 * 1024 * 1024 // dropped size-class objects: most of an arena
-const big = 4 * 1024 * 1024 // the large request (512 pages)
+const big = 200 * 8192 // the large request: 201 pages with the array's header, under the floor — a small request
 
 fn fill() int {
 	mut keep := [][]u8{cap: small_bytes / small}
