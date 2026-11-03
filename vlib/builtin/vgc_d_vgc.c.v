@@ -112,6 +112,7 @@ fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
+fn C.vgc_gctrace_pace(cycle u64, nt u64, acct u64, prev u64, live u64, one u64) // VGC_GCTRACE=2 pace line, stop-safe
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64) // VGC_GCTRACE=3 carve line (cx-home/v#58)
 fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash

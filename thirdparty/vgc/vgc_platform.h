@@ -2515,6 +2515,20 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
     vgc__ws("KB threads="); vgc__wdec(lthreads);
     vgc__ws("\n");
 }
+// VGC_GCTRACE=2 pace line (cx-home/v#62): the cycle's pacing answer and its inputs. Written
+// while the world is stopped, so through vgc__ws / vgc__wdec (write(2), no lock): fprintf's
+// formatter takes libc's locale lock, which a stopped mutator may hold (inet_ntop4's snprintf
+// in an HTTP handler), and the stop then waits on it for good.
+static void vgc_gctrace_pace(uint64_t cycle, uint64_t nt, uint64_t acct, uint64_t prev,
+                             uint64_t live, uint64_t one) {
+    vgc__ws("[gc "); vgc__wdec(cycle);
+    vgc__ws("] pace nt="); vgc__wdec(nt);
+    vgc__ws(" acct="); vgc__wdec(acct);
+    vgc__ws(" prev="); vgc__wdec(prev);
+    vgc__ws(" live="); vgc__wdec(live);
+    vgc__ws(" one="); vgc__wdec(one);
+    vgc__ws("\n");
+}
 // VGC_GCTRACE=3 carve line (cx-home/v#58): a request the pool did not serve.
 static void vgc_gctrace_carve(uint64_t cycle, uint64_t npages, uint64_t new_arena, uint64_t arena_idx,
                               uint64_t pool_kb, uint64_t trimmed_kb, uint64_t hot_max, uint64_t cold_max,
