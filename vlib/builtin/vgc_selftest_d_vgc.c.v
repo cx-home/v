@@ -609,21 +609,21 @@ pub fn vgc_mark_held_selftest() u32 {
 	// a marked set over the several-thread floor (the batch rows' 5-14 MB)
 	big := vgc_headroom_floor_lo * 2
 	// 20 held, a 1.3 ms mark (over the line), 28 free CPUs: five markers, not one
-	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, big) != 5 {
+	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, big, true) != 5 {
 		return 1
 	}
 	// 20 held, a 0.5 ms mark (under the line): the same five
-	if vgc_mark_plan_count(8, 500 * us, ms, 20, 28, true, 0, big) != 5 {
+	if vgc_mark_plan_count(8, 500 * us, ms, 20, 28, true, 0, big, true) != 5 {
 		return 2
 	}
 	// 16 held: four; 28 held: seven
-	if vgc_mark_plan_count(8, 1300 * us, ms, 16, 28, true, 0, big) != 4
-		|| vgc_mark_plan_count(8, 1300 * us, ms, 28, 28, true, 0, big) != 7 {
+	if vgc_mark_plan_count(8, 1300 * us, ms, 16, 28, true, 0, big, true) != 4
+		|| vgc_mark_plan_count(8, 1300 * us, ms, 28, 28, true, 0, big, true) != 7 {
 		return 3
 	}
 	// a small heap: 30 us of work times 20 held is under the line, the stop
 	// does not weigh (free 0) and the mark stays on one marker
-	if vgc_stop_weighs(30 * us, ms, 20) || vgc_mark_plan_count(8, 30 * us, ms, 20, 0, true, 0, big) != 1 {
+	if vgc_stop_weighs(30 * us, ms, 20) || vgc_mark_plan_count(8, 30 * us, ms, 20, 0, true, 0, big, true) != 1 {
 		return 4
 	}
 	// the stop weighs once the work times the held mutators reaches the line
@@ -631,33 +631,33 @@ pub fn vgc_mark_held_selftest() u32 {
 		return 5
 	}
 	// one mutator (free 0): one marker per ms of work, as before
-	if vgc_mark_plan_count(8, 3 * ms, ms, 1, 0, true, 0, big) != 3
-		|| vgc_mark_plan_count(8, 1300 * us, ms, 1, 0, true, 0, big) != 1 {
+	if vgc_mark_plan_count(8, 3 * ms, ms, 1, 0, true, 0, big, true) != 3
+		|| vgc_mark_plan_count(8, 1300 * us, ms, 1, 0, true, 0, big, true) != 1 {
 		return 6
 	}
 	// a busy box (free 0) with 20 held: one marker for a 1.3 ms mark, as before
-	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 0, true, 0, big) != 1 {
+	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 0, true, 0, big, true) != 1 {
 		return 7
 	}
 	// the free CPUs bound the floor: three free, three markers
-	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 3, true, 0, big) != 3 {
+	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 3, true, 0, big, true) != 3 {
 		return 8
 	}
 	// a long mark keeps one marker per ms: 10 ms on 20 held, ten markers
-	if vgc_mark_plan_count(8, 10 * ms, ms, 20, 28, true, 0, big) != 10 {
+	if vgc_mark_plan_count(8, 10 * ms, ms, 20, 28, true, 0, big, true) != 10 {
 		return 9
 	}
 	// the back-off's target still caps the plan
-	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 2, big) != 2 {
+	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 2, big, true) != 2 {
 		return 10
 	}
 	// VGC_MARK_PAR_MIN_US=0 (line 0): the configured count, widened by the held
-	if vgc_mark_plan_count(8, 0, 0, 20, 28, true, 0, big) != 21
-		|| vgc_mark_plan_count(8, 0, 0, 20, 28, false, 0, big) != 8 {
+	if vgc_mark_plan_count(8, 0, 0, 20, 28, true, 0, big, true) != 21
+		|| vgc_mark_plan_count(8, 0, 0, 20, 28, false, 0, big, true) != 8 {
 		return 11
 	}
 	// a configured single marker stays single
-	if vgc_mark_plan_count(1, 10 * ms, ms, 20, 28, true, 0, big) != 1 {
+	if vgc_mark_plan_count(1, 10 * ms, ms, 20, 28, true, 0, big, true) != 1 {
 		return 12
 	}
 	// cx-home/v#62: a marked set under the several-thread floor (a server's sub-MB mark)
@@ -666,15 +666,23 @@ pub fn vgc_mark_held_selftest() u32 {
 	// k=28 held ~29 threads over ~60 us marks, so the quarter fielded seven markers
 	// where four did, and every stop grew and woke them (misc-epic-62/-65/-66)
 	small := vgc_headroom_floor_lo / 5
-	if vgc_mark_plan_count(8, 60 * us, ms, 29, 28, true, 0, small) != 4
-		|| vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, small) != 1
-		|| vgc_mark_plan_count(8, 60 * us, ms, 29, 3, true, 0, small) != 3
-		|| vgc_mark_plan_count(8, 60 * us, ms, 29, 0, true, 0, small) != 1 {
+	if vgc_mark_plan_count(8, 60 * us, ms, 29, 28, true, 0, small, true) != 4
+		|| vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, small, true) != 1
+		|| vgc_mark_plan_count(8, 60 * us, ms, 29, 3, true, 0, small, true) != 3
+		|| vgc_mark_plan_count(8, 60 * us, ms, 29, 0, true, 0, small, true) != 1 {
 		return 13
 	}
 	// at the floor the quarter holds: 28 held, a 60 us mark, seven
-	if vgc_mark_plan_count(8, 60 * us, ms, 28, 28, true, 0, vgc_headroom_floor_lo) != 7 {
+	if vgc_mark_plan_count(8, 60 * us, ms, 28, 28, true, 0, vgc_headroom_floor_lo, true) != 7 {
 		return 14
+	}
+	// a cycle paced as one thread plans as the head did over the floor too: a server
+	// whose 3-4 MB marked set crosses 4 MB (87 held at http-json-echo k=28) gets four
+	// markers under the line and one per ms over it, not 21 (misc-epic-70)
+	if vgc_mark_plan_count(8, 60 * us, ms, 87, 28, true, 0, big, false) != 4
+		|| vgc_mark_plan_count(8, 1300 * us, ms, 87, 28, true, 0, big, false) != 1
+		|| vgc_mark_plan_count(8, 1300 * us, ms, 87, 28, true, 0, big, true) != 21 {
+		return 15
 	}
 	return 0
 }
