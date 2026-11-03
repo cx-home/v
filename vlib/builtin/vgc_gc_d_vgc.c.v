@@ -1213,6 +1213,31 @@ fn vgc_minor_plan(promote bool) bool {
 	return true
 }
 
+// vgc_minor_next answers, at a cycle's end (vgc_update_trigger, the minor
+// count of this cycle already in), whether the NEXT cycle is minor by the
+// plan vgc_minor_plan makes at its start — the same tests, less the ones only
+// that start knows (a due promotion, a watched address): then the next
+// trigger is the minor's share of the full cycle's headroom (lever 8,
+// cx-home/v#56).
+fn vgc_minor_next(marked u64) bool {
+	if vgc_young_on == 0 || vgc_young_minors <= 0 || vgc_watch_addr != 0 {
+		return false
+	}
+	if C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
+		return false
+	}
+	if vgc_minor_count >= u64(vgc_young_minors) {
+		return false
+	}
+	if vgc_full_marked > 0 && marked >= 2 * vgc_full_marked {
+		return false
+	}
+	if vgc_full_goal == 0 || marked >= vgc_full_goal {
+		return false
+	}
+	return true
+}
+
 // vgc_minor_cards scans, on the collecting thread, the old objects of every
 // span a card was set in since the last stop (STW, cx-home/v#56 step 2): an
 // old object's pointer to a young one lies in a page whose card the barrier
@@ -4733,6 +4758,27 @@ fn vgc_update_trigger() {
 	if !vgc_minor_this_cycle {
 		vgc_full_marked = marked
 		vgc_full_goal = goal
+	}
+	// cx-home/v#56 lever 8: when the next cycle is minor (vgc_minor_next, the
+	// plan vgc_minor_plan makes at its start), its trigger is its share of
+	// the full cycle's headroom — the minors share (full goal - full marked)
+	// by allocation, at least hr_min each — not the full cycle's goal: a
+	// minor at twice the sticky marked set let the young garbage fill the
+	// heap to that goal between two stops (binary-trees 18 after its stretch
+	// tree: eight minors at 262–272 MB marked, goal 525–545, 13 arenas and
+	// 270 MB of pool at 49 MB live; measure/collector-epic-80's F traces;
+	// young/wave.v: 96 MB of young garbage over 48 MB live ran minors=1 at a
+	// 107 MB peak). The full cycle's rules are unchanged: its goal is the
+	// pacer's, recorded above, and the minors run inside it.
+	// vgc_young_wave_test.v.
+	if vgc_minor_next(marked) {
+		mut share := (vgc_full_goal - vgc_full_marked) / u64(vgc_young_minors)
+		if share < hr_min {
+			share = hr_min
+		}
+		if marked + share < goal {
+			goal = marked + share
+		}
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
 	// cx-home/v#56: the per-thread accounting flush follows the budget when
