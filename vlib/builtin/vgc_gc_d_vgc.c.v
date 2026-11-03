@@ -1214,19 +1214,22 @@ fn vgc_minor_plan(promote bool) bool {
 }
 
 // vgc_minor_next answers, at a cycle's end (vgc_update_trigger, the minor
-// count of this cycle already in), whether the NEXT cycle is minor by the
-// plan vgc_minor_plan makes at its start — the same tests, less the ones only
-// that start knows (a due promotion, a watched address): then the next
-// trigger is the minor's share of the full cycle's headroom (lever 8,
-// cx-home/v#56).
+// count of this cycle already in), whether the NEXT cycle runs inside the
+// full cycle's headroom: a minor by the plan vgc_minor_plan makes at its
+// start — the same tests, less the ones only that start knows (a due
+// promotion, a watched address) — or the full that closes a run of minors
+// (the count reached). Then the next trigger is one share of that headroom
+// (lever 8, cx-home/v#56): the full that closes the run collects after its
+// share too, else the young garbage fills the heap from the last minor to
+// the full goal (young/wave.v: eight minors at 62 MB, then 83 MB of heap
+// before the full at 108). A full the live set's growth forces (the sticky
+// marked set doubled since the last full, or past its goal) keeps the
+// pacer's goal.
 fn vgc_minor_next(marked u64) bool {
 	if vgc_young_on == 0 || vgc_young_minors <= 0 || vgc_watch_addr != 0 {
 		return false
 	}
 	if C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
-		return false
-	}
-	if vgc_minor_count >= u64(vgc_young_minors) {
 		return false
 	}
 	if vgc_full_marked > 0 && marked >= 2 * vgc_full_marked {
@@ -4759,10 +4762,11 @@ fn vgc_update_trigger() {
 		vgc_full_marked = marked
 		vgc_full_goal = goal
 	}
-	// cx-home/v#56 lever 8: when the next cycle is minor (vgc_minor_next, the
-	// plan vgc_minor_plan makes at its start), its trigger is its share of
-	// the full cycle's headroom — the minors share (full goal - full marked)
-	// by allocation, at least hr_min each — not the full cycle's goal: a
+	// cx-home/v#56 lever 8: when the next cycle runs inside the full cycle's
+	// headroom (vgc_minor_next: a minor by the plan vgc_minor_plan makes at
+	// its start, or the full that closes the run of minors), its trigger is
+	// its share of that headroom — the minors share (full goal - full
+	// marked) by allocation, at least hr_min each — not the full goal: a
 	// minor at twice the sticky marked set let the young garbage fill the
 	// heap to that goal between two stops (binary-trees 18 after its stretch
 	// tree: eight minors at 262–272 MB marked, goal 525–545, 13 arenas and
