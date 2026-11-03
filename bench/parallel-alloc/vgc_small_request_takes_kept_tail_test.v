@@ -13,14 +13,18 @@
 // is the small arena — decision 98 (a): a small arena serves small requests
 // only, and a request from the floor up takes nothing of it, so a kept run
 // and the requests an eighth of it or less meet in a small arena alone): a
-// 200-page buffer beside a 40-page one, the buffer dropped and collected
-// twice (the size recurs: a kept run), then the neighbour dropped and
-// collected (it joins the run: 241 pages, kept for 200), the small arena's
-// tail spent by held buffers (spend_tail), then a 25-page request held. On
-// a6b748f75 the request carves a second arena and the run stays 241 pages.
-// Now the run reads 25 pages shorter at the same base, pooled, and the arena
-// count holds; the next 200-page buffer takes the run and the count holds.
-// Its own process (a fresh heap).
+// 200-page buffer beside a 40-page one, the buffer dropped and collected,
+// asked for again (the size recurs: a kept run) and dropped with its
+// neighbour, then one collection: the neighbour joins the run at its free
+// (241 pages, kept for 200). The two drop together because an explicit
+// gc_collect() trims the whole pool at its end (vgc_pool_trim_all): a run
+// pooled by one collection is cold at the next, and a cold run takes no hot
+// neighbour under vgc_pool_cold_merge_min pages (vgc_pool_states_meet). Then
+// the small arena's tail is spent by held buffers (spend_tail) and a 25-page
+// request held. On a6b748f75 the request carves a second arena and the run
+// stays 241 pages. Now the run reads 25 pages shorter at the same base,
+// pooled, and the arena count holds; the next 200-page buffer takes the run
+// and the count holds. Its own process (a fresh heap).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_small_request_takes_kept_tail_test.v
 module main
@@ -77,26 +81,21 @@ fn test_a_small_request_takes_a_kept_runs_tail() {
 	n := 199 * page // 200 pages with the header
 	key := drop_run(n)
 	mut buf := fill(40 * page) // carved right after the run: its neighbour
-	println('vgc_small_request_takes_kept_tail: the run at ${key ^ mask}, its end ${(key ^ mask) +
-		200 * usize(page)}, the neighbour at ${usize(buf.data)} (arenas ${vgc_arenas_count()})')
 	assert usize(buf.data) == (key ^ mask) + 200 * usize(page), 'the neighbour was not carved right after the run: ${usize(buf.data)} vs ${
 		(key ^ mask) + 200 * usize(page)}'
+
 	scrub_stack()
 	gc_collect()
 	key2 := drop_run(n) // the second period: the size recurs; takes the first's run
 	assert key2 == key, 'the second period did not take the first run'
+	buf = []u8{} // the neighbour drops with the run: it joins the run at its free (one collection frees both hot)
 	scrub_stack()
-	gc_collect() // the run is pooled, kept whole for its size
+	gc_collect() // the run is pooled with its neighbour, kept for its size
 	run := voidptr(key ^ mask)
 	arena, kind := vgc_arena_kind_probe(run)
 	assert arena >= 0 && kind == 2, 'the 200-page run is not in a small arena: arena ${arena} kind=${kind}'
-	pages0, born0, pooled0 := vgc_span_probe(run)
-	assert pooled0 && born0 && pages0 >= 200, 'the run is not pooled whole before the neighbour drops: ${pages0} ${born0} ${pooled0}'
-	buf = []u8{} // the neighbour drops: it joins the run at its free
-	scrub_stack()
-	gc_collect()
 	pages1, born1, pooled1 := vgc_span_probe(run)
-	assert pooled1 && born1 && pages1 >= pages0 + 40, 'the neighbour did not join the run: ${pages0} -> ${pages1} ${born1} ${pooled1}'
+	assert pooled1 && born1 && pages1 >= 240, 'the neighbour did not join the run: ${pages1} pages, born=${born1} pooled=${pooled1}'
 	mut spent := [][]u8{} // held: the tail left is under the 25-page request
 	spend_tail(arena, int(pages1), mut spent)
 	arenas1 := vgc_arenas_count()
