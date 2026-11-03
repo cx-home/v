@@ -1822,9 +1822,11 @@ fn vgc_gctrace_emit() {
 	// ~1 MB stamp counted, the threads over 64 KB at this stop and the stop before, the live
 	// mutators, one thread or several (level 1 keeps one line per collection)
 	if vgc_gctrace >= 2 {
-		C.fprintf(C.stderr, c'[gc %llu] pace nt=%d acct=%d prev=%d live=%u one=%d\n',
-			C.vgc_ull(u64(vgc_heap.gc_cycle)), vgc_trace_pace_nt, vgc_acct_threads, vgc_acct_threads_prev,
-			C.vgc_atomic_load_u32(&vgc_heap.live_threads), int(vgc_trace_pace_one))
+		// under the stop: the collector's own writer, never fprintf (a stopped mutator may hold
+		// libc's locale lock; vgc_gctrace_stop_safe_test)
+		C.vgc_gctrace_pace(u64(vgc_heap.gc_cycle), u64(vgc_trace_pace_nt), u64(vgc_acct_threads),
+			u64(vgc_acct_threads_prev), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
+			u64(if vgc_trace_pace_one { 1 } else { 0 }))
 	}
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
