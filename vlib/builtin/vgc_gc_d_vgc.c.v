@@ -2779,7 +2779,7 @@ fn vgc_mark_plan() int {
 	free := vgc_stop_weighed_cpus(vgc_mark_last_work_ns, vgc_mark_par_min_ns)
 	total := vgc_mark_plan_count(vgc_mark_workers_cfg, vgc_mark_last_work_ns, vgc_mark_par_min_ns,
 		live, free, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target,
-		C.vgc_atomic_load_u64(&vgc_heap.heap_marked))
+		C.vgc_atomic_load_u64(&vgc_heap.heap_marked), !vgc_paced_one)
 	if total <= 1 {
 		return 1
 	}
@@ -2818,12 +2818,18 @@ fn vgc_mark_plan() int {
 // marker finishes (hello-http k=28 C=256: peak +1.4-5.0 MB over the head, CPU
 // per request 32-34 us against 28-30, misc-epic-65). template-render and
 // json-codec at k=16..28 mark 5-14 MB and keep the quarter.
-fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide bool, target int, marked u64) int {
+// The quarter also needs the cycle to pace as several allocating threads
+// (`several`, vgc_paced_one false): a server paced as one thread runs a small
+// goal over a 3-4 MB marked set, which crosses 4 MB on many stops, and the
+// quarter of its 87 held handlers fielded 21 markers on 1,879 of 3,763 stops
+// (http-json-echo k=28 C=256, VGC_GCTRACE=2 trace of a2c8c5f15): requests/s
+// ~76k against the head's ~110k (misc-epic-70). The batch rows pace as several.
+fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide bool, target int, marked u64, several bool) int {
 	if cfg <= 1 {
 		return 1
 	}
 	mut floor := 1
-	if free >= 2 && marked >= vgc_headroom_floor_lo {
+	if free >= 2 && several && marked >= vgc_headroom_floor_lo {
 		floor = vgc_mark_held_floor(live, free)
 	} else if work < line {
 		// under the several-thread floor (`marked`, a server's sub-MB mark) the stop
