@@ -1,7 +1,8 @@
 // vgc_frame_arena_placement_test.v — the arena kinds (cx-home/v#58): a
 // request of a quarter arena or more (vgc_frame_pages, 2,048 pages of 8 KB)
-// is placed in a frame arena, a smaller one in a plain arena, and the two
-// never share an arena: a frame's arena hands its tail to no buffer, so a
+// is placed in a frame arena, a smaller one in a plain arena (one under the
+// rounding's floor, 256 pages, in a small arena: decision 98 (a)), and the
+// kinds never share an arena: a frame's arena hands its tail to no buffer, so a
 // frame's run merges back whole as its neighbours die (vgc_arena_pick,
 // vgc_pool_at in vlib/builtin/vgc_d_vgc.c.v; vgc_arena_probe reports an
 // address's arena and its kind). The quarter is the line: 2,047 pages plus
@@ -49,8 +50,8 @@ fn test_a_frame_and_a_buffer_never_share_an_arena() {
 	// the plain tail spent (a frame takes a plain tail before a carve): one
 	// arena so far, its carved bytes the committed ones; a once-asked buffer
 	// of the tail less 64 pages, held, leaves a tail no frame fits
-	assert vgc_arenas_count() == 1, 'more than one arena before the tail is spent: ${vgc_arenas_count()}'
-	tail := 8192 - int(gc_memory_use() / usize(page))
+	assert vgc_arenas_count() == 2, 'more than the small arena and the plain one before the tail is spent: ${vgc_arenas_count()}'
+	tail := int(vgc_arena_tail_probe(oi)) // the plain arena's tail, in pages
 	mut spent := []u8{}
 	if tail > 2048 + 64 {
 		spent =
@@ -63,9 +64,9 @@ fn test_a_frame_and_a_buffer_never_share_an_arena() {
 	fi, ff := vgc_arena_probe(frame.data)
 	assert fi >= 0 && ff, 'the recurring 3000-page frame is not in a frame arena: arena ${fi} frames=${ff}'
 	buf :=
-		fill(200 * page) // the buffer after the frame, under the rounding's floor: a plain arena, not the frame's tail (from the floor up, with no plain tail, it lies in the frame tail: vgc_plain_takes_the_frame_tail_test.v)
-	bi, bf := vgc_arena_probe(buf.data)
-	assert bi >= 0 && !bf, 'the 200-page buffer is in a frame arena: arena ${bi} frames=${bf}'
+		fill(200 * page) // the buffer after the frame, under the rounding's floor: a small request, the small arena — not the frame's tail (from the floor up, with no plain tail, it lies in the frame tail: vgc_plain_takes_the_frame_tail_test.v)
+	bi, bk := vgc_arena_kind_probe(buf.data)
+	assert bi >= 0 && bk == 2, 'the 200-page buffer is not in a small arena: arena ${bi} kind=${bk}'
 	assert bi != fi, 'the buffer shares the frame\'s arena ${fi}'
 	line := fill(2047 * page) // 2,048 pages with the header: a frame request
 	li, lf := vgc_arena_probe(line.data)

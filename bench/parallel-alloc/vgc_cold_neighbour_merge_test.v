@@ -19,7 +19,9 @@
 // separator) cannot hold it, so on 14dfcca7f — the hot run and the cold run
 // apart, 3000 and 2900 pages — it carves a second arena; now the merged
 // 5900-page cold run serves it and the arena count holds. Its own process (a fresh
-// heap: one arena).
+// heap: the small arena of the runtime's own spans and the plain arena the
+// frames open — a request under the rounding's floor is a small request and
+// takes nothing of a plain arena, decision 98 (a)).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_cold_neighbour_merge_test.v
 module main
@@ -55,17 +57,17 @@ fn test_a_freed_run_joins_its_cold_neighbour() {
 		fill(3000 * page) // held: the lower frame, asked for once (plain), from the first arena's tail
 	assert drop_frame(2900 * page) == 2900 * page // the upper frame, dropped (its own size, asked for once: the two runs merge)
 	sep := fill(mb) // held: nothing merges with the upper frame's run from above
-	assert drop_frame(60 * page) == 60 * page // a 61-page run pooled past the separator: the small requests between the collections split it, not the cold run (a plain arena's cold run is any request's; in a frame arena no small request reached it)
+	assert drop_frame(60 * page) == 60 * page // a 61-page run pooled in the small arena: the small requests between the collections split it, not the cold run (a small request takes nothing of a plain arena)
 	scrub_stack()
 	gc_collect() // the upper run is pooled, hot
 	gc_collect()
 	gc_collect()
 	gc_collect() // the trim has returned it to the OS (vgc_pool_trim_age = 2)
 	arenas0 := vgc_arenas_count()
-	// the two frames and the separator sit in the first arena: the frames,
-	// asked for once each, are plain (cx-home/v#58: the kind is a size's own
-	// recurrence)
-	assert arenas0 == 1, 'the two frames and the separator did not fit the first arena: ${arenas0}'
+	// the two frames and the separator sit in the plain arena beside the
+	// small one: the frames, asked for once each, are plain (cx-home/v#58:
+	// the kind is a size's own recurrence)
+	assert arenas0 == 2, 'the two frames and the separator did not fit the plain arena beside the small one: ${arenas0}'
 	lower = []u8{}
 	scrub_stack()
 	gc_collect() // the lower run is freed beside the cold run: one 5900-page cold run

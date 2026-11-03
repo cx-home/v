@@ -11,9 +11,11 @@
 // next 8 and 32 MB requests found neither a tail nor a span.
 //
 // The shape: a 32 MB buffer dropped and collected (pooled whole, its size
-// asked for once), then sixteen 1 MB buffers held. They come out of the
-// pooled span: the committed arena bytes (gc_memory_use) do not grow. Its
-// own process (a fresh heap: one arena with its tail free).
+// asked for once), then fifteen 2 MB buffers held (257 pages each with the
+// array's header, rounded to 272: plain requests, from the rounding's floor
+// up — a request under it is a small one and takes nothing of a plain run,
+// decision 98 (a)). They come out of the pooled span: the committed arena
+// bytes (gc_memory_use) do not grow. Its own process (a fresh heap).
 //
 // Run: ./v -gc e -cc cc test bench/parallel-alloc/vgc_once_seen_size_split_test.v
 module main
@@ -40,11 +42,11 @@ fn test_a_once_seen_size_is_split_by_the_smaller_requests() {
 	gc_collect()
 	use0 := gc_memory_use()
 	mut held := [][]u8{}
-	for _ in 0 .. 16 {
-		held << fill(mb)
+	for _ in 0 .. 15 {
+		held << fill(2 * mb)
 	}
 	use1 := gc_memory_use()
-	println('vgc_once_seen_size_split: committed ${use0 / mb} MB after the 32 MB frame was pooled, ${use1 / mb} MB after sixteen 1 MB buffers (${held.len})')
+	println('vgc_once_seen_size_split: committed ${use0 / mb} MB after the 32 MB frame was pooled, ${use1 / mb} MB after fifteen 2 MB buffers (${held.len})')
 	assert use0 > 0
-	assert use1 <= use0 + mb, 'the 1 MB buffers did not come out of the pooled 32 MB span: committed ${use0 / mb} -> ${use1 / mb} MB'
+	assert use1 <= use0 + 2 * mb, 'the 2 MB buffers did not come out of the pooled 32 MB span: committed ${use0 / mb} -> ${use1 / mb} MB'
 }

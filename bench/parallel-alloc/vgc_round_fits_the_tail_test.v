@@ -59,11 +59,13 @@ fn frames_begin() {
 fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	frames_begin()
 	held := fill(2100 * page) // asked for once: plain, held
+	hi, _ :=
+		vgc_arena_probe(held.data) // the plain arena (the small one holds the runtime's own spans)
 	// the plain tail spent (a frame takes a plain tail before a carve): one
 	// arena so far, its carved bytes the committed ones; a once-asked buffer
 	// of the tail less 64 pages, held, leaves a tail no frame fits
-	assert vgc_arena_count() == 1, 'more than one arena before the tail is spent: ${vgc_arena_count()}'
-	tail := 8192 - int(gc_memory_use() / usize(page))
+	assert vgc_arena_count() == 2, 'more than the small arena and the plain one before the tail is spent: ${vgc_arena_count()}'
+	tail := int(vgc_arena_tail_probe(hi)) // the plain arena's tail, in pages
 	mut spent := []u8{}
 	if tail > 2048 + 64 {
 		spent =
@@ -78,7 +80,8 @@ fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	line := fill(2047 * page) // 2048 pages, recurring: the frame arena's tail, 3968 pages left
 	li, lf := vgc_arena_probe(line.data)
 	assert li == fi && lf, 'the 2048-page frame did not take the frame arena\'s tail: arena ${li} frames=${lf}'
-	once := fill(3900 * page) // asked for once: plain, held — a plain arena of its own: the frame tail left after it (67 pages) would not hold the largest recurring frame (vgc_frame_tail_past_room), so the mirror rule leaves the tail to the frames
+	once :=
+		fill(3900 * page) // asked for once: plain, held — a plain arena of its own: the frame tail left after it (67 pages) would not hold the largest recurring frame (vgc_frame_tail_past_room), so the mirror rule leaves the tail to the frames
 	arenas0 := vgc_arena_count()
 	use0 := gc_memory_use()
 	second :=

@@ -45,8 +45,8 @@ fn test_a_frame_asked_for_once_is_plain_and_the_kinds_begin_at_its_second_reques
 	// the plain tail cut to 2700 pages, held: short of the 3000-page frame (a
 	// frame takes a plain tail before a carve) and still holding the 2500-page
 	// one below; one arena so far, its carved bytes the committed ones
-	assert vgc_arenas_count() == 1, 'more than one arena before the tail is cut: ${vgc_arenas_count()}'
-	tail := 8192 - int(gc_memory_use() / usize(page))
+	assert vgc_arenas_count() == 2, 'more than the small arena and the plain one before the tail is cut: ${vgc_arenas_count()}'
+	tail := int(vgc_arena_tail_probe(fi)) // the plain arena's tail, in pages
 	assert tail > 2700 + 64, 'the first arena\'s tail is already short: ${tail} pages'
 	spent :=
 		fill((tail - 2701) * page) // tail - 2700 pages with the header; asked for once: plain, held

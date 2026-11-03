@@ -30,8 +30,8 @@ const small = 1024
 const keep_bytes = 2 * 1024 * 1024
 const drop_bytes = 40 * 1024 * 1024
 const arena = 64 * 1024 * 1024
-const tail_max = 4 * 1024 * 1024
-const big = 8 * 1024 * 1024 // 1,024 pages: past any size-class span and the arena tail
+const tail_max = 1024 * 1024 // under the request below, so no arena tail holds it
+const big = 200 * 8192 // 201 pages with the array's header: past any size-class span and the arena tail, under the rounding's floor (a small request, served by the small arenas where the 1 KB spans lie: decision 98 (a))
 
 struct Hold {
 mut:
