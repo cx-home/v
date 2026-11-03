@@ -816,9 +816,14 @@ pub fn vgc_pace_answer_selftest() u32 {
 	// a server's few handlers over the ~1 MB stamp (3-4 of 87 at http-json-echo k=28 under a
 	// several-thread goal, P6's trace): the stamp too reads several only at half the live
 	// mutators, so it does not hold a server at several either
-	if !vgc_pace_one_thread(3, 3, 0, 87, true, 500) || !vgc_pace_one_thread(4, 7, 6, 87, false, 500)
-		|| vgc_pace_one_thread(2, 0, 0, 4, true, 500) {
+	if !vgc_pace_one_thread(4, 7, 6, 87, false, 500) || !vgc_pace_one_thread(3, 3, 0, 87, false, 500)
+		|| vgc_pace_one_thread(2, 0, 0, 4, false, 500) {
 		return 5
+	}
+	// after a one-thread cycle the stamp enters several at two or more (the head's reading:
+	// two threads over ~1 MB under a one-thread goal), so hello-http k=4 is not held at one
+	if vgc_pace_one_thread(3, 3, 0, 87, true, 500) || vgc_pace_one_thread(2, 2, 2, 15, true, 500) {
+		return 6
 	}
 	return 0
 }

@@ -4254,7 +4254,8 @@ pub fn vgc_limit_selftest() u32 {
 
 // vgc_pace_one_thread says whether this cycle paces as ONE allocating thread (the quarter,
 // vgc_one_thread_pct; cx-home/v#56). nt, the threads stamped as allocating this cycle
-// (vgc_alloc_threads, ~1 MB each), two or more and half the live mutators or more, means
+// (vgc_alloc_threads, ~1 MB each), two or more after a one-thread cycle, or two or more and
+// half the live mutators or more, means
 // several. Otherwise acct, the threads that
 // allocated vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), and prev,
 // that count at the stop before, decide when they agree: a count reaches several when it is two
@@ -4271,7 +4272,12 @@ pub fn vgc_limit_selftest() u32 {
 // (server peak 39-43 MB against 30 at http-json-echo k=28, misc-epic-66/-69); half the live
 // mutators keeps a server at one thread. The stamp the same: under a several-thread goal (20-30 MB)
 // 3-4 of a server's 87 handlers cross ~1 MB a cycle, and "over one" held it at several for the
-// rest of the run (134 of 843 cycles at goal >= 10 MB, P6's VGC_GCTRACE=2 trace). A single reading flips on a passing state: json-codec
+// rest of the run (134 of 843 cycles at goal >= 10 MB, P6's VGC_GCTRACE=2 trace). So the
+// stamp ENTERS several at two or more after a one-thread cycle (was_one, as the head reads it:
+// two threads over ~1 MB under a one-thread goal is real several-thread allocation) and STAYS
+// there only at half the live mutators: under the several-thread goal a server's 3-4 stamped
+// handlers then fall back to one on the next cycle, where the half-of-live stamp alone held
+// hello-http k=4 C=256 at one (~128k requests/s against the head's ~152k, misc-epic-70). A single reading flips on a passing state: json-codec
 // at k=1 read its driver and its one worker over 64 KB in the one cycle of the hand-over (a
 // 5 MB goal: the peak 12.3 -> 15.2 MB), and a back-to-back stop under 20 mutators reads few
 // threads over 64 KB (template-render's headroom 256 MB -> 1.4 MB in one cycle). Several
@@ -4281,7 +4287,7 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle
 	if cycle == 0 {
 		return true
 	}
-	if nt > 1 && nt * 2 >= live {
+	if nt > 1 && (was_one || nt * 2 >= live) {
 		return false
 	}
 	several := acct > 1 && acct * 2 >= live
