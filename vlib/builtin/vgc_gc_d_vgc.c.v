@@ -4256,40 +4256,36 @@ pub fn vgc_limit_selftest() u32 {
 
 // vgc_pace_one_thread says whether this cycle paces as ONE allocating thread (the quarter,
 // vgc_one_thread_pct; cx-home/v#56). nt, the threads stamped as allocating this cycle
-// (vgc_alloc_threads, ~1 MB each), two or more after a one-thread cycle, or two or more and
-// half the live mutators or more, means
-// several. Otherwise acct, the threads that
-// allocated vgc_acct_flush_min (64 KB) or more since the last stop (vgc_acct_threads), and prev,
-// that count at the stop before, decide when they agree: a count reaches several when it is two
-// or more AND half the live mutators (`live`) or more; both there: several; neither: one. One
-// reading on the other side keeps was_one, the previous cycle's answer. The first collection,
-// whose cycle is the program's start-up (cx-core-code#123), is one.
+// (vgc_alloc_threads, ~1 MB each), two or more, means several, as the head reads it.
+// Otherwise acct, the threads that allocated vgc_acct_flush_min (64 KB) or more since the last
+// stop (vgc_acct_threads), and prev, that count at the stop before, decide when they agree: a
+// count reaches several when it is two or more AND half the live mutators (`live`) or more;
+// both there: several; neither: one. One reading on the other side keeps was_one, the previous
+// cycle's answer. The first collection, whose cycle is the program's start-up
+// (cx-core-code#123), is one.
 // cx-home/v#62: the stamp alone read 20 mutators as one thread, because the quarter's budget
 // (marked/4, ~1.4 MB on a 5.4 MB live set) split 20 ways keeps every worker under the 1 MB
 // stamp: template-render on 20 mutators paced ~1,500 of 1,852 cycles at goal = marked + ~1.5 MB.
-// A batch runs its k workers over 64 KB every cycle (k of k+2 threads). A server holds every
-// thread it runs (87 at http-json-echo k=28 C=256) and only a few cross 64 KB between stops (at
-// most 7 of 87, 3 of 39, 2 of 15, 2 of 6 in VGC_GCTRACE's pace lines): under "two or more" alone
-// they read as several, and one such cycle's GOGC=100 goal then held the answer at several
-// (server peak 39-43 MB against 30 at http-json-echo k=28, misc-epic-66/-69); half the live
-// mutators keeps a server at one thread. The stamp the same: under a several-thread goal (20-30 MB)
-// 3-4 of a server's 87 handlers cross ~1 MB a cycle, and "over one" held it at several for the
-// rest of the run (134 of 843 cycles at goal >= 10 MB, P6's VGC_GCTRACE=2 trace). So the
-// stamp ENTERS several at two or more after a one-thread cycle (was_one, as the head reads it:
-// two threads over ~1 MB under a one-thread goal is real several-thread allocation) and STAYS
-// there only at half the live mutators: under the several-thread goal a server's 3-4 stamped
-// handlers then fall back to one on the next cycle, where the half-of-live stamp alone held
-// hello-http k=4 C=256 at one (~128k requests/s against the head's ~152k, misc-epic-70). A single reading flips on a passing state: json-codec
-// at k=1 read its driver and its one worker over 64 KB in the one cycle of the hand-over (a
-// 5 MB goal: the peak 12.3 -> 15.2 MB), and a back-to-back stop under 20 mutators reads few
-// threads over 64 KB (template-render's headroom 256 MB -> 1.4 MB in one cycle). Several
-// allocating threads keep GOGC=100, as the doc at vgc_one_thread_pct says; the stamp still
-// decides the per-thread scaling (cx-home/v#16, cx-private#1916).
+// A batch runs its k workers over 64 KB every cycle (k of k+2 threads): the 64 KB count reads it
+// as several. A server holds every thread it runs (87 at http-json-echo k=28 C=256) and only a
+// few cross 64 KB between stops (at most 7 of 87, 3 of 39, 2 of 15, 2 of 6 in VGC_GCTRACE's pace
+// lines): half the live mutators keeps the 64 KB count from reading a server as several, so a
+// server paces as the head paces it — by the stamp alone (http-json-echo k=4 C=256: 61 of 404
+// cycles several, every one by the stamp). A stamp held to half the live mutators too
+// (a2c8c5f15, 88fdac947) kept a server at the quarter: http-json-echo k=12 C=256 ran 6,347
+// collections against the head's 1,966 for the same requests, at ~80k requests/s against
+// 101-113k and 42-44 us of CPU per request against 34-37 (misc-epic-71). A single 64 KB reading
+// flips on a passing state: json-codec at k=1 read its driver and its one worker over 64 KB in
+// the one cycle of the hand-over (a 5 MB goal: the peak 12.3 -> 15.2 MB), and a back-to-back
+// stop under 20 mutators reads few threads over 64 KB (template-render's headroom
+// 256 MB -> 1.4 MB in one cycle). Several allocating threads keep GOGC=100, as the doc at
+// vgc_one_thread_pct says; the stamp still decides the per-thread scaling (cx-home/v#16,
+// cx-private#1916).
 fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle u64) bool {
 	if cycle == 0 {
 		return true
 	}
-	if nt > 1 && (was_one || nt * 2 >= live) {
+	if nt > 1 {
 		return false
 	}
 	several := acct > 1 && acct * 2 >= live
