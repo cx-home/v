@@ -6375,6 +6375,10 @@ fn vgc_nursery_alloc(npages u32) &VGC_Span {
 			vgc_heap.arenas[idx].cards = cmem
 			vgc_heap.arenas[idx].owner = 0
 			vgc_heap.arenas[idx].nursery = true
+			// cx-home/v#58's kinds: a nursery arena holds class spans only — requests under
+			// the rounding's floor — so it is a small arena, and its pooled spans answer the
+			// small requests the class refills make (vgc_request_kind)
+			vgc_heap.arenas[idx].kind = vgc_kind_small
 		}
 		vgc_nursery_next += vgc_arena_size
 		vgc_nursery_cur = idx
@@ -6387,7 +6391,7 @@ fn vgc_nursery_alloc(npages u32) &VGC_Span {
 			vgc_arena_hi = usize(mem) + vgc_arena_size
 		}
 		if vgc_gctrace >= 3 {
-			vgc_gctrace_carve_emit(npages, 1, idx)
+			vgc_gctrace_carve_emit(npages, 1, idx, VGC_PoolKinds{})
 		}
 	}
 	base := vgc_heap.arenas[idx].base + vgc_heap.arenas[idx].used
@@ -6773,7 +6777,9 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	// the F rows). Pooled first, the committed bytes level off at the working
 	// set and the young range covers the spans a growing heap carves
 	// (young/pool_first.v, vgc_nursery_pool_first_test.v).
-	mut new_span, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages)
+	// cx-home/v#58: a class span is a request of its own kind (vgc_request_kind) — the
+	// small arenas when its pages lie under the rounding's floor, as the general path
+	mut new_span, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages, vgc_request_kind(npages))
 	if new_span != unsafe { nil } {
 		vgc_span_recycled_ready(mut new_span, cold, npages)
 	} else {
