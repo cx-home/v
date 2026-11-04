@@ -40,7 +40,7 @@ fn test_the_full_that_closes_a_run_of_minors_runs_at_its_share_of_the_headroom()
 		os.rm(exe) or {}
 	}
 	r :=
-		os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 VGC_ONE_THREAD_PCT=100 HOLD_MB=72 WAVE_MB=96 ${os.quoted_path(exe)}')
+		os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 VGC_GCTRACE=2 VGC_ONE_THREAD_PCT=100 HOLD_MB=72 WAVE_MB=96 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	d := done_line(r.output)
 	println('vgc_young_closing_full: ${d}')

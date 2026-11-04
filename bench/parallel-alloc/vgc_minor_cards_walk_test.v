@@ -40,7 +40,7 @@ fn test_a_minor_cycle_reads_the_dirty_cards_and_no_other_span() {
 	defer {
 		os.rm(exe) or {}
 	}
-	r := os.execute('VGC_YOUNG=1 LIVE_MB=96 STORES=10 ${os.quoted_path(exe)}')
+	r := os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 LIVE_MB=96 STORES=10 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	d := done_line(r.output)
 	println('vgc_minor_cards_walk: ${d}')

@@ -35,7 +35,7 @@ fn test_a_wave_of_young_garbage_is_collected_by_minors_within_the_headroom() {
 	defer {
 		os.rm(exe) or {}
 	}
-	r := os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 WAVE_MB=96 ${os.quoted_path(exe)}')
+	r := os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 VGC_GCTRACE=2 WAVE_MB=96 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	d := done_line(r.output)
 	println('vgc_young_wave: ${d}')

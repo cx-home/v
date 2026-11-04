@@ -67,7 +67,7 @@ fn run_wave(env string) (Cycles, string) {
 		os.rm(exe) or {}
 	}
 	r :=
-		os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 VGC_ONE_THREAD_PCT=100 WAVE_MB=96 ${env} ${os.quoted_path(exe)}')
+		os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 VGC_GCTRACE=2 VGC_ONE_THREAD_PCT=100 WAVE_MB=96 ${env} ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	lines := r.output.split_into_lines()
 	done := lines.filter(it.starts_with('done bad='))
@@ -149,7 +149,7 @@ fn test_a_minor_cycle_is_not_the_pause_the_concurrent_cycle_is_judged_by() {
 	defer {
 		os.rm(exe) or {}
 	}
-	r := os.execute('VGC_YOUNG=1 VGC_ONE_THREAD_PCT=100 ${os.quoted_path(exe)}')
+	r := os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 VGC_ONE_THREAD_PCT=100 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	lines := r.output.split_into_lines().filter(it.starts_with('done bad='))
 	assert lines.len == 1, r.output

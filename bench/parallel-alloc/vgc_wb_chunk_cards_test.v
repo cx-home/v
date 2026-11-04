@@ -42,7 +42,7 @@ fn test_a_store_into_any_arena_finds_its_card_inline() {
 	defer {
 		os.rm(exe) or {}
 	}
-	r := os.execute('VGC_YOUNG=1 LIVE_MB=256 RECS=64 REPEAT=1000 ${os.quoted_path(exe)}')
+	r := os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 LIVE_MB=256 RECS=64 REPEAT=1000 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	d := done_line(r.output)
 	println('vgc_wb_chunk_cards: ${d}')

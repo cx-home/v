@@ -1211,6 +1211,27 @@ __global vgc_young_cards_last = u64(0)
 // minor cycle and counts the objects it missed (missed= on the VGC_GCTRACE=2
 // minor line, vgc_cm_verify_missed_count).
 __global vgc_young_minors = int(8)
+// cx-home/v#56 lever 12: the bound of the live set the regime's minor cycles
+// serve. A full cycle whose marked set reads at or over it leaves the regime
+// disarmed (vgc_young_end: vgc_young_on 0) — no minor cycle, and the gate
+// back to the permanent range at that stop (vgc_wb_regime), so the mutators
+// pay no barrier outside a concurrent middle, as with the regime off — until a
+// full cycle reads under it again and re-arms it the way the first full
+// cycle armed it (every card cleared at that stop, the gate widened under it).
+// Both switches happen at a full cycle's end, where every object has been
+// traced and every card is clear, so no minor ever reads cards a narrowed
+// gate did not keep. Over a large live set the minors' stops cost more than
+// the concurrent full cycles they stand in for, and the full's headroom is
+// the pacer's anyway: binary-trees 18 (measure/collector-epic-90, levers
+// 8–11b, x3 quiet, the old collector A) read cx interpreted 7.56 s against A's
+// 5.86 with 589 minors, 582 of them at 32 MB marked or more, and cx native
+// 0.61 s against 0.54 (16 of its 22 minors past 32 MB, the barrier on the
+// whole run). The bound is the live floor the one-thread pacing switches at
+// (vgc_headroom_live_floor, 32 MB): the minors' memory serves the small heap
+// whose garbage up to the goal is resident at the peak — csv-aggregate and
+// json-codec 1 KB at 1–4 MB marked, the issue's rows. VGC_YOUNG_LIVE_MB sets
+// it in MB (0 = no bound: minors at any size).
+__global vgc_young_live_max = u64(32) * 1024 * 1024
 __global vgc_minor_this_cycle = false
 __global vgc_minor_count = u64(0)
 __global vgc_minor_cycles = u64(0)
@@ -2670,6 +2691,14 @@ pub fn vgc_init() {
 			mv := C.atoll(minors_env)
 			if mv >= 0 && mv <= 1000 {
 				vgc_young_minors = int(mv)
+			}
+		}
+		// cx-home/v#56 lever 12: the live set the minors serve (0 = no bound)
+		ylive_env := C.getenv(c'VGC_YOUNG_LIVE_MB')
+		if ylive_env != unsafe { nil } {
+			lv := C.atoll(ylive_env)
+			if lv >= 0 && lv <= 1048576 {
+				vgc_young_live_max = u64(lv) * 1024 * 1024
 			}
 		}
 	} $else {

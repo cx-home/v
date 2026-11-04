@@ -360,14 +360,18 @@ fn vgc_gc_start() {
 		vgc_minor_count++
 		vgc_minor_cycles++
 	} else {
-		vgc_young_end()
 		vgc_minor_count = 0
 	}
 	C.vgc_atomic_store_u32(&vgc_force_full, 0)
-	vgc_wb_set(vgc_wb_regime())
 
 	// Compute live bytes from mark bits
 	marked := vgc_count_marked()
+	// cx-home/v#56 lever 12: a full cycle arms the young regime by its marked
+	// set (vgc_young_end), then the gate's range is set under the stop
+	if !vgc_minor_this_cycle {
+		vgc_young_end(marked)
+	}
+	vgc_wb_set(vgc_wb_regime())
 	vgc_ph[6] = C.vgc_now_ns()
 	vgc_mark_adapt(marked) // cx-home/v#16: the next cycle's marker count
 	vgc_grow_gate_prev_marked = C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
@@ -1188,7 +1192,7 @@ fn vgc_cards_clear() {
 // the young regime's doc at vgc_young_mode): the cycle traced every object,
 // so the cards are counted for the trace and cleared; from the first cycle on
 // the regime is armed, and vgc_wb_set opens the gate over the arenas.
-fn vgc_young_end() {
+fn vgc_young_end(marked u64) {
 	if vgc_young_mode == 0 {
 		return
 	}
@@ -1196,7 +1200,13 @@ fn vgc_young_end() {
 		vgc_young_cards_last = vgc_cards_count()
 	}
 	vgc_cards_clear()
-	vgc_young_on = 1
+	// cx-home/v#56 lever 12: armed for the cycles after this full only while
+	// its marked set (the live set) reads under the bound (vgc_young_live_max)
+	vgc_young_on = if vgc_young_live_max == 0 || marked < vgc_young_live_max {
+		u32(1)
+	} else {
+		u32(0)
+	}
 }
 
 // vgc_minor_plan decides whether the cycle about to start is minor
@@ -1860,12 +1870,12 @@ fn vgc_gc_start_concurrent() {
 		1
 	})
 	vgc_mark_work_from_cpu_at(mcpu0, mwait0, mcpu1, mwait1)
-	vgc_young_end()
 	vgc_minor_count = 0 // cx-home/v#56 step 2: a concurrent cycle is a full one
 	C.vgc_atomic_store_u32(&vgc_force_full, 0)
-	vgc_wb_set(vgc_wb_regime()) // cx-home/v#15: the permanent regime stays
 
 	marked := vgc_count_marked()
+	vgc_young_end(marked) // cx-home/v#56 lever 12: armed by the marked set
+	vgc_wb_set(vgc_wb_regime()) // cx-home/v#15: the permanent regime stays
 	vgc_full_marked = marked
 	vgc_ph[6] = C.vgc_now_ns()
 	vgc_mark_adapt(marked)
