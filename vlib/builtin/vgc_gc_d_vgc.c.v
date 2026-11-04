@@ -4276,6 +4276,35 @@ pub fn vgc_limit_selftest() u32 {
 	return 0
 }
 
+// vgc_thread_floor is the live-set bound's floor for nt > 1 allocating threads (cx-home/v#16):
+// the adaptive floor x nt, held to 4 x the marked set while the collections are cheap
+// (cx-private#1910, integrator ruling 2026-10-11T08:19:47Z), and — cx-home/v#62 — held to
+// vgc_small_live_floor_x x the marked set at any cost reading while the marked set is under the
+// several-thread floor (vgc_headroom_floor_lo, 4 MB). A server's live set is 1-2 MB and its
+// stamp counts 3-5 of its handlers over ~1 MB on a busy cycle: one reading of the overhead over
+// ~2 % lifted the floor to 4 MB x nt, a 20-31 MB goal over 2 MB marked, and the free pool that
+// goal leaves stood at the peak (http-json-echo k=12 and k=28 C=256: peaks 34.7 / 35.3 MB in 1 and
+// 2 of 5 runs against 29.7-31.8 in the others, misc-epic-74). Batch workers mark 5-14 MB and keep
+// the floor x nt. VGC_SMALL_LIVE_FLOOR_X overrides (0 switches the bound off).
+fn vgc_thread_floor(afloor u64, nt int, marked u64, capped bool) u64 {
+	mut floor := afloor * u64(nt)
+	mut cap := u64(0)
+	if capped {
+		cap = marked * 4
+	} else if vgc_small_live_floor_x > 0 && marked < vgc_headroom_floor_lo {
+		cap = marked * vgc_small_live_floor_x
+	} else {
+		return floor
+	}
+	if cap < afloor {
+		cap = afloor
+	}
+	if floor > cap {
+		floor = cap
+	}
+	return floor
+}
+
 // vgc_pace_one_thread says whether this cycle paces as ONE allocating thread (the quarter,
 // vgc_one_thread_pct; cx-home/v#56). nt, the threads stamped as allocating this cycle
 // (vgc_alloc_threads, ~1 MB each), two or more, means several, as the head reads it.
@@ -4480,16 +4509,7 @@ fn vgc_update_trigger() {
 				// cycle) to 8 MB of headroom against 32-40: 2.5-2.8x the
 				// collections and 79k -> 57-62k req/s on a quiet box
 				// (cx-private#1910 PERF-EVID, 2026-10-11).
-				floor *= u64(nt)
-				if vgc_headroom_floor_capped {
-					mut cap := marked * 4
-					if cap < afloor {
-						cap = afloor
-					}
-					if floor > cap {
-						floor = cap
-					}
-				}
+				floor = vgc_thread_floor(floor, nt, marked, vgc_headroom_floor_capped)
 			}
 			if live_cap < floor {
 				live_cap = floor

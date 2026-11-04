@@ -836,3 +836,44 @@ pub fn vgc_pace_answer_selftest() u32 {
 	}
 	return 0
 }
+
+// vgc_small_live_floor_selftest (cx-home/v#62): the per-thread floor over a marked set under the
+// several-thread floor is held to vgc_small_live_floor_x x marked whatever the cost reading; a
+// batch's marked set (5 MB and up) keeps the floor x nt; cheap collections keep 4 x marked.
+pub fn vgc_small_live_floor_selftest() u32 {
+	mb := u64(1024 * 1024)
+	saved_x := vgc_small_live_floor_x
+	saved_lo := vgc_headroom_floor_lo
+	defer {
+		vgc_small_live_floor_x = saved_x
+		vgc_headroom_floor_lo = saved_lo
+	}
+	vgc_small_live_floor_x = 8
+	vgc_headroom_floor_lo = 4 * mb
+	// a server: 2 MB marked, five stamped handlers, a costly cycle: 16 MB, not 4 MB x 5 = 20 MB
+	if vgc_thread_floor(4 * mb, 5, 2 * mb, false) != 16 * mb {
+		return 1
+	}
+	// the same, cheap: 4 x marked = 8 MB, as before
+	if vgc_thread_floor(4 * mb, 5, 2 * mb, true) != 8 * mb {
+		return 2
+	}
+	// two stamped threads under the bound keep afloor x 2
+	if vgc_thread_floor(4 * mb, 2, 2 * mb, false) != 8 * mb {
+		return 3
+	}
+	// a batch: 6 MB marked (afloor 12 MB), 20 workers, costly: 240 MB (the flat cap bounds it later)
+	if vgc_thread_floor(12 * mb, 20, 6 * mb, false) != 240 * mb {
+		return 4
+	}
+	// a tiny marked set never goes under the adaptive floor itself
+	if vgc_thread_floor(4 * mb, 5, 256 * 1024, false) != 4 * mb {
+		return 5
+	}
+	// VGC_SMALL_LIVE_FLOOR_X=0: the head's floor x nt
+	vgc_small_live_floor_x = 0
+	if vgc_thread_floor(4 * mb, 5, 2 * mb, false) != 20 * mb {
+		return 6
+	}
+	return 0
+}

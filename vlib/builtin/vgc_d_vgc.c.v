@@ -1532,6 +1532,10 @@ __global vgc_ph_sapply_ns = u64(0)
 // heaps. A thread counts when it allocated since the previous cycle.
 // VGC_HEADROOM_PER_THREAD=0 switches the scaling off.
 __global vgc_headroom_per_thread = true
+// The multiple of a small marked set (under vgc_headroom_floor_lo) the per-thread floor is held
+// to at any cost reading (cx-home/v#62, vgc_thread_floor). VGC_SMALL_LIVE_FLOOR_X overrides
+// (decimal; 0 = no bound).
+__global vgc_small_live_floor_x = u64(8)
 // One arena tail per allocating thread (cx-examples#403): a thread carves new
 // spans from an arena no other live thread carves, so its first touches of
 // fresh pages do not interleave with another thread's in one mapping. On macOS
@@ -2424,6 +2428,11 @@ pub fn vgc_init() {
 	pt_env := C.getenv(c'VGC_HEADROOM_PER_THREAD')
 	if pt_env != unsafe { nil } {
 		vgc_headroom_per_thread = C.atoll(pt_env) != 0
+	}
+	slx_env := C.getenv(c'VGC_SMALL_LIVE_FLOOR_X')
+	if slx_env != unsafe { nil } {
+		x := C.atoll(slx_env)
+		vgc_small_live_floor_x = if x > 0 { u64(x) } else { u64(0) }
 	}
 	pgc_env := C.getenv(c'VGC_POOL_GOAL_COMP')
 	if pgc_env != unsafe { nil } {
