@@ -42,7 +42,10 @@ fn test_every_store_into_an_old_object_sets_its_pages_card() {
 	defer {
 		os.rm(exe) or {}
 	}
-	r := os.execute('VGC_YOUNG=1 VGC_GCTRACE=2 ${os.quoted_path(exe)}')
+	// VGC_YOUNG_LIVE_MB=0: (i) holds 70 MB live, past the bound at which a full cycle
+	// disarms the regime (cx-home/v#56 lever 12) — the case tests the gate widening
+	// over a new arena under the regime, so the bound is lifted
+	r := os.execute('VGC_YOUNG=1 VGC_YOUNG_LIVE_MB=0 VGC_GCTRACE=2 ${os.quoted_path(exe)}')
 	assert r.exit_code == 0, r.output
 	assert r.output.contains('done hold=9 '), r.output
 	for name in stores {
