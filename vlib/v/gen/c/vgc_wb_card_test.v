@@ -1,9 +1,10 @@
 // vgc_wb_card_test.v — cx-home/v#56 lever 5: the generated C's write-barrier
-// gate reads the card itself. The headers carry the hint record's C shape
-// (`struct vgc_wb_hint_t`: base, size, cards — VGC_WbHint's fields in
-// vlib/builtin/vgc_d_vgc.c.v, in that order), builtin's record pointer
-// `vgc_wb_hp`, the page shift as builtin's vgc_page_shift, and vgc_wb_gate
-// reads the card before it calls vgc_wb_store. The program of
+// gate reads the card itself; lever 10: from the cards by chunk. The headers
+// carry builtin's table of chunk tables `vgc_wb_cards` (vgc_chunk_cards in
+// thirdparty/vgc/vgc_platform.h), the page shift as builtin's vgc_page_shift,
+// the chunk shift and count as the address map's (VGC_ADDR_SHIFT,
+// VGC_ADDR_MAP_SIZE), and vgc_wb_gate reads the card before it calls
+// vgc_wb_store. The program of
 // vgc_wb_epoch_test.v builds and runs as before.
 import os
 
@@ -17,8 +18,7 @@ fn test_the_gate_reads_the_card_before_the_call() {
 	assert res.exit_code == 0, res.output
 	c := os.read_file('${out}.c')!
 	os.rm('${out}.c') or {}
-	assert c.contains('struct vgc_wb_hint_t { size_t base; size_t size; unsigned char* cards; };'), 'the hint record is not declared'
-	assert c.contains('extern void* vgc_wb_hp;'), 'the record pointer is not declared'
+	assert c.contains('extern void* vgc_wb_cards;'), 'the chunk card tables are not declared'
 	// the page shift the gate uses is builtin's
 	builtin := os.read_file(os.join_path(os.dir(vexe), 'vlib', 'builtin', 'vgc_d_vgc.c.v'))!
 	shift := builtin.split_into_lines().filter(it.starts_with('const vgc_page_shift = '))
@@ -29,11 +29,20 @@ fn test_the_gate_reads_the_card_before_the_call() {
 	assert gate.len == 1, 'the gate is not emitted once'
 	g := gate[0]
 	assert g.contains('(size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len'), 'the range test is gone:\n${g}'
-	card := g.index('h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return;') or { -1 }
+	card := g.index('t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return;') or {
+		-1
+	}
 	call := g.index('vgc_wb_store(p);') or { -1 }
 	assert card >= 0, 'the gate does not read the card:\n${g}'
 	assert call > card, 'the call is not after the card read:\n${g}'
-	assert g.contains('h != 0 && (size_t)(uintptr_t)p - h->base < h->size &&'), 'the card read is not under the hint\'s range:\n${g}'
+	assert g.contains('t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 &&'), 'the card read is not under the chunk table\'s bounds:\n${g}'
+	// the chunk shift is the address map's (VGC_ADDR_SHIFT, vgc_platform.h)
+	plat := os.read_file(os.join_path(os.dir(vexe), 'thirdparty', 'vgc', 'vgc_platform.h'))!
+	assert plat.contains('#define VGC_ADDR_SHIFT 26 '), 'VGC_ADDR_SHIFT in vgc_platform.h'
+	assert c.contains('#define VGC_WB_CHUNK_SHIFT 26\n'), "the gate's chunk shift is not VGC_ADDR_SHIFT"
+	assert plat.contains('#define VGC_ADDR_MAP_SIZE 65536 '), 'VGC_ADDR_MAP_SIZE in vgc_platform.h'
+	assert c.contains('#define VGC_WB_CHUNKS 65536\n'), "the gate's chunk count is not VGC_ADDR_MAP_SIZE"
+	assert c.contains('#define VGC_WB_CHUNK_MASK ${(1 << (26 - n)) - 1}\n'), "the gate's card mask is not a chunk's cards less one"
 	built :=
 		os.execute('${os.quoted_path(vexe)} -gc e -o ${os.quoted_path(out)} ${os.quoted_path(src)}')
 	assert built.exit_code == 0, built.output

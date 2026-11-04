@@ -1335,16 +1335,22 @@ pub fn (mut g Gen) init() {
 			// cx-home/v#22: msvc has no __builtin_expect; the hint is a macro the
 			// native header (thirdparty/vgc/vgc_native.h) defines the same way.
 			g.cheaders.writeln('#ifndef VGC_WB_UNLIKELY\n#if defined(_MSC_VER) && !defined(__clang__)\n#define VGC_WB_UNLIKELY(x) (x)\n#else\n#define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)\n#endif\n#endif')
-			// cx-home/v#56 lever 5: the gate reads the card itself — a store into the
-			// hint arena (vgc_wb_hp: builtin's VGC_WbHint record of the arena the
-			// gate's low end lies in, written once per arena, nil in a concurrent
-			// middle) whose page's card is set makes no call; vgc_wb_store would read
-			// that card and return. The record's layout is VGC_WbHint's and the page
-			// shift is builtin's vgc_page_shift (vgc_wb_card_test.v holds them equal).
-			g.cheaders.writeln('struct vgc_wb_hint_t { size_t base; size_t size; unsigned char* cards; };')
-			g.cheaders.writeln('extern void* vgc_wb_hp;')
+			// cx-home/v#56 lever 5: the gate reads the card itself — a store into a
+			// page whose card is set makes no call; vgc_wb_store would read that
+			// card and return.
+			// cx-home/v#56 lever 10: the cards by 64 MB chunk — vgc_wb_cards is
+			// builtin's table of chunk tables (vgc_chunk_cards in vgc_platform.h:
+			// one byte a page, 8,192 a chunk), so the gate finds a store's card
+			// from its address by one shift and reads it inline for any arena
+			// (before, it read the record of one arena, vgc_wb_hp, and every
+			// store into another arena called). The shifts are builtin's
+			// vgc_page_shift and VGC_ADDR_SHIFT (vgc_wb_card_test.v holds them).
+			g.cheaders.writeln('extern void* vgc_wb_cards;')
 			g.cheaders.writeln('#define VGC_WB_PAGE_SHIFT 13')
-			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { const struct vgc_wb_hint_t* h = (const struct vgc_wb_hint_t*)vgc_wb_hp; if (h != 0 && (size_t)(uintptr_t)p - h->base < h->size && h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return; vgc_wb_store(p); } }')
+			g.cheaders.writeln('#define VGC_WB_CHUNK_SHIFT 26')
+			g.cheaders.writeln('#define VGC_WB_CHUNKS 65536')
+			g.cheaders.writeln('#define VGC_WB_CHUNK_MASK 8191')
+			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { unsigned char** t = (unsigned char**)vgc_wb_cards; size_t ci = (size_t)(uintptr_t)p >> VGC_WB_CHUNK_SHIFT; if (t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 && t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return; vgc_wb_store(p); } }')
 			// cx-home/v#56 lever 3: a store statement's second gate is made only when
 			// a stop ran between its first gate and its store (assign_stmt): the stop
 			// count vgc_wb_epoch read before the first gate, compared after the store.

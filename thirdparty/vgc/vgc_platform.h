@@ -1082,6 +1082,60 @@ static inline int vgc_addr_to_arena2(uintptr_t addr) {
     return v ? v - 1 : -1;
 }
 
+// cx-home/v#56 lever 10: the card tables by chunk. A card is one byte per
+// 8 KB page (VGC_CHUNK_CARD_SHIFT = vgc_page_shift), and the cards of a 64 MB
+// chunk of the address space are one table of 8,192 bytes, found from an
+// address by one shift (vgc_chunk_cards[addr >> VGC_ADDR_SHIFT]) and indexed
+// by the page's offset in the chunk — no arena lookup: the generated C's
+// write-barrier gate (cgen's vgc_wb_gate, the native header's) reads any
+// arena's card inline and vgc_wb_store sets it without vgc_find_arena. Before,
+// every arena carried its own table and the gate read the record of ONE arena
+// (the one at the range's low end, vgc_wb_hp), so a store into any other
+// arena called vgc_wb_store, which resolved the arena out of line
+// (vgc_wb_store_slow): under the young regime that arena was the nursery's
+// first, where the young test already answers, and every store into an old
+// object called — 45 % of binary-trees 18's samples in the cx image (A: 20 %
+// under the permanent regime; measure/bin/collector-epic/w89/profile.md). A
+// chunk's table is allocated when the first arena touching the chunk is
+// carved (vgc_chunk_cards_register, under the heap lock, before the arena is
+// published) and never freed; the list of registered chunks is the stop's
+// walk (vgc_minor_cards, vgc_cards_count, vgc_cards_clear). Both tables are
+// static tables the data-segment root scan leaves out (vgc_static_tables).
+#define VGC_CHUNK_CARD_SHIFT 13
+#define VGC_CHUNK_CARDS (1u << (VGC_ADDR_SHIFT - VGC_CHUNK_CARD_SHIFT))
+static unsigned char* vgc_chunk_cards[VGC_ADDR_MAP_SIZE];
+static uint32_t vgc_chunk_list[VGC_ADDR_MAP_SIZE];
+static int vgc_chunk_n;
+
+// Registers the chunks [base, base + size) touches: a table for each that has
+// none. Returns 0 when a table could not be allocated (the arena is not
+// carved then: a store into it would set no card).
+static inline int vgc_chunk_cards_register(uintptr_t base, size_t size) {
+    uintptr_t lo = base >> VGC_ADDR_SHIFT;
+    uintptr_t hi = (base + size - 1) >> VGC_ADDR_SHIFT;
+    if (hi >= VGC_ADDR_MAP_SIZE) return 0;
+    for (uintptr_t i = lo; i <= hi; i++) {
+        if (vgc_atomic_load_u64(&vgc_chunk_cards[i]) != 0) continue;
+        unsigned char* t = (unsigned char*)vgc_os_alloc(VGC_CHUNK_CARDS);
+        if (t == 0) return 0;
+        vgc_chunk_list[vgc_chunk_n++] = (uint32_t)i;
+        vgc_atomic_store_u64(&vgc_chunk_cards[i], (uint64_t)(uintptr_t)t); // RELEASE: the table before the arena
+    }
+    return 1;
+}
+
+// The table of the chunk addr lies in, or 0 (no arena touches that chunk).
+static inline unsigned char* vgc_chunk_cards_of(uintptr_t addr) {
+    uintptr_t i = addr >> VGC_ADDR_SHIFT;
+    if (i >= VGC_ADDR_MAP_SIZE) return 0;
+    return (unsigned char*)(uintptr_t)vgc_atomic_load_u64(&vgc_chunk_cards[i]);
+}
+static inline int vgc_chunk_count(void) { return vgc_chunk_n; }
+static inline uintptr_t vgc_chunk_base_at(int n) { return (uintptr_t)vgc_chunk_list[n] << VGC_ADDR_SHIFT; }
+static inline unsigned char* vgc_chunk_table_at(int n) { return vgc_chunk_cards[vgc_chunk_list[n]]; }
+// The table of tables, for the gate's global (vgc_wb_cards).
+static inline void* vgc_chunk_cards_table(void) { return (void*)vgc_chunk_cards; }
+
 // ============================================================
 // Thread creation (for GC workers - avoids V's spawn which
 // causes import cycles with builtin -> sync.threads -> builtin)
@@ -2918,7 +2972,7 @@ static inline void vgc_trace_init(void) {}
 // ask about every cycle, and its packed indices the same aliasing hazard — and
 // the touched-page cache below holds page bits, not references.
 // VGC_STATIC_TABLES is the count; vgc_scan_data_range sizes its exclusions by it.
-#define VGC_STATIC_TABLES 5
+#define VGC_STATIC_TABLES 7
 typedef struct { uintptr_t base; uint64_t bits[16]; } vgc_tc_window; // 1,024 pages from base
 static vgc_tc_window vgc_tc_windows[8];
 static int vgc_tc_nwindows;
@@ -2939,6 +2993,12 @@ static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
     his[3] = (uintptr_t)&vgc_addr_map2[0] + sizeof(vgc_addr_map2);
     los[4] = (uintptr_t)&vgc_tc_windows[0];
     his[4] = (uintptr_t)&vgc_tc_windows[0] + sizeof(vgc_tc_windows);
+    // cx-home/v#56 lever 10: the card tables by chunk (pointers to mmap'd
+    // tables outside the arenas) and the registered chunks' indices
+    los[5] = (uintptr_t)&vgc_chunk_cards[0];
+    his[5] = (uintptr_t)&vgc_chunk_cards[0] + sizeof(vgc_chunk_cards);
+    los[6] = (uintptr_t)&vgc_chunk_list[0];
+    his[6] = (uintptr_t)&vgc_chunk_list[0] + sizeof(vgc_chunk_list);
     return VGC_STATIC_TABLES;
 }
 

@@ -130,6 +130,14 @@ fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u
 fn C.abort()
 
 fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
+
+// cx-home/v#56 lever 10: the cards by chunk (vgc_chunk_cards in vgc_platform.h)
+fn C.vgc_chunk_cards_register(base usize, size usize) int
+fn C.vgc_chunk_cards_of(addr usize) &u8
+fn C.vgc_chunk_count() int
+fn C.vgc_chunk_base_at(n int) usize
+fn C.vgc_chunk_table_at(n int) &u8
+fn C.vgc_chunk_cards_table() voidptr
 fn C.vgc_addr_to_arena2(addr usize) int
 fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_touched_ranges(lo usize, hi usize, los &usize, his &usize, max int) int // cx-home/v#15
@@ -140,6 +148,8 @@ fn C.vgc_addr_to_arena(addr usize) int
 // ============================================================
 
 const vgc_page_shift = 13 // cgen's inline gate carries it as VGC_WB_PAGE_SHIFT (vgc_wb_card_test.v)
+// cx-home/v#56 lever 10: the cards of one 64 MB chunk (VGC_ADDR_SHIFT - vgc_page_shift; VGC_CHUNK_CARDS in vgc_platform.h, VGC_WB_CHUNK_MASK + 1 in cgen's gate)
+const vgc_chunk_cards_n = usize(1) << (26 - vgc_page_shift)
 const vgc_page_size = 8192
 const vgc_max_small_size = u32(32768) // objects > this are "large"
 const vgc_num_classes = 68
@@ -538,11 +548,6 @@ mut:
 	// carve_cycle is the gc_cycle of the owner's last carve from this tail: an
 	// owner holds the tail only while it carves (vgc_arena_owner_cycles).
 	carve_cycle u64
-	// cx-home/v#56 step 1: the arena's card table, one byte per page (the
-	// young regime's doc at vgc_young_mode): out-of-line like the page map,
-	// mmap-zeroed at arena creation, never freed, published by the same
-	// narenas store; nil under the default build (no barrier calls it)
-	cards &u8 = unsafe { nil }
 	// cx-home/v#58: the arena's kind (vgc_kind_plain, vgc_kind_frames,
 	// vgc_kind_small), set at the arena's carve from the request that carved
 	// it and never changed: a frame arena holds requests of vgc_frame_pages or
@@ -1129,11 +1134,14 @@ __global vgc_wb_mode = u32(0)
 // spans come off the general arenas again from then on.
 __global vgc_nursery_base = usize(0)
 __global vgc_nursery_end = usize(0)
-__global vgc_nursery_next = usize(0) // the next chunk's address
-__global vgc_nursery_cur = int(-1) // the arena the bump is in
+__global vgc_nursery_next = usize(0)
+// the next chunk's address
+__global vgc_nursery_cur = int(-1)
+// the arena the bump is in
 __global vgc_young_lo = usize(0)
 __global vgc_young_len = usize(0)
 const vgc_nursery_reserve = usize(16) * 1024 * 1024 * 1024
+
 __global vgc_wb_lo = usize(0)
 __global vgc_wb_len = usize(0)
 // cx-home/v#56 lever 3 (the store's second gate): the stops counted — bumped
@@ -1143,7 +1151,8 @@ __global vgc_wb_len = usize(0)
 // generated C's second gate (vgc_wb_epoch_moved, cgen) is made only then.
 __global vgc_wb_epoch = usize(0)
 __global vgc_perm_len = usize(0)
-// the cards: one byte per page of every arena (VGC_Arena.cards). vgc_wb_store
+// the cards: one byte per page, in tables by 64 MB chunk (vgc_chunk_cards,
+// lever 10). vgc_wb_store
 // sets the page's card (an atomic byte store when it reads 0: a line sixteen
 // threads wrote on every ring store cost stw_scaling T=16 -12..-30 %; set once
 // per stop it stays shared) before a pointer store the gate let through, and
@@ -1212,46 +1221,18 @@ __global vgc_minor_last_objs = u64(0)
 // cx-home/v#56 lever 9: the spans whose cards the last minor cycle read
 __global vgc_minor_last_visited = u64(0)
 __global vgc_force_full = u32(0)
-// the barrier's arena hint (vgc_wb_store's fast path): the entry of the
-// arena the gate's low end lies in, nil none, stored by vgc_wb_set (STW). An
-// arena's entry never moves and its base, size and cards never change once
-// published, so a stale hint resolves a store correctly or misses to
-// vgc_find_arena (vgc_wb_store_slow). The interpreter stores into its
-// start-up state (the permanent generation) some 25 M times in json-codec
-// 1 KB x100,000, and the full resolution on every call read +9 % instructions
-// retired and +4 % wall against the flat table's range test
-// (measure/collector-epic-23). The hint is the entry's address, not its
-// index (cx-home/v#56, fasta 25,000,000 +2.4 % wall on the stack): an index
-// into vgc_heap.arenas cost the fast path a bounds check with its panic
-// frame (a stack-protected 0x80-byte frame on every call), a second acquire
-// load and two multiplies — 83 instructions against the flat table's 48,
-// and 3.3x the barrier's share of the mutator's samples — where the entry
-// read through a pointer costs one plain load.
-__global vgc_wb_hint = &VGC_Arena(unsafe { nil })
-// cx-home/v#56 lever 5: the generated C's gate reads the card itself. The
-// hint arena as a record the gate can read (cgen's vgc_wb_gate: `struct
-// vgc_wb_hint_t`, the same three fields in the same order): a store the
-// range test let through, into the hint arena, whose page's card is set
-// makes no call — vgc_wb_store would read that card and return — so the
-// interpreter's stores into its start-up state (25 M in json-codec 1 KB
-// x100,000, measure/collector-epic-23) pay the call once per page per stop.
-// An arena's record is written once (its base, size and table never change)
-// and never rewritten, so the one pointer load a gate makes reads a record
-// consistent with itself: a mutator frozen mid-gate across a stop that moved
-// the hint reads the old record or the new, and either resolves its store in
-// that arena correctly or calls the barrier. vgc_wb_hp is nil in a concurrent
-// middle (every store dirties its span through the call, vgc_wb_set(1)) and
-// when the hint arena has no table. vgc_wb_calls counts the calls made under
-// -d vgc_wb_count (vgc_wb_calls_count, the lever's test).
-struct VGC_WbHint {
-mut:
-	base  usize
-	size  usize
-	cards &u8 = unsafe { nil }
-}
-
-__global vgc_wb_hints = [vgc_max_arenas]VGC_WbHint{}
-__global vgc_wb_hp = voidptr(0)
+// cx-home/v#56 lever 10: the gate reads the card through the table of chunk
+// tables (vgc_chunk_cards in vgc_platform.h: one byte a page, 8,192 a 64 MB
+// chunk, found from the stored-into address by one shift) — any arena's,
+// inline; vgc_wb_cards is that table's address, set once at vgc_init and
+// never rewritten. Before, the gate read the record of ONE arena (vgc_wb_hp,
+// the arena at the range's low end — under the young regime the nursery's
+// first, where the young test already answers) and a store into any other
+// arena called vgc_wb_store, which resolved the arena out of line
+// (vgc_wb_store_slow -> vgc_find_arena: 45 % of binary-trees 18's samples in
+// the cx image, measure/bin/collector-epic/w89/profile.md). vgc_wb_calls
+// counts the calls made under -d vgc_wb_count (vgc_wb_calls_count).
+__global vgc_wb_cards = unsafe { nil }
 __global vgc_wb_calls = u64(0)
 // the calls that went off the hint record to vgc_wb_store_slow (lever 6)
 __global vgc_wb_slow_calls = u64(0)
@@ -1273,15 +1254,6 @@ fn vgc_wb_set(mode u32) {
 		vgc_wb_lo = vgc_perm_lo
 		vgc_wb_len = vgc_perm_len
 	}
-	mut hint := &VGC_Arena(unsafe { nil })
-	mut hi := -1
-	if (mode & 1) == 0 && vgc_wb_len != 0 {
-		hi = vgc_find_arena(vgc_wb_lo)
-		if hi >= 0 {
-			hint = unsafe { &vgc_heap.arenas[hi] }
-		}
-	}
-	vgc_wb_hint = hint
 	// cx-home/v#56 lever 7: the young range — the nursery above its bump as
 	// of this stop; empty in a concurrent middle (every store dirties its
 	// span there) and without a nursery
@@ -1295,19 +1267,6 @@ fn vgc_wb_set(mode u32) {
 		vgc_young_lo = bump
 		vgc_young_len = vgc_nursery_end - bump
 	}
-	// the gate's record of the hint arena (cx-home/v#56 lever 5), nil in a
-	// concurrent middle (no hint there) and for an arena without a table
-	mut hp := voidptr(0)
-	if hi >= 0 && hint.cards != unsafe { nil } {
-		mut rec := unsafe { &vgc_wb_hints[hi] }
-		if rec.cards == unsafe { nil } {
-			rec.base = hint.base
-			rec.size = hint.size
-			rec.cards = hint.cards
-		}
-		hp = voidptr(rec)
-	}
-	vgc_wb_hp = hp
 }
 
 // vgc_wb_store_into is the bulk mutators' barrier call — array.v's element
@@ -1350,7 +1309,9 @@ pub fn vgc_wb_calls_count() u64 {
 	return C.vgc_atomic_load_u64(&vgc_wb_calls)
 }
 
-// vgc_wb_slow_calls_count reports the barrier calls that went off the hint
+// vgc_wb_slow_calls_count reports the barrier calls that resolved their arena
+// out of line — none since lever 10 (the cards by chunk); the count stays for
+// lever 6's test. Before: the calls that went off the hint
 // record to vgc_wb_store_slow under -d vgc_wb_count (cx-home/v#56 lever 6's
 // test; 0 in every other build).
 pub fn vgc_wb_slow_calls_count() u64 {
@@ -1426,13 +1387,9 @@ pub fn vgc_carved_probe() u64 {
 pub fn vgc_card_dirty(p voidptr) bool {
 	mut dirty := false
 	$if vgc_concurrent ? {
-		addr := usize(p)
-		ai := vgc_find_arena(addr)
-		if ai >= 0 {
-			a := unsafe { &vgc_heap.arenas[ai] }
-			if a.cards != unsafe { nil } {
-				dirty = unsafe { a.cards[(addr - a.base) / vgc_page_size] } != 0
-			}
+		c := vgc_card_ptr(usize(p))
+		if c != unsafe { nil } {
+			dirty = unsafe { *c } != 0
 		}
 	}
 	return dirty
@@ -2145,10 +2102,11 @@ pub fn vgc_birth_span_of(p voidptr) usize {
 }
 
 // vgc_find_span_addr: the current descriptor address for `p` (0 = none).
-@[markused]
+
 // vgc_noscan_probe reports to a test whether the span holding p is a noscan
 // span (cx-home/v#56: the verifier's missed words lay in a scanned buffer of
 // a map's metas shape).
+@[markused]
 pub fn vgc_noscan_probe(p voidptr) bool {
 	sp := vgc_find_span(p)
 	return sp != unsafe { nil } && sp.noscan
@@ -2480,6 +2438,8 @@ fn vgc_atfork_child() {
 
 @[markused]
 pub fn vgc_init() {
+	// cx-home/v#56 lever 10: the gate's table of chunk card tables
+	vgc_wb_cards = C.vgc_chunk_cards_table()
 	C.vgc_init_size_tables()
 	// cx #973: cache the data-segment root ranges while still single-threaded
 	// (the collector must never take the loader lock under STW — see
@@ -6165,11 +6125,10 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }, false
 		}
-		// cx-home/v#56 step 1: the arena's cards, one byte per page
-		mut cmem := &u8(unsafe { nil })
+		// cx-home/v#56 lever 10: the cards by chunk (vgc_chunk_cards) — a
+		// table for every chunk the arena touches that has none yet
 		$if vgc_concurrent ? {
-			cmem = unsafe { &u8(C.vgc_os_alloc(nmap)) }
-			if cmem == unsafe { nil } {
+			if C.vgc_chunk_cards_register(usize(mem), asize) == 0 {
 				C.vgc_os_free(psmem, usize(sizeof(voidptr)) * nmap)
 				C.vgc_os_free(mem, asize)
 				C.vgc_mutex_unlock(&vgc_heap.lock)
@@ -6181,7 +6140,6 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			vgc_heap.arenas[arena_idx].size = asize
 			vgc_heap.arenas[arena_idx].used = nbytes
 			vgc_heap.arenas[arena_idx].page_span = &&VGC_Span(psmem)
-			vgc_heap.arenas[arena_idx].cards = cmem
 			vgc_heap.arenas[arena_idx].owner = 0
 			vgc_heap.arenas[arena_idx].kind = kind
 		}
@@ -6379,10 +6337,8 @@ fn vgc_nursery_alloc(npages u32) &VGC_Span {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }
 		}
-		mut cmem := &u8(unsafe { nil })
 		$if vgc_concurrent ? {
-			cmem = unsafe { &u8(C.vgc_os_alloc(nmap)) }
-			if cmem == unsafe { nil } {
+			if C.vgc_chunk_cards_register(usize(mem), vgc_arena_size) == 0 {
 				C.vgc_os_free(psmem, usize(sizeof(voidptr)) * nmap)
 				C.vgc_mutex_unlock(&vgc_heap.lock)
 				return unsafe { nil }
@@ -6394,7 +6350,6 @@ fn vgc_nursery_alloc(npages u32) &VGC_Span {
 			vgc_heap.arenas[idx].size = vgc_arena_size
 			vgc_heap.arenas[idx].used = 0
 			vgc_heap.arenas[idx].page_span = &&VGC_Span(psmem)
-			vgc_heap.arenas[idx].cards = cmem
 			vgc_heap.arenas[idx].owner = 0
 			vgc_heap.arenas[idx].nursery = true
 			// cx-home/v#58's kinds: a nursery arena holds class spans only — requests under
@@ -6801,7 +6756,8 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	// (young/pool_first.v, vgc_nursery_pool_first_test.v).
 	// cx-home/v#58: a class span is a request of its own kind (vgc_request_kind) — the
 	// small arenas when its pages lie under the rounding's floor, as the general path
-	mut new_span, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages, vgc_request_kind(npages))
+	mut new_span, cold := vgc_get_free_span_cached(C.vgc_get_cache_idx(), npages,
+		vgc_request_kind(npages))
 	if new_span != unsafe { nil } {
 		vgc_span_recycled_ready(mut new_span, cold, npages)
 	} else {

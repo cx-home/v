@@ -1120,43 +1120,26 @@ fn vgc_rescan_plan() int {
 // vgc_cards_take reads and clears the cards of a span's pages (STW): true
 // when a store landed in the span since the last stop (cx-home/v#15, v#56).
 fn vgc_cards_take(span &VGC_Span) bool {
-	ai := vgc_find_arena(span.base)
-	if ai < 0 {
-		return false
-	}
-	a := unsafe { &vgc_heap.arenas[ai] }
-	if a.cards == unsafe { nil } {
-		return false
-	}
-	first := (span.base - a.base) / vgc_page_size
-	n := a.size / vgc_page_size
 	mut any := false
 	for k in 0 .. usize(span.npages) {
-		pg := first + k
-		if pg >= n {
-			break
-		}
-		if unsafe { a.cards[pg] } != 0 {
+		c := vgc_card_ptr(span.base + k * vgc_page_size)
+		if c != unsafe { nil } && unsafe { *c } != 0 {
 			any = true
 			unsafe {
-				a.cards[pg] = 0
+				*c = 0
 			}
 		}
 	}
 	return any
 }
 
-// vgc_cards_count counts the set cards of every published arena.
+// vgc_cards_count counts the set cards of every registered chunk.
 fn vgc_cards_count() u64 {
-	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 	mut n := u64(0)
-	for i in 0 .. nar {
-		a := unsafe { &vgc_heap.arenas[i] }
-		if a.cards == unsafe { nil } {
-			continue
-		}
-		for pg in 0 .. a.size / vgc_page_size {
-			if unsafe { a.cards[pg] } != 0 {
+	for i in 0 .. C.vgc_chunk_count() {
+		t := C.vgc_chunk_table_at(i)
+		for k in 0 .. vgc_chunk_cards_n {
+			if unsafe { t[k] } != 0 {
 				n++
 			}
 		}
@@ -1164,14 +1147,10 @@ fn vgc_cards_count() u64 {
 	return n
 }
 
-// vgc_cards_clear clears every arena's cards (STW).
+// vgc_cards_clear clears every registered chunk's cards (STW).
 fn vgc_cards_clear() {
-	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
-	for i in 0 .. nar {
-		a := unsafe { &vgc_heap.arenas[i] }
-		if a.cards != unsafe { nil } {
-			unsafe { C.memset(a.cards, 0, a.size / vgc_page_size) }
-		}
+	for i in 0 .. C.vgc_chunk_count() {
+		unsafe { C.memset(C.vgc_chunk_table_at(i), 0, vgc_chunk_cards_n) }
 	}
 }
 
@@ -1252,9 +1231,10 @@ fn vgc_minor_next(marked u64) bool {
 // page a card was set in since the last stop (STW, cx-home/v#56 step 2): an
 // old object's pointer to a young one lies in a page whose card the barrier
 // set, and the young object is shaded like a root's referent. Lever 9: the
-// scan walks the arenas' card tables — a byte a page, eight clean pages a
-// word — and resolves a set card to its span through the arena's page map,
-// so it reads the dirty set and no other span; before, it asked every span
+// scan walks the card tables — a byte a page, eight clean pages a word; by
+// 64 MB chunk since lever 10 (vgc_chunk_cards) — and resolves a set card to
+// its span (vgc_find_span, once per dirty page), so it reads the dirty set
+// and no other span; before, it asked every span
 // in use for its cards (vgc_cards_take: an arena lookup and a page loop a
 // span, 33,000–52,000 spans a minor on binary-trees 18, 624 minors a run,
 // measure/collector-epic-85's F trace), so a minor's stop grew with the
@@ -1271,33 +1251,28 @@ fn vgc_minor_cards() {
 	mut spans := u64(0)
 	mut objs := u64(0)
 	mut visited := u64(0)
-	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
-	for ai in 0 .. nar {
-		a := unsafe { &vgc_heap.arenas[ai] }
-		if a.cards == unsafe { nil } || a.page_span == unsafe { nil } {
-			continue
-		}
-		npg := a.size / vgc_page_size
+	for ci in 0 .. C.vgc_chunk_count() {
+		cards := C.vgc_chunk_table_at(ci)
+		cbase := C.vgc_chunk_base_at(ci)
 		mut prev := &VGC_Span(unsafe { nil })
 		mut counted := false
 		mut done := u32(0)
 		mut pg := usize(0)
-		for pg < npg {
-			if (pg & 7) == 0 && pg + 8 <= npg
-				&& unsafe { *(&u64(voidptr(usize(a.cards) + pg))) } == 0 {
+		for pg < vgc_chunk_cards_n {
+			if (pg & 7) == 0 && unsafe { *(&u64(voidptr(usize(cards) + pg))) } == 0 {
 				pg += 8
 				continue
 			}
-			if unsafe { a.cards[pg] } == 0 {
+			if unsafe { cards[pg] } == 0 {
 				pg++
 				continue
 			}
 			unsafe {
-				a.cards[pg] = 0
+				cards[pg] = 0
 			}
-			span := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[pg]))))) }
-			plo := a.base + pg * vgc_page_size
+			plo := cbase + pg * vgc_page_size
 			pg++
+			span := vgc_find_span(voidptr(plo))
 			if span == unsafe { nil } || !span.in_use {
 				continue
 			}
@@ -1580,7 +1555,7 @@ fn vgc_perm_promote() {
 		vgc_perm_lo = lo
 		vgc_perm_hi = hi
 		// the gate's range in the permanent regime alone (vgc_wb_set, at this
-		// stop's end); the cards are the arenas' own (VGC_Arena.cards)
+		// stop's end); the cards are the chunk tables' (vgc_chunk_cards, lever 10)
 		vgc_perm_len = hi - lo
 		// the page bitmap over the range (a promotion that widened the range
 		// takes a fresh one; the old is left to the OS at exit — promotions are
@@ -2562,14 +2537,16 @@ fn vgc_scan_data_range(lo usize, hi usize, worker int) {
 	// array and the 7.5 MB of strings it held, permanent/perm_transient.v)
 	mut ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
 		usize(voidptr(&vgc_workbuf_end)), usize(voidptr(&vgc_perm_lo)), usize(voidptr(&vgc_perm_hi)),
-		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0]!
+		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0, 0, 0]!
 	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
 		usize(voidptr(&vgc_workbuf_end)) + w, usize(voidptr(&vgc_perm_lo)) + w,
 		
-			usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0]!
+			usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0, 0,
+		0]!
 	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
 	// vgc_platform.h): the arena address maps, the chunk tables and the
-	// touched-page cache — VGC_STATIC_TABLES (5) of them, from slot 7.
+	// touched-page cache, the chunk card tables (lever 10) — VGC_STATIC_TABLES
+	// (7) of them, from slot 7.
 	C.vgc_static_tables(&ex_los[7], &ex_his[7])
 	// The collector's own clocks, CPU times and bit summaries are integers, not
 	// references, and nothing else stores into them: scanned, a value that falls
@@ -3771,23 +3748,12 @@ pub fn vgc_wb_store(obj voidptr) {
 			return
 		}
 		if (mode & 1) == 0 {
-			// the permanent or the young regime alone: the page's card in its
-			// arena's table, set when not set (vgc_young_mode doc); the stop
-			// reads it as the span's dirty bit. The arena is the hint record's
-			// (cx-home/v#56 lever 6: vgc_wb_hp, the record the generated C's
-			// gate reads — one plain load and one range test, no index into
-			// vgc_heap.arenas on this path: the indexed read's bounds check and
-			// panic frame, a second acquire load and two multiplies made the
-			// bulk mutators' barrier call, which the gate's card read does not
-			// shorten, 83 instructions against the record's 48) or, off the
-			// record, vgc_find_arena's out of line (vgc_wb_store_slow).
-			addr := usize(obj)
-			h := &VGC_WbHint(vgc_wb_hp)
-			if h != unsafe { nil } && addr - h.base < h.size {
-				vgc_card_set(h.cards, addr - h.base)
-				return
-			}
-			vgc_wb_store_slow(addr)
+			// the permanent or the young regime alone: the page's card, set when
+			// not set (vgc_young_mode doc); the stop reads it as the span's dirty
+			// bit. The card is found from the address by one shift (cx-home/v#56
+			// lever 10: the tables by chunk, vgc_chunk_cards) — no arena lookup
+			// on this path, in or out of line.
+			vgc_card_mark(usize(obj))
 			return
 		}
 		span := vgc_find_span(obj)
@@ -3803,37 +3769,24 @@ pub fn vgc_wb_store(obj voidptr) {
 	}
 }
 
-// vgc_card_set sets the card of the page at byte offset off into the arena
-// whose table is cards, when it is not set (the barrier's one idempotent
-// atomic byte store).
+// vgc_card_ptr is the card of the page addr lies in — a byte in its chunk's
+// table (cx-home/v#56 lever 10) — or nil when no arena touches that chunk.
 @[inline]
-fn vgc_card_set(cards &u8, off usize) {
-	card := unsafe { &u8(voidptr(usize(cards) + off / vgc_page_size)) }
-	if unsafe { *card } == 0 {
-		_ = C.vgc_atomic_fetch_or_u8(card, 1)
+fn vgc_card_ptr(addr usize) &u8 {
+	t := C.vgc_chunk_cards_of(addr)
+	if t == unsafe { nil } {
+		return unsafe { nil }
 	}
+	return unsafe { &u8(voidptr(usize(t) + ((addr >> vgc_page_shift) & (vgc_chunk_cards_n - 1)))) }
 }
 
-// vgc_wb_store_slow is the barrier's path off the hint record: the store's
-// arena resolved by vgc_find_arena. Out of line so the fast path carries no
-// frame for it (the indexed read of vgc_heap.arenas has a bounds check whose
-// panic builds its message on the stack). -d vgc_wb_count counts its calls
-// (vgc_wb_slow_calls_count, lever 6's test).
-@[noinline]
-fn vgc_wb_store_slow(addr usize) {
-	$if vgc_concurrent ? {
-		$if vgc_wb_count ? {
-			C.vgc_atomic_add_u64(&vgc_wb_slow_calls, 1)
-		}
-		ai := vgc_find_arena(addr)
-		if ai < 0 {
-			return
-		}
-		a := unsafe { &vgc_heap.arenas[ai] }
-		if a.cards == unsafe { nil } {
-			return
-		}
-		vgc_card_set(a.cards, addr - a.base)
+// vgc_card_mark sets the card of the page addr lies in, when it is not set
+// (the barrier's one idempotent atomic byte store).
+@[inline]
+fn vgc_card_mark(addr usize) {
+	card := vgc_card_ptr(addr)
+	if card != unsafe { nil } && unsafe { *card } == 0 {
+		_ = C.vgc_atomic_fetch_or_u8(card, 1)
 	}
 }
 

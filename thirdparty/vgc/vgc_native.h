@@ -80,19 +80,23 @@ void vgc_native_unpin(void* p);
 // held equal by vlib/v/gen/c/vgc_native_header_test.v): [vgc_wb_lo, +vgc_wb_len)
 // is empty when no barrier is needed, the permanent generation's range once
 // promoted, and the whole address space during a concurrent middle. A store
-// into the hint arena (vgc_wb_hp: the runtime's VGC_WbHint record of the
-// arena the range's low end lies in — base, size, cards — written once per
-// arena, nil in a concurrent middle) whose page's card is set makes no call
-// (cx-home/v#56); the page shift is the runtime's vgc_page_shift.
+// whose page's card is set makes no call (cx-home/v#56; the cards by chunk,
+// lever 10, below).
 extern size_t vgc_wb_lo;
 extern size_t vgc_wb_len;
 // cx-home/v#56 lever 7: the young range — the runtime's nursery above the bump
 // the last stop read; a store into it makes no call (the gate's first test)
 extern size_t vgc_young_lo;
 extern size_t vgc_young_len;
-struct vgc_wb_hint_t { size_t base; size_t size; unsigned char* cards; };
-extern void* vgc_wb_hp;
+// cx-home/v#56 lever 10: the cards by 64 MB chunk — vgc_wb_cards is the
+// runtime's table of chunk tables (vgc_chunk_cards: one byte a page, 8,192
+// a chunk), so a store's card is found from its address by one shift and
+// read inline for any arena; the page shift is the runtime's vgc_page_shift.
+extern void* vgc_wb_cards;
 #define VGC_WB_PAGE_SHIFT 13
+#define VGC_WB_CHUNK_SHIFT 26
+#define VGC_WB_CHUNKS 65536
+#define VGC_WB_CHUNK_MASK 8191
 void vgc_wb_store(void* obj);
 #ifndef VGC_WB_UNLIKELY
   #if defined(_MSC_VER) && !defined(__clang__)
@@ -101,7 +105,7 @@ void vgc_wb_store(void* obj);
     #define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)
   #endif
 #endif
-static inline void vgc_native_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { const struct vgc_wb_hint_t* h = (const struct vgc_wb_hint_t*)vgc_wb_hp; if (h != 0 && (size_t)(uintptr_t)p - h->base < h->size && h->cards[((size_t)(uintptr_t)p - h->base) >> VGC_WB_PAGE_SHIFT] != 0) return; vgc_wb_store(p); } }
+static inline void vgc_native_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { unsigned char** t = (unsigned char**)vgc_wb_cards; size_t ci = (size_t)(uintptr_t)p >> VGC_WB_CHUNK_SHIFT; if (t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 && t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return; vgc_wb_store(p); } }
 
 // 4. blocking regions: gc_safe_region_enter/exit under fixed exported names (a
 // V pub fn is static in an object-file build of the runtime, _VOBJECTFILE).

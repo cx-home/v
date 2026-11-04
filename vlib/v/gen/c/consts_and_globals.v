@@ -528,14 +528,14 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 	// symbols, which current Apple ld and lld no longer do (duplicate-symbol error).
 	is_bundled_mod := util.should_bundle_module(node.mod)
 	// NATV-18 (cx-home/v#47): vgc_wb_lo / vgc_wb_len are the store gate's range
-	// (and vgc_wb_epoch the stop count its second gate reads, and vgc_wb_hp the
-	// hint record the gate reads the card through, cx-home/v#56),
+	// (and vgc_wb_epoch the stop count its second gate reads, and vgc_wb_cards the
+	// chunk card tables the gate reads the card through, cx-home/v#56),
 	// declared `extern` in the C headers (cgen's vgc_wb_gate and
 	// thirdparty/vgc/vgc_native.h) for every unit that stores, native ones
 	// included; an object-file build (-o x.o) gave them object-local linkage, and
 	// `static` after the headers' `extern` is a C error (no -gc e object built).
 	is_vgc_abi_global := node.mod == 'builtin'
-		&& node.fields.any(it.name.all_after_last('.') in ['vgc_wb_lo', 'vgc_wb_len', 'vgc_wb_epoch', 'vgc_wb_hp', 'vgc_young_lo', 'vgc_young_len'])
+		&& node.fields.any(it.name.all_after_last('.') in ['vgc_wb_lo', 'vgc_wb_len', 'vgc_wb_epoch', 'vgc_wb_cards', 'vgc_young_lo', 'vgc_young_len'])
 	visibility_kw := if g.should_use_object_local_linkage(node.mod) && !is_vgc_abi_global {
 		'static '
 	} else if g.pref.build_mode == .build_module && is_bundled_mod {
@@ -774,7 +774,8 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// type ... is not assignable") when this runs in `_vinit` rather
 					// than at declaration — the path taken under `-usecache`/build_module.
 					// memcpy the default in, mirroring the `{E_STRUCT}` path above.
-					if g.table.final_sym(field.typ).kind == .struct && g.global_zero_default(field.typ, 0) {
+					if g.table.final_sym(field.typ).kind == .struct
+						&& g.global_zero_default(field.typ, 0) {
 						// every field of the struct defaults to zero: memset, not a
 						// stack temporary of the whole struct (cx-home/v#32)
 						init += '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 5z'
