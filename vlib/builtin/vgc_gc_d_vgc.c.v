@@ -1259,12 +1259,14 @@ fn vgc_minor_next(marked u64) bool {
 fn vgc_minor_cards() {
 	mut spans := u64(0)
 	mut objs := u64(0)
+	mut visited := u64(0)
 	nsp := vgc_heap.nspans
 	for i in 0 .. nsp {
 		span := unsafe { vgc_heap.allspans[i] }
 		if span == unsafe { nil } || !span.in_use {
 			continue
 		}
+		visited++
 		if !vgc_cards_take(span) {
 			continue
 		}
@@ -1291,6 +1293,7 @@ fn vgc_minor_cards() {
 	}
 	vgc_minor_last_spans = spans
 	vgc_minor_last_objs = objs
+	vgc_minor_last_visited = visited
 }
 
 // vgc_scan_perm_obj scans one object's words as vgc_scan_range does (every

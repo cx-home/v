@@ -1209,6 +1209,8 @@ __global vgc_full_marked = u64(0)
 __global vgc_full_goal = u64(0)
 __global vgc_minor_last_spans = u64(0)
 __global vgc_minor_last_objs = u64(0)
+// cx-home/v#56 lever 9: the spans whose cards the last minor cycle read
+__global vgc_minor_last_visited = u64(0)
 __global vgc_force_full = u32(0)
 // the barrier's arena hint (vgc_wb_store's fast path): the entry of the
 // arena the gate's low end lies in, nil none, stored by vgc_wb_set (STW). An
@@ -1366,6 +1368,26 @@ fn vgc_wb_regime() u32 {
 // step 2; 0 with the young regime off).
 pub fn vgc_minor_cycles_count() u64 {
 	return vgc_minor_cycles
+}
+
+// vgc_minor_last_walk reports the last minor cycle's card scan as the
+// collector counted it (cx-home/v#56 lever 9's test): the spans whose cards
+// it read, the spans a card was set in and the old objects it scanned.
+pub fn vgc_minor_last_walk() (u64, u64, u64) {
+	return vgc_minor_last_visited, vgc_minor_last_spans, vgc_minor_last_objs
+}
+
+// vgc_spans_in_use reports the heap's spans in use (the walk's bound before
+// lever 9).
+pub fn vgc_spans_in_use() u64 {
+	mut n := u64(0)
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span != unsafe { nil } && span.in_use {
+			n++
+		}
+	}
+	return n
 }
 
 // vgc_full_goal_probe reports the last full cycle's goal, the bound of the
