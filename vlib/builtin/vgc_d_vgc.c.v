@@ -1357,6 +1357,14 @@ pub fn vgc_full_goal_probe() u64 {
 	return vgc_full_goal
 }
 
+// vgc_stw_last_pause_probe reports the last stop-the-world pause (ns) the
+// next concurrent cycle's stops are judged by (cx-private#1910's back-off,
+// vgc_stw_last_pause_ns): the last stop-the-world FULL cycle's — a minor
+// cycle's stop is not written there (cx-home/v#56 lever 11).
+pub fn vgc_stw_last_pause_probe() u64 {
+	return vgc_stw_last_pause_ns
+}
+
 // vgc_cm_verify_missed_count reports the objects -d vgc_cm_verify found
 // unmarked after a cycle, in all (0 under other builds).
 pub fn vgc_cm_verify_missed_count() u64 {
