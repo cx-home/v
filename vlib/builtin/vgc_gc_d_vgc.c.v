@@ -1249,46 +1249,100 @@ fn vgc_minor_next(marked u64) bool {
 }
 
 // vgc_minor_cards scans, on the collecting thread, the old objects of every
-// span a card was set in since the last stop (STW, cx-home/v#56 step 2): an
+// page a card was set in since the last stop (STW, cx-home/v#56 step 2): an
 // old object's pointer to a young one lies in a page whose card the barrier
-// set, and the young object is shaded like a root's referent. The cards are
-// read and cleared (vgc_cards_take); a span the permanent rescan already took
-// reads clean here (at a minor cycle that rescan scans a dirty permanent
-// span's old objects beside its permanent ones, vgc_rescan_perm_span), and a
-// span without pointers has its cards dropped.
+// set, and the young object is shaded like a root's referent. Lever 9: the
+// scan walks the arenas' card tables — a byte a page, eight clean pages a
+// word — and resolves a set card to its span through the arena's page map,
+// so it reads the dirty set and no other span; before, it asked every span
+// in use for its cards (vgc_cards_take: an arena lookup and a page loop a
+// span, 33,000–52,000 spans a minor on binary-trees 18, 624 minors a run,
+// measure/collector-epic-85's F trace), so a minor's stop grew with the
+// heap. A card marks the page of the address the gate was given — an
+// object's base (the generated C's gate, the bulk mutators: an array's
+// buffer, a struct) — so the old objects scanned for a dirty page are those
+// that overlap it, whole (an object straddling two dirty pages is scanned
+// once: `done` keeps the index the span's scan reached). Every set card is
+// cleared, a freed span's and a pointer-free span's too; a permanent span's
+// cards were taken by the permanent rescan before this (vgc_rescan_walk:
+// at a minor cycle it scans a dirty permanent span's old objects beside its
+// permanent ones, vgc_rescan_perm_span), so they read clean here.
 fn vgc_minor_cards() {
 	mut spans := u64(0)
 	mut objs := u64(0)
 	mut visited := u64(0)
-	nsp := vgc_heap.nspans
-	for i in 0 .. nsp {
-		span := unsafe { vgc_heap.allspans[i] }
-		if span == unsafe { nil } || !span.in_use {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	for ai in 0 .. nar {
+		a := unsafe { &vgc_heap.arenas[ai] }
+		if a.cards == unsafe { nil } || a.page_span == unsafe { nil } {
 			continue
 		}
-		visited++
-		if !vgc_cards_take(span) {
-			continue
-		}
-		if span.noscan || span.alloc_bits == unsafe { nil } || span.mark_bits == unsafe { nil }
-			|| span.elem_size == 0 {
-			continue
-		}
-		spans++
-		nbytes := (span.nelems + 7) / 8
-		for b in 0 .. nbytes {
-			mut sel := unsafe { span.alloc_bits[b] & span.mark_bits[b] }
-			for sel != 0 {
-				bi := C.vgc_ctz8(sel)
-				sel &= sel - 1
-				idx := b * 8 + u32(bi)
-				if idx >= span.nelems {
-					break
+		npg := a.size / vgc_page_size
+		mut prev := &VGC_Span(unsafe { nil })
+		mut counted := false
+		mut done := u32(0)
+		mut pg := usize(0)
+		for pg < npg {
+			if (pg & 7) == 0 && pg + 8 <= npg
+				&& unsafe { *(&u64(voidptr(usize(a.cards) + pg))) } == 0 {
+				pg += 8
+				continue
+			}
+			if unsafe { a.cards[pg] } == 0 {
+				pg++
+				continue
+			}
+			unsafe {
+				a.cards[pg] = 0
+			}
+			span := unsafe { &VGC_Span(voidptr(C.vgc_atomic_load_u64(&u64(voidptr(&a.page_span[pg]))))) }
+			plo := a.base + pg * vgc_page_size
+			pg++
+			if span == unsafe { nil } || !span.in_use {
+				continue
+			}
+			if span != prev {
+				prev = span
+				counted = false
+				done = 0
+				visited++
+			}
+			if span.noscan || span.alloc_bits == unsafe { nil } || span.mark_bits == unsafe { nil }
+				|| span.elem_size == 0 {
+				continue
+			}
+			if !counted {
+				counted = true
+				spans++
+			}
+			elem := usize(span.elem_size)
+			// the old objects overlapping the page: from the one holding its
+			// first byte to the one holding its last
+			mut lo := u32(0)
+			if plo > span.base {
+				lo = u32((plo - span.base) / elem)
+			}
+			if lo < done {
+				lo = done
+			}
+			mut hi := u32((plo + vgc_page_size - 1 - span.base) / elem)
+			if hi >= span.nelems {
+				hi = span.nelems - 1
+			}
+			if lo > hi {
+				continue
+			}
+			for idx := lo; idx <= hi; idx++ {
+				b := idx >> 3
+				m := u8(1) << (idx & 7)
+				if unsafe { span.alloc_bits[b] & span.mark_bits[b] & m } == 0 {
+					continue
 				}
-				lo := span.base + usize(idx) * usize(span.elem_size)
-				vgc_scan_range(lo, lo + usize(span.elem_size), 0)
+				olo := span.base + usize(idx) * elem
+				vgc_scan_range(olo, olo + elem, 0)
 				objs++
 			}
+			done = hi + 1
 		}
 	}
 	vgc_minor_last_spans = spans
@@ -1622,8 +1676,10 @@ fn vgc_cm_verify(self_idx int) {
 			if span == unsafe { nil } || !span.in_use || span.mark_bits == unsafe { nil } {
 				continue
 			}
-			unsafe { C.memcpy(voidptr(usize(side) + usize(i) * 136), span.mark_bits, (span.nelems +
-				7) / 8) }
+			unsafe {
+				C.memcpy(voidptr(usize(side) + usize(i) * 136), span.mark_bits,
+					(span.nelems + 7) / 8)
+			}
 		}
 		// cx-home/v#15: from zero — the permanent objects are traced too, so a
 		// pointer stored into one that no barrier dirtied shows as a miss
