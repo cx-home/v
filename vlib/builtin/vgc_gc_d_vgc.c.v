@@ -101,7 +101,12 @@ fn vgc_gc_start() {
 			&& ((vgc_perm_on == 0 && vgc_perm_cycle != 0 && vgc_heap.gc_cycle + 1 >= vgc_perm_cycle)
 			|| vgc_perm_request)
 		// cx-home/v#56 step 2: a minor cycle stops the world; the concurrent
-		// cycle is a full one
+		// cycle is a full one. Lever 11: the test below reads the last FULL
+		// cycle's mark work and root scan (a minor keeps its own records,
+		// vgc_minor_mark_last_work_ns / vgc_minor_root_last_ns), so the full
+		// that closes a run of minors is judged as the full before it was —
+		// judged by the minor's 0.3 ms mark it ran stop-the-world every time
+		// (binary-trees 18 cx interpreted: 88 fulls, 1,450 ms of stops).
 		vgc_minor_this_cycle = vgc_minor_plan(promote)
 		if !promote && !vgc_minor_this_cycle && (vgc_cm_mode == 1
 			|| (vgc_cm_mode == 2 && vgc_cm_backoff == 0 && vgc_mark_last_work_ns >= vgc_cm_min_ns
@@ -117,7 +122,10 @@ fn vgc_gc_start() {
 	}
 	$if vgc_concurrent ? {
 		// one backoff cycle spent (after the CAS: every thread that reached the
-		// pacer calls in for the same cycle)
+		// pacer calls in for the same cycle). cx-home/v#56: a minor cycle
+		// spends one too — under the young regime a back-off of 8, 16, 32, 64
+		// cycles holds 1, 2, 4, 8 stop-the-world fulls (one probe a run of
+		// minors), the old collector's cadence of probes in fulls
 		if vgc_cm_backoff > 0 {
 			vgc_cm_backoff--
 		}
@@ -240,7 +248,13 @@ fn vgc_gc_start() {
 	// Scan roots: stacks + globals (conservative scanning)
 	vgc_roots_par_n = vgc_roots_plan()
 	vgc_mark_roots()
-	vgc_root_last_ns = vgc_ph[4] - vgc_ph[1] // cx-private#1910: the next cycle's selection
+	// cx-private#1910: the next cycle's selection; cx-home/v#56 lever 11: a
+	// minor's record is its own (vgc_minor_root_last_ns), the full's stays
+	if vgc_minor_this_cycle {
+		vgc_minor_root_last_ns = vgc_ph[4] - vgc_ph[1]
+	} else {
+		vgc_root_last_ns = vgc_ph[4] - vgc_ph[1]
+	}
 	vgc_watch_snapshot(2) // STAGE 2: post stack roots
 
 	// Shade in-flight spawn-argument structs. These are live (a freshly created
@@ -301,20 +315,30 @@ fn vgc_gc_start() {
 	// Final drain of work queue
 	vgc_drain_mark_work(0)
 	vgc_ph[5] = C.vgc_now_ns()
-	vgc_mark_last_ns = vgc_ph[5] - vgc_ph[4] // the next cycle's parallel-mark decision (cx-home/v#16)
-	// The single-marker-equivalent work of that mark: n markers took last_ns,
+	// the next cycle's parallel-mark decision (cx-home/v#16). The
+	// single-marker-equivalent work of that mark: n markers took last_ns,
 	// so one would have taken about n x last_ns. The next cycle plans its
 	// marker count from the WORK, not the wall time a parallel cycle left —
 	// planned from the wall time, eight markers that cut a 3 ms mark to 0.6 ms
 	// dropped the next cycle back to one marker, which took 3 ms again: the
 	// count flapped 1/8 every other cycle and the pool's CPU was spent on
 	// marks that one or two markers cover (json-codec 1 MB: user +15 % for
-	// wall -5 %).
-	vgc_mark_last_work_ns = vgc_mark_last_ns * u64(if vgc_mark_nworkers_cur > 1 {
+	// wall -5 %). cx-home/v#56 lever 11: a minor cycle's mark goes to the
+	// minor's record; the full's (what the concurrent test and the next
+	// full's marker plan read) stays until the next full.
+	mark_ns := vgc_ph[5] - vgc_ph[4]
+	work_ns := mark_ns * u64(if vgc_mark_nworkers_cur > 1 {
 		vgc_mark_nworkers_cur
 	} else {
 		1
 	})
+	if vgc_minor_this_cycle {
+		vgc_minor_mark_last_ns = mark_ns
+		vgc_minor_mark_last_work_ns = work_ns
+	} else {
+		vgc_mark_last_ns = mark_ns
+		vgc_mark_last_work_ns = work_ns
+	}
 	vgc_mark_work_from_cpu(mcpu0, mwait0)
 	vgc_watch_snapshot(5) // STAGE 5: post final drain (mark term)
 	$if vgc_concurrent ? {
@@ -442,7 +466,13 @@ fn vgc_gc_start() {
 	vgc_update_trigger()
 	$if vgc_concurrent ? {
 		// cx-private#1910: what the next concurrent cycle's stops are judged by
-		if vgc_gc_last_end > vgc_gc_t0 {
+		// — the last stop-the-world FULL's pause; cx-home/v#56 lever 11: a
+		// minor's stop is not written here (a concurrent full whose two stops
+		// read ~1.3 ms "lost" against the minor's ~1 ms and the back-off sent
+		// the next 8, 16, 32, 64 cycles to stop-the-world fulls: binary-trees
+		// 18 cx interpreted, 36 of the 44 fulls at 49 MB live stop-the-world
+		// with the concurrent test itself already judged by the full's mark)
+		if !vgc_minor_this_cycle && vgc_gc_last_end > vgc_gc_t0 {
 			vgc_stw_last_pause_ns = vgc_gc_last_end - vgc_gc_t0
 		}
 	}
@@ -2936,9 +2966,28 @@ fn vgc_mark_work_from_cpu_at(cpu0 u64, wait0 u64, cpu1 u64, wait1 u64) {
 		cpu = if w < cpu { cpu - w } else { 0 }
 	}
 	vgc_mark_last_cpu_ns = cpu
-	if cpu < vgc_mark_last_work_ns {
+	// cx-home/v#56 lever 11: the record of this cycle's kind
+	if vgc_minor_this_cycle {
+		if cpu < vgc_minor_mark_last_work_ns {
+			vgc_minor_mark_last_work_ns = cpu
+		}
+	} else if cpu < vgc_mark_last_work_ns {
 		vgc_mark_last_work_ns = cpu
 	}
+}
+
+// vgc_mark_last_work answers the single-marker work the cycle about to start
+// is planned from: the last cycle of its kind (cx-home/v#56 lever 11) — a
+// minor's from the last minor, a full's from the last full. The minor after
+// a full planned from the full's 17 ms mark took eight markers for a 0.3 ms
+// mark (binary-trees 18, 643 minors a run), and the full after a minor
+// planned from the minor's took one marker for a 17 ms mark.
+@[inline]
+fn vgc_mark_last_work() u64 {
+	if vgc_minor_this_cycle {
+		return vgc_minor_mark_last_work_ns
+	}
+	return vgc_mark_last_work_ns
 }
 
 // cx-home/v#56: a stop holds every registered mutator, so its length costs
@@ -2976,9 +3025,10 @@ fn vgc_mark_plan() int {
 	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked {
 		return 1
 	}
+	last_work := vgc_mark_last_work() // cx-home/v#56 lever 11: of this cycle's kind
 	live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
-	free := vgc_stop_weighed_cpus(vgc_mark_last_work_ns, vgc_mark_par_min_ns)
-	total := vgc_mark_plan_count(vgc_mark_workers_cfg, vgc_mark_last_work_ns, vgc_mark_par_min_ns,
+	free := vgc_stop_weighed_cpus(last_work, vgc_mark_par_min_ns)
+	total := vgc_mark_plan_count(vgc_mark_workers_cfg, last_work, vgc_mark_par_min_ns,
 		live, free, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target,
 		C.vgc_atomic_load_u64(&vgc_heap.heap_marked), !vgc_paced_one)
 	if total <= 1 {
@@ -3224,6 +3274,14 @@ fn vgc_walk_adapt(walked_ns u64) {
 // preempted marker holding the cycle's tail — halves the marker count for the
 // next 32 parallel cycles, then the configured count is tried again.
 fn vgc_mark_adapt(marked u64) {
+	// cx-home/v#56 lever 11: a minor cycle takes no part — its mark covers the
+	// young set and the dirty cards, not the marked set the rate divides by
+	// (a 0.3 ms minor over 49 MB sticky-marked read a rate no full meets,
+	// and the full's parallel probes lost against it); a minor's markers
+	// come from its own work record (vgc_mark_last_work), without a probe.
+	if vgc_minor_this_cycle {
+		return
+	}
 	kb := marked / 1024 + 1
 	rate := vgc_mark_last_ns / kb
 	// cx-private#1910 cut 1: a concurrent cycle's mark is its middle, run

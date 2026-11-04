@@ -1556,6 +1556,18 @@ __global vgc_mark_nworkers_cur = int(1)
 // the previous mark's single-marker-equivalent work (ns): its wall time x its
 // marker count — what the next cycle plans its marker count from
 __global vgc_mark_last_work_ns = u64(0)
+// cx-home/v#56 lever 11: a minor cycle's last mark, its single-marker work
+// and its root scan, kept apart from the full cycle's three above — a cycle
+// is planned from the last cycle of its kind. Before, a minor wrote the
+// shared records: the full that closes a run of minors was judged for the
+// concurrent cycle by the minor's mark (~0.3 ms on binary-trees 18, under
+// VGC_CM_MIN_US) and ran stop-the-world — 88 fulls, 1,450 ms of stops
+// against 559 over the old collector's 112 (84 of them concurrent) — and the
+// minor after a full inherited the full's marker plan (eight markers on a
+// 0.3 ms mark, 643 minors a run). vgc_young_full_cm_test.v.
+__global vgc_minor_mark_last_ns = u64(0)
+__global vgc_minor_mark_last_work_ns = u64(0)
+__global vgc_minor_root_last_ns = u64(0)
 __global vgc_mark_rate1 = u64(0)
 // cx-private#1910 cut 1: the single-marker baseline of the concurrent middles (vgc_mark_adapt)
 __global vgc_mark_rate1_cm = u64(0)
