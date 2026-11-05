@@ -123,7 +123,7 @@ fn C.vgc_gctrace_cm(cycle u64, stop1_us u64, middle_us u64, stop2_us u64, rescan
 fn C.vgc_gctrace_perm(cycle u64, spans u64, kb u64, dirty_spans u64, dirty_objs u64, young_objs u64, rescan_us u64, missed u64, promoted u64) // VGC_GCTRACE=2 permanent-generation line (cx-home/v#15)
 fn C.vgc_gctrace_young(cycle u64, cards u64) // VGC_GCTRACE=2 young-regime line (cx-home/v#56 step 1)
 fn C.vgc_gctrace_minor(cycle u64, n u64, spans u64, objs u64, missed u64) // VGC_GCTRACE=2 minor-cycle line (cx-home/v#56 step 2)
-fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers)
+fn C.vgc_gctrace_phases(cycle u64, stw_us u64, clear_us u64, susp_us u64, data_us u64, stacks_us u64, mark_us u64, count_us u64, sweep_us u64, tail_us u64, seg_kb u64, spans_in_use u64, markers u64, walkers u64, swalk_us u64, sapply_us u64, mshare u64) // VGC_GCTRACE=2 per-cycle phase line (cx-home/v#15, cx-home/v#16 markers, walkers, cx-home/v#56 the busiest marker's share)
 fn C.vgc_verify_report(kind u64, referrer_addr u64, referrer_size u64, off u64, referent_addr u64, referent_size u64) // mark-closure verifier (-d vgc_verify)
 fn C.vgc_rootfind_enumerate(arena_lo u64, arena_hi u64) // /proc/self/maps root-finder (-d vgc_verify)
 fn C.vgc_rootfind_report(referrer u64, in_stack int, target u64, tsz u64, kind u64) // root-finder hit reporter
@@ -1682,6 +1682,12 @@ __global vgc_rescan_nworkers_cur = int(1)
 __global vgc_rescan_term = false
 __global vgc_rescan_last_work_ns = u64(0)
 __global vgc_rescan_sum = [vgc_walk_sum_len]u64{}
+// cx-home/v#56 lever 13: the objects each marker scanned in this cycle's
+// parallel drains (vgc_mark_objs[w * 16], one 128-byte stride a marker), for
+// the VGC_GCTRACE=2 phase line's mshare= (the busiest marker's share of the
+// objects, percent; 0 when the mark ran on one marker); cleared at each
+// emit
+__global vgc_mark_objs = [vgc_walk_sum_len]u64{}
 // the next inuse_bits word to claim (reset by the collector before each walk)
 __global vgc_walk_sum = [vgc_walk_sum_len]u64{}
 // per-walker marked-byte sums, one per 128-byte stride (vgc_walk_sum[w * 16])

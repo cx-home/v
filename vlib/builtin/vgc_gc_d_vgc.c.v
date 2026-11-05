@@ -2007,12 +2007,26 @@ fn vgc_gctrace_emit() {
 		for w in 0 .. (vgc_heap.nspans + 7) / 8 {
 			in_use += u64(C.vgc_popcount8(unsafe { vgc_heap.inuse_bits[w] }))
 		}
+		// cx-home/v#56 lever 13: the busiest marker's share of the objects the
+		// parallel drains scanned (0 = one marker), the counters cleared for the
+		// next cycle
+		mut mobjs := u64(0)
+		mut mtop := u64(0)
+		for w in 0 .. vgc_max_markers {
+			c := vgc_mark_objs[w * 16]
+			mobjs += c
+			if c > mtop {
+				mtop = c
+			}
+			vgc_mark_objs[w * 16] = 0
+		}
+		mshare := if mobjs == 0 { u64(0) } else { mtop * 100 / mobjs }
 		C.vgc_gctrace_phases(u64(vgc_heap.gc_cycle), vgc_ph_us(vgc_gc_t0, vgc_ph[0]), vgc_ph_us(vgc_ph[0],
 			vgc_ph[1]), vgc_ph_us(vgc_ph[1], vgc_ph[2]), vgc_ph_us(vgc_ph[2], vgc_ph[3]), vgc_ph_us(vgc_ph[3],
 			vgc_ph[4]), vgc_ph_us(vgc_ph[4], vgc_ph[5]), vgc_ph_us(vgc_ph[5], vgc_ph[6]), vgc_ph_us(vgc_ph[6],
 			vgc_ph[7]), vgc_ph_us(vgc_ph[7], vgc_gc_last_end), seg / 1024, in_use,
 			u64(vgc_mark_nworkers_cur), u64(vgc_walk_nworkers_cur), vgc_ph_swalk_ns / 1000,
-			vgc_ph_sapply_ns / 1000)
+			vgc_ph_sapply_ns / 1000, mshare)
 		$if vgc_concurrent ? {
 			// cx-home/v#15: the permanent generation's share of the cycle
 			if vgc_perm_on != 0 {
@@ -3529,6 +3543,7 @@ fn vgc_drain_mark_parallel(w int, n int) {
 		obj_addr := vgc_work_get(w)
 		if obj_addr != 0 {
 			vgc_mark_scan_obj(obj_addr, w)
+			vgc_mark_objs[w * 16]++
 			if C.vgc_atomic_load_u32(&vgc_mark_idle) > 0
 				&& unsafe { voidptr(vgc_heap.work_full) } == unsafe { nil } {
 				vgc_work_balance(w)

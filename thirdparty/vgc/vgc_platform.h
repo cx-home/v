@@ -2652,12 +2652,14 @@ static void vgc_gctrace_gate(uint64_t cycle, uint64_t probe, uint64_t marked,
 // just paced — stop the world, clear mark bits, suspended-thread roots, data
 // segments, stacks, mark drain, count, sweep, trigger/trace tail — plus the
 // data-segment KB the root scan walked and the in-use spans the walks visited.
+// mshare= (cx-home/v#56 lever 13): the busiest marker's share of the objects the
+// parallel mark scanned, percent (0 = one marker).
 static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_us,
                                uint64_t susp_us, uint64_t data_us, uint64_t stacks_us,
                                uint64_t mark_us, uint64_t count_us, uint64_t sweep_us,
                                uint64_t tail_us, uint64_t seg_kb, uint64_t spans_in_use,
                                uint64_t markers, uint64_t walkers, uint64_t swalk_us,
-                               uint64_t sapply_us) {
+                               uint64_t sapply_us, uint64_t mshare) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] phases stw="); vgc__wdec(stw_us);
     vgc__ws(" clear="); vgc__wdec(clear_us);
@@ -2674,6 +2676,7 @@ static void vgc_gctrace_phases(uint64_t cycle, uint64_t stw_us, uint64_t clear_u
     vgc__ws(" walkers="); vgc__wdec(walkers);
     vgc__ws(" swalk="); vgc__wdec(swalk_us);
     vgc__ws(" sapply="); vgc__wdec(sapply_us);
+    vgc__ws(" mshare="); vgc__wdec(mshare);
     vgc__ws("\n");
 }
 
