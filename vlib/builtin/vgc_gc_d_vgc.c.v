@@ -72,6 +72,7 @@ fn vgc_ph_us(a u64, b u64) u64 {
 // spilled — so vgc_gc_start must NOT re-record the collector's own range.
 @[export: 'vgc_gc_start']
 fn vgc_gc_start() {
+	mut minor := false
 	$if vgc_concurrent ? {
 		// cx-private#1910: the concurrent-mark cycle (two stops, the mark beside
 		// the mutators) when the last mark's work was long enough to be worth
@@ -107,8 +108,12 @@ fn vgc_gc_start() {
 		// that closes a run of minors is judged as the full before it was —
 		// judged by the minor's 0.3 ms mark it ran stop-the-world every time
 		// (binary-trees 18 cx interpreted: 88 fulls, 1,450 ms of stops).
-		vgc_minor_this_cycle = vgc_minor_plan(promote)
-		if !promote && !vgc_minor_this_cycle && (vgc_cm_mode == 1
+		// The plan is this call's answer, not the cycle's: a call that loses the
+		// phase CAS below (every mutator over the trigger beside a concurrent
+		// middle reaches here) must leave the running cycle's kind alone, so
+		// vgc_minor_this_cycle is written only after the CAS is won.
+		minor = vgc_minor_plan(promote)
+		if !promote && !minor && (vgc_cm_mode == 1
 			|| (vgc_cm_mode == 2 && vgc_cm_backoff == 0 && vgc_mark_last_work_ns >= vgc_cm_min_ns
 			&& vgc_mark_last_work_ns >= 2 * vgc_root_last_ns && vgc_cm_born_fits())) {
 			vgc_gc_start_concurrent()
@@ -121,6 +126,7 @@ fn vgc_gc_start() {
 		return
 	}
 	$if vgc_concurrent ? {
+		vgc_minor_this_cycle = minor // this cycle's kind, now that it is this thread's cycle
 		// one backoff cycle spent (after the CAS: every thread that reached the
 		// pacer calls in for the same cycle). cx-home/v#56: a minor cycle
 		// spends one too — under the young regime a back-off of 8, 16, 32, 64
