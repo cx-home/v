@@ -3,7 +3,7 @@
 // carry builtin's table of chunk tables `vgc_wb_cards` (vgc_chunk_cards in
 // thirdparty/vgc/vgc_platform.h), the page shift as builtin's vgc_page_shift,
 // the chunk shift and count as the address map's (VGC_ADDR_SHIFT,
-// VGC_ADDR_MAP_SIZE), and vgc_wb_gate reads the card before it calls
+// VGC_ADDR_MAP_SIZE), and the gate reads the card before it calls
 // vgc_wb_store. The program of
 // vgc_wb_epoch_test.v builds and runs as before.
 import os
@@ -27,8 +27,11 @@ fn test_the_gate_reads_the_card_before_the_call() {
 	assert c.contains('#define VGC_WB_PAGE_SHIFT ${n}\n'), 'the gate\'s page shift is not vgc_page_shift (${n})'
 	gate := c.split_into_lines().filter(it.starts_with('static inline void vgc_wb_gate(void* p)'))
 	assert gate.len == 1, 'the gate is not emitted once'
-	g := gate[0]
-	assert g.contains('(size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len'), 'the range test is gone:\n${g}'
+	assert gate[0].contains('(size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len'), 'the range test is gone:\n${gate[0]}'
+	// lever 14: the card read runs out of line, in vgc_wb_gate_card
+	card_fn := c.split_into_lines().filter(it.starts_with('static VGC_WB_NOINLINE void vgc_wb_gate_card(void* p)'))
+	assert card_fn.len == 1, 'vgc_wb_gate_card is not emitted once'
+	g := card_fn[0]
 	card := g.index('t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return;') or {
 		-1
 	}

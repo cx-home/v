@@ -105,7 +105,18 @@ void vgc_wb_store(void* obj);
     #define VGC_WB_UNLIKELY(x) __builtin_expect(x, 0)
   #endif
 #endif
-static inline void vgc_native_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { unsigned char** t = (unsigned char**)vgc_wb_cards; size_t ci = (size_t)(uintptr_t)p >> VGC_WB_CHUNK_SHIFT; if (t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 && t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return; vgc_wb_store(p); } }
+// cx-home/v#56 lever 14: the card read runs out of line (vgc_wb_gate_card), as in
+// cgen's vgc_wb_gate: the gate every store carries inline is the two range tests
+// and one call.
+#ifndef VGC_WB_NOINLINE
+  #if defined(_MSC_VER) && !defined(__clang__)
+    #define VGC_WB_NOINLINE __declspec(noinline)
+  #else
+    #define VGC_WB_NOINLINE __attribute__((noinline, unused))
+  #endif
+#endif
+static VGC_WB_NOINLINE void vgc_wb_gate_card(void* p) { unsigned char** t = (unsigned char**)vgc_wb_cards; size_t ci = (size_t)(uintptr_t)p >> VGC_WB_CHUNK_SHIFT; if (t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 && t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return; vgc_wb_store(p); }
+static inline void vgc_native_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_gate_card(p); }
 
 // 4. blocking regions: gc_safe_region_enter/exit under fixed exported names (a
 // V pub fn is static in an object-file build of the runtime, _VOBJECTFILE).

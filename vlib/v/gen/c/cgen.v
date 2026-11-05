@@ -1350,7 +1350,17 @@ pub fn (mut g Gen) init() {
 			g.cheaders.writeln('#define VGC_WB_CHUNK_SHIFT 26')
 			g.cheaders.writeln('#define VGC_WB_CHUNKS 65536')
 			g.cheaders.writeln('#define VGC_WB_CHUNK_MASK 8191')
-			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) { unsigned char** t = (unsigned char**)vgc_wb_cards; size_t ci = (size_t)(uintptr_t)p >> VGC_WB_CHUNK_SHIFT; if (t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 && t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return; vgc_wb_store(p); } }')
+			// cx-home/v#56 lever 14: the card read runs out of line, in
+			// vgc_wb_gate_card, and the gate every store site carries inline is the
+			// two range tests and one call. A store reaches the card read only when
+			// it lands in the gate's range (a concurrent cycle's middle, the young
+			// regime); inline at every site the read grew cx's text by ~0.6 MB
+			// (vgc_wb_gate_size_test.v). VGC_WB_NOINLINE keeps one copy per unit.
+			g.cheaders.writeln('#ifndef VGC_WB_NOINLINE\n#if defined(_MSC_VER) && !defined(__clang__)\n#define VGC_WB_NOINLINE __declspec(noinline)\n#else\n#define VGC_WB_NOINLINE __attribute__((noinline, unused))\n#endif\n#endif')
+			g.cheaders.writeln('static VGC_WB_NOINLINE void vgc_wb_gate_card(void* p) { unsigned char** t = (unsigned char**)vgc_wb_cards; size_t ci = (size_t)(uintptr_t)p >> VGC_WB_CHUNK_SHIFT; if (t != 0 && ci < VGC_WB_CHUNKS && t[ci] != 0 && t[ci][((size_t)(uintptr_t)p >> VGC_WB_PAGE_SHIFT) & VGC_WB_CHUNK_MASK] != 0) return; vgc_wb_store(p); }')
+			g.cheaders.writeln('static inline void vgc_wb_gate(void* p) { if ((size_t)(uintptr_t)p - vgc_young_lo < vgc_young_len) return; if (VGC_WB_UNLIKELY((size_t)(uintptr_t)p - vgc_wb_lo < vgc_wb_len)) vgc_wb_gate_card(p); }')
+			// lever 14: the second gate (assign_stmt, after a stop) is a call
+			g.cheaders.writeln('static VGC_WB_NOINLINE void vgc_wb_gate_again(void* p) { vgc_wb_gate(p); }')
 			// cx-home/v#56 lever 3: a store statement's second gate is made only when
 			// a stop ran between its first gate and its store (assign_stmt): the stop
 			// count vgc_wb_epoch read before the first gate, compared after the store.

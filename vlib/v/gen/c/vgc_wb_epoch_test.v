@@ -50,7 +50,7 @@ fn test_the_second_gate_is_made_only_after_a_stop() {
 	assert read < first, 'the count is read after the first gate:\n${link}'
 	assert first < store, 'the first gate follows the store:\n${link}'
 	assert store < moved, 'the test precedes the store:\n${link}'
-	assert lines[moved + 1].starts_with('vgc_wb_gate('), 'no second gate under the test:\n${link}'
+	assert lines[moved + 1].starts_with('vgc_wb_gate_again('), 'no second gate under the test:\n${link}'
 	// the same name is read and tested
 	name := lines[read].all_before(' = vgc_wb_epoch_now').all_after_last(' ')
 	assert lines[moved] == 'if (vgc_wb_epoch_moved(${name})) {', 'the test reads another count:\n${link}'

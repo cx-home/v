@@ -832,10 +832,16 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 	if epoch != '' {
 		g.writeln('if (vgc_wb_epoch_moved(${epoch})) {')
 		g.indent++
+		// cx-home/v#56 lever 14: the second gate is a call (vgc_wb_gate_again), not
+		// another inline copy at every store site — it runs only after a stop
+		pos2 := g.out.len
 		for i, lx in node_.left {
 			lt := if i < node_.left_types.len { node_.left_types[i] } else { ast.void_type }
 			g.gen_cm_write_barrier(lx, lt)
 		}
+		again := g.out.cut_to(pos2)
+		g.write(again.replace('vgc_wb_gate((voidptr)', 'vgc_wb_gate_again((voidptr)'))
+		g.empty_line = again.ends_with('\n') // the cut text ends its own lines
 		g.indent--
 		g.writeln('}')
 	}
