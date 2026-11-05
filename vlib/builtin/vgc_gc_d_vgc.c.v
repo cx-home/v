@@ -3535,9 +3535,10 @@ fn vgc_drain_mark_work(w int) {
 // are both empty counts itself idle and spins (yielding the core after a
 // while); the cycle's grey set is empty when every marker is idle (new work
 // comes only from a marker that is not), and a marker seeing the shared list
-// refilled leaves the idle count to take it. A marker holding a half-full
-// buffer while others idle and the shared list is empty publishes half of it
-// (Go's gcWork.balance), so the tail of a cycle is not one marker's walk.
+// refilled leaves the idle count to take it. A marker holding more than
+// vgc_work_balance_min entries while others idle and the shared list is empty
+// publishes the older half (Go's gcWork.balance; cx-home/v#56 lever 13), so
+// neither a tree's short grey stack nor the tail of a cycle is one marker's walk.
 fn vgc_drain_mark_parallel(w int, n int) {
 	for {
 		obj_addr := vgc_work_get(w)
@@ -3703,11 +3704,24 @@ fn vgc_work_get(w int) usize {
 	}
 }
 
-// Move half of the marker's local buffer (when it holds at least 64 entries)
-// into a buffer published on the shared list, for the idle markers.
+// Move half of the marker's local buffer (when it holds more than
+// vgc_work_balance_min entries) into a buffer published on the shared list,
+// for the idle markers — the OLDER half, the bottom of the stack.
+// cx-home/v#56 lever 13: a depth-first mark of a tree holds one pending child
+// a level, so its grey stack is about the tree's depth and never fills a
+// 256-entry buffer: the balance is the only way the other markers get any of
+// it. It shared only from 64 entries, and handed out the newest half: a
+// binary tree of 19 levels was walked by one marker while the others spun
+// (vgc_mark_balance_test: mshare 100 at two markers, 99 at four), and
+// binary-trees 18 marked its 32 MB at the one-marker time, 12–13 ms against
+// the old collector's 6.3–9.2. Go's gcWork.balance shares from more than four
+// (mgcwork.go); the older half is the work pushed first — in a depth-first
+// walk the siblings nearest the root, the largest subtrees — so an idle
+// marker takes a large share in one hand-off and the busy one keeps the
+// small, recent entries it is about to pop.
 fn vgc_work_balance(w int) {
 	mut buf := unsafe { &VGC_WorkBuf(voidptr(vgc_mark_local[w])) }
-	if buf == unsafe { nil } || buf.nobj < 64 {
+	if buf == unsafe { nil } || buf.nobj <= vgc_work_balance_min {
 		return
 	}
 	C.vgc_mutex_lock(&vgc_heap.work_lock)
@@ -3726,7 +3740,10 @@ fn vgc_work_balance(w int) {
 	half := buf.nobj / 2
 	unsafe {
 		for i in 0 .. half {
-			nb.obj[i] = buf.obj[buf.nobj - half + i]
+			nb.obj[i] = buf.obj[i]
+		}
+		for i in half .. buf.nobj {
+			buf.obj[i - half] = buf.obj[i]
 		}
 		nb.nobj = half
 		buf.nobj -= half

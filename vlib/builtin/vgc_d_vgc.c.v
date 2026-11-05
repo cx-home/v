@@ -1688,6 +1688,9 @@ __global vgc_rescan_sum = [vgc_walk_sum_len]u64{}
 // objects, percent; 0 when the mark ran on one marker); cleared at each
 // emit
 __global vgc_mark_objs = [vgc_walk_sum_len]u64{}
+// cx-home/v#56 lever 13: a marker shares half its grey buffer with the idle
+// markers once it holds more than this many entries (vgc_work_balance)
+const vgc_work_balance_min = 4
 // the next inuse_bits word to claim (reset by the collector before each walk)
 __global vgc_walk_sum = [vgc_walk_sum_len]u64{}
 // per-walker marked-byte sums, one per 128-byte stride (vgc_walk_sum[w * 16])
