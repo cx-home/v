@@ -836,3 +836,66 @@ pub fn vgc_pace_answer_selftest() u32 {
 	}
 	return 0
 }
+
+// vgc_minor_flag_selftest (cx-home/v#56 step 2): a cycle's kind belongs to the thread whose phase
+// CAS started it. Every mutator over the trigger calls vgc_gc_start — beside a concurrent cycle's
+// middle that is every allocating thread on every amortized check (heap_live stays over next_gc
+// until the cycle ends) — and a call that loses the CAS must not touch the running cycle's
+// vgc_minor_this_cycle. Built here: a full cycle in flight (phase mark, the flag false, as
+// vgc_gc_start_concurrent leaves it after its CAS) and the young regime armed so that a plan
+// made now answers minor; a losing call reads its plan and returns. 0 = pass, else the failed
+// check. Driven by bench/parallel-alloc/vgc_minor_flag_test.v.
+pub fn vgc_minor_flag_selftest() u32 {
+	$if vgc_concurrent ? {
+		s_phase := C.vgc_atomic_load_u32(&vgc_heap.gc_phase)
+		s_flag := vgc_minor_this_cycle
+		s_young := vgc_young_on
+		s_minors := vgc_young_minors
+		s_count := vgc_minor_count
+		s_fm := vgc_full_marked
+		s_fg := vgc_full_goal
+		s_ff := C.vgc_atomic_load_u32(&vgc_force_full)
+		s_pm := vgc_perm_mode
+		s_pr := vgc_perm_request
+		mut rc := u32(0)
+		if s_phase != vgc_phase_off {
+			return 9
+		}
+		// the full cycle in flight: its CAS is taken and it is not minor
+		C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_mark)
+		vgc_minor_this_cycle = false
+		// the young regime armed after a full: a plan made now answers minor
+		vgc_young_on = 1
+		vgc_young_minors = 8
+		vgc_minor_count = 0
+		vgc_full_marked = 0
+		vgc_full_goal = 0
+		C.vgc_atomic_store_u32(&vgc_force_full, 0)
+		vgc_perm_mode = 0
+		vgc_perm_request = false
+		if !vgc_minor_plan(false) {
+			rc = 1
+		} else {
+			// a mutator over the trigger beside the cycle: its CAS fails
+			vgc_gc_start()
+			if C.vgc_atomic_load_u32(&vgc_heap.gc_phase) != vgc_phase_mark {
+				rc = 2
+			} else if vgc_minor_this_cycle {
+				rc = 3
+			}
+		}
+		vgc_perm_request = s_pr
+		vgc_perm_mode = s_pm
+		C.vgc_atomic_store_u32(&vgc_force_full, s_ff)
+		vgc_full_goal = s_fg
+		vgc_full_marked = s_fm
+		vgc_minor_count = s_count
+		vgc_young_minors = s_minors
+		vgc_young_on = s_young
+		vgc_minor_this_cycle = s_flag
+		C.vgc_atomic_store_u32(&vgc_heap.gc_phase, s_phase)
+		return rc
+	} $else {
+		return 0
+	}
+}
