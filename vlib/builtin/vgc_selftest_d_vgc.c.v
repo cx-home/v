@@ -837,6 +837,35 @@ pub fn vgc_pace_answer_selftest() u32 {
 	return 0
 }
 
+// vgc_pace_startup_prev_selftest (cx-home/v#56, csv-aggregate's peak): the first collection is the
+// program's start-up (vgc_pace_one_thread answers one there, whatever its counts), so its 64 KB
+// count is no 'stop before' for the second collection to agree with. csv-aggregate 100 MB (cx
+// interpreted) read 2 of 2 live threads over 64 KB at the start-up stop and 2 of 3 at the next:
+// the two stops 'agreed', gc 1 paced as several (goal 4 MB, headroom 4,096 KB against the
+// one-thread 256 KB floor) and the run ended at 2 collections with peak RSS 15.8 MB vs Python
+// 3.12's 14.1 (VGC_GCTRACE=2 pace lines). Two readings after start-up still make several (a batch
+// of k workers), and the ~1 MB stamp at two or more still does at any cycle past start-up.
+// 0 = pass, else the failed check. Driven by bench/parallel-alloc/vgc_pace_startup_prev_test.v.
+pub fn vgc_pace_startup_prev_selftest() u32 {
+	// the stop after start-up, 2 of 3 over 64 KB now and 2 of 2 at start-up: one
+	if !vgc_pace_one_thread(0, 2, 2, 3, true, 1) || !vgc_pace_one_thread(1, 2, 2, 2, true, 1) {
+		return 1
+	}
+	// two readings past start-up (cycles 1 and 2) agree: several, as a batch reads
+	if vgc_pace_one_thread(0, 2, 2, 3, true, 2) || vgc_pace_one_thread(0, 16, 16, 18, true, 2) {
+		return 2
+	}
+	// the stamp at two or more past start-up: several at the stop after start-up too
+	if vgc_pace_one_thread(2, 2, 2, 3, true, 1) {
+		return 3
+	}
+	// the stop after start-up keeps the one-thread answer start-up gave when only it reads several
+	if !vgc_pace_one_thread(0, 2, 0, 3, true, 1) {
+		return 4
+	}
+	return 0
+}
+
 // vgc_minor_flag_selftest (cx-home/v#56 step 2): a cycle's kind belongs to the thread whose phase
 // CAS started it. Every mutator over the trigger calls vgc_gc_start — beside a concurrent cycle's
 // middle that is every allocating thread on every amortized check (heap_live stays over next_gc
