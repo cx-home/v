@@ -866,6 +866,43 @@ pub fn vgc_pace_startup_prev_selftest() u32 {
 	return 0
 }
 
+// vgc_pace_waiting_selftest (cx-platform-store#17, burst_put's peak RSS): several allocating threads in a
+// process that is waiting, not busy, pace as one thread while the marked set is under the live floor.
+// burst_put.cx (16 writers x 10,000 put-docs at full durability, cx interpreted) used 1.82 s of CPU over
+// 3.93 s of wall (0.46 cores for 18 threads: the writers wait on fsync) and paced every cycle past
+// start-up as several at GOGC=100 (marked 14-15 MB, goal 28-31 MB, peak RSS 77 MB vs Python 3.12's
+// 30.0); held to a 24 MB heap by VGC_MEMLIMIT_MB it read 59.0 MB at the same writes/s and p99. A busy
+// process (a batch, a server under load: a core or more) keeps GOGC=100 (cx-home/v#62).
+// 0 = pass, else the failed check. Driven by bench/parallel-alloc/vgc_pace_waiting_test.v.
+pub fn vgc_pace_waiting_selftest() u32 {
+	mb := u64(1024 * 1024)
+	ms := u64(1000000)
+	// several, 14 MB marked, 0.46 cores over the cycle: waiting, one
+	if !vgc_pace_one_or_waiting(false, 14 * mb, 460 * ms, 1000 * ms, 50) {
+		return 1
+	}
+	// several, 0.9 cores and 4 cores: busy, several
+	if vgc_pace_one_or_waiting(false, 14 * mb, 900 * ms, 1000 * ms, 50)
+		|| vgc_pace_one_or_waiting(false, 14 * mb, 4000 * ms, 1000 * ms, 50) {
+		return 2
+	}
+	// waiting past the live floor (32 MB): several, Go's pacing
+	if vgc_pace_one_or_waiting(false, 64 * mb, 100 * ms, 1000 * ms, 50) {
+		return 3
+	}
+	// off (VGC_WAIT_PCT=0), no CPU clock, no wall reading yet: the counts' answer
+	if vgc_pace_one_or_waiting(false, 14 * mb, 100 * ms, 1000 * ms, 0)
+		|| vgc_pace_one_or_waiting(false, 14 * mb, 0, 1000 * ms, 50)
+		|| vgc_pace_one_or_waiting(false, 14 * mb, 100 * ms, 0, 50) {
+		return 4
+	}
+	// one thread by the counts stays one, busy or not
+	if !vgc_pace_one_or_waiting(true, 14 * mb, 4000 * ms, 1000 * ms, 50) {
+		return 5
+	}
+	return 0
+}
+
 // vgc_minor_flag_selftest (cx-home/v#56 step 2): a cycle's kind belongs to the thread whose phase
 // CAS started it. Every mutator over the trigger calls vgc_gc_start — beside a concurrent cycle's
 // middle that is every allocating thread on every amortized check (heap_live stays over next_gc

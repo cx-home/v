@@ -989,6 +989,19 @@ static inline uint64_t vgc_thread_cpu_ns(void) {
 }
 #endif
 
+// cx-platform-store#17: the whole process's CPU time (every thread, the collector's too), the
+// pacer's reading of whether the program is busy or waiting (vgc_pace_one_or_waiting). 0 where
+// the clock is missing (Windows): the pacer then reads every program as busy, as before.
+#ifdef _WIN32
+static inline uint64_t vgc_process_cpu_ns(void) { return 0; }
+#else
+static inline uint64_t vgc_process_cpu_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
 // ============================================================
 // Simple mutex (adaptive spinlock with backoff)
 // ============================================================
@@ -2596,13 +2609,14 @@ static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
 // formatter takes libc's locale lock, which a stopped mutator may hold (inet_ntop4's snprintf
 // in an HTTP handler), and the stop then waits on it for good.
 static void vgc_gctrace_pace(uint64_t cycle, uint64_t nt, uint64_t acct, uint64_t prev,
-                             uint64_t live, uint64_t one) {
+                             uint64_t live, uint64_t one, uint64_t cpu_pm) {
     vgc__ws("[gc "); vgc__wdec(cycle);
     vgc__ws("] pace nt="); vgc__wdec(nt);
     vgc__ws(" acct="); vgc__wdec(acct);
     vgc__ws(" prev="); vgc__wdec(prev);
     vgc__ws(" live="); vgc__wdec(live);
     vgc__ws(" one="); vgc__wdec(one);
+    vgc__ws(" cpu_pm="); vgc__wdec(cpu_pm);
     vgc__ws("\n");
 }
 // VGC_GCTRACE=3 carve line (cx-home/v#58): a request the pool did not serve.

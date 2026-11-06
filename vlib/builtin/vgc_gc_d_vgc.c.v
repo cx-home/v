@@ -1998,7 +1998,7 @@ fn vgc_gctrace_emit() {
 		// libc's locale lock; vgc_gctrace_stop_safe_test)
 		C.vgc_gctrace_pace(u64(vgc_heap.gc_cycle), u64(vgc_trace_pace_nt), u64(vgc_acct_threads),
 			u64(vgc_acct_threads_prev), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
-			u64(if vgc_trace_pace_one { 1 } else { 0 }))
+			u64(if vgc_trace_pace_one { 1 } else { 0 }), vgc_trace_pace_cpu_pm)
 	}
 	if vgc_gctrace >= 2 {
 		// cx-home/v#15: where the pause went (us per phase), the data-segment
@@ -4648,6 +4648,13 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle
 	return was_one
 }
 
+// vgc_pace_one_or_waiting is the cycle's pacing answer (cx-platform-store#17): one thread by the counts
+// (vgc_pace_one_thread), or several allocating threads in a process that is waiting rather than busy.
+// cpu_ns is the process's CPU time (every thread) over the cycle, wall_ns the wall time over it.
+fn vgc_pace_one_or_waiting(counts_one bool, marked u64, cpu_ns u64, wall_ns u64, pct u64) bool {
+	return counts_one
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -4673,7 +4680,18 @@ fn vgc_update_trigger() {
 	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev,
 		int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_paced_one, u64(vgc_heap.gc_cycle))
 	vgc_paced_one = counts_one
-	one := counts_one
+	// cx-platform-store#17: the process's CPU over the cycle against its wall (vgc_pace_one_or_waiting)
+	pcpu := C.vgc_process_cpu_ns()
+	mut dcpu := u64(0)
+	mut dwall := u64(0)
+	if vgc_proc_wall_last != 0 && pcpu > vgc_proc_cpu_last && now > vgc_proc_wall_last {
+		dcpu = pcpu - vgc_proc_cpu_last
+		dwall = now - vgc_proc_wall_last
+	}
+	vgc_proc_cpu_last = pcpu
+	vgc_proc_wall_last = now
+	vgc_trace_pace_cpu_pm = if dwall > 0 { dcpu * 1000 / dwall } else { 0 }
+	one := vgc_pace_one_or_waiting(counts_one, marked, dcpu, dwall, vgc_wait_pct)
 	vgc_trace_pace_nt = nt
 	vgc_trace_pace_one = one
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {

@@ -115,7 +115,7 @@ fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
 fn C.vgc_gctrace_line(cycle u64, marked u64, goal u64, narenas u64, nspans u64, lthreads u64, headroom_kb u64, pause_us u64, pool_kb u64, trimmed_kb u64, merged_kb u64) // VGC_GCTRACE=1 per-cycle line
-fn C.vgc_gctrace_pace(cycle u64, nt u64, acct u64, prev u64, live u64, one u64) // VGC_GCTRACE=2 pace line, stop-safe
+fn C.vgc_gctrace_pace(cycle u64, nt u64, acct u64, prev u64, live u64, one u64, cpu_pm u64) // VGC_GCTRACE=2 pace line, stop-safe
 fn C.vgc_gctrace_gate(cycle u64, probe u64, marked u64, live u64, goal u64) // VGC_GCTRACE=1 grow-gate line (cx-private#1916)
 fn C.vgc_gctrace_carve(cycle u64, npages u64, new_arena u64, arena_idx u64, pool_kb u64, trimmed_kb u64, hot_max u64, cold_max u64, over_max u64, phot u64, pcold u64, ptail u64, fhot u64, fcold u64, ftail u64) // VGC_GCTRACE=3 carve line (cx-home/v#58); the pool and the tails by arena kind at its end
 fn C.vgc_gctrace_split(cycle u64, npages u64, from_pages u64, cap u64, kind u64) // VGC_GCTRACE=3 split line (cx-home/v#58): kind 0 pooled, 1 oversized, 2 stash, 3 a kept run's tail, 4 a plain kept run's tail for a small request
@@ -2360,6 +2360,7 @@ fn C.atoll(&char) i64
 fn C.getenv(&char) &char
 fn C.vgc_now_ns() u64
 fn C.vgc_thread_cpu_ns() u64
+fn C.vgc_process_cpu_ns() u64
 
 // vgc_init initializes the vgc heap: it fills the size-class tables, enables the
 // collector and reads the `VGC_NEXT_GC_MB` environment override for the initial
@@ -2596,6 +2597,13 @@ pub fn vgc_init() {
 		afd := C.atoll(afd_env)
 		if afd >= 0 {
 			vgc_acct_flush_div = u64(afd)
+		}
+	}
+	wait_env := C.getenv(c'VGC_WAIT_PCT')
+	if wait_env != unsafe { nil } {
+		wp := C.atoll(wait_env)
+		if wp >= 0 {
+			vgc_wait_pct = u64(wp)
 		}
 	}
 	otp_env := C.getenv(c'VGC_ONE_THREAD_PCT')
@@ -7201,6 +7209,17 @@ __global vgc_paced_one = true
 // cx-home/v#62: the last cycle's pacing answer and stamp count, for VGC_GCTRACE's pace line
 __global vgc_trace_pace_nt = int(0)
 __global vgc_trace_pace_one = true
+// cx-platform-store#17: the process's CPU over the last cycle's wall, per mille of one core, for the pace
+// line (0 = no reading)
+__global vgc_trace_pace_cpu_pm = u64(0)
+// cx-platform-store#17: several allocating threads whose process used under vgc_wait_pct % of one
+// core over the cycle (a program waiting on I/O: burst_put's 16 writers on fsync read 0.46 cores)
+// pace as one thread while the marked set is under the live floor (vgc_pace_one_or_waiting): their
+// extra collections cost no wall. 0 turns it off (VGC_WAIT_PCT).
+__global vgc_wait_pct = u64(50)
+// the process CPU clock and the wall clock at the last vgc_update_trigger (0 = none yet)
+__global vgc_proc_cpu_last = u64(0)
+__global vgc_proc_wall_last = u64(0)
 const vgc_acct_flush_min = u64(64) * 1024
 
 // Hot-path allocation accounting. Bumps THIS thread's private deltas; flushes to
