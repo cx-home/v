@@ -7090,6 +7090,9 @@ fn vgc_force_collect() {
 			C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo, vgc_cache(ci).stack_limit_hi)
 			C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
 				vgc_cache(ci).stack_base)
+			// cx-home/v#56: and the collection's own frames leave no heap address
+			// for the next calls at that depth (vgc_collection_residue_test)
+			C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo, vgc_cache(ci).stack_limit_hi)
 		}
 	} else {
 		vgc_gc_start()
@@ -7289,6 +7292,10 @@ fn vgc_maybe_gc() {
 						vgc_cache(ci).stack_limit_hi)
 					C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
 						vgc_cache(ci).stack_base)
+					// cx-home/v#56: the collection's own frames leave no heap address
+					// for the next calls at that depth (vgc_collection_residue_test)
+					C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo,
+						vgc_cache(ci).stack_limit_hi)
 				}
 			} else {
 				vgc_gc_start()
