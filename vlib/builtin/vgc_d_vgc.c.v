@@ -141,6 +141,7 @@ fn C.vgc_chunk_cards_table() voidptr
 fn C.vgc_addr_to_arena2(addr usize) int
 fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_touched_ranges(lo usize, hi usize, los &usize, his &usize, max int) int // cx-home/v#15
+fn C.vgc_stack_candidates(a usize, hi usize, alo usize, ahi usize, out &usize, cap int, next &usize) int // cx-home/v#56 lever 16
 fn C.vgc_addr_to_arena(addr usize) int
 
 // ============================================================

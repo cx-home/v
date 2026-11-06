@@ -928,3 +928,114 @@ pub fn vgc_minor_flag_selftest() u32 {
 		return 0
 	}
 }
+
+// vgc_stack_scan_selftest (cx-home/v#56 lever 16): the thread-stack scan reads every byte offset a
+// with a + 8 <= hi (cx-home/v#60) and shades each value in [vgc_arena_lo, vgc_arena_hi). Its byte loop
+// moves into vgc_stack_candidates (vgc_platform.h), which hands back up to cap candidate offsets a call
+// and where to go on: driven to the end of a range, it must answer exactly the offsets the byte loop
+// would, in address order, for every start and end offset (aligned or not) and every cap — the bounds
+// themselves (alo in, ahi out), a value whose last byte would lie past hi, and a run of random bytes.
+// 0 = pass, else the failed check. Driven by bench/parallel-alloc/vgc_stack_scan_test.v.
+fn vgc_sst_put(at usize, v usize) {
+	unsafe { C.memcpy(voidptr(at), &v, sizeof(usize)) }
+}
+
+// the offsets vgc_stack_candidates answers over [lo, hi), cap at a time: their count and an ordered hash
+fn vgc_sst_scan(lo usize, hi usize, alo usize, ahi usize, cap int) (int, u64) {
+	mut hits := [64]usize{}
+	mut n := 0
+	mut h := u64(0)
+	mut addr := lo
+	for addr + sizeof(usize) <= hi {
+		mut next := hi
+		k := C.vgc_stack_candidates(addr, hi, alo, ahi, &hits[0], cap, &next)
+		if k < 0 || k > cap || (k == 0 && next <= addr) {
+			return -1, h
+		}
+		for i in 0 .. k {
+			n++
+			h = h * 1000003 + u64(hits[i] - lo) + 1
+		}
+		addr = next
+	}
+	return n, h
+}
+
+// the byte loop vgc_scan_stack_range ran before lever 16, as the reference
+fn vgc_sst_ref(lo usize, hi usize, alo usize, ahi usize) (int, u64) {
+	mut n := 0
+	mut h := u64(0)
+	mut addr := lo
+	for addr + sizeof(usize) <= hi {
+		mut val := usize(0)
+		unsafe { C.memcpy(&val, voidptr(addr), sizeof(usize)) }
+		if val >= alo && val < ahi {
+			n++
+			h = h * 1000003 + u64(addr - lo) + 1
+		}
+		addr++
+	}
+	return n, h
+}
+
+pub fn vgc_stack_scan_selftest() u32 {
+	alo := usize(0x2000_0000)
+	ahi := usize(0x6000_0000)
+	mut buf := [168]u8{}
+	base := unsafe { usize(voidptr(&buf[0])) }
+	// a run of random bytes, then the planted values over it
+	mut x := u64(0x9e3779b97f4a7c15)
+	for i in 0 .. 168 {
+		x = x * 6364136223846793005 + 1442695040888963407
+		buf[i] = u8(x >> 56)
+	}
+	vgc_sst_put(base + 0, alo) // the low bound: in
+	vgc_sst_put(base + 13, ahi - 1) // the last address: in
+	vgc_sst_put(base + 30, ahi) // the high bound: out
+	vgc_sst_put(base + 41, alo - 1) // under the low bound: out
+	vgc_sst_put(base + 57, alo + 0x1234)
+	vgc_sst_put(base + 77, alo + 0x77)
+	vgc_sst_put(base + 99, ahi - 0x99)
+	vgc_sst_put(base + 120, alo + 0x120)
+	vgc_sst_put(base + 160, alo + 8) // the last offset of the whole range
+	// check 1: the whole range, as the byte loop reads it
+	rn, rh := vgc_sst_ref(base, base + 168, alo, ahi)
+	cn, ch := vgc_sst_scan(base, base + 168, alo, ahi, 64)
+	if rn < 7 || cn != rn || ch != rh {
+		return 1
+	}
+	// check 2: every start and end offset, aligned or not, and a cap of 1, 3 and 64
+	for lo_off in 0 .. 17 {
+		for hi_off in lo_off .. 169 {
+			lo := base + usize(lo_off)
+			hi := base + usize(hi_off)
+			n0, h0 := vgc_sst_ref(lo, hi, alo, ahi)
+			for cap in [1, 3, 64]! {
+				n1, h1 := vgc_sst_scan(lo, hi, alo, ahi, cap)
+				if n1 != n0 || h1 != h0 {
+					return 2
+				}
+			}
+		}
+	}
+	// check 3: the bounds one word at a time — alo and ahi - 1 in, ahi and alo - 1 out, and a value
+	// whose last byte lies past hi is not read
+	mut hits := [64]usize{}
+	mut next := usize(0)
+	if C.vgc_stack_candidates(base + 0, base + 8, alo, ahi, &hits[0], 64, &next) != 1 || hits[0] != base {
+		return 3
+	}
+	if C.vgc_stack_candidates(base + 13, base + 21, alo, ahi, &hits[0], 64, &next) != 1
+		|| hits[0] != base + 13 {
+		return 3
+	}
+	if C.vgc_stack_candidates(base + 30, base + 38, alo, ahi, &hits[0], 64, &next) != 0
+		|| C.vgc_stack_candidates(base + 41, base + 49, alo, ahi, &hits[0], 64, &next) != 0 {
+		return 3
+	}
+	if C.vgc_stack_candidates(base + 160, base + 167, alo, ahi, &hits[0], 64, &next) != 0
+		|| next != base + 167 {
+		return 3
+	}
+	return 0
+}

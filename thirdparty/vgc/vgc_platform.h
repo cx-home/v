@@ -3126,4 +3126,13 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
 }
 #endif
 
+// cx-home/v#56 lever 16: vgc_stack_candidates — the thread-stack scan's byte loop (stub until the
+// fix: it reads nothing). vgc_stack_scan_selftest drives it.
+static inline int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t alo, uintptr_t ahi,
+                                       uintptr_t* out, int cap, uintptr_t* next) {
+    (void)a; (void)alo; (void)ahi; (void)out; (void)cap;
+    *next = hi;
+    return 0;
+}
+
 #endif // VGC_PLATFORM_H
