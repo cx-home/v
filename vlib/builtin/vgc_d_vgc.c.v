@@ -8207,6 +8207,11 @@ fn vgc_find_arena(addr usize) int {
 	}
 	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
+		// cx-private#1923: a chunk no arena registered holds no arena's byte (vgc_addr_chunk_unmapped):
+		// a stack word, a C struct, the gap between two arenas — no scan
+		if C.vgc_addr_chunk_unmapped(addr) != 0 {
+			return -1
+		}
 		arena_idx = -1
 		C.vgc_atomic_add_u64(&vgc_find_arena_scans, 1)
 		for i in 0 .. nar {
