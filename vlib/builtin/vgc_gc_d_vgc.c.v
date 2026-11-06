@@ -4652,7 +4652,15 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle
 // (vgc_pace_one_thread), or several allocating threads in a process that is waiting rather than busy.
 // cpu_ns is the process's CPU time (every thread) over the cycle, wall_ns the wall time over it.
 fn vgc_pace_one_or_waiting(counts_one bool, marked u64, cpu_ns u64, wall_ns u64, pct u64) bool {
-	return counts_one
+	if counts_one {
+		return true
+	}
+	// no reading (the first cycle, no process clock) or VGC_WAIT_PCT=0: the counts decide; past the live
+	// floor Go's pacing stands (vgc_one_thread_small)
+	if pct == 0 || cpu_ns == 0 || wall_ns == 0 || !vgc_one_thread_small(marked) {
+		return false
+	}
+	return cpu_ns * 100 < wall_ns * pct
 }
 
 fn vgc_update_trigger() {
