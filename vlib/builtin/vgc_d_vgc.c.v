@@ -139,6 +139,7 @@ fn C.vgc_chunk_base_at(n int) usize
 fn C.vgc_chunk_table_at(n int) &u8
 fn C.vgc_chunk_cards_table() voidptr
 fn C.vgc_addr_to_arena2(addr usize) int
+fn C.vgc_addr_chunk_unmapped(addr usize) int
 fn C.vgc_static_tables(los &usize, his &usize) int
 fn C.vgc_touched_ranges(lo usize, hi usize, los &usize, his &usize, max int) int // cx-home/v#15
 fn C.vgc_addr_to_arena(addr usize) int
@@ -8167,6 +8168,10 @@ fn vgc_memdup_noscan(src voidptr, n isize) voidptr {
 	return mem
 }
 
+// cx-private#1923: the linear scans vgc_find_arena ran (its fallback past both chunk entries), for
+// vgc_find_arena_selftest
+__global vgc_find_arena_scans = u64(0)
+
 // ============================================================
 // Span lookup (find which span owns an address) - O(1) via address map
 // ============================================================
@@ -8203,6 +8208,7 @@ fn vgc_find_arena(addr usize) int {
 	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		arena_idx = -1
+		C.vgc_atomic_add_u64(&vgc_find_arena_scans, 1)
 		for i in 0 .. nar {
 			a := unsafe { &vgc_heap.arenas[i] }
 			if addr >= a.base && addr < a.base + a.size {

@@ -1082,6 +1082,16 @@ static inline int vgc_addr_to_arena2(uintptr_t addr) {
     return v ? v - 1 : -1;
 }
 
+// cx-private#1923 (the write barrier's misses): whether no arena has ever registered addr's chunk —
+// every arena registers each chunk it spans before it is counted (the RELEASE store above, then
+// narenas), so a chunk no entry names holds no arena's byte and vgc_find_arena answers -1 without
+// its linear scan. Past the map (4 TB) the answer is no: the scan stays the only check there.
+static inline int vgc_addr_chunk_unmapped(uintptr_t addr) {
+    uintptr_t idx = addr >> VGC_ADDR_SHIFT;
+    if (idx >= VGC_ADDR_MAP_SIZE) return 0;
+    return vgc_atomic_load_u16(&vgc_addr_map[idx]) == 0;
+}
+
 // cx-home/v#56 lever 10: the card tables by chunk. A card is one byte per
 // 8 KB page (VGC_CHUNK_CARD_SHIFT = vgc_page_shift), and the cards of a 64 MB
 // chunk of the address space are one table of 8,192 bytes, found from an

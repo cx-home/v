@@ -866,6 +866,36 @@ pub fn vgc_pace_startup_prev_selftest() u32 {
 	return 0
 }
 
+// vgc_find_arena_selftest (cx-private#1923, the write barrier's misses): an address in a chunk no arena
+// ever registered — a stack word — is answered -1 at once, without vgc_find_arena's linear scan over
+// every arena. In a concurrent middle every pointer store passes the gate (vgc_wb_set: the whole
+// address space) and vgc_wb_store resolves its span, and every conservative root word inside the
+// heap's range resolves one: a store into a stack frame or a C struct missed both chunk entries and
+// scanned the arenas (misc-epic's sql-roundtrips k = 1 profile: 7.1 % in vgc_find_arena under the
+// barrier; csv-aggregate k = 1 6.9 %). 0 = pass, else the failed check. Driven by
+// bench/parallel-alloc/vgc_find_arena_miss_test.v.
+pub fn vgc_find_arena_selftest() u32 {
+	s := 'vgc_find_arena_selftest '.repeat(64)
+	if vgc_find_arena(usize(s.str)) < 0 {
+		return 1
+	}
+	mut buf := [4]u64{}
+	buf[0] = u64(s.len)
+	w := unsafe { usize(voidptr(&buf[0])) }
+	// the stack's chunk: no arena registers it
+	if C.vgc_addr_chunk_unmapped(w) == 0 {
+		return 4
+	}
+	scans := C.vgc_atomic_load_u64(&vgc_find_arena_scans)
+	if vgc_find_arena(w) != -1 || vgc_find_arena(w + 4096) != -1 {
+		return 2
+	}
+	if C.vgc_atomic_load_u64(&vgc_find_arena_scans) != scans {
+		return 3
+	}
+	return 0
+}
+
 // vgc_minor_flag_selftest (cx-home/v#56 step 2): a cycle's kind belongs to the thread whose phase
 // CAS started it. Every mutator over the trigger calls vgc_gc_start — beside a concurrent cycle's
 // middle that is every allocating thread on every amortized check (heap_live stays over next_gc
