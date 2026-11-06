@@ -4636,7 +4636,9 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle
 		return false
 	}
 	several := acct > 1 && acct * 2 >= live
-	several_prev := prev > 1 && prev * 2 >= live
+	// cx-home/v#56: the start-up collection (cycle 0) answers one whatever it counts, so its count is
+	// no stop before for cycle 1 to agree with (csv-aggregate: 2 of 2 at start-up, 2 of 3 at gc 1).
+	several_prev := cycle > 1 && prev > 1 && prev * 2 >= live
 	if !several && !several_prev {
 		return true
 	}
