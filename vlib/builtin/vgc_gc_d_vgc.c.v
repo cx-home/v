@@ -2717,18 +2717,25 @@ fn vgc_scan_range(lo usize, hi usize, w int) {
 // and clang spilled a ?cx.Node's bytes 1..23, which put its element pointer at
 // sp+0x407 (cx-platform-fabric#10). Heap objects and the data segment keep the
 // aligned scan: their pointer fields are typed, so the compiler aligns them.
-// The value is read with memcpy (an unaligned load, defined in C); a value
-// outside the arena bounds is dropped before the call, as vgc_shade's first
-// check would drop it.
+// A value outside the arena bounds is dropped before the shade, as vgc_shade's
+// first check would drop it. cx-home/v#56 lever 16: the byte loop is
+// vgc_stack_candidates (vgc_platform.h), a C function the PGO profile neither
+// instruments nor reads, which hands back up to 64 offsets whose word lies in
+// the arena bounds a call; each is read again (memcpy, an unaligned load) and
+// shaded here in address order, as the byte loop shaded them.
 fn vgc_scan_stack_range(lo usize, hi usize, w int) {
+	mut hits := [64]usize{}
 	mut addr := lo
 	for addr + sizeof(usize) <= hi {
-		mut val := usize(0)
-		unsafe { C.memcpy(&val, voidptr(addr), sizeof(usize)) }
-		if val >= vgc_arena_lo && val < vgc_arena_hi {
+		mut next := hi
+		n := C.vgc_stack_candidates(addr, hi, vgc_arena_lo, vgc_arena_hi, &hits[0], 64, &next)
+		for k in 0 .. n {
+			at := hits[k]
+			mut val := usize(0)
+			unsafe { C.memcpy(&val, voidptr(at), sizeof(usize)) }
 			$if vgc_rootdiag ? {
 				if vgc_rd_cat != 0 {
-					vgc_rd_shade_root(addr, val, w)
+					vgc_rd_shade_root(at, val, w)
 				} else {
 					vgc_shade(val, w)
 				}
@@ -2736,7 +2743,7 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 				vgc_shade(val, w)
 			}
 		}
-		addr++
+		addr = next
 	}
 }
 

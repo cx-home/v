@@ -3126,13 +3126,77 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
 }
 #endif
 
-// cx-home/v#56 lever 16: vgc_stack_candidates — the thread-stack scan's byte loop (stub until the
-// fix: it reads nothing). vgc_stack_scan_selftest drives it.
-static inline int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t alo, uintptr_t ahi,
-                                       uintptr_t* out, int cap, uintptr_t* next) {
-    (void)a; (void)alo; (void)ahi; (void)out; (void)cap;
+// cx-home/v#56 lever 16: vgc_stack_candidates — the thread-stack scan's byte loop (vgc_scan_stack_range
+// reads every byte offset a with a + sizeof(word) <= hi, cx-home/v#60). It answers up to cap offsets in
+// [a, hi) whose word lies in [alo, ahi), in address order, writes them to out, and sets *next to the
+// first offset it has not read (hi once the range is done); the caller shades each. Why a C function of
+// its own: the PGO profile recorded vgc_scan_stack_range with zero counts (pre-inlined into
+// vgc_mark_roots and vgc_roots_stacks_slice), and the shipped PGO build's stack phase read slower than
+// the -O2 build's on the same tree — fasta 1,000,000, 3,085 cycles: 50.0 vs 43.3 us a cycle at the head,
+// 53.5 vs 43.8 with lever 15, which changed nothing in the loop (measure/collector-epic-105). Kept out of
+// the profile (noinline, no_profile_instrument_function), both builds compile it alike. It reads eight
+// offsets a pass, one unsigned compare each ((v - alo) < (ahi - alo)), and branches once per pass.
+#if defined(_MSC_VER) && !defined(__clang__)
+  #define VGC_STACK_SCAN_FN __declspec(noinline) static
+#elif (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 7)) && !defined(__TINYC__)
+  #define VGC_STACK_SCAN_FN __attribute__((noinline, no_profile_instrument_function)) static
+#else
+  #define VGC_STACK_SCAN_FN __attribute__((noinline)) static
+#endif
+VGC_STACK_SCAN_FN int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t alo, uintptr_t ahi,
+                                           uintptr_t* out, int cap, uintptr_t* next) {
+    const uintptr_t W = sizeof(uintptr_t);
+    if (cap < 1) {
+        *next = a;
+        return 0;
+    }
+    if (hi < a || hi - a < W || ahi <= alo) {
+        *next = hi;
+        return 0;
+    }
+    const uintptr_t span = ahi - alo;
+    const uintptr_t last = hi - W; // the last offset whose word lies below hi
+    int n = 0;
+    while (a <= last && last - a >= 7) {
+        uintptr_t v0, v1, v2, v3, v4, v5, v6, v7;
+        memcpy(&v0, (const void*)(a + 0), W);
+        memcpy(&v1, (const void*)(a + 1), W);
+        memcpy(&v2, (const void*)(a + 2), W);
+        memcpy(&v3, (const void*)(a + 3), W);
+        memcpy(&v4, (const void*)(a + 4), W);
+        memcpy(&v5, (const void*)(a + 5), W);
+        memcpy(&v6, (const void*)(a + 6), W);
+        memcpy(&v7, (const void*)(a + 7), W);
+        unsigned m = (unsigned)(v0 - alo < span) | (unsigned)(v1 - alo < span) << 1
+            | (unsigned)(v2 - alo < span) << 2 | (unsigned)(v3 - alo < span) << 3
+            | (unsigned)(v4 - alo < span) << 4 | (unsigned)(v5 - alo < span) << 5
+            | (unsigned)(v6 - alo < span) << 6 | (unsigned)(v7 - alo < span) << 7;
+        if (m != 0) {
+            for (unsigned k = 0; k < 8; k++) {
+                if ((m >> k) & 1u) {
+                    out[n++] = a + k;
+                    if (n == cap) {
+                        *next = a + k + 1;
+                        return n;
+                    }
+                }
+            }
+        }
+        a += 8;
+    }
+    for (; a <= last; a++) {
+        uintptr_t v;
+        memcpy(&v, (const void*)a, W);
+        if (v - alo < span) {
+            out[n++] = a;
+            if (n == cap) {
+                *next = a + 1;
+                return n;
+            }
+        }
+    }
     *next = hi;
-    return 0;
+    return n;
 }
 
 #endif // VGC_PLATFORM_H
