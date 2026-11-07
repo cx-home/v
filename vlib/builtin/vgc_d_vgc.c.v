@@ -3341,6 +3341,9 @@ __global vgc_arena_of_scans = u64(0)
 fn vgc_arena_of(addr usize) int {
 	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 	mut arena_idx := C.vgc_addr_to_arena(addr)
+	if arena_idx < 0 && (addr >> 26) < 65536 {
+		return -1 // a chunk no arena touches (see vgc_find_arena)
+	}
 	if arena_idx >= 0 && arena_idx < nar && addr >= vgc_heap.arenas[arena_idx].base
 		&& addr < vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		return arena_idx
@@ -8312,6 +8315,13 @@ fn vgc_find_arena(addr usize) int {
 	// + page maps it gates. A plain read here raced the locked writer (TSan).
 	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 	mut arena_idx := C.vgc_addr_to_arena(addr)
+	// cx-platform-store#55: a chunk with no first entry is a chunk no arena
+	// touches (vgc_addr_map_register fills the first entry of every chunk an
+	// arena covers) — the address is in no arena, no scan (the mark's
+	// non-pointer words between hundreds of arenas each scanned the table)
+	if arena_idx < 0 && (addr >> 26) < 65536 {
+		return -1
+	}
 	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		// the chunk's second arena (cx-home/v#15 lever 3: an arena straddles
