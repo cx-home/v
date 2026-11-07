@@ -3334,13 +3334,22 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 // (a lookup the address maps did not answer); read by vgc_arena_of_selftest.
 __global vgc_arena_of_scans = u64(0)
 
-// vgc_arena_of resolves the arena index owning `addr`, or -1. Same hint +
+// vgc_arena_of resolves the arena index owning `addr`, or -1. Same two hints +
 // linear-fallback discipline as vgc_find_span (the addr_map hint is 1 GB-coarse,
 // so older arenas sharing a chunk need the fallback). Slow-path only (pool
 // split/coalesce); arenas are never freed, so a resolved index stays valid.
 fn vgc_arena_of(addr usize) int {
 	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 	mut arena_idx := C.vgc_addr_to_arena(addr)
+	if arena_idx >= 0 && arena_idx < nar && addr >= vgc_heap.arenas[arena_idx].base
+		&& addr < vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
+		return arena_idx
+	}
+	// the chunk's second arena (cx-platform-store#55; vgc_find_arena's lever 3):
+	// each arena shares both of its chunks with a neighbour, and for its part of
+	// a chunk whose first entry names the neighbour every lookup scanned the
+	// table — O(arenas) per split and coalesce, under free_spans_lock
+	arena_idx = C.vgc_addr_to_arena2(addr)
 	if arena_idx >= 0 && arena_idx < nar && addr >= vgc_heap.arenas[arena_idx].base
 		&& addr < vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		return arena_idx
