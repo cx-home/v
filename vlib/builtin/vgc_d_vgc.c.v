@@ -3379,6 +3379,80 @@ fn vgc_arena_of(addr usize) int {
 __global vgc_pool_hot_bits = [129]u64{}
 __global vgc_pool_cold_bits = [129]u64{}
 
+// cx-platform-store#55: the pooled spans of each arena kind (cx-home/v#58: plain,
+// frames, small) on each sized list, hot and cold, and one bit per list while it
+// holds a span of the kind — so a refill asks only the lists holding its kind and
+// never walks a list to learn it holds none (vgc_pool_at, vgc_pool_best_fit,
+// vgc_pool_kept_tail). Kept by vgc_pool_push and vgc_pool_unlink (a pooled span's
+// size, decommit flag and arena never change while it is linked), under
+// free_spans_lock like the lists. Row (kind * 2 + cold): 8193 tallies, 129 words.
+__global vgc_pool_kind_tally = [49158]u32{}
+__global vgc_pool_kind_bits = [774]u64{}
+__global vgc_pool_over_kind = [3]u32{}
+
+@[inline]
+fn vgc_pool_kind_row(kind u8, cold bool) int {
+	return int(kind) * 2 + if cold { 1 } else { 0 }
+}
+
+// vgc_pool_kind_note adds d (+1 linked, -1 unlinked) to the tally of span's kind
+// on its list, and keeps the list's bit for that kind.
+fn vgc_pool_kind_note(span &VGC_Span, d int) {
+	kind := vgc_span_kind(span)
+	if kind > vgc_kind_small {
+		return
+	}
+	if span.npages > u32(vgc_max_pooled_pages) {
+		if d > 0 {
+			vgc_pool_over_kind[kind]++
+		} else if vgc_pool_over_kind[kind] > 0 {
+			vgc_pool_over_kind[kind]--
+		}
+		return
+	}
+	row := vgc_pool_kind_row(kind, span.decommitted)
+	n := int(span.npages)
+	ti := row * 8193 + n
+	bi := row * 129 + (n >> 6)
+	bit := u64(1) << u64(n & 63)
+	if d > 0 {
+		vgc_pool_kind_tally[ti]++
+		vgc_pool_kind_bits[bi] |= bit
+	} else if vgc_pool_kind_tally[ti] > 0 {
+		vgc_pool_kind_tally[ti]--
+		if vgc_pool_kind_tally[ti] == 0 {
+			vgc_pool_kind_bits[bi] &= ~bit
+		}
+	}
+}
+
+// vgc_pool_kind_has: list n (hot or cold) holds a span of the kind.
+@[inline]
+fn vgc_pool_kind_has(n u32, kind u8, cold bool) bool {
+	return vgc_pool_kind_tally[vgc_pool_kind_row(kind, cold) * 8193 + int(n)] > 0
+}
+
+// The smallest sized list of at least n pages holding a span of the kind (hot
+// or cold), within the pooled range; 0 = none. Under free_spans_lock.
+fn vgc_pool_first_at_least_kind(n u32, kind u8) u32 {
+	mut w := int(n >> 6)
+	mut bit := int(n & 63)
+	hr := vgc_pool_kind_row(kind, false) * 129
+	cr := vgc_pool_kind_row(kind, true) * 129
+	for w < 129 {
+		mut m := vgc_pool_kind_bits[hr + w] | vgc_pool_kind_bits[cr + w]
+		if bit > 0 {
+			m &= ~u64(0) << u64(bit)
+		}
+		if m != 0 {
+			return (u32(w) << 6) + u32(C.vgc_ctz64(m))
+		}
+		w++
+		bit = 0
+	}
+	return 0
+}
+
 // The smallest non-empty sized list (hot or cold) holding spans of at least n
 // pages, within the pooled range; 0 = none. Under free_spans_lock.
 fn vgc_pool_first_at_least(n u32) u32 {
@@ -3435,6 +3509,7 @@ fn vgc_pool_push(mut span VGC_Span) {
 			vgc_pool_hot_bits[span.npages >> 6] |= u64(1) << u64(span.npages & 63)
 		}
 	}
+	vgc_pool_kind_note(span, 1)
 }
 
 // vgc_pool_push_aged pools a span that INHERITS a trim clock older than now —
@@ -3550,6 +3625,7 @@ fn vgc_pool_push_aged(mut span VGC_Span, gen u32) {
 // vgc_pool_unlink removes a pooled span from whichever free list holds it.
 // Same locking contract as vgc_pool_push.
 fn vgc_pool_unlink(mut span VGC_Span) {
+	vgc_pool_kind_note(span, -1)
 	sz := u64(span.npages) * u64(vgc_page_size)
 	if span.decommitted {
 		vgc_heap.pool_trimmed_bytes -= sz
@@ -4101,8 +4177,15 @@ fn vgc_pool_first_of_kind(head &VGC_Span, kind u8) &VGC_Span {
 // vgc_pool_at answers a pooled span of n pages of the arena kind, hot first
 // (no recommit), then cold; nil when the lists hold none of that kind.
 fn vgc_pool_at(n u32, kind u8) &VGC_Span {
-	mut s := vgc_pool_first_of_kind(vgc_heap.free_spans[n], kind)
-	if s == unsafe { nil } {
+	mut s := &VGC_Span(unsafe { nil })
+	if kind > vgc_kind_small || n > u32(vgc_max_pooled_pages) {
+		return s
+	}
+	// cx-platform-store#55: a list holding no span of the kind is not walked
+	if vgc_pool_kind_has(n, kind, false) {
+		s = vgc_pool_first_of_kind(vgc_heap.free_spans[n], kind)
+	}
+	if s == unsafe { nil } && vgc_pool_kind_has(n, kind, true) {
 		s = vgc_pool_first_of_kind(vgc_heap.free_spans_cold[n], kind)
 	}
 	return s
@@ -4343,8 +4426,13 @@ fn vgc_get_free_span_locked(npages u32, cap u32, kind u8) (&VGC_Span, bool) {
 			return cand, cold
 		}
 	}
-	// Oversized list: first fit, split the tail back into circulation.
-	mut o := vgc_heap.free_oversized
+	// Oversized list: first fit, split the tail back into circulation (walked only
+	// while it holds a span of the kind, cx-platform-store#55).
+	mut o := if kind <= vgc_kind_small && vgc_pool_over_kind[kind] == 0 {
+		&VGC_Span(unsafe { nil })
+	} else {
+		vgc_heap.free_oversized
+	}
 	for o != unsafe { nil } {
 		if o.npages >= npages && (cap == 0 || o.npages <= cap || !o.large_born)
 			&& vgc_span_kind(o) == kind {
@@ -4426,14 +4514,14 @@ fn vgc_pool_small_leaves_whole(kept &VGC_Span, npages u32) bool {
 // room (a merged run, or a frame beside a freed buffer), so one run's
 // slack is spent before a new arena is.
 fn vgc_pool_kept_tail(npages u32, kind u8) &VGC_Span {
-	mut n := vgc_pool_first_at_least(npages + 1)
+	mut n := vgc_pool_first_at_least_kind(npages + 1, kind)
 	for n != 0 && n <= u32(vgc_max_pooled_pages) {
 		cand := vgc_pool_at(n, kind)
 		if cand != unsafe { nil } && vgc_pool_keeps_whole(cand, n, npages, 0)
 			&& vgc_pool_small_leaves_whole(cand, npages) && !vgc_large_recurs_between(n - npages, n) {
 			return cand
 		}
-		n = vgc_pool_first_at_least(n + 1)
+		n = vgc_pool_first_at_least_kind(n + 1, kind)
 	}
 	return unsafe { nil }
 }
@@ -4446,7 +4534,7 @@ fn vgc_pool_kept_tail(npages u32, kind u8) &VGC_Span {
 // never answered: the tail first.
 fn vgc_pool_best_fit(npages u32, cap u32, kind u8) (&VGC_Span, &VGC_Span) {
 	mut kept := &VGC_Span(unsafe { nil })
-	mut n := vgc_pool_first_at_least(npages + 1)
+	mut n := vgc_pool_first_at_least_kind(npages + 1, kind)
 	for n != 0 && n <= u32(vgc_max_pooled_pages) {
 		cand := vgc_pool_at(n, kind)
 		if cand != unsafe { nil } {
@@ -4457,7 +4545,7 @@ fn vgc_pool_best_fit(npages u32, cap u32, kind u8) (&VGC_Span, &VGC_Span) {
 				kept = cand
 			}
 		}
-		n = vgc_pool_first_at_least(n + 1)
+		n = vgc_pool_first_at_least_kind(n + 1, kind)
 	}
 	return unsafe { nil }, kept
 }

@@ -147,6 +147,7 @@ pub fn vgc_pool_aged_selftest(n int) (u32, u64) {
 	saved_mark1 := vgc_heap.free_spans_aged_mark[int(np) * 2 + 1]
 	saved_bytes := vgc_heap.pool_bytes
 	saved_cycle := vgc_heap.gc_cycle
+	saved_k := vgc_pool_kind_save(np)
 	vgc_heap.free_spans[np] = unsafe { nil }
 	vgc_heap.free_spans_tail[np] = unsafe { nil }
 	vgc_heap.free_spans_aged_mark[int(np) * 2] = unsafe { nil }
@@ -207,6 +208,7 @@ pub fn vgc_pool_aged_selftest(n int) (u32, u64) {
 	vgc_heap.free_spans_aged_mark[int(np) * 2 + 1] = saved_mark1
 	vgc_heap.pool_bytes = saved_bytes
 	vgc_heap.gc_cycle = saved_cycle
+	vgc_pool_kind_restore(np, saved_k)
 	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
 	unsafe { C.free(descs) }
 	return rc, elapsed
@@ -1150,13 +1152,28 @@ pub fn vgc_pool_kind_selftest(n int) (u32, u64, u64) {
 	return rc, small_steps, plain_steps
 }
 
-// the pool's per-kind tallies of list np (none yet: the walk is the only answer)
+// the pool's per-kind tallies of list np (vgc_pool_kind_tally), saved, cleared and restored by a selftest
+// that files its own descriptors on the list
 fn vgc_pool_kind_save(np u32) [6]u32 {
-	return [6]u32{}
+	mut k := [6]u32{}
+	for r in 0 .. 6 {
+		k[r] = vgc_pool_kind_tally[r * 8193 + int(np)]
+	}
+	return k
 }
 
 fn vgc_pool_kind_clear(np u32) {
+	vgc_pool_kind_restore(np, [6]u32{})
 }
 
 fn vgc_pool_kind_restore(np u32, k [6]u32) {
+	bit := u64(1) << u64(np & 63)
+	for r in 0 .. 6 {
+		vgc_pool_kind_tally[r * 8193 + int(np)] = k[r]
+		if k[r] > 0 {
+			vgc_pool_kind_bits[r * 129 + int(np >> 6)] |= bit
+		} else {
+			vgc_pool_kind_bits[r * 129 + int(np >> 6)] &= ~bit
+		}
+	}
 }
