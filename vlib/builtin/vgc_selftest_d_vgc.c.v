@@ -794,22 +794,27 @@ pub fn vgc_pace_one_thread_selftest() u32 {
 	return 0
 }
 
-// vgc_pace_answer_selftest (cx-home/v#62): the 64 KB count paces as several only when it reaches
-// half the live mutators at this stop and the stop before; the ~1 MB stamp at two or more, as the
-// head reads it. A server holds every thread it runs
-// (87 at http-json-echo k=28 C=256) and only a few of them cross 64 KB between stops (VGC_GCTRACE
-// pace lines: at most 7 of 87, 3 of 39, 2 of 15, 2 of 6): one thread, whatever its marked set and
-// whatever the cycle before answered — a reading that flipped one cycle to several no longer
-// locks it in. A batch runs its k workers over 64 KB every cycle (k of k+2 threads): several.
+// vgc_pace_answer_selftest (cx-home/v#62, cx-private#1869): the 64 KB count paces as several when
+// two or more threads crossed 64 KB at this stop and at the stop before, whatever the live count;
+// the ~1 MB stamp at two or more, as the head reads it. A server holds every thread it runs (27
+// at http-json-echo C=128 on dev2, 87 at k=28 C=256) and its reactors cross 64 KB between stops
+// (VGC_GCTRACE=2 pace lines at C=128: acct 4-12 of 27). Held to half the live mutators, the count
+// read that server as one thread at every cycle, and the quarter (goal = marked + 25 %, ~2 MB on
+// a 1-2 MB live set) drove ~330 collections a second of ~0.6-2 ms stops: p99 at 128 connections
+// 2.34-2.54 ms against Python's 1.60 (misc-epic-91/-92/-95). VGC_ONE_THREAD_PCT=100 on the same
+// build cut the collections ~4x and doubled the requests a second on the same box. One reading
+// on the other side still keeps the previous cycle's answer, and one thread over 64 KB is one.
 // 0 = pass, else the failing check. Driven by bench/parallel-alloc/vgc_pace_answer_test.v.
 pub fn vgc_pace_answer_selftest() u32 {
-	// server readings, two stops running, after a cycle that answered several: one
-	if !vgc_pace_one_thread(0, 7, 7, 87, false, 500) || !vgc_pace_one_thread(1, 3, 3, 39, false, 500)
-		|| !vgc_pace_one_thread(0, 2, 2, 15, false, 500) || !vgc_pace_one_thread(1, 2, 2, 6, false, 500) {
+	// server readings, two stops running, after a cycle that answered one: several
+	if vgc_pace_one_thread(0, 7, 7, 87, true, 500) || vgc_pace_one_thread(1, 3, 3, 39, true, 500)
+		|| vgc_pace_one_thread(0, 2, 2, 15, true, 500) || vgc_pace_one_thread(1, 2, 2, 6, true, 500)
+		|| vgc_pace_one_thread(0, 12, 5, 27, true, 500) {
 		return 1
 	}
-	// one burst over half on a server pacing as one, at this stop or the stop before: still one
-	if !vgc_pace_one_thread(0, 7, 50, 87, true, 500) || !vgc_pace_one_thread(0, 50, 7, 87, true, 500) {
+	// one burst on a server pacing as one, at this stop or the stop before only: still one
+	if !vgc_pace_one_thread(0, 7, 1, 87, true, 500) || !vgc_pace_one_thread(0, 1, 7, 87, true, 500)
+		|| !vgc_pace_one_thread(0, 12, 0, 27, true, 500) {
 		return 2
 	}
 	// batch workers k of k+2, two stops running: several, at k = 1 (two of three), 16, 20, 28
@@ -817,8 +822,8 @@ pub fn vgc_pace_answer_selftest() u32 {
 		|| vgc_pace_one_thread(1, 20, 20, 22, true, 500) || vgc_pace_one_thread(0, 28, 28, 30, true, 500) {
 		return 3
 	}
-	// exactly half (and two or more) counts as several; one under half does not
-	if vgc_pace_one_thread(0, 3, 3, 6, true, 500) || !vgc_pace_one_thread(0, 2, 2, 5, false, 500) {
+	// two at both stops is several whatever the live count; one at both stops is one
+	if vgc_pace_one_thread(0, 2, 2, 5, true, 500) || !vgc_pace_one_thread(0, 1, 1, 5, false, 500) {
 		return 4
 	}
 	// the ~1 MB stamp at two or more is several whatever the live count and the cycle before,
