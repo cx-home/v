@@ -8286,6 +8286,10 @@ fn vgc_memdup_noscan(src voidptr, n isize) voidptr {
 // Span lookup (find which span owns an address) - O(1) via address map
 // ============================================================
 
+// vgc_find_arena_scans counts vgc_find_arena's linear scans of the arena table;
+// read by vgc_find_arena_selftest.
+__global vgc_find_arena_scans = u64(0)
+
 // vgc_find_arena resolves addr to the index of the arena it lies in, or -1
 // (the arena resolution of vgc_find_span, which the card barrier shares —
 // cx-home/v#56 step 1).
@@ -8318,6 +8322,7 @@ fn vgc_find_arena(addr usize) int {
 	if arena_idx < 0 || arena_idx >= nar || addr < vgc_heap.arenas[arena_idx].base
 		|| addr >= vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		arena_idx = -1
+		C.vgc_atomic_add_u64(&vgc_find_arena_scans, 1)
 		for i in 0 .. nar {
 			a := unsafe { &vgc_heap.arenas[i] }
 			if addr >= a.base && addr < a.base + a.size {

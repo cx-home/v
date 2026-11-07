@@ -1177,3 +1177,43 @@ fn vgc_pool_kind_restore(np u32, k [6]u32) {
 		}
 	}
 }
+
+// vgc_find_arena_selftest (cx-platform-store#55): an address in a 64 MB chunk that no arena touches resolves to
+// -1 from the address map alone — every chunk an arena touches has a first map entry (vgc_addr_map_register), so
+// an empty entry means no arena, and the arena table is not scanned. The mark asks vgc_find_span for every word
+// it reads that lies inside [vgc_arena_lo, vgc_arena_hi); on a heap of hundreds of arenas spread over the address
+// space most such non-pointers lie between arenas, and each one scanned the whole table (the store daemon at
+// 1,000,000 documents: 70 % of a 4 s sample in that loop, a forced collection inside one put-docs). Probes: the
+// chunk below the lowest arena, the chunk above the highest, and every chunk inside the hull no arena touches.
+// Answers (0 = pass else the failed check, the probes, the scans during the probes).
+pub fn vgc_find_arena_selftest() (u32, int, u64) {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	if nar < 1 {
+		return 1, 0, 0
+	}
+	chunk := usize(1) << 26
+	mut lo := vgc_heap.arenas[0].base
+	mut hi := vgc_heap.arenas[0].base + vgc_heap.arenas[0].size
+	for i in 1 .. nar {
+		if vgc_heap.arenas[i].base < lo {
+			lo = vgc_heap.arenas[i].base
+		}
+		if vgc_heap.arenas[i].base + vgc_heap.arenas[i].size > hi {
+			hi = vgc_heap.arenas[i].base + vgc_heap.arenas[i].size
+		}
+	}
+	mut probes := 0
+	before := C.vgc_atomic_load_u64(&vgc_find_arena_scans)
+	mut c := (lo / chunk - 1) * chunk
+	end := (hi / chunk + 2) * chunk
+	for c < end && probes < 4096 {
+		if C.vgc_addr_to_arena(c) < 0 && C.vgc_addr_to_arena(c + chunk - 1) < 0 {
+			probes++
+			if vgc_find_arena(c + 4096) != -1 {
+				return 2, probes, C.vgc_atomic_load_u64(&vgc_find_arena_scans) - before
+			}
+		}
+		c += chunk
+	}
+	return 0, probes, C.vgc_atomic_load_u64(&vgc_find_arena_scans) - before
+}
