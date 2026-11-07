@@ -4613,8 +4613,8 @@ pub fn vgc_limit_selftest() u32 {
 // (vgc_alloc_threads, ~1 MB each), two or more, means several, as the head reads it.
 // Otherwise acct, the threads that allocated vgc_acct_flush_min (64 KB) or more since the last
 // stop (vgc_acct_threads), and prev, that count at the stop before, decide when they agree: a
-// count reaches several when it is two or more AND half the live mutators (`live`) or more;
-// both there: several; neither: one. One reading on the other side keeps was_one, the previous
+// count reaches several when it is two or more, whatever the live mutators (`live`, kept for
+// the trace); both there: several; neither: one. One reading on the other side keeps was_one, the previous
 // cycle's answer. The first collection, whose cycle is the program's start-up
 // (cx-core-code#123), is one.
 // cx-home/v#62: the stamp alone read 20 mutators as one thread, because the quarter's budget
@@ -4623,9 +4623,11 @@ pub fn vgc_limit_selftest() u32 {
 // A batch runs its k workers over 64 KB every cycle (k of k+2 threads): the 64 KB count reads it
 // as several. A server holds every thread it runs (87 at http-json-echo k=28 C=256) and only a
 // few cross 64 KB between stops (at most 7 of 87, 3 of 39, 2 of 15, 2 of 6 in VGC_GCTRACE's pace
-// lines): half the live mutators keeps the 64 KB count from reading a server as several, so a
-// server paces as the head paces it — by the stamp alone (http-json-echo k=4 C=256: 61 of 404
-// cycles several, every one by the stamp). A stamp held to half the live mutators too
+// lines). Held to half the live mutators the count never read a server as several, and the
+// quarter paced it: http-json-echo at C=128 on dev2 (27 threads, 4-12 over 64 KB between stops)
+// ran ~330 collections a second on a ~2 MB goal and its p99 read 2.34-2.54 ms against Python's
+// 1.60 (cx-private#1869, misc-epic-91/-92/-95); two or more over 64 KB at two stops running is
+// several whatever the live count. A stamp held to half the live mutators too
 // (a2c8c5f15, 88fdac947) kept a server at the quarter: http-json-echo k=12 C=256 ran 6,347
 // collections against the head's 1,966 for the same requests, at ~80k requests/s against
 // 101-113k and 42-44 us of CPU per request against 34-37 (misc-epic-71). A single 64 KB reading
@@ -4642,10 +4644,10 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle
 	if nt > 1 {
 		return false
 	}
-	several := acct > 1 && acct * 2 >= live
+	several := acct > 1
 	// cx-home/v#56: the start-up collection (cycle 0) answers one whatever it counts, so its count is
 	// no stop before for cycle 1 to agree with (csv-aggregate: 2 of 2 at start-up, 2 of 3 at gc 1).
-	several_prev := cycle > 1 && prev > 1 && prev * 2 >= live
+	several_prev := cycle > 1 && prev > 1
 	if !several && !several_prev {
 		return true
 	}
