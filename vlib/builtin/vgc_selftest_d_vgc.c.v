@@ -1089,3 +1089,74 @@ pub fn vgc_arena_of_selftest() (u32, int, u64) {
 	}
 	return 0, nshared, C.vgc_atomic_load_u64(&vgc_arena_of_scans) - before
 }
+
+// vgc_pool_kind_selftest (cx-platform-store#55): the pool answers "a span of this kind of n pages" without
+// walking the spans of another kind. cx-home/v#58's arena kinds (plain, frames, small) share the pooled size
+// lists, and vgc_pool_at walked a whole list (vgc_pool_first_of_kind, one arena lookup a span) to learn it held
+// none of the asked kind — vgc_pool_best_fit and vgc_pool_kept_tail then asked every populated size above the
+// request, so one refill walked every pooled span of the other kinds (the store daemon at 1,000,000 documents:
+// most of the lock-holding thread's samples once vgc_arena_of's scan was gone). n plain spans (descriptors
+// outside the arenas read as plain) on the list of np pages, nothing else there: asking it for a small span must
+// look at no span; asking it for a plain one, at one. Answers (0 = pass else the failed check, the steps of the
+// small ask, the steps of the plain ask). Driven by bench/parallel-alloc/vgc_pool_kind_test.v.
+pub fn vgc_pool_kind_selftest(n int) (u32, u64, u64) {
+	np := u32(8190)
+	descs := unsafe { &VGC_Span(C.calloc(usize(n), sizeof(VGC_Span))) }
+	if descs == unsafe { nil } {
+		return 1, 0, 0
+	}
+	C.vgc_mutex_lock(&vgc_heap.free_spans_lock)
+	saved_head := vgc_heap.free_spans[np]
+	saved_tail := vgc_heap.free_spans_tail[np]
+	saved_cold := vgc_heap.free_spans_cold[np]
+	saved_bytes := vgc_heap.pool_bytes
+	saved_hot_w := vgc_pool_hot_bits[np >> 6]
+	saved_cold_w := vgc_pool_cold_bits[np >> 6]
+	saved_k := vgc_pool_kind_save(np)
+	vgc_heap.free_spans[np] = unsafe { nil }
+	vgc_heap.free_spans_tail[np] = unsafe { nil }
+	vgc_heap.free_spans_cold[np] = unsafe { nil }
+	vgc_pool_kind_clear(np)
+	for i in 0 .. n {
+		mut d := unsafe { &descs[i] }
+		d.npages = np
+		vgc_pool_push(mut d)
+	}
+	mut rc := u32(0)
+	vgc_pool_kind_steps = 0
+	small := vgc_pool_at(np, vgc_kind_small)
+	small_steps := vgc_pool_kind_steps
+	vgc_pool_kind_steps = 0
+	plain := vgc_pool_at(np, vgc_kind_plain)
+	plain_steps := vgc_pool_kind_steps
+	if small != unsafe { nil } {
+		rc = 2
+	} else if plain == unsafe { nil } {
+		rc = 3
+	}
+	for i in 0 .. n {
+		mut d := unsafe { &descs[i] }
+		vgc_pool_unlink(mut d)
+	}
+	vgc_heap.free_spans[np] = saved_head
+	vgc_heap.free_spans_tail[np] = saved_tail
+	vgc_heap.free_spans_cold[np] = saved_cold
+	vgc_heap.pool_bytes = saved_bytes
+	vgc_pool_hot_bits[np >> 6] = saved_hot_w
+	vgc_pool_cold_bits[np >> 6] = saved_cold_w
+	vgc_pool_kind_restore(np, saved_k)
+	C.vgc_mutex_unlock(&vgc_heap.free_spans_lock)
+	unsafe { C.free(descs) }
+	return rc, small_steps, plain_steps
+}
+
+// the pool's per-kind tallies of list np (none yet: the walk is the only answer)
+fn vgc_pool_kind_save(np u32) [6]u32 {
+	return [6]u32{}
+}
+
+fn vgc_pool_kind_clear(np u32) {
+}
+
+fn vgc_pool_kind_restore(np u32, k [6]u32) {
+}

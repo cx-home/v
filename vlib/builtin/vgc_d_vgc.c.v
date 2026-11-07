@@ -4080,11 +4080,16 @@ fn vgc_span_kind(s &VGC_Span) u8 {
 	return unsafe { vgc_heap.arenas[i].kind }
 }
 
+// vgc_pool_kind_steps counts the spans vgc_pool_first_of_kind has looked at
+// (under free_spans_lock, as every caller holds it); read by vgc_pool_kind_selftest.
+__global vgc_pool_kind_steps = u64(0)
+
 // vgc_pool_first_of_kind answers the first span of the pool list at head
 // whose arena is of the kind (vgc_kind_plain, vgc_kind_frames, vgc_kind_small).
 fn vgc_pool_first_of_kind(head &VGC_Span, kind u8) &VGC_Span {
 	mut s := unsafe { head }
 	for s != unsafe { nil } {
+		vgc_pool_kind_steps++
 		if vgc_span_kind(s) == kind {
 			return s
 		}
