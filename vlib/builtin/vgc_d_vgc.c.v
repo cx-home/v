@@ -3330,6 +3330,10 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 // Span management (translated from Go's mspan operations)
 // ============================================================
 
+// vgc_arena_of_scans counts vgc_arena_of's linear scans over the arena table
+// (a lookup the address maps did not answer); read by vgc_arena_of_selftest.
+__global vgc_arena_of_scans = u64(0)
+
 // vgc_arena_of resolves the arena index owning `addr`, or -1. Same hint +
 // linear-fallback discipline as vgc_find_span (the addr_map hint is 1 GB-coarse,
 // so older arenas sharing a chunk need the fallback). Slow-path only (pool
@@ -3341,6 +3345,7 @@ fn vgc_arena_of(addr usize) int {
 		&& addr < vgc_heap.arenas[arena_idx].base + vgc_heap.arenas[arena_idx].size {
 		return arena_idx
 	}
+	C.vgc_atomic_add_u64(&vgc_arena_of_scans, 1)
 	for i in 0 .. nar {
 		a := unsafe { &vgc_heap.arenas[i] }
 		if addr >= a.base && addr < a.base + a.size {

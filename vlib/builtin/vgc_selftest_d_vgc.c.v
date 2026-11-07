@@ -1039,3 +1039,53 @@ pub fn vgc_stack_scan_selftest() u32 {
 	}
 	return 0
 }
+
+// vgc_arena_of_selftest (cx-platform-store#55): vgc_arena_of — the arena lookup of the pool's span
+// split, tail split, coalesce and decommit checks — answers every address of every arena from the
+// address maps, never from a scan of the arena table. An arena is a 64 MB mmap at whatever address
+// the OS hands out, so it straddles two 64 MB chunks of vgc_addr_map and shares each with a
+// neighbour; for the part of an arena in a chunk whose first entry names the neighbour the answer is
+// vgc_addr_map2 (cx-home/v#15 lever 3, which vgc_find_arena reads). Probes: each arena's first and
+// last byte and both sides of every chunk boundary inside it. Returns (0 = pass else the failed
+// check, the probes whose chunk's first entry names another arena, the scans during the probes).
+// Driven by bench/parallel-alloc/vgc_arena_of_test.v.
+pub fn vgc_arena_of_selftest() (u32, int, u64) {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	if nar < 2 {
+		return 1, 0, 0
+	}
+	mut probes := [64]usize{}
+	mut nshared := 0
+	before := C.vgc_atomic_load_u64(&vgc_arena_of_scans)
+	for i in 0 .. nar {
+		base := vgc_heap.arenas[i].base
+		size := vgc_heap.arenas[i].size
+		if size == 0 {
+			continue
+		}
+		mut n := 0
+		probes[n] = base
+		n++
+		probes[n] = base + size - 1
+		n++
+		chunk := usize(1) << 26
+		mut b := (base / chunk + 1) * chunk
+		for b < base + size && n + 2 <= 64 {
+			probes[n] = b - 1
+			n++
+			probes[n] = b
+			n++
+			b += chunk
+		}
+		for k in 0 .. n {
+			p := probes[k]
+			if vgc_arena_of(p) != i {
+				return 2, nshared, C.vgc_atomic_load_u64(&vgc_arena_of_scans) - before
+			}
+			if C.vgc_addr_to_arena(p) != i {
+				nshared++
+			}
+		}
+	}
+	return 0, nshared, C.vgc_atomic_load_u64(&vgc_arena_of_scans) - before
+}
