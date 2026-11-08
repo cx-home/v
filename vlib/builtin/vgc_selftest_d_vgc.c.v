@@ -1222,3 +1222,20 @@ pub fn vgc_find_arena_selftest() (u32, int, u64) {
 	}
 	return 0, probes, C.vgc_atomic_load_u64(&vgc_find_arena_scans) - before
 }
+
+// vgc_mutex_selftest_lock / _unlock / vgc_selftest_thread_cpu_ns (cx-private#1923 §1): the collector's lock and the
+// calling thread's CPU clock for bench/parallel-alloc/vgc_mutex_wait_test.v, which asks that a thread waiting on a
+// held lock spends almost none of the wait on the CPU. At many allocating threads (json-codec 1 MB at k = 24 on 28
+// cores) the waiters of free_spans_lock (the stash refills through vgc_central_get_fresh) were ~14 % of the
+// program's CPU in sched_yield, every waiter kept runnable while one thread held the lock.
+pub fn vgc_mutex_selftest_lock(lk &u32) {
+	C.vgc_mutex_lock(lk)
+}
+
+pub fn vgc_mutex_selftest_unlock(lk &u32) {
+	C.vgc_mutex_unlock(lk)
+}
+
+pub fn vgc_selftest_thread_cpu_ns() u64 {
+	return C.vgc_thread_cpu_ns()
+}
