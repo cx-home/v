@@ -599,6 +599,22 @@ pub fn vgc_mark_wide_selftest() u32 {
 	if vgc_walk_sum_len < vgc_max_markers * 16 {
 		return 7
 	}
+	// cx-private#1923: the widening is bounded by the marked set, one marker per
+	// vgc_mark_wide_per_marker (64 MB) of it. json-codec 1 MB at k=56 marks
+	// 170-511 MB per cycle and fielded 28 markers from 56 held parses: a 10 ms mark
+	// of 28 threads, each mostly idle on an emptied grey set, read k=56's CPU per
+	// unit 12,400 us against 9,100 with the configured eight at the same wall
+	// (0.64-0.70 s). 28 xlsx parses' 8 GB still widens to the free CPUs.
+	mb := u64(1024) * 1024
+	if vgc_mark_plan_count(8, 80 * u64(1000) * 1000, u64(1000) * 1000, 56, 28, true, 0, 263 * mb, true) != 8 {
+		return 8
+	}
+	if vgc_mark_plan_count(8, 80 * u64(1000) * 1000, u64(1000) * 1000, 56, 28, true, 0, 1024 * mb, true) != 16 {
+		return 9
+	}
+	if vgc_mark_plan_count(8, 800 * u64(1000) * 1000, u64(1000) * 1000, 28, 28, true, 0, 8192 * mb, true) != 28 {
+		return 10
+	}
 	return 0
 }
 
