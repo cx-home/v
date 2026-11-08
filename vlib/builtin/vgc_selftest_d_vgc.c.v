@@ -572,27 +572,27 @@ pub fn vgc_arena_owner_selftest() u32 {
 // 0 = ok; n = the failed case.
 pub fn vgc_mark_wide_selftest() u32 {
 	// 28 parses on 28 free CPUs: 28 markers, not the configured 8
-	if vgc_mark_wide_total(8, 28, 28) != 28 {
+	if vgc_mark_wide_total(8, 28, 28, u64(8192) * 1024 * 1024) != 28 {
 		return 1
 	}
 	// one per held mutator plus the collector
-	if vgc_mark_wide_total(8, 12, 28) != 13 {
+	if vgc_mark_wide_total(8, 12, 28, u64(8192) * 1024 * 1024) != 13 {
 		return 2
 	}
 	// the box's other load takes CPUs away
-	if vgc_mark_wide_total(8, 28, 20) != 20 {
+	if vgc_mark_wide_total(8, 28, 20, u64(8192) * 1024 * 1024) != 20 {
 		return 3
 	}
 	// a busy box, or under the line: the configured count
-	if vgc_mark_wide_total(8, 28, 0) != 8 {
+	if vgc_mark_wide_total(8, 28, 0, u64(8192) * 1024 * 1024) != 8 {
 		return 4
 	}
 	// a stop of four mutators keeps eight
-	if vgc_mark_wide_total(8, 4, 28) != 8 {
+	if vgc_mark_wide_total(8, 4, 28, u64(8192) * 1024 * 1024) != 8 {
 		return 5
 	}
 	// never past vgc_max_markers
-	if vgc_mark_wide_total(8, 100, 128) != vgc_max_markers {
+	if vgc_mark_wide_total(8, 100, 128, u64(8192) * 1024 * 1024) != vgc_max_markers {
 		return 6
 	}
 	// the per-worker sums hold every marker
@@ -632,6 +632,8 @@ pub fn vgc_mark_held_selftest() u32 {
 	us := u64(1000)
 	// a marked set over the several-thread floor (the batch rows' 5-14 MB)
 	big := vgc_headroom_floor_lo * 2
+	// a marked set the widening fields every free CPU for (cx-private#1923: one marker per 64 MB)
+	huge := u64(8192) * 1024 * 1024
 	// 20 held, a 1.3 ms mark (over the line), 28 free CPUs: five markers, not one
 	if vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, big, true) != 5 {
 		return 1
@@ -668,7 +670,8 @@ pub fn vgc_mark_held_selftest() u32 {
 		return 8
 	}
 	// a long mark keeps one marker per ms: 10 ms on 20 held, ten markers
-	if vgc_mark_plan_count(8, 10 * ms, ms, 20, 28, true, 0, big, true) != 10 {
+	if vgc_mark_plan_count(8, 10 * ms, ms, 20, 28, true, 0, huge, true) != 10
+		|| vgc_mark_plan_count(8, 10 * ms, ms, 20, 28, true, 0, big, true) != 8 {
 		return 9
 	}
 	// the back-off's target still caps the plan
@@ -676,7 +679,8 @@ pub fn vgc_mark_held_selftest() u32 {
 		return 10
 	}
 	// VGC_MARK_PAR_MIN_US=0 (line 0): the configured count, widened by the held
-	if vgc_mark_plan_count(8, 0, 0, 20, 28, true, 0, big, true) != 21
+	if vgc_mark_plan_count(8, 0, 0, 20, 28, true, 0, huge, true) != 21
+		|| vgc_mark_plan_count(8, 0, 0, 20, 28, true, 0, big, true) != 8
 		|| vgc_mark_plan_count(8, 0, 0, 20, 28, false, 0, big, true) != 8 {
 		return 11
 	}
@@ -705,7 +709,7 @@ pub fn vgc_mark_held_selftest() u32 {
 	// markers under the line and one per ms over it, not 21 (misc-epic-70)
 	if vgc_mark_plan_count(8, 60 * us, ms, 87, 28, true, 0, big, false) != 4
 		|| vgc_mark_plan_count(8, 1300 * us, ms, 87, 28, true, 0, big, false) != 1
-		|| vgc_mark_plan_count(8, 1300 * us, ms, 87, 28, true, 0, big, true) != 21 {
+		|| vgc_mark_plan_count(8, 1300 * us, ms, 87, 28, true, 0, huge, true) != 21 {
 		return 15
 	}
 	return 0

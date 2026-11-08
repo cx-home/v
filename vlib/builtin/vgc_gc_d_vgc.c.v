@@ -3129,7 +3129,7 @@ fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide boo
 	}
 	mut total := cfg
 	if wide && live >= total {
-		total = vgc_mark_wide_total(total, live, free)
+		total = vgc_mark_wide_total(total, live, free, marked)
 	}
 	mut by_work := if line == 0 { total } else { int(work / line) }
 	if by_work < floor {
@@ -3171,10 +3171,23 @@ fn vgc_mark_held_floor(live int, free int) int {
 // of parse results in a 650-920 ms stop with the eight configured markers and
 // 410 ms with sixteen (cx-examples#403). The previous mark's work still bounds
 // the count (vgc_mark_plan: one marker per vgc_mark_par_min_ns of it).
-fn vgc_mark_wide_total(cfg int, live int, free int) int {
+// cx-private#1923: the `marked` set bounds the widening too, one marker per
+// vgc_mark_wide_per_marker of it. A parallel mark's work reads its markers
+// times its wall, so the work bound above never pulls a widened pool back:
+// json-codec 1 MB at k=56 (170-511 MB marked a cycle, 56 held parses) fielded
+// 28 markers on every cycle, each mostly idle on an emptied grey set — k=56's
+// CPU per unit 12,400 us against 9,100 with the configured eight, at the same
+// wall. The xlsx parses' 8 GB still widen to every free CPU.
+const vgc_mark_wide_per_marker = u64(64) * 1024 * 1024
+
+fn vgc_mark_wide_total(cfg int, live int, free int, marked u64) int {
 	mut n := live + 1
 	if free < n {
 		n = free
+	}
+	by_marked := marked / vgc_mark_wide_per_marker
+	if by_marked < u64(n) {
+		n = int(by_marked)
 	}
 	if n > vgc_max_markers {
 		n = vgc_max_markers
