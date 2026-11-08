@@ -992,24 +992,40 @@ static inline uint64_t vgc_thread_cpu_ns(void) {
 // ============================================================
 // Simple mutex (adaptive spinlock with backoff)
 // ============================================================
+// cx-private#1923 §1: past the spin tiers a contended lock blocks in the kernel
+// on its word (0 free, 1 held, 2 held with waiters),
+// instead of a sched_yield loop that keeps every waiter runnable (~14 % of the CPU at
+// k = 24 json workers, the stash refills under free_spans_lock). Elsewhere: yield.
+#if defined(__APPLE__)
+  extern int __ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us);
+  extern int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+  static inline void vgc_lockword_wait(volatile uint32_t* w) { (void)__ulock_wait(1u | 0x01000000u, (void*)w, 2, 1000); }
+  static inline void vgc_lockword_wake(volatile uint32_t* w) { (void)__ulock_wake(1u | 0x01000000u, (void*)w, 0); }
+#else
+  static inline void vgc_lockword_wait(volatile uint32_t* w) { (void)w; vgc_thread_yield(); }
+  static inline void vgc_lockword_wake(volatile uint32_t* w) { (void)w; }
+#endif
 static inline void vgc_mutex_lock(volatile uint32_t* lock) {
-    for (int spin = 0; ; spin++) {
+    for (int spin = 0; spin < 32; spin++) {
         uint32_t expected = 0;
         if (vgc_atomic_cas_u32(lock, &expected, 1)) {
             return;
         }
         if (spin < 16) {
             vgc_cpu_pause();
-        } else if (spin < 32) {
-            for (int i = 0; i < spin; i++) vgc_cpu_pause();
         } else {
-            vgc_thread_yield();
+            for (int i = 0; i < spin; i++) vgc_cpu_pause();
         }
+    }
+    while (__atomic_exchange_n(lock, 2, __ATOMIC_ACQUIRE) != 0) {
+        vgc_lockword_wait(lock);
     }
 }
 
 static inline void vgc_mutex_unlock(volatile uint32_t* lock) {
-    vgc_atomic_store_u32(lock, 0);
+    if (__atomic_exchange_n(lock, 0, __ATOMIC_RELEASE) == 2) {
+        vgc_lockword_wake(lock);
+    }
 }
 
 // ============================================================
