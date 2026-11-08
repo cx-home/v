@@ -63,6 +63,7 @@ fn C.vgc_ncpu() int
 fn C.vgc_box_busy(ncpu int) int
 fn C.vgc_box_free_cpus(ncpu int, own int) int
 fn C.vgc_yield()
+fn C.vgc_perturb_draw(permille u32, seed u64, gen u64) int
 fn C.vgc_popcount8(x u8) int
 fn C.vgc_ctz8(x u8) int // lowest set bit of a non-zero byte (cx-home/v#15)
 fn C.vgc_ctz64(x u64) int // lowest set bit of a non-zero word (cx-private#1910: the pool summary)
@@ -733,6 +734,14 @@ __global vgc_heap = VGC_Heap{}
 // Coarse allocator lock (-d vgc_coarse_alloc only): serializes all mutator
 // malloc/free/realloc to confirm/baseline the residual allocator data race.
 __global vgc_alloc_lock = u32(0)
+// cx-private#1923 §2: the schedule-perturbation mode (vgc_perturb). The per-mille of
+// perturbation points that yield (0 = off: a point is one load and a branch), the seed
+// and its generation (a new one on every vgc_perturb_set reseeds each thread's draw),
+// and how many points have yielded since start-up.
+__global vgc_perturb_permille = u32(0)
+__global vgc_perturb_seed = u64(0)
+__global vgc_perturb_gen = u64(0)
+__global vgc_perturb_count = u64(0)
 // Fast bounds check for pointer validation
 __global vgc_arena_lo = usize(0)
 __global vgc_arena_hi = usize(0)
@@ -2599,6 +2608,14 @@ pub fn vgc_init() {
 			vgc_acct_flush_div = u64(afd)
 		}
 	}
+	// cx-private#1923 §2: VGC_PERTURB=<per-mille> turns the perturbation mode on,
+	// VGC_PERTURB_SEED=<n> seeds it (0 when absent)
+	pseed_env := C.getenv(c'VGC_PERTURB_SEED')
+	vgc_perturb_set(vgc_perturb_parse(C.getenv(c'VGC_PERTURB')), if pseed_env != unsafe { nil } {
+		u64(C.atoll(pseed_env))
+	} else {
+		u64(0)
+	})
 	otp_env := C.getenv(c'VGC_ONE_THREAD_PCT')
 	if otp_env != unsafe { nil } {
 		otp := C.atoll(otp_env)
@@ -7378,6 +7395,7 @@ fn vgc_acct_free(sz u64) {
 
 // Amortized GC trigger check - avoids atomic loads on every allocation
 fn vgc_maybe_gc() {
+	vgc_perturb() // the allocator's poll is a perturbation point (cx-private#1923 §2)
 	C.vgc_trace(21, C.vgc_get_cache_idx(), C.vgc_atomic_load_u64(&vgc_heap.heap_live),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.gc_enabled))) // MAYBE_GC entry (diagnostic, pre-gate)
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) != 0 {
@@ -8415,6 +8433,67 @@ fn vgc_safepoint() {
 			&vgc_cache(cache_idx).stopped, &vgc_cache(cache_idx).park_seq,
 			&vgc_cache(cache_idx).stack_lo, &vgc_cache(cache_idx).stack_hi,
 			vgc_cache(cache_idx).stack_base)
+	}
+}
+
+// ── Schedule perturbation (cx-private#1923 §2) ──────────────────────────────
+// A perturbation point gives the core up at random, at the per-mille the mode was
+// set to (VGC_PERTURB at start-up, or vgc_perturb_set), so the interleavings a quiet
+// box never produces are produced on purpose and the stress corpus runs under them.
+// The points: the allocator's poll (vgc_maybe_gc) and every caller of vgc_perturb
+// (cx's channel locks). One yielding draw in eight sleeps 50 us instead of only
+// giving the core up. Off, a point is one atomic load and a branch.
+
+// vgc_perturb_parse reads VGC_PERTURB's value: a per-mille clamped to 1000; absent,
+// negative or not a number is 0 (off).
+pub fn vgc_perturb_parse(s &char) u32 {
+	if s == unsafe { nil } {
+		return 0
+	}
+	v := C.atoll(s)
+	if v <= 0 {
+		return 0
+	}
+	if v > 1000 {
+		return 1000
+	}
+	return u32(v)
+}
+
+// vgc_perturb_set sets the mode: the per-mille of points that yield (clamped to
+// 1000) and the seed; every thread reseeds its draw at its next point.
+pub fn vgc_perturb_set(permille u32, seed u64) {
+	C.vgc_atomic_store_u32(&vgc_perturb_permille, 0)
+	C.vgc_atomic_store_u64(&vgc_perturb_seed, seed)
+	C.vgc_atomic_add_u64(&vgc_perturb_gen, 1)
+	C.vgc_atomic_store_u32(&vgc_perturb_permille, if permille > 1000 {
+		u32(1000)
+	} else {
+		permille
+	})
+}
+
+// vgc_perturb_taken: how many perturbation points have yielded since start-up
+pub fn vgc_perturb_taken() u64 {
+	return C.vgc_atomic_load_u64(&vgc_perturb_count)
+}
+
+// vgc_perturb is a perturbation point (exported for C callers under that name)
+@[export: 'vgc_perturb']
+pub fn vgc_perturb() {
+	pm := C.vgc_atomic_load_u32(&vgc_perturb_permille)
+	if pm == 0 {
+		return
+	}
+	d := C.vgc_perturb_draw(pm, C.vgc_atomic_load_u64(&vgc_perturb_seed), C.vgc_atomic_load_u64(&vgc_perturb_gen))
+	if d == 0 {
+		return
+	}
+	C.vgc_atomic_add_u64(&vgc_perturb_count, 1)
+	if d == 2 {
+		C.vgc_usleep(50)
+	} else {
+		C.vgc_yield()
 	}
 }
 

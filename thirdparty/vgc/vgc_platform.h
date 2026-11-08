@@ -1204,6 +1204,32 @@ static inline int vgc_start_thread_rc(vgc_thread_fn fn) {
   #include <sched.h>
   static inline void vgc_yield(void) { sched_yield(); }
 #endif
+
+// cx-private#1923 §2: the schedule-perturbation mode's draw (vgc_perturb). Each thread
+// steps its own xorshift64 sequence, seeded from the mode's seed and the thread's
+// stack address the first time it draws after vgc_perturb_set (a new generation).
+// Answers 0 (no yield), 1 (give the core up) or 2 (sleep 50 us: off the core long
+// enough for another thread to run its critical section through).
+#if defined(VGC_TLS)
+  static VGC_TLS uint64_t _vgc_perturb_rng = 0;
+  static VGC_TLS uint64_t _vgc_perturb_rng_gen = 0;
+#else
+  static uint64_t _vgc_perturb_rng = 0;
+  static uint64_t _vgc_perturb_rng_gen = 0;
+#endif
+static inline int vgc_perturb_draw(uint32_t permille, uint64_t seed, uint64_t gen) {
+  uint64_t x = _vgc_perturb_rng;
+  if (_vgc_perturb_rng_gen != gen || x == 0) {
+    uint64_t here = (uint64_t)(uintptr_t)&x;
+    x = (seed + 0x9E3779B97F4A7C15ull) ^ (here * 0xBF58476D1CE4E5B9ull);
+    if (x == 0) x = 1;
+    _vgc_perturb_rng_gen = gen;
+  }
+  x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+  _vgc_perturb_rng = x;
+  if ((uint32_t)((x >> 20) % 1000u) >= permille) return 0;
+  return ((x >> 8) & 7u) == 0 ? 2 : 1;
+}
 #ifdef _WIN32
   static inline int vgc_ncpu(void) { SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors; }
   static inline int vgc_box_busy(int ncpu) { (void)ncpu; return 0; }
