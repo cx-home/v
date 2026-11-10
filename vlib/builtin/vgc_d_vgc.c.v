@@ -76,7 +76,7 @@ fn C.vgc_mutex_lock(lk &u32)
 fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
 fn C.vgc_install_thread_exit(idx int)
-fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, spill_hi &usize, stack_base usize)
 fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping on gc_stop_flag
 fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
@@ -98,7 +98,7 @@ fn C.vgc_susp_reset_all() // cx-private#1910: the fork child's suspend records, 
 fn C.vgc_susp_chunk_bounds(ci int, lo &usize, hi &usize) int // chunk ci's suspend records to the high-water mark (scanned by vgc_mark_roots)
 fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
 fn C.vgc_thread_regs(idx int, sp_out &usize, regs &usize, max int) int
-fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, stack_base usize)
+fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, spill_hi &usize, stack_base usize)
 fn C.vgc_clear_dead_stack(limit_lo usize, limit_hi usize) // cx-home/v#51: zero the dead stack below the caller
 fn C.vgc_num_cpus() int
 fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default ceiling)
@@ -375,6 +375,10 @@ mut:
 	stack_base usize // fixed stack boundary for this thread
 	stack_lo   usize // lowest stack address (for root scanning)
 	stack_hi   usize // highest stack address
+	// cx-home/v#66: the top of the spilled-register jmp_buf the trampoline that last set
+	// [stack_lo, stack_hi] put at its bottom (vgc_run_gc_spilled, vgc_park_spill), 0 when
+	// another path set the range. [stack_lo, spill_hi) is scanned at aligned words only.
+	spill_hi usize
 	// Registration-time TRUE stack bounds of the underlying OS thread (cx #743).
 	// A registered thread suspended while running on a FOREIGN stack (a host
 	// runtime's green-thread stack, e.g. a Go M executing goroutine code between
@@ -2489,6 +2493,7 @@ fn vgc_atfork_child() {
 			C.vgc_atomic_store_u32(&vgc_cache(i).safe, 0)
 			c.stack_lo = 0
 			c.stack_hi = 0
+			c.spill_hi = 0
 		}
 	}
 	C.vgc_susp_reset_all()
@@ -3150,6 +3155,7 @@ fn vgc_thread_exit_cb(idx int) {
 		vgc_cache(idx).registered = false
 		vgc_cache(idx).stack_lo = 0
 		vgc_cache(idx).stack_hi = 0
+		vgc_cache(idx).spill_hi = 0
 		C.vgc_atomic_store_u32(&vgc_cache(idx).safe, 0) // cx #316 hygiene (also reset at register)
 	}
 	// Atomic decrement — see the bump in vgc_register_thread (lock-free PACE reader).
@@ -3334,11 +3340,13 @@ fn vgc_refresh_stack_range_for_sp(cache_idx int, sp usize) {
 		unsafe {
 			vgc_cache(cache_idx).stack_lo = stack_base
 			vgc_cache(cache_idx).stack_hi = sp
+			vgc_cache(cache_idx).spill_hi = 0
 		}
 	} else {
 		unsafe {
 			vgc_cache(cache_idx).stack_lo = sp
 			vgc_cache(cache_idx).stack_hi = stack_base
+			vgc_cache(cache_idx).spill_hi = 0
 		}
 	}
 }
@@ -7216,7 +7224,7 @@ fn vgc_force_collect() {
 			// cx-home/v#51: the trampoline's frame lands on zeroed stack
 			C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo, vgc_cache(ci).stack_limit_hi)
 			C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
-				vgc_cache(ci).stack_base)
+				&vgc_cache(ci).spill_hi, vgc_cache(ci).stack_base)
 			// cx-home/v#56: and the collection's own frames leave no heap address
 			// for the next calls at that depth (vgc_collection_residue_test)
 			C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo, vgc_cache(ci).stack_limit_hi)
@@ -7419,7 +7427,7 @@ fn vgc_maybe_gc() {
 					C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo,
 						vgc_cache(ci).stack_limit_hi)
 					C.vgc_run_gc_spilled(&vgc_cache(ci).stack_lo, &vgc_cache(ci).stack_hi,
-						vgc_cache(ci).stack_base)
+						&vgc_cache(ci).spill_hi, vgc_cache(ci).stack_base)
 					// cx-home/v#56: the collection's own frames leave no heap address
 					// for the next calls at that depth (vgc_collection_residue_test)
 					C.vgc_clear_dead_stack(vgc_cache(ci).stack_limit_lo,
@@ -8442,7 +8450,7 @@ fn vgc_safepoint() {
 		C.vgc_park_spill(&vgc_heap.gc_stop_flag, &vgc_heap.gc_stop_seq, &vgc_heap.gc_stopped_count,
 			&vgc_cache(cache_idx).stopped, &vgc_cache(cache_idx).park_seq,
 			&vgc_cache(cache_idx).stack_lo, &vgc_cache(cache_idx).stack_hi,
-			vgc_cache(cache_idx).stack_base)
+			&vgc_cache(cache_idx).spill_hi, vgc_cache(cache_idx).stack_base)
 	}
 }
 

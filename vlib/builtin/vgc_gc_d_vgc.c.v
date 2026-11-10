@@ -2428,7 +2428,7 @@ fn vgc_roots_stacks_slice(slot int, n int) {
 	for i < vgc_heap.ncaches {
 		cache := unsafe { vgc_cache(i) }
 		if cache.registered && cache.stack_lo > 0 && cache.stack_hi > cache.stack_lo {
-			vgc_scan_stack_range(cache.stack_lo, cache.stack_hi, slot)
+			vgc_scan_thread_stack(cache.stack_lo, cache.stack_hi, cache.spill_hi, slot)
 		}
 		i += n
 	}
@@ -2535,7 +2535,7 @@ fn vgc_mark_roots() {
 				vgc_rd_base = cache.stack_hi
 				vgc_rd_own = i == C.vgc_get_cache_idx()
 			}
-			vgc_scan_stack_range(cache.stack_lo, cache.stack_hi, 0)
+			vgc_scan_thread_stack(cache.stack_lo, cache.stack_hi, cache.spill_hi, 0)
 			$if vgc_rootdiag ? {
 				vgc_rd_cat = 0
 				vgc_rd_base = 0
@@ -2744,6 +2744,25 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 			}
 		}
 		addr = next
+	}
+}
+
+// vgc_scan_thread_stack scans a registered thread's [lo, hi) stack range. The
+// bottom of it, up to spill_hi, is the jmp_buf of callee-saved registers the
+// spill trampoline (vgc_run_gc_spilled, vgc_park_spill) put there and that
+// trampoline's own words: every word in it is aligned, so it is scanned at
+// aligned words only; the frames above keep the byte-offset scan (cx-home/v#60).
+// The byte scan over the jmp_buf built a root from two adjacent spilled words
+// (cx-home/v#66): the high half of clang's 0x28F5C28F5C28F5C3 (`/ 100`) and the
+// low half of a register holding 1 read at a 4-byte offset as 0x1_28f5c28f, an
+// interior address of a dropped 240 MB list, which vgc_metadata_roots_test kept
+// marked at -O2. spill_hi 0 (a range another path set) scans the range as before.
+fn vgc_scan_thread_stack(lo usize, hi usize, spill_hi usize, w int) {
+	if spill_hi > lo && spill_hi <= hi {
+		vgc_scan_range(lo, spill_hi, w)
+		vgc_scan_stack_range(spill_hi, hi, w)
+	} else {
+		vgc_scan_stack_range(lo, hi, w)
 	}
 }
 

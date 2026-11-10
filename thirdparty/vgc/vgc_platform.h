@@ -1282,7 +1282,18 @@ static inline int vgc_perturb_draw(uint32_t permille, uint64_t seed, uint64_t ge
 // `buf` stays alive across the whole collection (mark+sweep) since the body
 // runs nested here. vgc_gc_start must NOT re-record the collector's own range.
 extern VGC_V_EXPORT void vgc_gc_start(void);
-static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t base) {
+// cx-home/v#66: the top of a spill trampoline's jmp_buf, word-aligned upward —
+// the scan reads [sp, top) at aligned words only (vgc_scan_thread_stack): it is
+// the trampoline's own frame below the spilled callee-saved registers, all of
+// them aligned words, and a byte-offset read across two of them made a false
+// root at -O2. 0 when the stack grows up or the buffer is not at the range's
+// bottom, which keeps the byte-offset scan for the whole range.
+static inline uintptr_t vgc_spill_top(uintptr_t sp, uintptr_t base, void* buf, size_t n) {
+    uintptr_t top = ((uintptr_t)buf + n + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1);
+    if (base < sp || (uintptr_t)buf < sp || top > base) { return 0; }
+    return top;
+}
+static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t* spill_hi, uintptr_t base) {
     jmp_buf buf;
     setjmp(buf);
     // Anchor at the REAL stack pointer (not the frame pointer): `buf` holding the
@@ -1292,6 +1303,7 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t ba
     uintptr_t sp = vgc_real_sp();
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (base >= sp) { *lo = sp; *hi = base; } else { *lo = base; *hi = sp; }
+    *spill_hi = vgc_spill_top(sp, base, &buf, sizeof(buf));
     vgc_gc_start();
     vgc_keep_alive(&buf);
 }
@@ -1422,7 +1434,8 @@ static inline void vgc_wait_flag_clear(uint32_t* flag) {
 static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
                                   uint32_t* stopped_count, uint32_t* my_stopped,
                                   uint32_t* my_park_seq, uintptr_t* range_lo,
-                                  uintptr_t* range_hi, uintptr_t stack_base) {
+                                  uintptr_t* range_hi, uintptr_t* spill_hi,
+                                  uintptr_t stack_base) {
     jmp_buf buf;
     setjmp(buf);
     // Real SP, not the frame pointer: the spilled-register jmp_buf lives below the
@@ -1431,6 +1444,7 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
     else { *range_lo = stack_base; *range_hi = sp; }
+    *spill_hi = vgc_spill_top(sp, stack_base, &buf, sizeof(buf));
     // Stamp WHICH stop-cycle this park answers, BEFORE publishing stopped=1 (a
     // collector that trusts stopped therefore also sees a matching seq). A stale
     // stopped=1 from the previous cycle otherwise lets a back-to-back GC count a
