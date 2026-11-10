@@ -4759,6 +4759,51 @@ pub fn vgc_span_census() string {
 	return out.join(' ')
 }
 
+// vgc_free_page_census answers what a page return INSIDE in-use spans could
+// give back (cx-platform-store#58): over every in-use span, the vgc pages
+// (8 KB) no allocated object touches, in bytes, and of those the ones whose
+// whole 16 KB OS page (macOS arm64) holds no live vgc page — the part
+// madvise could return there; also the 4 KB-page share (every free vgc page
+// is whole 4 KB pages). A diagnostic: one pass over the spans' alloc bits.
+pub fn vgc_free_page_census() (u64, u64, u64) {
+	mut state := map[u64]u8{} // vgc page index -> 1 live, 2 free inside an in-use span
+	for i in 0 .. vgc_heap.nspans {
+		span := unsafe { vgc_heap.allspans[i] }
+		if span == unsafe { nil } || !span.in_use || span.alloc_bits == unsafe { nil } {
+			continue
+		}
+		first := u64(span.base) >> vgc_page_shift
+		for p in 0 .. u64(span.npages) {
+			if (first + p) !in state {
+				state[first + p] = 2
+			}
+		}
+		for o in 0 .. span.nelems {
+			if C.vgc_bitmap_get(span.alloc_bits, o) == 0 {
+				continue
+			}
+			a0 := u64(span.base) + u64(o) * u64(span.elem_size)
+			a1 := a0 + u64(span.elem_size) - 1
+			for pg := a0 >> vgc_page_shift; pg <= a1 >> vgc_page_shift; pg++ {
+				state[pg] = 1
+			}
+		}
+	}
+	mut free8 := u64(0)
+	mut free16 := u64(0)
+	for pg, st in state {
+		if st != 2 {
+			continue
+		}
+		free8 += u64(vgc_page_size)
+		partner := pg ^ 1 // the other 8 KB half of its 16 KB OS page
+		if (state[partner] or { 0 }) != 1 {
+			free16 += u64(vgc_page_size)
+		}
+	}
+	return free8, free16, free8
+}
+
 // vgc_pool_lock_takes answers (refills, lock takes) summed over every slot
 // ever used — the cx-private#1910 evidence: the share of span refills that
 // took free_spans_lock. Racy reads of slow-path counters; exact enough.
