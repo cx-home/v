@@ -7694,6 +7694,16 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 
 	C.vgc_atomic_add_u64(&vgc_heap.heap_live, u64(n))
 	C.vgc_atomic_add_u64(&vgc_heap.total_alloc, u64(n))
+	// cx-private#1923 §1: a large object is the calling thread's allocation too
+	// (gc_thread_allocated, cx-home/v#62) — already in total_alloc, so it counts as
+	// flushed. The owner writes its own slot; the collector writes it only at a
+	// stop, when this thread is parked.
+	lidx := C.vgc_get_cache_idx()
+	if lidx >= 0 {
+		unsafe {
+			vgc_cache(lidx).alloc_flushed += u64(n)
+		}
+	}
 
 	ptr := unsafe { voidptr(span.base) }
 	if zero_fill {

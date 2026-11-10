@@ -52,3 +52,38 @@ fn test_this_threads_own_allocation_counts_across_a_collection() {
 	assert after >= mid, 'the count went back at a collection (${mid} -> ${after})'
 	assert after - b >= u64(16384) * 240, 'counted ${after - b} of ~4 MB across a collection'
 }
+
+// cx-private#1923 §1 (misc-epic-117): a large object (a span of its own, vgc_alloc_large) is this
+// thread's allocation too. It was counted in the process-wide total only, so cx-core-code's fold
+// scrub asked the process-wide count instead (a fold step that builds one large answer moved this
+// thread's count by nothing) — and at k mutators the process-wide count brought each worker's
+// 256 KB scrub due k times as often as its own work: json-codec 1 KB at k=28 spent ~10 % of its CPU
+// in that memset (cx_stack_scrub -> __bzero, 4,573 of 45,280 busy samples; none at k=1).
+@[noinline]
+fn large_churn(n int) int {
+	mut total := 0
+	for _ in 0 .. n {
+		a := []u8{len: 4 * 1024 * 1024} // a span of its own
+		total += a.len
+	}
+	return total
+}
+
+fn other_large(n int) u64 {
+	b := gc_thread_allocated()
+	large_churn(n)
+	return gc_thread_allocated() - b
+}
+
+fn test_a_large_allocation_is_this_threads_and_not_anothers() {
+	b := gc_thread_allocated()
+	large_churn(8) // 32 MB in eight large objects
+	mine := gc_thread_allocated() - b
+	assert mine >= u64(8) * 4 * 1024 * 1024, 'this thread counted ${mine} B of its 32 MB of large objects'
+	m0 := gc_thread_allocated()
+	t := spawn other_large(8)
+	theirs := t.wait()
+	moved := gc_thread_allocated() - m0
+	assert theirs >= u64(8) * 4 * 1024 * 1024, 'the other thread counted ${theirs} B of its 32 MB'
+	assert moved < quarter, 'this thread counted ${moved} B of another thread large objects'
+}
