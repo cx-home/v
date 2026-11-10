@@ -43,6 +43,19 @@ fn drop_run(n int) usize {
 	return usize(b.data) ^ mask
 }
 
+// run_and_neighbour carves the run and its neighbour while the run is live,
+// then drops the run: a collection the neighbour's request brings on (the
+// heap's goal is small in a fresh process) must not free the run first, or
+// the neighbour takes the run's own pages. An -O0 build kept the dropped run
+// named by a dead stack slot through that collection; an optimized one does
+// not (cx-home/v#66).
+@[noinline]
+fn run_and_neighbour(n int, m int, mut nb []u8) usize {
+	b := fill(n)
+	nb = fill(m)
+	return usize(b.data) ^ mask
+}
+
 @[noinline]
 fn scrub_stack() {
 	mut pad := [65536]u8{}
@@ -70,8 +83,8 @@ fn spend_tail(arena int, mut spent [][]u8) {
 
 fn test_a_small_request_takes_a_plain_kept_runs_tail() {
 	n := 999 * page // 1000 pages with the header: plain
-	key := drop_run(n)
-	mut buf := fill(299 * page) // 300 pages, carved right after the run: its neighbour
+	mut buf := []u8{}
+	key := run_and_neighbour(n, 299 * page, mut buf) // 300 pages, carved right after the run: its neighbour
 	assert usize(buf.data) == (key ^ mask) + 1000 * usize(page), 'the neighbour was not carved right after the run: ${usize(buf.data)} vs ${
 		(key ^ mask) + 1000 * usize(page)}'
 

@@ -68,7 +68,16 @@ fn test_an_unaligned_stack_word_keeps_its_object_across_gc_collect() {
 		_ = hide_under_guard(mut slot, off)
 		gc_collect()
 		after := vgc_span_census()
-		assert spans(after, '65544') == spans(before, '65544') + 1, 'offset ${off}: the buffer held only at an unaligned stack offset was swept: census before ${before}, after ${after}'
+		// the buffer's own span, read after the collection (the address is
+		// read back from the slot only now, so no aligned copy of it roots it).
+		// Not the census's count of its size: an optimized build keeps the
+		// last offset's buffer and its `other` named in registers or spill
+		// slots through the first collection and drops them at the second, so
+		// the count moved by +1 - 2 at -O1/-O2 with this buffer held (cx-home/v#66)
+		held := read_back(slot, off)
+		hpages, _, hpooled := vgc_span_probe(held)
+		assert hpages > 0 && !hpooled, 'offset ${off}: the buffer held only at an unaligned stack offset was swept: its span ${hpages} pages pooled=${hpooled}; census before ${before}, after ${after}'
+		assert spans(after, '65544') >= 1, 'offset ${off}: no 65544-byte span in use after the collection: census ${after}'
 		// the next allocation of its size must not land on it
 		other := []u8{len: buf_len, init: 9}
 		p := read_back(slot, off)

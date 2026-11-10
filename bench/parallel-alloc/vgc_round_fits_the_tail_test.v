@@ -47,10 +47,42 @@ fn fill(n int) []u8 {
 // recurring frame size (cx-home/v#58, vgc_frames_begun) — the first drop is
 // plain, the second takes its pooled run in place (a frame with nothing of
 // its kind takes a plain pooled run before a carve).
+// ask asks for n bytes and drops them: the buffer is named only in this
+// frame, which scrub_stack overwrites before the collection that frees it.
+@[noinline]
+fn ask(n int) int {
+	return fill(n).len
+}
+
+// scrub_stack overwrites the dead frames under its caller: an -O0 build left
+// the dropped 2047-page frame named by a dead slot through frames_begin's
+// first collection, so the first drop was not pooled there as it is at
+// -O1/-O2 (cx-home/v#66); every build now drops it.
+@[noinline]
+fn scrub_stack() {
+	mut pad := [65536]u8{}
+	unsafe { C.memset(&pad[0], 0, 65536) }
+	if pad[32768] != 0 {
+		println('')
+	}
+}
+
+// keep names a held buffer to the end of the test: an optimized build that
+// reads only a buffer's length after its probe keeps no root for it, so a
+// held buffer was collected under the next request and its run served that
+// request (cx-home/v#66).
+@[noinline]
+fn keep(p voidptr) {
+	if usize(p) == 1 {
+		println('')
+	}
+}
+
 @[noinline]
 fn frames_begin() {
 	for _ in 0 .. 2 {
-		assert fill(2047 * page).len == 2047 * page
+		assert ask(2047 * page) == 2047 * page
+		scrub_stack()
 		gc_collect()
 	}
 	assert vgc_frames_probe(), 'the frame arenas have not begun after a frame size asked for twice'
@@ -68,8 +100,17 @@ fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	tail := int(vgc_arena_tail_probe(hi)) // the plain arena's tail, in pages
 	mut spent := []u8{}
 	if tail > 2048 + 64 {
-		spent =
-			fill((tail - 65) * page) // tail - 64 pages with the header; asked for once: plain, held
+		// tail - 64 pages with the header, asked for once: plain, held — but
+		// never a size of the 3900-page frame's granule block (3841..4096):
+		// a size of its block asked for before makes the once-asked 3901 a
+		// drifting frame (vgc_large_round), which then takes the frame tail.
+		// With frames_begin's first drop pooled (every build, cx-home/v#66)
+		// the plain tail is 3968 pages and tail - 64 lay in that block.
+		mut pages := tail - 64
+		if pages > 3840 {
+			pages = 3840
+		}
+		spent = fill((pages - 1) * page)
 	}
 	first :=
 		fill(2100 * page) // 2101 pages, rounded to 2176; the size recurs, nothing of it pooled: a frame arena of its own
@@ -91,6 +132,12 @@ fn test_a_rounded_request_that_misses_every_tail_takes_one_at_its_exact_size() {
 	si, sf := vgc_arena_probe(second.data)
 	sp, _, _ := vgc_span_probe(second.data)
 	grew := (use1 - use0) / usize(page)
+	keep(held.data)
+	keep(spent.data)
+	keep(first.data)
+	keep(line.data)
+	keep(once.data)
+	keep(second.data)
 	println('vgc_round_fits_the_tail: the 3900-page frame (3901 pages, rounded to 4096) took a ${sp}-page span in arena ${si} (the 2100-page frame\'s: ${fi}), committed grew by ${grew} pages, arenas ${arenas0} -> ${arenas1} (${held.len} ${spent.len} ${first.len} ${line.len} ${once.len} ${second.len})')
 	assert arenas1 == arenas0, 'the rounded request carved an arena while its exact size fit a tail: ${arenas0} -> ${arenas1}'
 	assert si == fi && sf, 'the exact size did not take the frame arena\'s tail: arena ${si} frames=${sf}'

@@ -50,12 +50,6 @@ fn fill(n int) []u8 {
 }
 
 @[noinline]
-fn drop_frame(n int) usize {
-	b := fill(n)
-	return usize(b.data) ^ mask
-}
-
-@[noinline]
 fn scrub_stack() {
 	mut pad := [65536]u8{}
 	unsafe { C.memset(&pad[0], 0, 65536) }
@@ -71,14 +65,25 @@ fn period(order []int) (usize, usize, usize) {
 	mut k6 := usize(0)
 	mut k4 := usize(0)
 	mut k2 := usize(0)
+	// the period's frames are held until it ends, then dropped at once: a
+	// collection a later frame's request brings on must not free an earlier
+	// frame, whose run would then serve it. An -O0 build kept each dropped
+	// frame named by a dead stack slot through those collections; an
+	// optimized one does not, and the three frames shared one arena
+	// (cx-home/v#66). `held` is in memory (its address goes to the pushes)
+	// until period returns; scrub_stack clears it before the collections.
+	mut held := [][]u8{cap: 3}
 	for n in order {
-		k := drop_frame(n * page)
+		b := fill(n * page)
+		k := usize(b.data) ^ mask
+		held << b
 		match n {
 			6144 { k6 = k }
 			4864 { k4 = k }
 			else { k2 = k }
 		}
 	}
+	assert held.len == order.len
 	return k6, k4, k2
 }
 

@@ -33,10 +33,43 @@ fn fill(n int) []u8 {
 // recurring frame size (cx-home/v#58, vgc_frames_begun) — the first drop is
 // plain, the second takes its pooled run in place (a frame with nothing of
 // its kind takes a plain pooled run before a carve).
+// ask asks for n bytes and drops them: the buffer is named only in this
+// frame, which scrub_stack overwrites before the collection that frees it.
+@[noinline]
+fn ask(n int) int {
+	return fill(n).len
+}
+
+// scrub_stack overwrites the dead frames under its caller: an -O0 build left
+// the dropped 2047-page frame named by a dead slot through frames_begin's
+// first collection, so the first drop was not pooled there as it is at
+// -O1/-O2 (cx-home/v#66); every build now drops it.
+@[noinline]
+fn scrub_stack() {
+	mut pad := [65536]u8{}
+	unsafe { C.memset(&pad[0], 0, 65536) }
+	if pad[32768] != 0 {
+		println('')
+	}
+}
+
+// keep names a held buffer to the end of the test: an optimized build that
+// reads only a buffer's length after its probe keeps no root for it, so the
+// held buffer was collected under the next request and its run served that
+// request (the recurring frame took the once-asked frame's pooled run:
+// frames=false at -O1/-O2, cx-home/v#66).
+@[noinline]
+fn keep(p voidptr) {
+	if usize(p) == 1 {
+		println('')
+	}
+}
+
 @[noinline]
 fn frames_begin() {
 	for _ in 0 .. 2 {
-		assert fill(2047 * page).len == 2047 * page
+		assert ask(2047 * page) == 2047 * page
+		scrub_stack()
 		gc_collect()
 	}
 	assert vgc_frames_probe(), 'the frame arenas have not begun after a frame size asked for twice'
@@ -74,5 +107,11 @@ fn test_a_frame_and_a_buffer_never_share_an_arena() {
 	under := fill(2046 * page) // 2,047 pages with the header: a plain one
 	ui, uf := vgc_arena_probe(under.data)
 	assert !uf, 'the 2047-page request is in a frame arena: arena ${ui}'
+	keep(first.data)
+	keep(spent.data)
+	keep(frame.data)
+	keep(buf.data)
+	keep(line.data)
+	keep(under.data)
 	println('vgc_frame_arena_placement: the once-asked frame in arena ${oi}, the recurring one in ${fi}, buffer in ${bi}, the quarter line in ${li}, under it in ${ui}, arenas ${vgc_arenas_count()} (${first.len} ${spent.len} ${frame.len} ${buf.len} ${line.len} ${under.len})')
 }
