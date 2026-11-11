@@ -463,6 +463,11 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline int vgc_os_commit(void* ptr, size_t size) {
       return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
   }
+  // cx-home/v#69's test hook (VGC_TEST_ARENA_HINT): an arena mapped at a chosen
+  // address; NULL when the range is taken.
+  static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
+      return VirtualAlloc((void*)at, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  }
   static inline void vgc_os_free(void* ptr, size_t size) {
       (void)size;
       VirtualFree(ptr, 0, MEM_RELEASE);
@@ -526,6 +531,13 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline int vgc_os_commit(void* ptr, size_t size) {
       void* q = mmap(ptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
       return q != MAP_FAILED;
+  }
+  // cx-home/v#69's test hook (VGC_TEST_ARENA_HINT): an arena mapped at a chosen
+  // address, as a hint (never MAP_FIXED: nothing mapped is replaced); a mapping
+  // the kernel placed elsewhere is returned all the same and the caller reads it.
+  static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
+      void* p = mmap((void*)at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      return (p == MAP_FAILED) ? NULL : p;
   }
   static inline void vgc_os_free(void* ptr, size_t size) {
       munmap(ptr, size);

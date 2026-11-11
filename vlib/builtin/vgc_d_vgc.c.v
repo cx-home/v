@@ -134,6 +134,8 @@ fn C.vgc_addr_map_register(base usize, size usize, arena_idx int)
 
 // cx-home/v#56 lever 10: the cards by chunk (vgc_chunk_cards in vgc_platform.h)
 fn C.vgc_chunk_cards_register(base usize, size usize) int
+fn C.vgc_os_alloc_at(size usize, at usize) voidptr
+fn C.strtoull(s &char, endp &&char, base int) u64
 fn C.vgc_chunk_cards_of(addr usize) &u8
 fn C.vgc_chunk_count() int
 fn C.vgc_chunk_base_at(n int) usize
@@ -1582,6 +1584,12 @@ __global vgc_mark_pool_next = u32(0)
 // vgc_init; off, it costs one load per pool thread's life.
 __global vgc_test_pool_arrive = false
 __global vgc_test_lock = u32(0)
+// cx-home/v#69: a test hook — VGC_TEST_ARENA_HINT=<address> maps every arena
+// carved after vgc_init at that address and upward (a hint, one arena after
+// another), the stand-in for Linux's mmap, which hands out addresses near the
+// top of the user address space (x86-64 ~127 TB, arm64 ~256 TB) where macOS
+// hands out a few GB. Read once at vgc_init; off (0), a carve pays one load.
+__global vgc_test_arena_hint = usize(0)
 __global vgc_mark_spawn_gen = u32(0)
 // the generation a starting pool thread has already seen: vgc_mark_go as it
 // stood when the collector created it, before this cycle's advance. A thread
@@ -2668,6 +2676,10 @@ pub fn vgc_init() {
 		vgc_pool_goal_comp = C.atoll(pgc_env) != 0
 	}
 	vgc_test_pool_arrive = C.getenv(c'VGC_TEST_POOL_ARRIVE') != unsafe { nil }
+	tah_env := C.getenv(c'VGC_TEST_ARENA_HINT')
+	if tah_env != unsafe { nil } {
+		vgc_test_arena_hint = usize(C.strtoull(tah_env, unsafe { nil }, 0))
+	}
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
 		pv := C.atoll(pm_env)
@@ -6299,7 +6311,12 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			return unsafe { nil }, false
 		}
 		asize := if nbytes > vgc_arena_size { nbytes } else { vgc_arena_size }
-		mem := C.vgc_os_alloc(asize)
+		mut mem := unsafe { nil }
+		if vgc_test_arena_hint != 0 {
+			mem = vgc_test_arena_map(asize)
+		} else {
+			mem = C.vgc_os_alloc(asize)
+		}
 		if mem == unsafe { nil } {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }, false
@@ -6495,6 +6512,15 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		vgc_pool_compensate(u64(nbytes))
 	}
 	return span, false
+}
+
+// vgc_test_arena_map maps an arena at the test hook's address (cx-home/v#69,
+// VGC_TEST_ARENA_HINT) and moves the hook past it, a 64 MB gap between arenas;
+// under the heap lock, as every carve is.
+fn vgc_test_arena_map(asize usize) voidptr {
+	mem := C.vgc_os_alloc_at(asize, vgc_test_arena_hint)
+	vgc_test_arena_hint += (asize + vgc_arena_size - 1) / vgc_arena_size * vgc_arena_size + vgc_arena_size
+	return mem
 }
 
 // vgc_nursery_reserve_range reserves the nursery's address range at vgc_init
