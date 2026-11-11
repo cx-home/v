@@ -2678,7 +2678,7 @@ pub fn vgc_init() {
 	vgc_test_pool_arrive = C.getenv(c'VGC_TEST_POOL_ARRIVE') != unsafe { nil }
 	tah_env := C.getenv(c'VGC_TEST_ARENA_HINT')
 	if tah_env != unsafe { nil } {
-		vgc_test_arena_hint = usize(C.strtoull(tah_env, unsafe { nil }, 0))
+		vgc_test_arena_hint = unsafe { usize(C.strtoull(tah_env, nil, 0)) }
 	}
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
