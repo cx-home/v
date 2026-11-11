@@ -124,6 +124,37 @@ fn (c &PcsCfg) pcs_rhs_is_fresh_string(rhs ast.Expr, result_typ ast.Type) bool {
 	}
 }
 
+// pcs_rhs_borrows reports whether `rhs` READS a value out of existing storage
+// (a field, an element or slice, a pointee, or another binding) rather than
+// building a new one. Such a value shares the source's buffer, so a binding of
+// it never owns what it would free (cx-home/v#70). A branch-valued RHS borrows
+// when any branch's value does.
+fn pcs_rhs_borrows(rhs ast.Expr) bool {
+	return match rhs {
+		ast.Ident, ast.SelectorExpr, ast.IndexExpr { true }
+		ast.PrefixExpr { rhs.op == .mul }
+		ast.ParExpr { pcs_rhs_borrows(rhs.expr) }
+		ast.UnsafeExpr { pcs_rhs_borrows(rhs.expr) }
+		ast.AsCast { pcs_rhs_borrows(rhs.expr) }
+		ast.CastExpr { pcs_rhs_borrows(rhs.expr) }
+		ast.IfExpr { pcs_branch_values_borrow(rhs.branches.map(it.stmts)) }
+		ast.MatchExpr { pcs_branch_values_borrow(rhs.branches.map(it.stmts)) }
+		else { false }
+	}
+}
+
+fn pcs_branch_values_borrow(branches [][]ast.Stmt) bool {
+	for stmts in branches {
+		if stmts.len > 0 {
+			last := stmts.last()
+			if last is ast.ExprStmt && pcs_rhs_borrows(last.expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // pcs_is_store_target reports whether an assignment LHS writes THROUGH an existing
 // object (a struct field, a collection element, or a pointer dereference) rather
 // than (re)binding a plain local. Storing into such a target retains the stored
@@ -1049,6 +1080,33 @@ fn (mut c PcsCfg) pcs_scan_share_stmt(st ast.Stmt) {
 				}
 				if e is ast.CallExpr && c.pcs_is_fresh_array_call(e) {
 					fresh = true
+				}
+			}
+			// A by-value heap binding read OUT of storage this function does not
+			// own aliases that storage: V copies only the array/string/map header,
+			// so `sl := m.vals[1..3]`, `all := m.vals`, `inner := m.nests[2]`,
+			// `s := *p` or `a := some_global` all share the owner's buffer and
+			// elements. When the source is a borrowed pointer, a global or a
+			// parameter's field, no local heap var appears on the RHS, so the
+			// aliasing pin above never fired and Perceus dropped the binding at
+			// its last use — `Array_T_free(&sl)` released the holder's elements
+			// (cx-home/v#70: the holder then read freed, reused memory). Pin the
+			// binding whenever its own RHS borrows; marking shared only ever
+			// suppresses a drop, and the tracing backstop reclaims the value.
+			if !fresh && lhs_heap.len > 0 {
+				if st.left.len == st.right.len {
+					for i, l in st.left {
+						if l is ast.Ident && l.name in lhs_heap && pcs_rhs_borrows(st.right[i]) {
+							c.pcs_mark_shared(l.name)
+						}
+					}
+				} else {
+					// `a, b := f()`: a multi-value call hands back values the callee
+					// may have read out of its receiver or arguments (the single-
+					// value case is pinned by the call rule below).
+					for n in lhs_heap {
+						c.pcs_mark_shared(n)
+					}
 				}
 			}
 			if !fresh && lhs_heap.len > 0 && rhs_heap.len > 0 {
