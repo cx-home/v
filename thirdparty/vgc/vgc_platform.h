@@ -463,6 +463,11 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline int vgc_os_commit(void* ptr, size_t size) {
       return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
   }
+  // cx-home/v#69: the address-indexed tables (vgc_addr_tables_init); pages are
+  // zero-filled on first touch.
+  static inline void* vgc_os_alloc_lazy(size_t size) {
+      return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  }
   // cx-home/v#69's test hook (VGC_TEST_ARENA_HINT): an arena mapped at a chosen
   // address; NULL when the range is taken.
   static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
@@ -531,6 +536,13 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline int vgc_os_commit(void* ptr, size_t size) {
       void* q = mmap(ptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
       return q != MAP_FAILED;
+  }
+  // cx-home/v#69: the address-indexed tables (vgc_addr_tables_init) — read and
+  // written, but only the pages of the chunks in use are touched, so no swap is
+  // reserved for the rest (MAP_NORESERVE; defined above where a system lacks it).
+  static inline void* vgc_os_alloc_lazy(size_t size) {
+      void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      return (p == MAP_FAILED) ? NULL : p;
   }
   // cx-home/v#69's test hook (VGC_TEST_ARENA_HINT): an arena mapped at a chosen
   // address, as a hint (never MAP_FIXED: nothing mapped is replaced); a mapping
@@ -1052,7 +1064,17 @@ static inline void vgc_mutex_unlock(volatile uint32_t* lock) {
 // so the O(1) hint is right for the body of every arena and the linear fallback
 // only fires for the rare unaligned boundary chunk shared by two adjacent arenas.
 #define VGC_ADDR_SHIFT 26  // 64MB chunks (== vgc_arena_size)
-#define VGC_ADDR_MAP_SIZE 65536 // 65536 * 64MB = 4TB address coverage (same as old 4096*1GB)
+// cx-home/v#69: 4,194,304 * 64MB = 256 TB, a 48-bit user address space whole.
+// It was 65536 (4 TB), and macOS hands out mmap addresses of a few GB, but
+// Linux hands them out near the top of the user address space (x86-64 ~127 TB,
+// arm64 ~256 TB): every arena carve there was refused (vgc_chunk_cards_register)
+// and a -gc e program died at its first allocation, 'out of memory … arenas 0'.
+// The tables are no longer static arrays: at this size they would be 48 MB of
+// .bss inside the data segments the root scan slices by address among the
+// markers (vgc_roots_data_slice). vgc_addr_tables_init maps them once, lazily
+// (MAP_NORESERVE), at the first arena carve — single-threaded, in _vinit, before
+// any thread exists — and only the pages of the chunks in use are ever touched.
+#define VGC_ADDR_MAP_SIZE 4194304 // 4194304 * 64MB = 256TB address coverage
 
 // Maps (address >> VGC_ADDR_SHIFT) -> arena_index+1 (0 = not mapped), TWICE:
 // an arena is an mmap of vgc_arena_size at whatever address the OS hands out,
@@ -1067,10 +1089,31 @@ static inline void vgc_mutex_unlock(volatile uint32_t* lock) {
 // single-object arena is larger, never smaller), so the second entry makes
 // the lookup exact: the hint names one arena, vgc_addr_map2 the other, and
 // the linear scan is left for a chunk that somehow holds a third.
-static uint16_t vgc_addr_map[VGC_ADDR_MAP_SIZE];
-static uint16_t vgc_addr_map2[VGC_ADDR_MAP_SIZE];
+static uint16_t* vgc_addr_map;  // VGC_ADDR_MAP_SIZE entries (vgc_addr_tables_init)
+static uint16_t* vgc_addr_map2; // VGC_ADDR_MAP_SIZE entries
+static unsigned char** vgc_chunk_cards; // VGC_ADDR_MAP_SIZE entries (the card tables by chunk, below)
+static int vgc_addr_tables_ok;
+
+// Maps the three address-indexed tables (cx-home/v#69): once, at the first arena
+// carve (under the heap lock; the first carve runs in _vinit, single-threaded,
+// so the pointers are written before any reader thread exists), or at vgc_init.
+// Untouched pages cost no memory; MAP_NORESERVE charges no swap for them.
+// Returns 0 when the mapping failed: the carve is refused (a loud out of memory).
+static inline int vgc_addr_tables_init(void) {
+    if (vgc_addr_tables_ok) return 1;
+    size_t n = (size_t)VGC_ADDR_MAP_SIZE;
+    size_t bytes = n * sizeof(uint16_t) * 2 + n * sizeof(unsigned char*);
+    unsigned char* t = (unsigned char*)vgc_os_alloc_lazy(bytes);
+    if (t == 0) return 0;
+    vgc_chunk_cards = (unsigned char**)t;
+    vgc_addr_map = (uint16_t*)(t + n * sizeof(unsigned char*));
+    vgc_addr_map2 = vgc_addr_map + n;
+    vgc_addr_tables_ok = 1;
+    return 1;
+}
 
 static inline void vgc_addr_map_register(uintptr_t base, size_t size, int arena_idx) {
+    if (!vgc_addr_tables_init()) return; // no map: lookups take the linear scan
     uintptr_t lo = base >> VGC_ADDR_SHIFT;
     uintptr_t hi = (base + size - 1) >> VGC_ADDR_SHIFT;
     uint16_t me = (uint16_t)(arena_idx + 1);
@@ -1096,7 +1139,7 @@ static inline void vgc_addr_map_register(uintptr_t base, size_t size, int arena_
 // Returns arena index or -1
 static inline int vgc_addr_to_arena(uintptr_t addr) {
     uintptr_t idx = addr >> VGC_ADDR_SHIFT;
-    if (idx >= VGC_ADDR_MAP_SIZE) return -1;
+    if (idx >= VGC_ADDR_MAP_SIZE || vgc_addr_map == 0) return -1;
     int v = (int)vgc_atomic_load_u16(&vgc_addr_map[idx]); // ACQUIRE (pairs with register's RELEASE)
     return v ? v - 1 : -1;
 }
@@ -1105,7 +1148,7 @@ static inline int vgc_addr_to_arena(uintptr_t addr) {
 // does not contain addr, before the linear scan.
 static inline int vgc_addr_to_arena2(uintptr_t addr) {
     uintptr_t idx = addr >> VGC_ADDR_SHIFT;
-    if (idx >= VGC_ADDR_MAP_SIZE) return -1;
+    if (idx >= VGC_ADDR_MAP_SIZE || vgc_addr_map2 == 0) return -1;
     int v = (int)vgc_atomic_load_u16(&vgc_addr_map2[idx]);
     return v ? v - 1 : -1;
 }
@@ -1131,8 +1174,10 @@ static inline int vgc_addr_to_arena2(uintptr_t addr) {
 // static tables the data-segment root scan leaves out (vgc_static_tables).
 #define VGC_CHUNK_CARD_SHIFT 13
 #define VGC_CHUNK_CARDS (1u << (VGC_ADDR_SHIFT - VGC_CHUNK_CARD_SHIFT))
-static unsigned char* vgc_chunk_cards[VGC_ADDR_MAP_SIZE];
-static uint32_t vgc_chunk_list[VGC_ADDR_MAP_SIZE];
+// the registered chunks, in order (65536 chunks = 4 TB of arenas, past any
+// heap the arena ceiling allows)
+#define VGC_CHUNK_LIST_MAX 65536
+static uint32_t vgc_chunk_list[VGC_CHUNK_LIST_MAX];
 static int vgc_chunk_n;
 
 // Registers the chunks [base, base + size) touches: a table for each that has
@@ -1141,9 +1186,10 @@ static int vgc_chunk_n;
 static inline int vgc_chunk_cards_register(uintptr_t base, size_t size) {
     uintptr_t lo = base >> VGC_ADDR_SHIFT;
     uintptr_t hi = (base + size - 1) >> VGC_ADDR_SHIFT;
-    if (hi >= VGC_ADDR_MAP_SIZE) return 0;
+    if (hi >= VGC_ADDR_MAP_SIZE || !vgc_addr_tables_init()) return 0;
     for (uintptr_t i = lo; i <= hi; i++) {
         if (vgc_atomic_load_u64(&vgc_chunk_cards[i]) != 0) continue;
+        if (vgc_chunk_n >= VGC_CHUNK_LIST_MAX) return 0;
         unsigned char* t = (unsigned char*)vgc_os_alloc(VGC_CHUNK_CARDS);
         if (t == 0) return 0;
         vgc_chunk_list[vgc_chunk_n++] = (uint32_t)i;
@@ -1155,14 +1201,15 @@ static inline int vgc_chunk_cards_register(uintptr_t base, size_t size) {
 // The table of the chunk addr lies in, or 0 (no arena touches that chunk).
 static inline unsigned char* vgc_chunk_cards_of(uintptr_t addr) {
     uintptr_t i = addr >> VGC_ADDR_SHIFT;
-    if (i >= VGC_ADDR_MAP_SIZE) return 0;
+    if (i >= VGC_ADDR_MAP_SIZE || vgc_chunk_cards == 0) return 0;
     return (unsigned char*)(uintptr_t)vgc_atomic_load_u64(&vgc_chunk_cards[i]);
 }
 static inline int vgc_chunk_count(void) { return vgc_chunk_n; }
 static inline uintptr_t vgc_chunk_base_at(int n) { return (uintptr_t)vgc_chunk_list[n] << VGC_ADDR_SHIFT; }
 static inline unsigned char* vgc_chunk_table_at(int n) { return vgc_chunk_cards[vgc_chunk_list[n]]; }
 // The table of tables, for the gate's global (vgc_wb_cards).
-static inline void* vgc_chunk_cards_table(void) { return (void*)vgc_chunk_cards; }
+// vgc_init reads it once (single-threaded): the tables exist from then on.
+static inline void* vgc_chunk_cards_table(void) { vgc_addr_tables_init(); return (void*)vgc_chunk_cards; }
 
 // ============================================================
 // Thread creation (for GC workers - avoids V's spawn which
@@ -3054,20 +3101,22 @@ static int vgc_tc_nwindows;
 // window's page bits as its own: untouched .bss pages faulted in).
 static volatile uint32_t vgc_tc_lock;
 static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
-    los[0] = (uintptr_t)&vgc_addr_map[0];
-    his[0] = (uintptr_t)&vgc_addr_map[0] + sizeof(vgc_addr_map);
+    // cx-home/v#69: the address maps and the chunk card tables are mapped
+    // (vgc_addr_tables_init), outside the data segments; their pointers are left out
+    los[0] = (uintptr_t)&vgc_addr_map;
+    his[0] = (uintptr_t)&vgc_addr_map + sizeof(vgc_addr_map);
     los[1] = (uintptr_t)&vgc_susp_chunks[0];
     his[1] = (uintptr_t)&vgc_susp_chunks[0] + sizeof(vgc_susp_chunks);
     los[2] = (uintptr_t)&vgc_cache_chunk_tab[0];
     his[2] = (uintptr_t)&vgc_cache_chunk_tab[0] + sizeof(vgc_cache_chunk_tab);
-    los[3] = (uintptr_t)&vgc_addr_map2[0];
-    his[3] = (uintptr_t)&vgc_addr_map2[0] + sizeof(vgc_addr_map2);
+    los[3] = (uintptr_t)&vgc_addr_map2;
+    his[3] = (uintptr_t)&vgc_addr_map2 + sizeof(vgc_addr_map2);
     los[4] = (uintptr_t)&vgc_tc_windows[0];
     his[4] = (uintptr_t)&vgc_tc_windows[0] + sizeof(vgc_tc_windows);
     // cx-home/v#56 lever 10: the card tables by chunk (pointers to mmap'd
     // tables outside the arenas) and the registered chunks' indices
-    los[5] = (uintptr_t)&vgc_chunk_cards[0];
-    his[5] = (uintptr_t)&vgc_chunk_cards[0] + sizeof(vgc_chunk_cards);
+    los[5] = (uintptr_t)&vgc_chunk_cards;
+    his[5] = (uintptr_t)&vgc_chunk_cards + sizeof(vgc_chunk_cards);
     los[6] = (uintptr_t)&vgc_chunk_list[0];
     his[6] = (uintptr_t)&vgc_chunk_list[0] + sizeof(vgc_chunk_list);
     return VGC_STATIC_TABLES;

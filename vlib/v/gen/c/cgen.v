@@ -1348,7 +1348,7 @@ pub fn (mut g Gen) init() {
 			g.cheaders.writeln('extern void* vgc_wb_cards;')
 			g.cheaders.writeln('#define VGC_WB_PAGE_SHIFT 13')
 			g.cheaders.writeln('#define VGC_WB_CHUNK_SHIFT 26')
-			g.cheaders.writeln('#define VGC_WB_CHUNKS 65536')
+			g.cheaders.writeln('#define VGC_WB_CHUNKS 4194304')
 			g.cheaders.writeln('#define VGC_WB_CHUNK_MASK 8191')
 			// cx-home/v#56 lever 14: the card read runs out of line, in
 			// vgc_wb_gate_card, and the gate every store site carries inline is the

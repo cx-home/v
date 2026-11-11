@@ -95,7 +95,7 @@ extern size_t vgc_young_len;
 extern void* vgc_wb_cards;
 #define VGC_WB_PAGE_SHIFT 13
 #define VGC_WB_CHUNK_SHIFT 26
-#define VGC_WB_CHUNKS 65536
+#define VGC_WB_CHUNKS 4194304
 #define VGC_WB_CHUNK_MASK 8191
 void vgc_wb_store(void* obj);
 #ifndef VGC_WB_UNLIKELY

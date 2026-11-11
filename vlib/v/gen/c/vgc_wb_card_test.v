@@ -43,8 +43,8 @@ fn test_the_gate_reads_the_card_before_the_call() {
 	plat := os.read_file(os.join_path(os.dir(vexe), 'thirdparty', 'vgc', 'vgc_platform.h'))!
 	assert plat.contains('#define VGC_ADDR_SHIFT 26 '), 'VGC_ADDR_SHIFT in vgc_platform.h'
 	assert c.contains('#define VGC_WB_CHUNK_SHIFT 26\n'), "the gate's chunk shift is not VGC_ADDR_SHIFT"
-	assert plat.contains('#define VGC_ADDR_MAP_SIZE 65536 '), 'VGC_ADDR_MAP_SIZE in vgc_platform.h'
-	assert c.contains('#define VGC_WB_CHUNKS 65536\n'), "the gate's chunk count is not VGC_ADDR_MAP_SIZE"
+	assert plat.contains('#define VGC_ADDR_MAP_SIZE 4194304 '), 'VGC_ADDR_MAP_SIZE in vgc_platform.h'
+	assert c.contains('#define VGC_WB_CHUNKS 4194304\n'), "the gate's chunk count is not VGC_ADDR_MAP_SIZE"
 	assert c.contains('#define VGC_WB_CHUNK_MASK ${(1 << (26 - n)) - 1}\n'), "the gate's card mask is not a chunk's cards less one"
 	built :=
 		os.execute('${os.quoted_path(vexe)} -gc e -o ${os.quoted_path(out)} ${os.quoted_path(src)}')
