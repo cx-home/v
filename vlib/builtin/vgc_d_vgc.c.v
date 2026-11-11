@@ -1575,6 +1575,13 @@ __global vgc_mark_pool_n = int(0)
 // pool threads alive (the collector excluded)
 __global vgc_mark_pool_next = u32(0)
 // slot handed to a starting pool thread
+// cx-home/v#68: a test hook — VGC_TEST_POOL_ARRIVE=1 holds a starting pool thread
+// before its arrival while a mutator holds vgc_test_lock (vgc_test_lock_hold /
+// vgc_test_lock_release), the stand-in for a thread start that needs a lock a
+// mutator holds (ASan's thread registry on the sanitizer build). Read once at
+// vgc_init; off, it costs one load per pool thread's life.
+__global vgc_test_pool_arrive = false
+__global vgc_test_lock = u32(0)
 __global vgc_mark_spawn_gen = u32(0)
 // the generation a starting pool thread has already seen: vgc_mark_go as it
 // stood when the collector created it, before this cycle's advance. A thread
@@ -2660,6 +2667,7 @@ pub fn vgc_init() {
 	if pgc_env != unsafe { nil } {
 		vgc_pool_goal_comp = C.atoll(pgc_env) != 0
 	}
+	vgc_test_pool_arrive = C.getenv(c'VGC_TEST_POOL_ARRIVE') != unsafe { nil }
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
 		pv := C.atoll(pm_env)

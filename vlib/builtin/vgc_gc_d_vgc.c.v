@@ -3440,6 +3440,16 @@ fn vgc_parallel_mark() {
 // when every pool thread has reported the phase done — so no pool thread
 // touches the heap outside this stop, and the next phase starts on a joined
 // pool. Each phase of a cycle is one generation.
+// cx-home/v#68's hook: the lock a starting pool thread waits on (a test mutator
+// holds it most of the time; a stop that catches it holding keeps it held).
+pub fn vgc_test_lock_hold() {
+	C.vgc_atomic_store_u32(&vgc_test_lock, 1)
+}
+
+pub fn vgc_test_lock_release() {
+	C.vgc_atomic_store_u32(&vgc_test_lock, 0)
+}
+
 fn vgc_pool_run(phase u32, n int) {
 	vgc_pool_phase = phase
 	vgc_pool_phase_n = n
@@ -3488,6 +3498,13 @@ fn vgc_pool_phase_run(phase u32, slot int, n int) {
 // from the heap. It waits on the generation, drains the cycle it was woken for
 // (every pool thread is a marker of every parallel cycle), reports done.
 fn vgc_mark_worker_main() {
+	if vgc_test_pool_arrive {
+		// cx-home/v#68's hook (VGC_TEST_POOL_ARRIVE): arrive only while no mutator
+		// holds vgc_test_lock
+		for C.vgc_atomic_load_u32(&vgc_test_lock) != 0 {
+			C.vgc_yield()
+		}
+	}
 	slot := int(C.vgc_atomic_add_u32(&vgc_mark_pool_next, 1)) // 1-based; the collector is 0
 	// the generation at creation, not 0: a pool that grows after cycle G starts
 	// its new threads at G, so they wait for G+1 (vgc_mark_spawn_gen above). The
