@@ -107,13 +107,30 @@ fn test_the_full_that_closes_a_run_of_minors_takes_the_concurrent_cycle() {
 	c, out := run_wave('VGC_MARK_WORKERS=1 VGC_CM_BORN_PCT=0')
 	closing := c.fulls.filter(it > c.first_minor)
 	assert closing.len >= 1, 'no full cycle closed a run of minors\n${out}'
+	// cx-home/v#66: a closing full is owed the concurrent cycle only when the
+	// last FULL before it marked past the line (VGC_CM_MIN_US, 1000 us; one
+	// marker, so its mark is its work). Under the devbox build the first minor
+	// can run while the 48 MB is still being built (gc 1 a minor at 2 MB live,
+	// after gc 0's 301 us full), and the full that closes that run is rightly
+	// stop-the-world by the very rule this test holds: its last full marked
+	// under the line. The fulls after the 48 MB full are the ones judged.
+	mut judged := []int{}
 	mut stw := []int{}
 	for id in closing {
+		prev := c.fulls.filter(it < id)
+		if prev.len == 0 {
+			continue
+		}
+		if (c.mark_us[prev.last()] or { -1 }) < 1000 {
+			continue
+		}
+		judged << id
 		if id !in c.cm {
 			stw << id
 		}
 	}
-	println('vgc_young_full_cm: minors=${c.minors.len} closing_fulls=${closing.len} stw_closing=${stw} ${c.done}')
+	assert judged.len >= 1, 'no full cycle closed a run of minors after a full that marked past the line\n${out}'
+	println('vgc_young_full_cm: minors=${c.minors.len} closing_fulls=${closing.len} judged=${judged.len} stw_closing=${stw} ${c.done}')
 	assert stw.len == 0, 'the full cycles ${stw} closed a run of minors stop-the-world: judged for the concurrent cycle by the minor\'s mark, not the last full\'s\n${out}'
 }
 
@@ -123,15 +140,20 @@ fn test_a_minor_cycle_plans_its_markers_from_the_last_minor() {
 	// a minor is planned from the last minor: one whose mark and whose
 	// predecessor's mark both read under the line ran one marker (the minor
 	// after a full inherited the full's plan before)
+	// cx-home/v#66: the predecessor's WORK is what the plan reads (its mark
+	// times its markers, vgc_mark_work): under load a minor that ran 8 markers
+	// for a 346 us mark left 2.8 ms of work, and the next minor rightly took 2
+	// markers (cc -O0 suite at load ~20, gc 9 -> gc 10); its wall alone read
+	// under the line.
 	mut wide := []int{}
-	mut prev_us := -1
+	mut prev_work := -1
 	for id in minors {
 		m := c.mark_us[id] or { -1 }
 		n := c.markers[id] or { -1 }
-		if m >= 0 && m < 1000 && prev_us >= 0 && prev_us < 1000 && n > 1 {
+		if m >= 0 && m < 1000 && prev_work >= 0 && prev_work < 1000 && n > 1 {
 			wide << id
 		}
-		prev_us = m
+		prev_work = if m >= 0 { m * (if n > 1 { n } else { 1 }) } else { -1 }
 	}
 	println('vgc_young_minor_markers: minors=${minors.len} wide_minors=${wide} ${c.done}')
 	assert wide.len == 0, 'the minor cycles ${wide} ran several markers on a mark under 1 ms: planned from the full\'s mark, not the last minor\'s\n${out}'
