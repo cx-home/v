@@ -3227,6 +3227,18 @@ fn vgc_pool_ensure(total int) int {
 		}
 		vgc_mark_pool_n++
 	}
+	// cx-home/v#68: wait here, while the mutators still run, until every pool
+	// thread has ARRIVED (taken its slot in vgc_mark_worker_main). pthread_create
+	// returns before the thread runs, and a start can need a lock a mutator holds
+	// (ASan's thread registry: its pthread_create and thread-exit hooks lock it, and
+	// the new thread's start locks it too). The world stops right after this plan;
+	// a mutator stopped holding that lock left the thread unable to start, and
+	// vgc_pool_run's join, which counts every thread in vgc_mark_pool_n, spun on it
+	// for good (the soundness gate's workers4_20k on the sanitizer build, 18 min).
+	// A thread past its arrival needs only the generation's atomics.
+	for C.vgc_atomic_load_u32(&vgc_mark_pool_next) < u32(vgc_mark_pool_n) {
+		C.vgc_yield()
+	}
 	if vgc_mark_pool_n + 1 < total {
 		return vgc_mark_pool_n + 1
 	}
