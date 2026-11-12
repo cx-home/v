@@ -466,10 +466,6 @@ mut:
 	// is left to it (at most 26 pages = 208 KB).
 	tpool   [11]&VGC_Span
 	tpool_n int
-	// cx-core-code#145: bytes this thread carved off arena tails since it
-	// registered — the one-tail-per-thread rule applies from vgc_arena_own_bytes
-	// on (vgc_arena_carver)
-	carved u64
 	// refill statistics (cx-private#1910 evidence; slow path only)
 	pool_refills    u64 // vgc_get_free_span_cached calls
 	pool_lock_takes u64 // of which took free_spans_lock
@@ -1766,17 +1762,6 @@ __global vgc_arena_owner_on = true
 // The arena count of one working thread is first fit's
 // (bench/parallel-alloc/vgc_arena_owner_idle_test.v).
 __global vgc_arena_owner_cycles = u64(1)
-// A thread takes an arena tail of its own only once it carved this much
-// (cx-core-code#145): a thread that carves little — a [par] worker carving a
-// few hundred KB in the whole run — carved a 64 MB arena of its own, and each
-// arena costs resident pages beside its spans (its page->span map and card
-// table pages, one more mapping's page tables, the touched tail page):
-// fannkuch-redux 11 at [par 28] read 19.2-19.6 MB peak with 30 arenas and
-// 17.4-18.3 MB with the rule off. The first touches the rule keeps apart are a
-// heavy carver's (28 threads x 480 MB); below this bound a thread carves first
-// fit (bench/parallel-alloc/vgc_arena_owner_light_test.v). VGC_ARENA_OWN_KB
-// overrides (0: every carving thread owns, as before).
-__global vgc_arena_own_bytes = u64(4) * 1024 * 1024
 // markers this cycle, the collector included
 // Soft heap limit (bytes; VGC_MEMLIMIT_MB overrides): the pacer goal is clamped
 // here so collection always engages well before the physical arena ceiling.
@@ -2821,13 +2806,6 @@ pub fn vgc_init() {
 	if ao_env != unsafe { nil } {
 		vgc_arena_owner_on = C.atoll(ao_env) != 0
 	}
-	aob_env := C.getenv(c'VGC_ARENA_OWN_KB')
-	if aob_env != unsafe { nil } {
-		kb := C.atoll(aob_env)
-		if kb >= 0 {
-			vgc_arena_own_bytes = u64(kb) * 1024
-		}
-	}
 	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
 	if lim_env != unsafe { nil } {
 		lmb := C.atoll(lim_env)
@@ -3014,7 +2992,6 @@ fn vgc_register_thread_opt(wait bool) bool {
 	}
 	unsafe {
 		vgc_cache(idx).registered = true
-		vgc_cache(idx).carved = 0 // cx-core-code#145: a reused slot starts below the bound
 		vgc_cache(idx).stack_base = stack_base
 		// cx #743: keep the TRUE bounds too (0/0 when unknown) — the scan-range
 		// refresh validates externally-captured SPs against them, so a thread
@@ -5910,7 +5887,7 @@ fn vgc_frame_tail_past_room(nbytes usize) (usize, int) {
 }
 
 fn vgc_arena_tail_take(nbytes usize, kind u8) (usize, int) {
-	me := vgc_arena_carver()
+	me := if vgc_arena_owner_on { C.vgc_get_cache_idx() + 1 } else { 0 }
 	i := vgc_arena_pick(nbytes, me, vgc_heap.narenas, unsafe { &vgc_heap.arenas[0] },
 		vgc_arena_ceiling(), vgc_arena_owner_live, vgc_heap.gc_cycle, kind)
 	if i < 0 {
@@ -5920,37 +5897,7 @@ fn vgc_arena_tail_take(nbytes usize, kind u8) (usize, int) {
 	unsafe {
 		vgc_heap.arenas[i].used += nbytes
 	}
-	vgc_arena_carved(nbytes)
 	return base, i
-}
-
-// vgc_arena_carver answers the owner a carve runs as (vgc_arena_pick's `me`):
-// the calling thread's cache index + 1 once the thread carved
-// vgc_arena_own_bytes, else 0 — first fit, claiming nothing (cx-core-code#145).
-// Under the heap lock.
-fn vgc_arena_carver() int {
-	if !vgc_arena_owner_on {
-		return 0
-	}
-	ci := C.vgc_get_cache_idx()
-	if ci < 0 || ci >= vgc_heap.ncaches {
-		return 0
-	}
-	if unsafe { vgc_cache(ci).carved } < vgc_arena_own_bytes {
-		return 0
-	}
-	return ci + 1
-}
-
-// vgc_arena_carved counts nbytes carved off an arena by the calling thread
-// (vgc_arena_carver's bound). Under the heap lock.
-fn vgc_arena_carved(nbytes usize) {
-	ci := C.vgc_get_cache_idx()
-	if ci >= 0 && ci < vgc_heap.ncaches {
-		unsafe {
-			vgc_cache(ci).carved += u64(nbytes)
-		}
-	}
 }
 
 // vgc_arena_pick answers the first of the `n` arenas at `arenas` with nbytes of
@@ -6415,14 +6362,13 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			vgc_heap.arenas[arena_idx].owner = 0
 			vgc_heap.arenas[arena_idx].kind = kind
 		}
-		if asize == vgc_arena_size {
-			me := vgc_arena_carver()
+		if vgc_arena_owner_on && asize == vgc_arena_size {
+			me := C.vgc_get_cache_idx() + 1
 			if me > 0 {
 				vgc_arena_claim(unsafe { &vgc_heap.arenas[0] }, arena_idx + 1, arena_idx, me,
 					vgc_heap.gc_cycle)
 			}
 		}
-		vgc_arena_carved(nbytes)
 		// narenas is NOT bumped here: it is the publication point for this whole
 		// arena (base/size/used + the page_span map filled below) and must be
 		// stored with RELEASE only after all of that is written — see the atomic
