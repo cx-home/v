@@ -976,6 +976,13 @@ __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 // unchanged (0.88-0.91 s). A live set of 2 MB or more (csv-aggregate: 3 MB)
 // paces as before.
 __global vgc_headroom_floor_lo1 = u64(256) * 1024
+// The first collection's trigger (cx-private#1934): start-up allocates this much before the
+// collector's first cycle. At the one-thread floor (256 KB) a native n-body binary ran three
+// collections before its first step, ~15 % of its start. Only the first trigger: after the first
+// cycle the pacer's floor is vgc_headroom_floor_lo1 again, so a small live set paces as before.
+// VGC_FIRST_TRIGGER_KB overrides (0 or unset keeps the default; a value under the floor reads
+// as the floor).
+__global vgc_first_trigger = u64(4) * 1024 * 1024
 // One allocating thread's headroom as a percentage of the marked set: the GOGC term, the band's
 // live-set cap and the floor's scale for ONE thread (cx-home/v#56, cx-private#1977 L5). At Go's
 // 100 a 1.45 MB live set (json-codec 1 KB) paced to a 2.9 MB goal and its garbage up to the goal
@@ -2621,6 +2628,13 @@ pub fn vgc_init() {
 			vgc_headroom_floor_lo1 = u64(l1k) * 1024
 		}
 	}
+	ft_env := C.getenv(c'VGC_FIRST_TRIGGER_KB')
+	if ft_env != unsafe { nil } {
+		ftk := C.atoll(ft_env)
+		if ftk > 0 {
+			vgc_first_trigger = u64(ftk) * 1024
+		}
+	}
 	afd_env := C.getenv(c'VGC_ACCT_FLUSH_DIV')
 	if afd_env != unsafe { nil } {
 		afd := C.atoll(afd_env)
@@ -2854,6 +2868,11 @@ pub fn vgc_init() {
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0
 		&& vgc_headroom_floor_lo1 < vgc_heap.next_gc {
 		vgc_heap.next_gc = vgc_headroom_floor_lo1
+	}
+	// cx-private#1934: the first cycle waits for the start-up allowance (never above the
+	// initial headroom, never below the one-thread floor).
+	if vgc_heap.next_gc < vgc_first_trigger {
+		vgc_heap.next_gc = if vgc_first_trigger < vgc_headroom { vgc_first_trigger } else { vgc_headroom }
 	}
 	vgc_gc_last_end = C.vgc_now_ns()
 	vgc_heap.gc_phase = vgc_phase_off
