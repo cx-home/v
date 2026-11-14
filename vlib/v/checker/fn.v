@@ -631,8 +631,13 @@ fn (mut c Checker) fn_decl(mut node ast.FnDecl) {
 				v.typ = param.typ
 			} else if arg_typ_sym.info is ast.Struct {
 				if !param.typ.is_ptr() && arg_typ_sym.info.is_heap { // set auto_heap to promote value parameter
-					mut v := node.scope.find_var(param.name) or { continue }
-					v.is_auto_heap = true
+					// only when the body needs the parameter's address (cx-home/cx-core-data#97):
+					// a body that reads its fields and nothing else gets no heap copy a call
+					if param.is_mut || node.language != .v
+						|| c.heap_param_needs_copy(node.stmts, param.name, arg_typ_sym) {
+						mut v := node.scope.find_var(param.name) or { continue }
+						v.is_auto_heap = true
+					}
 				}
 				if arg_typ_sym.info.generic_types.len > 0 && !param.typ.has_flag(.generic)
 					&& arg_typ_sym.info.concrete_types.len == 0 {
