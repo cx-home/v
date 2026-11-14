@@ -2502,19 +2502,15 @@ fn vgc_mark_roots() {
 		vgc_scan_range(base, base + usize(n) * usize(sizeof(VGC_Cache)), 0)
 		left -= n
 	}
-	// The suspend records too (the captured register files, this cycle's and
-	// earlier ones'): the fixed BSS tables they replaced were scanned whole with
-	// the data segment every cycle, and this keeps exactly that coverage.
-	$if vgc_rootdiag ? {
-		vgc_rd_cat = 3
-	}
-	for ci in 0 .. C.vgc_ncache_chunks() {
-		mut slo := usize(0)
-		mut shi := usize(0)
-		if C.vgc_susp_chunk_bounds(ci, &slo, &shi) != 0 {
-			vgc_scan_range(slo, shi, 0)
-		}
-	}
+	// The suspend records are NOT scanned as a range (cx-home/cx-platform-store#74):
+	// the registers a thread was suspended with in THIS cycle are shaded precisely
+	// in vgc_scan_suspended_roots (vgc_thread_regs: regs[0..nregs] of the records
+	// acked this cycle), a cooperative parker's in its self-spilled range, and a
+	// safe-region thread's in its safe_regs. A whole-range scan of the records
+	// added only stale register files: those of threads not suspended this cycle,
+	// of threads that have exited (a store seal thread's record held one put-docs
+	// batch, ~0.8 MB, through every later cycle), and the words past nregs.
+	// vgc_exited_thread_regs_test.v.
 	vgc_ph[3] = C.vgc_now_ns()
 
 	// Scan each registered thread's stack (cx-home/v#56: every n-th one per
