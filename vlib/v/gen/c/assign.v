@@ -1643,6 +1643,13 @@ fn (mut g Gen) assign_stmt_body(node_ ast.AssignStmt) {
 							if sym.kind in [.map, .array] {
 								g.expr(val)
 								g.writeln('});')
+								// cx-home/v#71: the set this store opened is closed here, so its
+								// entry leaves g.cur_indexexpr too; left behind, the next index
+								// store in the program read it as its own map_set and lost its ` = `
+								set_idx := g.cur_indexexpr.index(left.pos.pos)
+								if set_idx >= 0 {
+									g.cur_indexexpr.delete(set_idx)
+								}
 								continue
 							}
 						}
@@ -2193,7 +2200,9 @@ fn (mut g Gen) assign_stmt_body(node_ ast.AssignStmt) {
 			g.is_assign_lhs = false
 			left_expr := left
 			if left_expr is ast.IndexExpr && g.cur_indexexpr.len > 0 {
-				cur_indexexpr = g.cur_indexexpr.len - 1
+				// cx-home/v#71: this store's own set (index_expr pushed its position), never another
+				// store's entry, as the second assign path already reads it
+				cur_indexexpr = g.cur_indexexpr.index(left_expr.pos.pos)
 			}
 			if is_fixed_array_var || is_va_list {
 				if is_decl {
