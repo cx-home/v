@@ -2729,6 +2729,9 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 			at := hits[k]
 			mut val := usize(0)
 			unsafe { C.memcpy(&val, voidptr(at), sizeof(usize)) }
+			if at & (sizeof(usize) - 1) != 0 && !vgc_unaligned_root_ok(val) {
+				continue
+			}
 			$if vgc_rootdiag ? {
 				if vgc_rd_cat != 0 {
 					vgc_rd_shade_root(at, val, w)
@@ -2741,6 +2744,32 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 		}
 		addr = next
 	}
+}
+
+// vgc_unaligned_root_max bounds the object a byte-offset (unaligned) stack word
+// may keep (cx-home/cx-platform-store#74). The byte scan reads words no code
+// wrote as one value: the high bytes of one aligned slot and the low bytes of
+// the next. On macOS the arena sits a few GB up, so a small integer beside zero
+// bytes composes a round arena address (store_columnar_test's runner: word
+// 0x1_3000_0000 at an odd offset of main's frame kept a 1.1 MB batch buffer).
+// v#60's unaligned spill names a small object (a ?cx.Node's element pointer;
+// its test keeps a 64 KB buffer), so an unaligned word keeps an object up to
+// this size; a larger one is kept only by an aligned word or a register.
+const vgc_unaligned_root_max = u32(256 * 1024)
+
+// vgc_unaligned_root_ok answers whether an unaligned stack word may shade val:
+// outside the spans, or in a span whose objects are at most
+// vgc_unaligned_root_max bytes (vgc_shade drops what is outside the spans).
+@[inline]
+fn vgc_unaligned_root_ok(val usize) bool {
+	if val < vgc_arena_lo || val >= vgc_arena_hi {
+		return true
+	}
+	span := vgc_find_span(voidptr(val))
+	if span == unsafe { nil } {
+		return true
+	}
+	return span.elem_size <= vgc_unaligned_root_max
 }
 
 // vgc_scan_thread_stack scans a registered thread's [lo, hi) stack range. The
