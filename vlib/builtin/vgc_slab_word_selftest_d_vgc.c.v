@@ -13,8 +13,10 @@ module builtin
 // long as the slab stayed current. cx's prof-052 (a 100,000-item array built
 // and dropped between two forced collections) read 2,413,096 bytes too many
 // in heap-bytes whenever the array's 2.4 MB item buffer was carved at that
-// address — under VGC_CM=1, or on a loaded box where the collector picks the
-// concurrent cycle, which allocates the slab; -d vgc_rootdiag named the word
+// address. The slab is carved by the promotion (vgc_perm_promote); cx read
+// the red only with the concurrent cycle on (VGC_CM=1: 4-10 % of runs;
+// VGC_CM=0: none in 20) or on a loaded box, where vgc picks that cycle more
+// often. -d vgc_rootdiag named the word
 // (root=data sym=vgc_perm_slab_end+0 reaches=2400008 B objs=1).
 //
 // The check: a 4 MB noscan block is allocated in a frame of its own, its
