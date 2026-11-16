@@ -2631,10 +2631,16 @@ fn vgc_scan_data_range(lo usize, hi usize, worker int) {
 		usize(voidptr(&vgc_ph_swalk_ns)), usize(voidptr(&vgc_ph_sapply_ns)),
 		usize(voidptr(&vgc_envchk_last)), usize(voidptr(&vgc_cm_pause_ns)),
 		usize(voidptr(&vgc_cm_stop1_ns)), usize(voidptr(&vgc_cm_middle_ns)),
-		usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns))]!
+		usize(voidptr(&vgc_cm_stop2_ns)), usize(voidptr(&vgc_cm_rescan_ns)),
+		usize(voidptr(&vgc_perm_slab_cur)), usize(voidptr(&vgc_perm_slab_end))]!
+	// cx-home/cx-core-code#278: the perm-bits slab's cursor and end (vgc_perm_bits_alloc)
+	// are addresses of the collector's own vgc_os_alloc'd chunk, never references
+	// into the heap — and the end is also the address of whatever the arena
+	// carves next to that chunk: scanned, it rooted cx's prof-052 dropped 2.4 MB
+	// array buffer (vgc_slab_word_selftest)
 	own_lens := [spchk_len, spchk_len, spchk_len, spchk_len, usize(8) * w,
 		usize(vgc_walk_sum_len) * w, usize(129) * w, usize(129) * w, w, w, w, w, w, w, w, w, w,
-		w, w, w, w, w, w, w, w, w, w]!
+		w, w, w, w, w, w, w, w, w, w, w, w]!
 	mut cur := lo
 	for cur < hi {
 		// the excluded range that starts first among those ending past cur
