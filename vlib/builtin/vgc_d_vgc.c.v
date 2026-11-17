@@ -4584,7 +4584,7 @@ fn vgc_pool_best_fit(npages u32, cap u32, kind u8) (&VGC_Span, &VGC_Span) {
 	mut kept := &VGC_Span(unsafe { nil })
 	mut n := vgc_pool_first_at_least_kind(npages + 1, kind)
 	for n != 0 && n <= u32(vgc_max_pooled_pages) {
-		cand := vgc_pool_at(n, kind)
+		mut cand := vgc_pool_at(n, kind)
 		if cand != unsafe { nil } {
 			if !vgc_pool_keeps_whole(cand, n, npages, cap) {
 				return cand, kept
@@ -6083,10 +6083,10 @@ fn vgc_gctrace_carve_emit(npages u32, new_arena int, arena_idx int, kinds VGC_Po
 		for b := 63; b >= 0; b-- {
 			bit := u64(1) << u64(b)
 			if hot == 0 && vgc_pool_hot_bits[w] & bit != 0 {
-				hot = u32(w << 6) + u32(b)
+				hot = (u32(w) << 6) + u32(b)
 			}
 			if cold == 0 && vgc_pool_cold_bits[w] & bit != 0 {
-				cold = u32(w << 6) + u32(b)
+				cold = (u32(w) << 6) + u32(b)
 			}
 		}
 	}

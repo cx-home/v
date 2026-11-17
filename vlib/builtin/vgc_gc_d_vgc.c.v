@@ -1318,7 +1318,7 @@ fn vgc_minor_cards() {
 			}
 			plo := cbase + pg * vgc_page_size
 			pg++
-			span := vgc_find_span(voidptr(plo))
+			mut span := vgc_find_span(voidptr(plo))
 			if span == unsafe { nil } || !span.in_use {
 				continue
 			}
@@ -3079,9 +3079,9 @@ fn vgc_mark_plan() int {
 	}
 	last_work := vgc_mark_last_work() // cx-home/v#56 lever 11: of this cycle's kind
 	live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
-	free := vgc_stop_weighed_cpus(last_work, vgc_mark_par_min_ns)
+	free_cpus := vgc_stop_weighed_cpus(last_work, vgc_mark_par_min_ns)
 	total := vgc_mark_plan_count(vgc_mark_workers_cfg, last_work, vgc_mark_par_min_ns,
-		live, free, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target,
+		live, free_cpus, vgc_mark_wide && !vgc_mark_workers_env, vgc_mark_n_target,
 		C.vgc_atomic_load_u64(&vgc_heap.heap_marked), !vgc_paced_one)
 	if total <= 1 {
 		return 1

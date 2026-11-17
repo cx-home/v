@@ -72,6 +72,12 @@ mut:
 	elem_size u32
 }
 
+struct VGC_Cache {
+mut:
+	stack_limit_lo usize
+	stack_limit_hi usize
+}
+
 __global vgc_heap = VGC_Heap{}
 __global vgc_arena_lo = usize(0)
 __global vgc_arena_hi = usize(0)
@@ -82,6 +88,22 @@ fn C.vgc_atomic_store_u64(ptr &u64, val u64)
 fn C.vgc_atomic_store_u32(ptr &u32, val u32)
 fn C.vgc_atomic_cas_u32(ptr &u32, expected &u32, desired u32) bool
 fn C.vgc_say(tag u64, v u64)
+fn C.vgc_get_cache_idx() int
+fn C.vgc_clear_dead_stack(limit_lo usize, limit_hi usize)
+
+// cx-home/v#72: gc_collect (cx-home/v#51), gc_total_allocated (cx-home/v#56) and
+// gc_thread_allocated (cx-home/v#62) read these in their `$if vgc ? {}` arms.
+fn vgc_cache(idx int) &VGC_Cache {
+	return unsafe { nil }
+}
+
+fn vgc_total_allocated() u64 {
+	return 0
+}
+
+fn vgc_thread_allocated() u64 {
+	return 0
+}
 
 fn vgc_pin(p voidptr) {
 }
