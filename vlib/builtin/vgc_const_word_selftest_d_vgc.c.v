@@ -53,19 +53,25 @@ fn vgc_const_word_seed() i64 {
 	return 0
 }
 
+// vgc_const_word_set writes the probe const's storage (a const is a plain
+// global in C). In a frame of its own: written inline in the carve, gcc on
+// Linux arm64 (-O0) left the block's address in a slot the scan counted under
+// the carve's caller (root=stack frame=vgc_const_word_live fp_off=16), and the
+// control round read 2 there while macOS read 0.
+@[noinline]
+fn vgc_const_word_set(v i64) {
+	unsafe {
+		mut w := &i64(voidptr(&vgc_const_word_probe))
+		*w = v
+	}
+}
+
 @[noinline]
 fn vgc_const_word_carve(which int) {
 	p := unsafe { malloc_noscan(vgc_const_word_block) }
 	match which {
-		1 {
-			unsafe {
-				mut w := &i64(voidptr(&vgc_const_word_probe))
-				*w = i64(p)
-			}
-		}
-		2 {
-			vgc_const_word_gprobe = i64(p)
-		}
+		1 { vgc_const_word_set(i64(p)) }
+		2 { vgc_const_word_gprobe = i64(p) }
 		else {}
 	}
 }
@@ -89,10 +95,7 @@ pub fn vgc_const_word_selftest() u32 {
 	saved := vgc_const_word_probe
 	gsaved := vgc_const_word_gprobe
 	defer {
-		unsafe {
-			mut w := &i64(voidptr(&vgc_const_word_probe))
-			*w = saved
-		}
+		vgc_const_word_set(saved)
 		vgc_const_word_gprobe = gsaved
 	}
 	half := u64(vgc_const_word_block / 2)
@@ -102,10 +105,7 @@ pub fn vgc_const_word_selftest() u32 {
 	if vgc_const_word_live(1) >= half {
 		return 3
 	}
-	unsafe {
-		mut w := &i64(voidptr(&vgc_const_word_probe))
-		*w = saved
-	}
+	vgc_const_word_set(saved)
 	if vgc_const_word_live(2) >= half {
 		return 4
 	}
