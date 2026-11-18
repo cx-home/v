@@ -4059,6 +4059,7 @@ fn vgc_verify_mark_closure() {
 									u64(obj_addr), u64(span.elem_size), u64(addr - obj_addr), u64(
 									tspan.base + usize(tidx) * usize(tspan.elem_size)),
 									u64(tspan.elem_size))
+								vgc_verify_report_gen(span, oi, obj_addr, tspan, tidx)
 							}
 							violations++
 							if !span.noscan {
@@ -4075,6 +4076,88 @@ fn vgc_verify_mark_closure() {
 		// tag 0xC105 = "CLOS(ure)" total; tag 0x5CA0 = SCAN-only (definite-bug) subset.
 		C.vgc_say(0xc105, u64(violations))
 		C.vgc_say(0x5ca0, u64(scan_viol))
+	}
+}
+
+// vgc_verify_report_gen follows one closure violation's report with the two
+// objects' generation and span state (cx-platform-store#75/#76: a SCAN
+// referrer marked every cycle whose child stays unmarked — is the referrer a
+// permanent object the dirty re-scan never reached, an old one at a minor, a
+// tiny-carved slot?). Tags: 0x7e01 flags — bit 0 referrer span perm, 1
+// referrer in perm_bits, 2 referrer in young_bits, 3 referent span perm, 4
+// referent in perm_bits, 5 referrer span dirty, 6 referrer span has_ptrmap, 7
+// referrer span is_tiny, 8 referrer an epoch candidate, 9 minor cycle, 10
+// referrer span inflight, 11 referent span is_tiny, 12 referent span noscan,
+// 13 referent span dirty; 0x7e02/0x7e03 the referrer's/referent's class
+// index | nelems << 8 | sweep_gen << 32; 0x7e04 gc_cycle; 0x7e10+k the
+// referrer's words; 0x7e40+k the referent's first eight words. Debug builds
+// only call it (-d vgc_verify / vgc_closonly / vgc_closlean).
+fn vgc_verify_report_gen(span &VGC_Span, oi u32, obj_addr usize, tspan &VGC_Span, tidx u32) {
+	mut gf := u64(0)
+	if span.perm != 0 {
+		gf |= 1
+	}
+	if span.perm_bits != unsafe { nil } && oi < 1088 {
+		if C.vgc_bitmap_get(span.perm_bits, oi) != 0 {
+			gf |= 2
+		}
+		if C.vgc_bitmap_get(vgc_young_bits(span), oi) != 0 {
+			gf |= 4
+		}
+	}
+	if tspan.perm != 0 {
+		gf |= 8
+	}
+	if tspan.perm_bits != unsafe { nil } && tidx < 1088
+		&& C.vgc_bitmap_get(tspan.perm_bits, tidx) != 0 {
+		gf |= 16
+	}
+	if span.dirty != 0 {
+		gf |= 32
+	}
+	if span.has_ptrmap {
+		gf |= 64
+	}
+	if span.is_tiny {
+		gf |= 128
+	}
+	if span.perm_cand != unsafe { nil } && oi < 1088
+		&& C.vgc_bitmap_get(span.perm_cand, oi) != 0 {
+		gf |= 256
+	}
+	if vgc_minor_this_cycle {
+		gf |= 512
+	}
+	if span.inflight != 0 {
+		gf |= 1024
+	}
+	if tspan.is_tiny {
+		gf |= 2048
+	}
+	if tspan.noscan {
+		gf |= 4096
+	}
+	if tspan.dirty != 0 {
+		gf |= 8192
+	}
+	C.vgc_say(0x7e01, gf)
+	C.vgc_say(0x7e02, u64(span.class_idx) | u64(span.nelems) << 8 | u64(span.sweep_gen) << 32)
+	C.vgc_say(0x7e03, u64(tspan.class_idx) | u64(tspan.nelems) << 8 | u64(tspan.sweep_gen) << 32)
+	C.vgc_say(0x7e04, u64(vgc_heap.gc_cycle))
+	nw := int(span.elem_size / u32(sizeof(usize)))
+	for k in 0 .. nw {
+		if k >= 32 {
+			break
+		}
+		C.vgc_say(0x7e10 + u64(k), u64(unsafe { *(&usize(voidptr(obj_addr + usize(k) * sizeof(usize)))) }))
+	}
+	t_addr := tspan.base + usize(tidx) * usize(tspan.elem_size)
+	tw := int(tspan.elem_size / u32(sizeof(usize)))
+	for k in 0 .. tw {
+		if k >= 8 {
+			break
+		}
+		C.vgc_say(0x7e40 + u64(k), u64(unsafe { *(&usize(voidptr(t_addr + usize(k) * sizeof(usize)))) }))
 	}
 }
 
