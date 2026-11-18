@@ -18,6 +18,36 @@ struct GlobalConstDef {
 	is_precomputed bool     // can be declared as a const in C: primitive, and a simple definition
 }
 
+// vgc_noscan_storage — the section attribute for the storage of a const or
+// `__global` whose type holds no reference (cx-home/cx-core-code#278): an int,
+// a float, a bool, an enum, a char or rune, or an alias of one (a duration in
+// nanoseconds, a byte count, a clock). Such a word is an integer, never a
+// root, and the vgc collector's data-segment scan read it conservatively: a
+// value in the arenas' address range (on macOS arm64 0x1_0000_0000-
+// 0x2_0000_0000 = 4.3-8.6 s in nanoseconds, 4-8 GB in bytes) rooted whatever
+// was carved there — cx-platform-store's `grp_shred_status_wait = 5 *
+// time.second` (0x12a05f200) kept a dropped 12 MB array in cx's prof-052.
+// The section (vnoscan; mach-o __DATA,__vnoscan) is left out of the scan
+// (vgc_noscan_ranges, thirdparty/vgc/vgc_platform.h; vgc_const_word_selftest).
+// usize and isize stay scanned: the collector's own address-sized globals hold
+// span addresses on purpose (vgc_perm_slab_end, excluded by name). Only under
+// -gc e, on the mach-o and ELF targets the collector reads the section on.
+fn (g &Gen) vgc_noscan_storage(typ ast.Type) string {
+	if g.pref.gc_mode != .vgc || typ.is_ptr() || typ.nr_muls() > 0 {
+		return ''
+	}
+	sym := g.table.final_sym(typ)
+	if sym.kind !in [.bool, .i8, .i16, .i32, .int, .i64, .u8, .u16, .u32, .u64, .f32, .f64,
+		.char, .rune, .enum, .int_literal, .float_literal] {
+		return ''
+	}
+	return match g.pref.os {
+		.macos, .ios { '__attribute__ ((section ("__DATA,__vnoscan"))) ' }
+		.linux, .freebsd, .openbsd, .netbsd, .dragonfly { '__attribute__ ((section ("vnoscan"))) ' }
+		else { '' }
+	}
+}
+
 fn (mut g Gen) const_decl(node ast.ConstDecl) {
 	g.inside_const = true
 	defer {
@@ -362,7 +392,8 @@ fn (mut g Gen) const_decl_init_later(mod string, name string, cname string, expr
 	if surround_cbr {
 		init.writeln('}')
 	}
-	mut def := '${g.static_non_parallel}${styp} ${cname}'
+	// cx-home/cx-core-code#278: a pointer-free const's storage is not a root
+	mut def := '${g.static_non_parallel}${styp} ${g.vgc_noscan_storage(typ)}${cname}'
 	if g.pref.parallel_cc {
 		// So that the const is usable in other files
 		// def = 'extern ${def}'
@@ -715,7 +746,16 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			} else {
 				''
 			}
-			def_builder.write_string('${extern}${tls_kw}${field_visibility_kw}${qualifiers}${styp} ${attributes}${final_c_name}')
+			// cx-home/cx-core-code#278: a pointer-free global's storage is not a
+			// root — on its definition, not on a declaration of another unit's,
+			// a thread-local or one with a section of its own
+			noscan := if global_defined_elsewhere || extern != '' || tls_kw != ''
+				|| node.attrs.contains('thread_local') || node.attrs.contains('_linker_section') {
+				''
+			} else {
+				g.vgc_noscan_storage(field.typ)
+			}
+			def_builder.write_string('${extern}${tls_kw}${field_visibility_kw}${qualifiers}${styp} ${attributes}${noscan}${final_c_name}')
 			needs_ending_semicolon = true
 		}
 		if global_defined_elsewhere {

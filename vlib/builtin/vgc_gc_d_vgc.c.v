@@ -47,6 +47,39 @@ __global vgc_nseg = int(0)
 // world, where the loader lock cannot be held by a frozen peer.
 fn vgc_cache_data_segments() {
 	vgc_nseg = C.vgc_data_segments(&vgc_seg_lo[0], &vgc_seg_hi[0], 8)
+	vgc_nnoscan = C.vgc_noscan_ranges(&vgc_noscan_lo[0], &vgc_noscan_hi[0], 2)
+}
+
+// cx-home/cx-core-code#278: the vnoscan section — the storage cgen gives every
+// V const and `__global` of a pointer-free type (Gen.vgc_noscan_storage: an
+// int, a float, a bool, an enum, an alias of one). Those words are integers,
+// never references, and the data-segment scan read them conservatively: a
+// value that falls inside the arenas' address range (on macOS arm64
+// 0x1_0000_0000-0x2_0000_0000 = 4.3-8.6 s in nanoseconds, 4-8 GB in bytes)
+// rooted whatever was carved there — cx-platform-store's
+// `grp_shred_status_wait = 5 * time.second` (0x12a05f200) kept a dropped
+// 12 MB array in cx's prof-052 (-d vgc_rootdiag: root=data
+// sym=_const_store__grp_shred_status_wait+0 reaches=12000008 B, 91 of 96 red
+// runs). The collector's own clocks were listed by hand (vgc_scan_data_range's
+// own_los, cx-home/v#45); a program's consts and globals cannot be. One range
+// per image (the executable and the image carrying vgc), cached beside the
+// segments (vgc_noscan_ranges, vgc_platform.h; vgc_const_word_selftest).
+__global vgc_noscan_lo = [2]usize{}
+__global vgc_noscan_hi = [2]usize{}
+__global vgc_nnoscan = int(0)
+
+fn C.vgc_noscan_ranges(los &usize, his &usize, max_ranges int) int
+
+// vgc_noscan_word answers whether a data-segment address lies in the vnoscan
+// section, i.e. is left out of the root scan (vgc_const_word_selftest's read).
+@[markused]
+pub fn vgc_noscan_word(addr usize) bool {
+	for k in 0 .. vgc_nnoscan {
+		if addr >= vgc_noscan_lo[k] && addr < vgc_noscan_hi[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // cx-home/v#15: the current cycle's phase stamps (ns), written by the collector
@@ -2591,14 +2624,16 @@ fn vgc_scan_data_range(lo usize, hi usize, worker int) {
 	// the base of the lowest, whose first slot may hold a young object: scanned,
 	// they rooted that object for the life of the process (a dropped 1.9 MB
 	// array and the 7.5 MB of strings it held, permanent/perm_transient.v)
+	// cx-home/cx-core-code#278: slots 14 and 15 are the vnoscan section's range
+	// in each image — the pointer-free consts and globals (vgc_noscan_lo doc).
 	mut ex_los := [heap_lo, usize(voidptr(&vgc_arena_lo)), usize(voidptr(&vgc_workbuf_cur)),
 		usize(voidptr(&vgc_workbuf_end)), usize(voidptr(&vgc_perm_lo)), usize(voidptr(&vgc_perm_hi)),
-		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0, 0, 0]!
+		usize(voidptr(&vgc_wb_lo)), 0, 0, 0, 0, 0, 0, 0, vgc_noscan_lo[0], vgc_noscan_lo[1]]!
 	mut ex_his := [heap_hi, usize(voidptr(&vgc_arena_lo)) + w, usize(voidptr(&vgc_workbuf_cur)) + w,
 		usize(voidptr(&vgc_workbuf_end)) + w, usize(voidptr(&vgc_perm_lo)) + w,
-		
+
 			usize(voidptr(&vgc_perm_hi)) + w, usize(voidptr(&vgc_wb_lo)) + w, 0, 0, 0, 0, 0, 0,
-		0]!
+		0, vgc_noscan_hi[0], vgc_noscan_hi[1]]!
 	// cx-home/v#15: the collector's own static tables (vgc_static_tables doc,
 	// vgc_platform.h): the arena address maps, the chunk tables and the
 	// touched-page cache, the chunk card tables (lever 10) — VGC_STATIC_TABLES

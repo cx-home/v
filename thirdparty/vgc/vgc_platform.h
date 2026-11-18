@@ -214,6 +214,60 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
 #endif
 
 // ============================================================
+// The vnoscan section (cx-home/cx-core-code#278): the storage cgen gives every
+// V const and `__global` of a pointer-free type (Gen.vgc_noscan_storage) —
+// integers the data-segment scan must not read as references. Its range in
+// each image, for vgc_scan_data_range's exclusions; cached by
+// vgc_cache_data_segments at init (the mach-o lookup takes the loader lock,
+// like vgc_data_segments). mach-o: section __vnoscan of segment __DATA (so it
+// sits inside the scanned segment and is cut out by range), in the main
+// executable and in the image carrying vgc. ELF: the section is named
+// `vnoscan` — a C identifier, so GNU ld and lld define __start_vnoscan and
+// __stop_vnoscan around it (weak here: a program with no such const, or a
+// linker that does not provide them, answers no range and scans as before).
+// Elsewhere: no range (the section attribute is not emitted there either).
+// ============================================================
+#if defined(__APPLE__)
+  static inline int vgc__image_noscan(const struct mach_header_64* mh, uintptr_t* los,
+                                      uintptr_t* his, int max_ranges, int n) {
+      if (n >= max_ranges || mh == 0) return n;
+      unsigned long sz = 0;
+      uint8_t* p = getsectiondata(mh, "__DATA", "__vnoscan", &sz);
+      if (p != 0 && sz > 0) {
+          los[n] = (uintptr_t)p;
+          his[n] = (uintptr_t)p + (uintptr_t)sz;
+          n++;
+      }
+      return n;
+  }
+  static inline int vgc_noscan_ranges(uintptr_t* los, uintptr_t* his, int max_ranges) {
+      const struct mach_header_64* exe = (const struct mach_header_64*)_dyld_get_image_header(0);
+      int n = vgc__image_noscan(exe, los, his, max_ranges, 0);
+      Dl_info info;
+      if (dladdr((const void*)&vgc__image_marker, &info) != 0 && info.dli_fbase != 0
+          && info.dli_fbase != (const void*)exe) {
+          n = vgc__image_noscan((const struct mach_header_64*)info.dli_fbase, los, his, max_ranges, n);
+      }
+      return n;
+  }
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+  extern char __start_vnoscan[] __attribute__((weak));
+  extern char __stop_vnoscan[] __attribute__((weak));
+  static inline int vgc_noscan_ranges(uintptr_t* los, uintptr_t* his, int max_ranges) {
+      if (max_ranges < 1 || &__start_vnoscan[0] == 0 || &__stop_vnoscan[0] == 0) return 0;
+      if ((uintptr_t)__stop_vnoscan <= (uintptr_t)__start_vnoscan) return 0;
+      los[0] = (uintptr_t)__start_vnoscan;
+      his[0] = (uintptr_t)__stop_vnoscan;
+      return 1;
+  }
+#else
+  static inline int vgc_noscan_ranges(uintptr_t* los, uintptr_t* his, int max_ranges) {
+      (void)los; (void)his; (void)max_ranges;
+      return 0;
+  }
+#endif
+
+// ============================================================
 // Thread-local storage
 // ============================================================
 #if (defined(__TINYC__) || defined(VGC_FORCE_TLS_BY_KEY)) && !defined(_WIN32)
