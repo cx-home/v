@@ -125,6 +125,11 @@ fn vgc_gc_start() {
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return
 	}
+	if vgc_ws_addr != 0 {
+		C.vgc_say(0x7e20, u64(vgc_ws_word()))
+		C.vgc_say(0x7e21, vgc_ws_state())
+		C.vgc_say(0x7e22, vgc_ws_calls)
+	}
 	$if vgc_concurrent ? {
 		vgc_minor_this_cycle = minor // this cycle's kind, now that it is this thread's cycle
 		// one backoff cycle spent (after the CAS: every thread that reached the
@@ -3913,6 +3918,13 @@ fn vgc_write_barrier(new_val voidptr) {
 @[export: 'vgc_wb_store']
 pub fn vgc_wb_store(obj voidptr) {
 	$if vgc_concurrent ? {
+		if vgc_ws_addr != 0 && usize(obj) == vgc_ws_addr {
+			vgc_ws_calls++
+			C.vgc_say(0x7e30, vgc_ws_calls)
+			C.fprintf(C.stderr, c'[ws] barrier call %llu on the watched object (mode %u, word now 0x%llx):\n',
+				C.vgc_ull(vgc_ws_calls), C.vgc_atomic_load_u32(&vgc_heap.wb_enabled), C.vgc_ull(u64(vgc_ws_word())))
+			print_backtrace_skipping_top_frames(1)
+		}
 		$if vgc_wb_count ? {
 			C.vgc_atomic_add_u64(&vgc_wb_calls, 1)
 		}
@@ -4144,6 +4156,9 @@ fn vgc_verify_report_gen(span &VGC_Span, oi u32, obj_addr usize, tspan &VGC_Span
 	C.vgc_say(0x7e02, u64(span.class_idx) | u64(span.nelems) << 8 | u64(span.sweep_gen) << 32)
 	C.vgc_say(0x7e03, u64(tspan.class_idx) | u64(tspan.nelems) << 8 | u64(tspan.sweep_gen) << 32)
 	C.vgc_say(0x7e04, u64(vgc_heap.gc_cycle))
+	// dev1 11-18: the referrer's card (bit 0) beside its span's dirty bit (bit 1)
+	rcard := vgc_card_ptr(obj_addr)
+	C.vgc_say(0x7e05, u64(if rcard != unsafe { nil } && unsafe { *rcard } != 0 { 1 } else { 0 }) | u64(if span.dirty != 0 { 2 } else { 0 }))
 	nw := int(span.elem_size / u32(sizeof(usize)))
 	for k in 0 .. nw {
 		if k >= 32 {

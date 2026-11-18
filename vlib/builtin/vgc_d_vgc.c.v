@@ -2680,6 +2680,14 @@ pub fn vgc_init() {
 	if tah_env != unsafe { nil } {
 		vgc_test_arena_hint = unsafe { usize(C.strtoull(tah_env, nil, 0)) }
 	}
+	wst_env := C.getenv(c'VGC_WATCH_STORE')
+	if wst_env != unsafe { nil } {
+		vgc_ws_addr = unsafe { usize(C.strtoull(wst_env, nil, 0)) }
+	}
+	wsto_env := C.getenv(c'VGC_WATCH_STORE_OFF')
+	if wsto_env != unsafe { nil } {
+		vgc_ws_off = unsafe { usize(C.strtoull(wsto_env, nil, 0)) }
+	}
 	pm_env := C.getenv(c'VGC_MARK_PAR_MIN_US')
 	if pm_env != unsafe { nil } {
 		pv := C.atoll(pm_env)
@@ -7438,6 +7446,7 @@ fn vgc_acct_free(sz u64) {
 // Amortized GC trigger check - avoids atomic loads on every allocation
 fn vgc_maybe_gc() {
 	vgc_perturb() // the allocator's poll is a perturbation point (cx-private#1923 §2)
+	vgc_ws_poll()
 	C.vgc_trace(21, C.vgc_get_cache_idx(), C.vgc_atomic_load_u64(&vgc_heap.heap_live),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.gc_enabled))) // MAYBE_GC entry (diagnostic, pre-gate)
 	if C.vgc_atomic_load_u32(&vgc_heap.gc_enabled) != 0 {
@@ -8094,6 +8103,87 @@ fn vgc_freering_lookup(strptr usize) {
 // vgc_set_watch(c)) and reads vgc_watch_report() at a stall. Gated by
 // vgc_watch_addr != 0 so it is a no-op (one compare) when unused.
 __global vgc_watch_addr = usize(0)
+
+// cx-platform-store#75/#76 (dev1 11-18): VGC_WATCH_STORE=<addr> watches one
+// object's word (VGC_WATCH_STORE_OFF, default 48 = word 6) for stores that
+// reach the barrier and for changes that did not: every vgc_wb_store call on
+// the object prints a backtrace (tag 0x7e30), the allocator's poll
+// (vgc_maybe_gc) prints a backtrace when the word changed since the last poll
+// with no barrier call in between (tag 0x7e31: old, 0x7e32: new, 0x7e33: the
+// barrier calls since), and each stop reports the word, the card and the
+// span's dirty and permanent bits (tags 0x7e20-0x7e22). Debug reads only.
+__global vgc_ws_addr = usize(0)
+__global vgc_ws_off = usize(48)
+__global vgc_ws_last = usize(0)
+__global vgc_ws_calls = u64(0)
+__global vgc_ws_polls = u64(0)
+
+// vgc_ws_live answers whether a span holds the watched address now (the read
+// of its word is safe only then: before the object exists the page may not be
+// mapped, and the poll runs from the first allocation).
+fn vgc_ws_live() bool {
+	if vgc_ws_addr == 0 {
+		return false
+	}
+	span := vgc_find_span(voidptr(vgc_ws_addr))
+	return span != unsafe { nil } && span.in_use && span.elem_size != 0
+		&& vgc_ws_off + sizeof(usize) <= usize(span.elem_size)
+}
+
+fn vgc_ws_word() usize {
+	if !vgc_ws_live() {
+		return 0
+	}
+	return unsafe { *(&usize(voidptr(vgc_ws_addr + vgc_ws_off))) }
+}
+
+// vgc_ws_state is card | dirty<<1 | perm<<2 | perm_bit<<3 of the watched
+// object's page and span (0xff.. when no span holds it).
+fn vgc_ws_state() u64 {
+	span := vgc_find_span(voidptr(vgc_ws_addr))
+	if span == unsafe { nil } || !span.in_use || span.elem_size == 0 {
+		return 0xffff
+	}
+	mut v := u64(0)
+	card := vgc_card_ptr(vgc_ws_addr)
+	if card != unsafe { nil } && unsafe { *card } != 0 {
+		v |= 1
+	}
+	if span.dirty != 0 {
+		v |= 2
+	}
+	if span.perm != 0 {
+		v |= 4
+	}
+	oi := u32((vgc_ws_addr - span.base) / usize(span.elem_size))
+	if span.perm_bits != unsafe { nil } && oi < 1088 && C.vgc_bitmap_get(span.perm_bits, oi) != 0 {
+		v |= 8
+	}
+	return v
+}
+
+// vgc_ws_poll runs in a mutator (the allocator's poll, vgc_maybe_gc): a word
+// that moved with no barrier call since the last poll is a store that bypassed
+// the barrier; the backtrace is the allocation's, near the store in time.
+fn vgc_ws_poll() {
+	if !vgc_ws_live() {
+		return
+	}
+	vgc_ws_polls++
+	cur := vgc_ws_word()
+	if cur != vgc_ws_last {
+		C.vgc_say(0x7e31, u64(vgc_ws_last))
+		C.vgc_say(0x7e32, u64(cur))
+		C.vgc_say(0x7e33, vgc_ws_calls)
+		if vgc_ws_calls == 0 {
+			C.fprintf(C.stderr, c'[ws] the watched word changed with NO barrier call since the last poll (poll %llu); the allocation that saw it:\n',
+				C.vgc_ull(vgc_ws_polls))
+			print_backtrace_skipping_top_frames(1)
+		}
+		vgc_ws_last = cur
+		vgc_ws_calls = 0
+	}
+}
 __global vgc_watch_in_root = u32(0)
 // UNUSED (the per-shade hook perturbed timing; removed)
 __global vgc_watch_marked = u32(0)
