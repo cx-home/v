@@ -1721,7 +1721,7 @@ static inline void vgc_install_thread_exit(int idx) {
 // it at registration, before it could become a suspend target). The forensic
 // walks run to vgc_susp_hwm, the slots ever made addressable.
 // ============================================================
-#define VGC_SUSP_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95 (arm64); x86_64 fills 15 (+32 XMM lanes on Windows)
+#define VGC_SUSP_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95 (arm64); x86_64 fills 15 + 32 XMM lanes (Windows, darwin) + 32 YMM-upper lanes (darwin with AVX) = 79
 #define VGC_SUSP_CHUNK_SHIFT 6
 #define VGC_SUSP_CHUNK (1 << VGC_SUSP_CHUNK_SHIFT)
 #define VGC_SUSP_MAX_CHUNKS 4096 // == vgc_max_cache_chunks (vgc_d_vgc.c.v)
@@ -1923,6 +1923,37 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   // pass 1 continues with the others, so the pause pays the per-thread
   // scheduling latency once, not once per thread.
   #define VGC_MAC_MAXREG VGC_SUSP_MAXREG
+  #if defined(__x86_64__)
+  // vgc_mac_x86_vector_regs: append a suspended thread's XMM0-15 (two 64-bit lanes each) and,
+  // when the AVX state reads, the YMM upper halves (two lanes each) to regs[c..max); returns the
+  // new count. The AVX state's first part is the float state, so one read serves both; without
+  // AVX the float state alone (cx-home/cx-core-code#282).
+  static inline int vgc_mac_x86_lanes(const struct __darwin_xmm_reg* x, int n, uintptr_t* regs, int c, int max) {
+      for (int i = 0; i < n && c + 1 < max; i++) {
+          uint64_t lo, hi;
+          memcpy(&lo, &x[i].__xmm_reg[0], 8);
+          memcpy(&hi, &x[i].__xmm_reg[8], 8);
+          regs[c++] = (uintptr_t)lo;
+          regs[c++] = (uintptr_t)hi;
+      }
+      return c;
+  }
+  static inline int vgc_mac_x86_vector_regs(thread_act_t t, uintptr_t* regs, int c, int max) {
+      x86_avx_state64_t av;
+      mach_msg_type_number_t na = x86_AVX_STATE64_COUNT;
+      if (thread_get_state(t, x86_AVX_STATE64, (thread_state_t)&av, &na) == KERN_SUCCESS) {
+          c = vgc_mac_x86_lanes(&av.__fpu_xmm0, 16, regs, c, max);
+          return vgc_mac_x86_lanes(&av.__fpu_ymmh0, 16, regs, c, max);
+      }
+      x86_float_state64_t fs;
+      mach_msg_type_number_t nf = x86_FLOAT_STATE64_COUNT;
+      if (thread_get_state(t, x86_FLOAT_STATE64, (thread_state_t)&fs, &nf) == KERN_SUCCESS) {
+          return vgc_mac_x86_lanes(&fs.__fpu_xmm0, 16, regs, c, max);
+      }
+      vgc_say(0xdead7, (uint64_t)t); // vector state unreadable: the general registers only (visible, not silent)
+      return c;
+  }
+  #endif
   // Thread registration key. Signal-free: no handler install, no sigmask edit —
   // a shared-library collector must not touch the host process's signal state
   // (the old install over Go's SIGURG handler silently broke the HOST's
@@ -2000,6 +2031,12 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
                           st.__rbp, st.__r8, st.__r9, st.__r10, st.__r11, st.__r12,
                           st.__r13, st.__r14, st.__r15 };
       for (int i = 0; i < 15 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = r[i];
+      // The vector registers too (cx-home/cx-core-code#282): clang copies a 16-byte V string
+      // ({ptr, len}) through one XMM register and libsystem's memmove uses YMM, so a thread
+      // suspended between such a load and its store holds the only reference there. arm64
+      // records its 64 NEON lanes above; here XMM0-15 (two lanes each) and, with AVX, the YMM
+      // upper halves: 15 + 32 + 32 = 79 <= VGC_MAC_MAXREG.
+      c = vgc_mac_x86_vector_regs((thread_act_t)t, s->regs, c, VGC_MAC_MAXREG);
     #else
       vgc_say(0xdead6, (uint64_t)t);
       __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
@@ -2073,6 +2110,19 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
                           (uintptr_t)uc->uc_mcontext->__ss.__r15 };
       for (int i = 0; i < 15 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = r[i];
       s->sp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+      // the XMM registers from the signal frame's float state (cx-home/cx-core-code#282; the
+      // mach path above records the YMM upper halves too)
+      {
+          const _STRUCT_X86_FLOAT_STATE64* fs = &uc->uc_mcontext->__fs;
+          const struct __darwin_xmm_reg* x = &fs->__fpu_xmm0;
+          for (int i = 0; i < 16 && c + 1 < VGC_MAC_MAXREG; i++) {
+              uint64_t lo, hi;
+              memcpy(&lo, &x[i].__xmm_reg[0], 8);
+              memcpy(&hi, &x[i].__xmm_reg[8], 8);
+              s->regs[c++] = (uintptr_t)lo;
+              s->regs[c++] = (uintptr_t)hi;
+          }
+      }
     #endif
       s->nregs = c;
       __atomic_store_n(&s->acked, 1, __ATOMIC_RELEASE);
