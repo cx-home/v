@@ -7237,6 +7237,9 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 			vgc_maybe_gc()
 		}
 	}
+	if vgc_ws_addr != 0 {
+		vgc_ws_alloc_check(ptr, n)
+	}
 	return ptr
 }
 
@@ -8117,6 +8120,11 @@ __global vgc_ws_off = usize(48)
 __global vgc_ws_last = usize(0)
 __global vgc_ws_calls = u64(0)
 __global vgc_ws_polls = u64(0)
+// the whole object's last snapshot (up to 32 words): a store at ANY word is
+// caught, not only the one at vgc_ws_off (the 14:10 run's edge moved from
+// word 6 to word 5 between two runs of the same binary)
+__global vgc_ws_snap = [32]usize{}
+__global vgc_ws_nwords = int(0)
 
 // vgc_ws_live answers whether a span holds the watched address now (the read
 // of its word is safe only then: before the object exists the page may not be
@@ -8170,19 +8178,47 @@ fn vgc_ws_poll() {
 		return
 	}
 	vgc_ws_polls++
-	cur := vgc_ws_word()
-	if cur != vgc_ws_last {
-		C.vgc_say(0x7e31, u64(vgc_ws_last))
-		C.vgc_say(0x7e32, u64(cur))
-		C.vgc_say(0x7e33, vgc_ws_calls)
-		if vgc_ws_calls == 0 {
-			C.fprintf(C.stderr, c'[ws] the watched word changed with NO barrier call since the last poll (poll %llu); the allocation that saw it:\n',
-				C.vgc_ull(vgc_ws_polls))
-			print_backtrace_skipping_top_frames(1)
+	span := vgc_find_span(voidptr(vgc_ws_addr))
+	mut nw := int(span.elem_size / u32(sizeof(usize)))
+	if nw > 32 {
+		nw = 32
+	}
+	vgc_ws_nwords = nw
+	mut changed := -1
+	for k in 0 .. nw {
+		cur := unsafe { *(&usize(voidptr(vgc_ws_addr + usize(k) * sizeof(usize)))) }
+		if cur != vgc_ws_snap[k] {
+			if changed < 0 {
+				changed = k
+				C.vgc_say(0x7e34, u64(k))
+				C.vgc_say(0x7e31, u64(vgc_ws_snap[k]))
+				C.vgc_say(0x7e32, u64(cur))
+				C.vgc_say(0x7e33, vgc_ws_calls)
+			}
+			vgc_ws_snap[k] = cur
 		}
-		vgc_ws_last = cur
+	}
+	if changed >= 0 {
+		C.fprintf(C.stderr, c'[ws] the watched object changed at word %d (poll %llu, barrier calls since the last poll %llu)%s:\n',
+			changed, C.vgc_ull(vgc_ws_polls), C.vgc_ull(vgc_ws_calls),
+			if vgc_ws_calls == 0 { c' -- NO barrier call: the store bypassed the barrier; this is the first poll after it' } else { c'' })
+		print_backtrace_skipping_top_frames(1)
 		vgc_ws_calls = 0
 	}
+}
+
+// vgc_ws_alloc_check prints where the watched object is allocated (the
+// allocation site names its type) and polls after every allocation.
+@[noinline]
+fn vgc_ws_alloc_check(ptr voidptr, n usize) {
+	if usize(ptr) == vgc_ws_addr {
+		C.fprintf(C.stderr, c'[ws] the watched object is ALLOCATED here (%llu bytes asked):\n', C.vgc_ull(u64(n)))
+		print_backtrace_skipping_top_frames(1)
+		for k in 0 .. 32 {
+			vgc_ws_snap[k] = 0
+		}
+	}
+	vgc_ws_poll()
 }
 __global vgc_watch_in_root = u32(0)
 // UNUSED (the per-shade hook perturbed timing; removed)

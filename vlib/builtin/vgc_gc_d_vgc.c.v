@@ -3918,6 +3918,9 @@ fn vgc_write_barrier(new_val voidptr) {
 @[export: 'vgc_wb_store']
 pub fn vgc_wb_store(obj voidptr) {
 	$if vgc_concurrent ? {
+		if vgc_ws_addr != 0 {
+			vgc_ws_poll()
+		}
 		if vgc_ws_addr != 0 && usize(obj) == vgc_ws_addr {
 			vgc_ws_calls++
 			C.vgc_say(0x7e30, vgc_ws_calls)
