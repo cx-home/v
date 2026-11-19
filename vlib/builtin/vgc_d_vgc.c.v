@@ -4273,6 +4273,17 @@ pub fn vgc_arena_tail_probe(i int) u32 {
 	return u32((a.size - a.used) / vgc_page_size)
 }
 
+// vgc_arena_base_probe reports arena i's base address to a test (0 for an
+// index past the arenas): cx-home/cx-core-code#282's cards index absolute
+// addresses >> vgc_page_shift, so every base must be a multiple of vgc_page_size.
+pub fn vgc_arena_base_probe(i int) usize {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	if i < 0 || i >= nar {
+		return 0
+	}
+	return unsafe { vgc_heap.arenas[i].base }
+}
+
 fn vgc_large_round_up(npages u32) u32 {
 	if npages < u32(vgc_large_round_min) || npages > u32(vgc_max_pooled_pages) {
 		return npages
