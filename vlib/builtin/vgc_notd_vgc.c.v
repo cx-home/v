@@ -47,6 +47,12 @@ fn vgc_memory_use() usize {
 	return 0
 }
 
+fn vgc_startup_begin() {
+}
+
+fn vgc_startup_done() {
+}
+
 fn vgc_safe_region_enter() {
 }
 

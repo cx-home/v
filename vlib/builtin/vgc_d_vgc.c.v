@@ -994,6 +994,19 @@ __global vgc_headroom_floor_lo1 = u64(256) * 1024
 // is the term at every small size, its floor vgc_headroom_floor_lo1.
 __global vgc_one_thread_pct = u64(25)
 
+// The first goal of a declared start-up (cx-home/v#76). A fresh process's
+// start-up is not a live set yet: a cx built program decodes its modules'
+// heads and builds its scopes (2.8 MB allocated for n-body built --native)
+// before its first explicit work, and at the one-thread clamp's 1 MB first
+// trigger it ran two cycles that marked ~nothing and freed nothing (~0.3-0.5
+// ms). A program that declares its start-up (gc_startup_begin at its first
+// line, gc_startup_done at its first explicit work) runs no cycle while it
+// allocates under this goal (VGC_FIRST_GOAL_MB, 4 MB), and at done the trigger
+// is re-based as if the start-up's heap had just been marked (heap_live + the
+// one-thread term), so the pacing that follows is the clamp's. A program that
+// declares nothing keeps cx-home/v#14's first cycle at the clamp.
+__global vgc_first_goal = u64(4) * 1024 * 1024
+
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
 // small heap whose garbage up to the goal is resident at the peak (json-codec 1 KB, 1 MB: 1-8 MB
@@ -1013,6 +1026,33 @@ fn vgc_one_thread_term(marked u64) u64 {
 		t = vgc_headroom_floor_lo1
 	}
 	return t
+}
+
+// vgc_startup_begin opens a declared start-up (cx-home/v#76): before any mark,
+// with the headroom not pinned, the trigger rises to the first goal so the
+// start-up's allocation runs no cycle. After a mark, or pinned, nothing moves.
+fn vgc_startup_begin() {
+	if vgc_headroom_pinned || vgc_heap.gc_cycle > 0 {
+		return
+	}
+	if C.vgc_atomic_load_u64(&vgc_heap.next_gc) < vgc_first_goal {
+		C.vgc_atomic_store_u64(&vgc_heap.next_gc, vgc_first_goal)
+	}
+}
+
+// vgc_startup_done closes a declared start-up: before any mark, the trigger is
+// re-based on the heap as it stands — heap_live + the one-thread term, the goal
+// a mark of that heap would have set — so the clamp's pacing resumes from the
+// start-up's live set instead of collecting it at once. Never lowers a trigger.
+fn vgc_startup_done() {
+	if vgc_headroom_pinned || vgc_heap.gc_cycle > 0 {
+		return
+	}
+	live := C.vgc_atomic_load_u64(&vgc_heap.heap_live)
+	goal := live + vgc_one_thread_term(live)
+	if goal > C.vgc_atomic_load_u64(&vgc_heap.next_gc) {
+		C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
+	}
 }
 
 // Parallel mark (cx-home/v#16). The mark phase is the pause: with the
@@ -2612,6 +2652,13 @@ pub fn vgc_init() {
 		l1 := C.atoll(lo1_env)
 		if l1 > 0 {
 			vgc_headroom_floor_lo1 = u64(l1) * 1024 * 1024
+		}
+	}
+	fg_env := C.getenv(c'VGC_FIRST_GOAL_MB')
+	if fg_env != unsafe { nil } {
+		fg := C.atoll(fg_env)
+		if fg > 0 {
+			vgc_first_goal = u64(fg) * 1024 * 1024
 		}
 	}
 	lo1k_env := C.getenv(c'VGC_HEADROOM_FLOOR_LO1_KB')

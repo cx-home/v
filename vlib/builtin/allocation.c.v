@@ -684,9 +684,15 @@ pub fn gc_heap_usage() GCHeapUsage {
 // would have set it. A program that declares nothing keeps the clamp's first
 // cycle. No-ops under Boehm and with no collector.
 pub fn gc_startup_begin() {
+	$if vgc ? {
+		vgc_startup_begin()
+	}
 }
 
 pub fn gc_startup_done() {
+	$if vgc ? {
+		vgc_startup_done()
+	}
 }
 
 pub fn gc_cycles() u64 {
