@@ -527,6 +527,21 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
       return VirtualAlloc((void*)at, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   }
+  // cx-home/cx-core-code#282: an arena's base must be a multiple of the
+  // collector's 8 KB page (its cards index absolute addresses >> 13);
+  // VirtualAlloc's allocation granularity is 64 KB, so these are the plain calls.
+  static inline void* vgc_os_alloc_aligned(size_t size, size_t align) {
+      (void)align;
+      return vgc_os_alloc(size);
+  }
+  static inline void* vgc_os_reserve_aligned(size_t size, size_t align) {
+      (void)align;
+      return vgc_os_reserve(size);
+  }
+  static inline void* vgc_os_alloc_at_aligned(size_t size, uintptr_t at, size_t align) {
+      (void)align;
+      return vgc_os_alloc_at(size, at);
+  }
   static inline void vgc_os_free(void* ptr, size_t size) {
       (void)size;
       VirtualFree(ptr, 0, MEM_RELEASE);
@@ -604,6 +619,42 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
       void* p = mmap((void*)at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       return (p == MAP_FAILED) ? NULL : p;
+  }
+  // cx-home/cx-core-code#282: an arena's base must be a multiple of the
+  // collector's 8 KB page (align): the cards (the write barrier's dirty bits,
+  // the inline gate, vgc_cards_take, the permanent generation's page bits) are
+  // indexed by the ABSOLUTE address >> 13 while a span sits at arena.base +
+  // k * 8 KB. darwin arm64's mmap is 16 KB-aligned; darwin x86-64's and
+  // Linux's only 4 KB-aligned — ardec-dev3 gave every 64 MB arena a base 4096
+  // mod 8192 — and such an arena splits each logical page across two cards, so
+  // vgc_cards_take(span) never re-scanned the upper half and a young object a
+  // permanent one held there was swept. The plain mapping is kept when it is
+  // already aligned (one call, arm64's case); otherwise it is replaced by one
+  // over-mapped by align, its head and tail trimmed (munmap of whole OS pages:
+  // align is a multiple of the OS page wherever this is reached).
+  static inline void* vgc_os_map_aligned(void* hint, size_t size, size_t align, int prot, int flags) {
+      void* p = mmap(hint, size, prot, flags, -1, 0);
+      if (p == MAP_FAILED) return NULL;
+      if (align == 0 || ((uintptr_t)p & (align - 1)) == 0) return p;
+      munmap(p, size);
+      size_t total = size + align;
+      char* q = (char*)mmap(hint, total, prot, flags, -1, 0);
+      if (q == (char*)MAP_FAILED) return NULL;
+      char* a = (char*)(((uintptr_t)q + align - 1) & ~(uintptr_t)(align - 1));
+      size_t head = (size_t)(a - q);
+      size_t tail = total - head - size;
+      if (head) munmap(q, head);
+      if (tail) munmap(a + size, tail);
+      return a;
+  }
+  static inline void* vgc_os_alloc_aligned(size_t size, size_t align) {
+      return vgc_os_map_aligned(NULL, size, align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+  }
+  static inline void* vgc_os_reserve_aligned(size_t size, size_t align) {
+      return vgc_os_map_aligned(NULL, size, align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+  }
+  static inline void* vgc_os_alloc_at_aligned(size_t size, uintptr_t at, size_t align) {
+      return vgc_os_map_aligned((void*)at, size, align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
   }
   static inline void vgc_os_free(void* ptr, size_t size) {
       munmap(ptr, size);
@@ -1775,7 +1826,7 @@ static inline void vgc_install_thread_exit(int idx) {
 // it at registration, before it could become a suspend target). The forensic
 // walks run to vgc_susp_hwm, the slots ever made addressable.
 // ============================================================
-#define VGC_SUSP_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95 (arm64); x86_64 fills 15 (+32 XMM lanes on Windows)
+#define VGC_SUSP_MAXREG 96   // 29 GP + fp + lr + 64 NEON lanes = 95 (arm64); x86_64 fills 15 + 32 XMM lanes (Windows, darwin) + 32 YMM-upper lanes (darwin with AVX) = 79
 #define VGC_SUSP_CHUNK_SHIFT 6
 #define VGC_SUSP_CHUNK (1 << VGC_SUSP_CHUNK_SHIFT)
 #define VGC_SUSP_MAX_CHUNKS 4096 // == vgc_max_cache_chunks (vgc_d_vgc.c.v)
@@ -1977,6 +2028,37 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   // pass 1 continues with the others, so the pause pays the per-thread
   // scheduling latency once, not once per thread.
   #define VGC_MAC_MAXREG VGC_SUSP_MAXREG
+  #if defined(__x86_64__)
+  // vgc_mac_x86_vector_regs: append a suspended thread's XMM0-15 (two 64-bit lanes each) and,
+  // when the AVX state reads, the YMM upper halves (two lanes each) to regs[c..max); returns the
+  // new count. The AVX state's first part is the float state, so one read serves both; without
+  // AVX the float state alone (cx-home/cx-core-code#282).
+  static inline int vgc_mac_x86_lanes(const struct __darwin_xmm_reg* x, int n, uintptr_t* regs, int c, int max) {
+      for (int i = 0; i < n && c + 1 < max; i++) {
+          uint64_t lo, hi;
+          memcpy(&lo, &x[i].__xmm_reg[0], 8);
+          memcpy(&hi, &x[i].__xmm_reg[8], 8);
+          regs[c++] = (uintptr_t)lo;
+          regs[c++] = (uintptr_t)hi;
+      }
+      return c;
+  }
+  static inline int vgc_mac_x86_vector_regs(thread_act_t t, uintptr_t* regs, int c, int max) {
+      x86_avx_state64_t av;
+      mach_msg_type_number_t na = x86_AVX_STATE64_COUNT;
+      if (thread_get_state(t, x86_AVX_STATE64, (thread_state_t)&av, &na) == KERN_SUCCESS) {
+          c = vgc_mac_x86_lanes(&av.__fpu_xmm0, 16, regs, c, max);
+          return vgc_mac_x86_lanes(&av.__fpu_ymmh0, 16, regs, c, max);
+      }
+      x86_float_state64_t fs;
+      mach_msg_type_number_t nf = x86_FLOAT_STATE64_COUNT;
+      if (thread_get_state(t, x86_FLOAT_STATE64, (thread_state_t)&fs, &nf) == KERN_SUCCESS) {
+          return vgc_mac_x86_lanes(&fs.__fpu_xmm0, 16, regs, c, max);
+      }
+      vgc_say(0xdead7, (uint64_t)t); // vector state unreadable: the general registers only (visible, not silent)
+      return c;
+  }
+  #endif
   // Thread registration key. Signal-free: no handler install, no sigmask edit —
   // a shared-library collector must not touch the host process's signal state
   // (the old install over Go's SIGURG handler silently broke the HOST's
@@ -2054,6 +2136,12 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
                           st.__rbp, st.__r8, st.__r9, st.__r10, st.__r11, st.__r12,
                           st.__r13, st.__r14, st.__r15 };
       for (int i = 0; i < 15 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = r[i];
+      // The vector registers too (cx-home/cx-core-code#282): clang copies a 16-byte V string
+      // ({ptr, len}) through one XMM register and libsystem's memmove uses YMM, so a thread
+      // suspended between such a load and its store holds the only reference there. arm64
+      // records its 64 NEON lanes above; here XMM0-15 (two lanes each) and, with AVX, the YMM
+      // upper halves: 15 + 32 + 32 = 79 <= VGC_MAC_MAXREG.
+      c = vgc_mac_x86_vector_regs((thread_act_t)t, s->regs, c, VGC_MAC_MAXREG);
     #else
       vgc_say(0xdead6, (uint64_t)t);
       __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
@@ -2127,6 +2215,19 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
                           (uintptr_t)uc->uc_mcontext->__ss.__r15 };
       for (int i = 0; i < 15 && c < VGC_MAC_MAXREG; i++) s->regs[c++] = r[i];
       s->sp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+      // the XMM registers from the signal frame's float state (cx-home/cx-core-code#282; the
+      // mach path above records the YMM upper halves too)
+      {
+          const _STRUCT_X86_FLOAT_STATE64* fs = &uc->uc_mcontext->__fs;
+          const struct __darwin_xmm_reg* x = &fs->__fpu_xmm0;
+          for (int i = 0; i < 16 && c + 1 < VGC_MAC_MAXREG; i++) {
+              uint64_t lo, hi;
+              memcpy(&lo, &x[i].__xmm_reg[0], 8);
+              memcpy(&hi, &x[i].__xmm_reg[8], 8);
+              s->regs[c++] = (uintptr_t)lo;
+              s->regs[c++] = (uintptr_t)hi;
+          }
+      }
     #endif
       s->nregs = c;
       __atomic_store_n(&s->acked, 1, __ATOMIC_RELEASE);

@@ -45,6 +45,11 @@ fn C.vgc_cpu_pause()
 fn C.vgc_os_alloc(size usize) voidptr
 fn C.vgc_os_free(ptr voidptr, size usize)
 fn C.vgc_os_reserve(size usize) voidptr // cx-home/v#56 lever 7: the nursery's range
+
+// cx-home/cx-core-code#282: arena bases a multiple of vgc_page_size (vgc_platform.h)
+fn C.vgc_os_alloc_aligned(size usize, align usize) voidptr
+fn C.vgc_os_reserve_aligned(size usize, align usize) voidptr
+fn C.vgc_os_alloc_at_aligned(size usize, at usize, align usize) voidptr
 fn C.vgc_os_commit(ptr voidptr, size usize) int
 fn C.vgc_os_decommit(ptr voidptr, size usize)
 fn C.vgc_os_page() usize
@@ -4273,6 +4278,17 @@ pub fn vgc_arena_tail_probe(i int) u32 {
 	return u32((a.size - a.used) / vgc_page_size)
 }
 
+// vgc_arena_base_probe reports arena i's base address to a test (0 for an
+// index past the arenas): cx-home/cx-core-code#282's cards index absolute
+// addresses >> vgc_page_shift, so every base must be a multiple of vgc_page_size.
+pub fn vgc_arena_base_probe(i int) usize {
+	nar := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	if i < 0 || i >= nar {
+		return 0
+	}
+	return unsafe { vgc_heap.arenas[i].base }
+}
+
 fn vgc_large_round_up(npages u32) u32 {
 	if npages < u32(vgc_large_round_min) || npages > u32(vgc_max_pooled_pages) {
 		return npages
@@ -6315,7 +6331,8 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		if vgc_test_arena_hint != 0 {
 			mem = vgc_test_arena_map(asize)
 		} else {
-			mem = C.vgc_os_alloc(asize)
+			// page-aligned: the cards index absolute addresses (cx-home/cx-core-code#282)
+			mem = C.vgc_os_alloc_aligned(asize, vgc_page_size)
 		}
 		if mem == unsafe { nil } {
 			C.vgc_mutex_unlock(&vgc_heap.lock)
@@ -6518,7 +6535,7 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 // VGC_TEST_ARENA_HINT) and moves the hook past it, a 64 MB gap between arenas;
 // under the heap lock, as every carve is.
 fn vgc_test_arena_map(asize usize) voidptr {
-	mem := C.vgc_os_alloc_at(asize, vgc_test_arena_hint)
+	mem := C.vgc_os_alloc_at_aligned(asize, vgc_test_arena_hint, vgc_page_size)
 	vgc_test_arena_hint += (asize + vgc_arena_size - 1) / vgc_arena_size * vgc_arena_size + vgc_arena_size
 	return mem
 }
@@ -6527,7 +6544,7 @@ fn vgc_test_arena_map(asize usize) voidptr {
 // (cx-home/v#56 lever 7; the doc at vgc_nursery_base): nothing is committed
 // until the bump reaches it. A failed reservation leaves the nursery off.
 fn vgc_nursery_reserve_range() {
-	mem := C.vgc_os_reserve(vgc_nursery_reserve)
+	mem := C.vgc_os_reserve_aligned(vgc_nursery_reserve, vgc_page_size)
 	if mem == unsafe { nil } {
 		return
 	}
