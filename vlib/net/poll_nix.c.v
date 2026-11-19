@@ -45,7 +45,16 @@ pub fn poll_ready(handle int, what PollFor, timeout time.Duration) !bool {
 		.except { 2 }
 	}
 
-	res := C.v_net_poll_one(handle, w, poll_timeout_ms(timeout))
+	ms := poll_timeout_ms(timeout)
+	// cx-home/v#77: a wait that can block is a GC-safe region, as select_fdset's is
+	// (the contract and the reason are stated there); a zero bound enters none.
+	if ms != 0 {
+		gc_safe_region_enter()
+	}
+	res := C.v_net_poll_one(handle, w, ms)
+	if ms != 0 {
+		gc_safe_region_exit()
+	}
 	if res < 0 {
 		code := error_code()
 		return error_with_code('net: socket error: ${code}', code)

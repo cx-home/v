@@ -130,18 +130,32 @@ fn select_fdset(handle int, test Select, timeout time.Duration) !bool {
 	C.FD_SET(handle, &set)
 
 	// infinite timeout is signaled by passing null as the timeout to select.
+	// cx-home/v#77: a wait that can block is a GC-safe region (gc_safe_region_enter,
+	// cx #316), as a semaphore wait is (cx-home/v#28): the thread hands its partly
+	// used spans to the other threads on entry (cx-home/v#36) and the collector
+	// covers it from its entry-time stack prefix and register snapshot instead of
+	// suspending it. A `cx fabric-serve` reader thread blocked in its read kept a
+	// fresh 8 KB span per size class it had touched — about 34 spans, 270 KB, per
+	// idle thread at 110 connections — because no socket wait entered a region.
+	// The contract holds here: select(2) writes the fd_set on this frame and
+	// nothing else; no allocation, no GC-pointer store, no new reference carried
+	// out. A zero timeout cannot block and enters no region.
 	if timeout == infinite_timeout {
-		match test {
+		gc_safe_region_enter()
+		r := match test {
 			.read {
-				socket_error(C.select(handle + 1, &set, C.NULL, C.NULL, &C.timeval(unsafe { nil })))!
+				C.select(handle + 1, &set, C.NULL, C.NULL, &C.timeval(unsafe { nil }))
 			}
 			.write {
-				socket_error(C.select(handle + 1, C.NULL, &set, C.NULL, &C.timeval(unsafe { nil })))!
+				C.select(handle + 1, C.NULL, &set, C.NULL, &C.timeval(unsafe { nil }))
 			}
 			.except {
-				socket_error(C.select(handle + 1, C.NULL, C.NULL, &set, &C.timeval(unsafe { nil })))!
+				C.select(handle + 1, C.NULL, C.NULL, &set, &C.timeval(unsafe { nil }))
 			}
 		}
+
+		gc_safe_region_exit()
+		socket_error(r)!
 	} else {
 		seconds := timeout / time.second
 		microseconds := time.Duration(timeout - (seconds * time.second)).microseconds()
@@ -149,17 +163,26 @@ fn select_fdset(handle int, test Select, timeout time.Duration) !bool {
 			tv_sec:  u64(seconds)
 			tv_usec: u64(microseconds)
 		}
-		match test {
+		blocks := timeout > 0
+		if blocks {
+			gc_safe_region_enter()
+		}
+		r := match test {
 			.read {
-				socket_error(C.select(handle + 1, &set, C.NULL, C.NULL, &tt))!
+				C.select(handle + 1, &set, C.NULL, C.NULL, &tt)
 			}
 			.write {
-				socket_error(C.select(handle + 1, C.NULL, &set, C.NULL, &tt))!
+				C.select(handle + 1, C.NULL, &set, C.NULL, &tt)
 			}
 			.except {
-				socket_error(C.select(handle + 1, C.NULL, C.NULL, &set, &tt))!
+				C.select(handle + 1, C.NULL, C.NULL, &set, &tt)
 			}
 		}
+
+		if blocks {
+			gc_safe_region_exit()
+		}
+		socket_error(r)!
 	}
 
 	return C.FD_ISSET(handle, &set) != 0
