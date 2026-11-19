@@ -677,6 +677,18 @@ pub fn gc_heap_usage() GCHeapUsage {
 // what a meter counting collections reads (cx-private#1796: it read
 // gc_heap_usage().bytes_since_gc, which under vgc held the cycle count). 0 with
 // no collector that counts them.
+// gc_startup_begin / gc_startup_done declare a process's start-up to the
+// collector (cx-home/v#76): between them the first cycle waits for the first
+// goal for one thread (VGC_FIRST_GOAL_MB, 4 MB) instead of the 1 MB clamp, and
+// at done the trigger is re-based on the heap as it stands, as a mark of it
+// would have set it. A program that declares nothing keeps the clamp's first
+// cycle. No-ops under Boehm and with no collector.
+pub fn gc_startup_begin() {
+}
+
+pub fn gc_startup_done() {
+}
+
 pub fn gc_cycles() u64 {
 	$if vgc ? {
 		return vgc_heap.gc_cycle
