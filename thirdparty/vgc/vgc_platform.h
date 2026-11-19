@@ -473,6 +473,21 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
       return VirtualAlloc((void*)at, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   }
+  // cx-home/cx-core-code#282: an arena's base must be a multiple of the
+  // collector's 8 KB page (its cards index absolute addresses >> 13);
+  // VirtualAlloc's allocation granularity is 64 KB, so these are the plain calls.
+  static inline void* vgc_os_alloc_aligned(size_t size, size_t align) {
+      (void)align;
+      return vgc_os_alloc(size);
+  }
+  static inline void* vgc_os_reserve_aligned(size_t size, size_t align) {
+      (void)align;
+      return vgc_os_reserve(size);
+  }
+  static inline void* vgc_os_alloc_at_aligned(size_t size, uintptr_t at, size_t align) {
+      (void)align;
+      return vgc_os_alloc_at(size, at);
+  }
   static inline void vgc_os_free(void* ptr, size_t size) {
       (void)size;
       VirtualFree(ptr, 0, MEM_RELEASE);
@@ -550,6 +565,42 @@ static inline void vgc_alloc_exit(void) { _vgc_alloc_held = 0; }
   static inline void* vgc_os_alloc_at(size_t size, uintptr_t at) {
       void* p = mmap((void*)at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       return (p == MAP_FAILED) ? NULL : p;
+  }
+  // cx-home/cx-core-code#282: an arena's base must be a multiple of the
+  // collector's 8 KB page (align): the cards (the write barrier's dirty bits,
+  // the inline gate, vgc_cards_take, the permanent generation's page bits) are
+  // indexed by the ABSOLUTE address >> 13 while a span sits at arena.base +
+  // k * 8 KB. darwin arm64's mmap is 16 KB-aligned; darwin x86-64's and
+  // Linux's only 4 KB-aligned — ardec-dev3 gave every 64 MB arena a base 4096
+  // mod 8192 — and such an arena splits each logical page across two cards, so
+  // vgc_cards_take(span) never re-scanned the upper half and a young object a
+  // permanent one held there was swept. The plain mapping is kept when it is
+  // already aligned (one call, arm64's case); otherwise it is replaced by one
+  // over-mapped by align, its head and tail trimmed (munmap of whole OS pages:
+  // align is a multiple of the OS page wherever this is reached).
+  static inline void* vgc_os_map_aligned(void* hint, size_t size, size_t align, int prot, int flags) {
+      void* p = mmap(hint, size, prot, flags, -1, 0);
+      if (p == MAP_FAILED) return NULL;
+      if (align == 0 || ((uintptr_t)p & (align - 1)) == 0) return p;
+      munmap(p, size);
+      size_t total = size + align;
+      char* q = (char*)mmap(hint, total, prot, flags, -1, 0);
+      if (q == (char*)MAP_FAILED) return NULL;
+      char* a = (char*)(((uintptr_t)q + align - 1) & ~(uintptr_t)(align - 1));
+      size_t head = (size_t)(a - q);
+      size_t tail = total - head - size;
+      if (head) munmap(q, head);
+      if (tail) munmap(a + size, tail);
+      return a;
+  }
+  static inline void* vgc_os_alloc_aligned(size_t size, size_t align) {
+      return vgc_os_map_aligned(NULL, size, align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+  }
+  static inline void* vgc_os_reserve_aligned(size_t size, size_t align) {
+      return vgc_os_map_aligned(NULL, size, align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
+  }
+  static inline void* vgc_os_alloc_at_aligned(size_t size, uintptr_t at, size_t align) {
+      return vgc_os_map_aligned((void*)at, size, align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
   }
   static inline void vgc_os_free(void* ptr, size_t size) {
       munmap(ptr, size);
