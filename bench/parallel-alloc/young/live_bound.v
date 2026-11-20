@@ -58,13 +58,27 @@ fn main() {
 		ring.hold[k] = batch(u64(k))
 	}
 	gc_collect()
+	// the young records the stores take are made before the count starts: a
+	// fresh object's own barrier (vgc_memdup's vgc_wb_store_into) is called
+	// when the thread's cached span, carved before the collection, still has a
+	// free slot — an old span — and that call is not a store into an old record
+	// (cx-home/v#77: the cold-class carve left the cached span two slots short of
+	// full at this collection, and calls read 2)
+	mut ys := []&Rec{len: recs, init: unsafe { nil }}
+	for s in 0 .. recs {
+		ys[s] = &Rec{
+			v: 1_000_000 + u64(s)
+		}
+	}
 	c0 := vgc_wb_calls_count()
 	for s in 0 .. recs {
-		store_into(mut ring.hold[slots - 1 - s % slots][7 + s / slots], &Rec{
-			v: 1_000_000 + u64(s)
-		}, repeat)
+		store_into(mut ring.hold[slots - 1 - s % slots][7 + s / slots], ys[s], repeat)
 	}
 	calls := vgc_wb_calls_count() - c0
+	// only the old records hold the young ones now (bad= reads them back)
+	for s in 0 .. recs {
+		ys[s] = unsafe { nil }
+	}
 	minors0 := vgc_minor_cycles_count()
 	mut g := &Rec(unsafe { nil })
 	wrecs := wave_mb * 1024 * 1024 / 64
