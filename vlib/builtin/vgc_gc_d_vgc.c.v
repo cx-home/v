@@ -2828,6 +2828,13 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 // interior address of a dropped 240 MB list, which vgc_metadata_roots_test kept
 // marked at -O2. spill_hi 0 (a range another path set) scans the range as before.
 fn vgc_scan_thread_stack(lo usize, hi usize, spill_hi usize, w int) {
+	$if vgc_shadow_stack ? {
+		// cx-home/v#74 (a): the reference-carrying aggregates sit in frame
+		// records clang cannot slice, so the machine stack is read at aligned
+		// words only (the records lie inside [lo, hi) and are read with it).
+		vgc_scan_range(lo, hi, w)
+		return
+	}
 	if spill_hi > lo && spill_hi <= hi {
 		vgc_scan_range(lo, spill_hi, w)
 		vgc_scan_stack_range(spill_hi, hi, w)
