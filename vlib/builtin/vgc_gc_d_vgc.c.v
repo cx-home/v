@@ -2339,6 +2339,16 @@ fn C.vgc_data_segments(los &usize, his &usize, max_ranges int) int
 // here so it reclaims next cycle. MUST run under STW, after mark, before sweep, while
 // gc_cycle still holds this cycle's value.
 fn vgc_protect_cached_spans() {
+	// cx-home/v#77: each class's shared span is a cache slot every thread carves
+	// from under the class's lock (vgc_cold_alloc).
+	for sc in 0 .. 136 {
+		s := vgc_heap.central[sc].shared
+		if s != unsafe { nil } {
+			unsafe {
+				s.sweep_gen = u32(vgc_heap.gc_cycle)
+			}
+		}
+	}
 	for i in 0 .. vgc_heap.ncaches {
 		c := unsafe { vgc_cache(i) }
 		if !c.registered {

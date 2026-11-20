@@ -474,6 +474,10 @@ mut:
 	// refill statistics (cx-private#1910 evidence; slow path only)
 	pool_refills    u64 // vgc_get_free_span_cached calls
 	pool_lock_takes u64 // of which took free_spans_lock
+	// cx-home/v#77: objects this thread has carved per class from the class's
+	// shared span (vgc_cold_alloc); at vgc_cold_warm the class is warm and takes
+	// a private span. A reused slot keeps its counts (its next thread starts warm).
+	cold [136]u8
 }
 
 // cx-private#1910: the stash covers the size classes' span sizes (vgc_class_npages
@@ -526,6 +530,13 @@ mut:
 	lock    u32 // spinlock
 	partial &VGC_Span = unsafe { nil } // spans with free objects (swept)
 	full    &VGC_Span = unsafe { nil } // spans with no free objects
+	// cx-home/v#77: the class's shared span — a thread's first vgc_cold_warm
+	// objects of a class are carved here under `lock` instead of in a private
+	// span of its own (vgc_cold_alloc). Stamped at every stop as a cache slot
+	// is (vgc_protect_cached_spans), never on `partial`.
+	shared &VGC_Span = unsafe { nil }
+	// 1 while one thread carves the next shared span outside `lock`.
+	cold_refill u32
 }
 
 // VGC_Arena tracks a chunk of memory obtained from the OS.
@@ -7066,6 +7077,72 @@ fn vgc_span_release_acquisition(span &VGC_Span) {
 	}
 }
 
+// cx-home/v#77 (piece a): cold-class packing. Threads started together each took
+// a private 8 KB span per class for their first object of it, and a non-moving
+// collector cannot pack the one live object each such span keeps afterwards
+// (vgc_cold_class_pack_test: 64 threads x 20 classes, 20.4x carved over live).
+// A thread's first vgc_cold_warm objects of a class are carved instead from the
+// class's shared span under the class's central lock; only a warm class gets a
+// private span. Soundness: the shared span is referenced by central.shared,
+// which vgc_protect_cached_spans stamps at every stop as it does a cache slot,
+// so the sweep never recycles it while it is installed; every carve and every
+// replacement happens under central.lock, so it has one carver at a time; a
+// full shared span is dropped as a full cache span is (B18) and swept normally.
+// Returns nil (the caller takes its private path) for a warm class, a thread
+// with a private span of the class already, an unregistered thread, or no span.
+const vgc_cold_warm = u8(2)
+
+fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
+	if cache_idx < 0 {
+		return unsafe { nil }, unsafe { nil }
+	}
+	mut c := unsafe { vgc_cache(cache_idx) }
+	if unsafe { c.alloc[span_class] } != unsafe { nil } || c.cold[span_class] >= vgc_cold_warm {
+		return unsafe { nil }, unsafe { nil }
+	}
+	c.cold[span_class]++
+	central := unsafe { &vgc_heap.central[span_class] }
+	mut span := unsafe { &VGC_Span(nil) }
+	for {
+		C.vgc_mutex_lock(&central.lock)
+		span = central.shared
+		if span != unsafe { nil } && span.in_use && span.alloc_count < span.nelems {
+			break
+		}
+		if central.cold_refill == 0 {
+			// One refiller per class; the fresh carve takes the heap's own locks,
+			// so it runs outside central.lock and the others wait for it.
+			unsafe {
+				vgc_heap.central[span_class].cold_refill = 1
+			}
+			C.vgc_mutex_unlock(&central.lock)
+			mut fresh := vgc_central_get_fresh(span_class)
+			C.vgc_mutex_lock(&central.lock)
+			unsafe {
+				vgc_heap.central[span_class].cold_refill = 0
+			}
+			if fresh == unsafe { nil } {
+				C.vgc_mutex_unlock(&central.lock)
+				return unsafe { nil }, unsafe { nil }
+			}
+			unsafe {
+				vgc_heap.central[span_class].shared = fresh
+			}
+			vgc_span_release_acquisition(fresh)
+			span = fresh
+			break
+		}
+		C.vgc_mutex_unlock(&central.lock)
+		C.vgc_yield()
+	}
+	ptr := unsafe { vgc_span_alloc_obj(mut span) }
+	C.vgc_mutex_unlock(&central.lock)
+	if ptr == unsafe { nil } {
+		return unsafe { nil }, unsafe { nil }
+	}
+	return ptr, span
+}
+
 fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 	if cache_idx < 0 {
 		// Unregistered thread: only a thread that allocates before it has
@@ -7185,7 +7262,13 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 	}
 
 	span_class := int(class_idx) * 2 // scan variant
-	mut span := vgc_cache_get_span(cache_idx, span_class)
+	// cx-home/v#77: a cold class carves from the class's shared span first.
+	cold_ptr, cold_span := vgc_cold_alloc(cache_idx, span_class)
+	mut span := if cold_ptr != unsafe { nil } {
+		cold_span
+	} else {
+		vgc_cache_get_span(cache_idx, span_class)
+	}
 	if span == unsafe { nil } {
 		// Out of span space: the pacer is heap_live-driven, so under thread-churn
 		// (wave threads exit leaving dead spans the pacer hasn't collected yet)
@@ -7215,7 +7298,10 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 	_ = ptrmap
 	_ = ptr_words
 
-	ptr := unsafe { vgc_span_alloc_obj(mut span) }
+	mut ptr := cold_ptr
+	if ptr == unsafe { nil } {
+		ptr = unsafe { vgc_span_alloc_obj(mut span) }
+	}
 	if ptr == unsafe { nil } {
 		vgc_span_handout_report(span, n) // cx-home/v#37: a handed-out span answered nil — say which
 	} else {
@@ -7628,7 +7714,13 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 	}
 
 	span_class := int(class_idx) * 2 + 1 // noscan variant
-	mut span := vgc_cache_get_span(cache_idx, span_class)
+	// cx-home/v#77: a cold class carves from the class's shared span first.
+	cold_ptr, cold_span := vgc_cold_alloc(cache_idx, span_class)
+	mut span := if cold_ptr != unsafe { nil } {
+		cold_span
+	} else {
+		vgc_cache_get_span(cache_idx, span_class)
+	}
 	if span == unsafe { nil } {
 		// Out of span space — reclaim + retry before OOM (see the scan-path note
 		// in vgc_malloc_typed_opts). Without this, a churn-time exhaustion makes
@@ -7642,7 +7734,10 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 		}
 	}
 
-	ptr := unsafe { vgc_span_alloc_obj(mut span) }
+	mut ptr := cold_ptr
+	if ptr == unsafe { nil } {
+		ptr = unsafe { vgc_span_alloc_obj(mut span) }
+	}
 	if ptr == unsafe { nil } {
 		vgc_span_handout_report(span, n) // cx-home/v#37: a handed-out span answered nil — say which
 	} else {
