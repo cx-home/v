@@ -2701,6 +2701,10 @@ pub fn vgc_init() {
 				vgc_cm_mode = int(cv)
 			}
 		}
+		$if vgc_unaligned_audit ? {
+			// cx-home/v#74 (c): every full cycle stop-the-world, so each is audited
+			vgc_cm_mode = 0
+		}
 		cmm_env := C.getenv(c'VGC_CM_MIN_US')
 		if cmm_env != unsafe { nil } {
 			cmv := C.atoll(cmm_env)

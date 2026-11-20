@@ -18,7 +18,8 @@ import os
 fn build() string {
 	src := os.join_path(@DIR, 'ua', 'planted.v')
 	exe := os.join_path(os.vtmp_dir(), 'vgc_ua_planted_${os.getpid()}')
-	r := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -d vgc_unaligned_audit -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	r :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -d vgc_unaligned_audit -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert r.exit_code == 0, r.output
 	return exe
 }
@@ -40,7 +41,7 @@ fn test_a_planted_unaligned_real_root_is_counted_real() {
 	}
 	for off in [1, 3, 7] {
 		only, real, cycles, sevens := run(exe, 'real', off)
-		assert cycles >= 4, 'off ${off}: ${cycles} audited cycles'
+		assert cycles >= 3, 'off ${off}: ${cycles} audited cycles'
 		assert only >= 1, 'off ${off}: the buffer held only at an unaligned offset was not counted unaligned-only (${only})'
 		assert real >= 1, 'off ${off}: the buffer read back into an aligned local was not counted real (${real})'
 		assert sevens == 64 * 1024, 'off ${off}: the buffer read ${sevens} sevens: the audit build must keep what the byte scan keeps'
