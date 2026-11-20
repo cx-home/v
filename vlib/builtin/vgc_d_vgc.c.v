@@ -2934,6 +2934,17 @@ fn vgc_register_thread_opt(wait bool) bool {
 		} else if vgc_cache_chunk_ensure(vgc_heap.ncaches) {
 			idx = vgc_heap.ncaches
 			vgc_heap.ncaches = idx + 1
+			if idx == 0 {
+				// cx-core-code#295: the first thread (main) runs first and alone,
+				// so it starts warm: the cold-class carve (cx-home/v#77) is for
+				// threads started together, and a thread that warms a class pays
+				// the shared span AND its own (one more page a class touched).
+				for c in 0 .. 136 {
+					unsafe {
+						vgc_cache(idx).cold[c] = vgc_cold_warm
+					}
+				}
+			}
 		}
 		if idx >= 0 {
 			break
