@@ -975,7 +975,20 @@ fn (mut s SSLConn) init() ! {
 
 	if unsafe { s.certs != nil } {
 		C.mbedtls_ssl_conf_ca_chain(&s.conf, &s.certs.cacert, 0)
-		C.mbedtls_ssl_conf_own_cert(&s.conf, &s.certs.client_cert, &s.certs.client_key)
+		// An own certificate only when the caller gave one (cert AND key). With
+		// only `verify` set, client_cert/client_key are initialized but EMPTY:
+		// configured as the client's identity, mbedtls answers a server's
+		// CertificateRequest by failing the handshake (-28160) instead of
+		// sending an empty Certificate message — every CA-pinned call to a
+		// server that requests an optional client certificate (kube-apiserver)
+		// failed (cx-home/v#78).
+		if s.config.cert != '' && s.config.cert_key != '' {
+			ret = C.mbedtls_ssl_conf_own_cert(&s.conf, &s.certs.client_cert, &s.certs.client_key)
+			if ret != 0 {
+				return error_with_code('net.mbedtls SSLConn.init, mbedtls_ssl_conf_own_cert failed ret: ${ret}',
+					ret)
+			}
+		}
 	}
 
 	if s.config.validate {
