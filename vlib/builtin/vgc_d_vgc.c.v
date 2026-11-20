@@ -1769,6 +1769,14 @@ __global vgc_headroom_per_thread = true
 // xlsx parses in one process read 24 s of system time against 1.5 s for 12.
 // One thread carves exactly as first fit did. VGC_ARENA_OWNER=0 switches it off.
 __global vgc_arena_owner_on = true
+// A thread takes an arena tail of its own only once it allocated this many
+// bytes (cx-private#2056): below it, it carves the shared tails first fit. The
+// rule is for threads that each first-touch a working set (#403's xlsx parses,
+// a megabyte a piece); thousands of parked workers that allocate a few KB each
+// claimed a fresh tail apiece, every worker's first span alone in its own
+// pages (~10 KB resident a worker: cx's 4,000-worker chain read 233.5 MB, first
+// fit 192.5 MB). VGC_ARENA_OWNER_MIN_KB sets it (0: every allocating thread).
+__global vgc_arena_owner_min = u64(1024 * 1024)
 // An owner holds its arena's tail only while it carves: a thread that carved
 // none of it in this completed cycle or the last (vgc_arena_owner_cycles) leaves
 // the tail to the next thread that carves. A thread that carved a few spans at
@@ -2825,6 +2833,13 @@ pub fn vgc_init() {
 	ao_env := C.getenv(c'VGC_ARENA_OWNER')
 	if ao_env != unsafe { nil } {
 		vgc_arena_owner_on = C.atoll(ao_env) != 0
+	}
+	aom_env := C.getenv(c'VGC_ARENA_OWNER_MIN_KB')
+	if aom_env != unsafe { nil } {
+		kb := C.atoll(aom_env)
+		if kb >= 0 {
+			vgc_arena_owner_min = u64(kb) * 1024
+		}
 	}
 	lim_env := C.getenv(c'VGC_MEMLIMIT_MB')
 	if lim_env != unsafe { nil } {
@@ -5917,8 +5932,29 @@ fn vgc_frame_tail_past_room(nbytes usize) (usize, int) {
 	return 0, -1
 }
 
+// vgc_arena_owner_me is the arena owner the calling thread carves as: its cache
+// index + 1 once it allocated vgc_arena_owner_min bytes (its monotone count,
+// alloc_flushed + alloc_delta), else 0 — first fit, the shared tails
+// (cx-private#2056). 0 too with the rule off or no cache.
+fn vgc_arena_owner_me() int {
+	if !vgc_arena_owner_on {
+		return 0
+	}
+	ci := C.vgc_get_cache_idx()
+	if ci < 0 {
+		return 0
+	}
+	if vgc_arena_owner_min > 0 {
+		c := vgc_cache(ci)
+		if c.alloc_flushed + c.alloc_delta < vgc_arena_owner_min {
+			return 0
+		}
+	}
+	return ci + 1
+}
+
 fn vgc_arena_tail_take(nbytes usize, kind u8) (usize, int) {
-	me := if vgc_arena_owner_on { C.vgc_get_cache_idx() + 1 } else { 0 }
+	me := vgc_arena_owner_me()
 	i := vgc_arena_pick(nbytes, me, vgc_heap.narenas, unsafe { &vgc_heap.arenas[0] },
 		vgc_arena_ceiling(), vgc_arena_owner_live, vgc_heap.gc_cycle, kind)
 	if i < 0 {
@@ -6395,7 +6431,7 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			vgc_heap.arenas[arena_idx].kind = kind
 		}
 		if vgc_arena_owner_on && asize == vgc_arena_size {
-			me := C.vgc_get_cache_idx() + 1
+			me := vgc_arena_owner_me()
 			if me > 0 {
 				vgc_arena_claim(unsafe { &vgc_heap.arenas[0] }, arena_idx + 1, arena_idx, me,
 					vgc_heap.gc_cycle)
