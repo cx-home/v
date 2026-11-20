@@ -2844,6 +2844,80 @@ static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t
     fprintf(stderr, "\n");
 }
 
+// cx-home/v#74 option (c) (-d vgc_unaligned_audit): the audit's lines. Each
+// line goes to VGC_UA_LOG (appended, O_APPEND: every process a run starts writes
+// to the one file the environment names) or to stderr without it. A line is
+// `[ua-audit] pid=P exe=E gc=N kind=only|real thread=T off=O where=W word=V
+// obj=B bytes=X frame=F`; at exit, when any cycle was audited, one summary line
+// `[ua-audit] pid=P exe=E summary only=N real=M cycles=C overflow=O`.
+#include <fcntl.h>
+static int vgc_ua_fd = -2;
+static uint64_t vgc_ua_cnt[4]; // 0 only, 1 real, 2 audited cycles, 3 overflow
+static const char* vgc_ua_exe(void) {
+#if defined(__APPLE__)
+    const char* n = getprogname();
+    return n ? n : "?";
+#else
+    return "?";
+#endif
+}
+static void vgc_ua_write(const char* b, int n) {
+    if (vgc_ua_fd == -2) {
+        const char* p = getenv("VGC_UA_LOG");
+        vgc_ua_fd = (p && *p) ? open(p, O_WRONLY | O_APPEND | O_CREAT, 0644) : 2;
+        if (vgc_ua_fd < 0) vgc_ua_fd = 2;
+    }
+    if (n > 0) (void)!write(vgc_ua_fd, b, (size_t)n);
+}
+static void vgc_ua_exit(void) {
+    if (vgc_ua_cnt[2] == 0) return;
+    char b[256];
+    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s summary only=%llu real=%llu cycles=%llu overflow=%llu\n",
+                     (int)getpid(), vgc_ua_exe(), (unsigned long long)vgc_ua_cnt[0], (unsigned long long)vgc_ua_cnt[1],
+                     (unsigned long long)vgc_ua_cnt[2], (unsigned long long)vgc_ua_cnt[3]);
+    vgc_ua_write(b, n < (int)sizeof b ? n : (int)sizeof b - 1);
+}
+static void vgc_ua_add(int k, uint64_t n) {
+    if (k == 2 && vgc_ua_cnt[2] == 0) atexit(vgc_ua_exit);
+    vgc_ua_cnt[k] += n;
+}
+static uint64_t vgc_ua_get(int k) { return vgc_ua_cnt[k]; }
+// the return address into the function whose frame holds `where` on the calling
+// thread's own stack (the frame-pointer walk vgc_rd_report makes), 0 off it
+static uintptr_t vgc_ua_frame_lr(uintptr_t where) {
+#if defined(__GNUC__) || defined(__clang__)
+    void** fp = (void**)__builtin_frame_address(0);
+    void* prev_lr = 0;
+    for (int i = 0; i < 4096 && fp; i++) {
+        if ((uintptr_t)fp > where) return (uintptr_t)prev_lr;
+        prev_lr = fp[1];
+        void** next = (void**)fp[0];
+        if (next <= fp) break;
+        fp = next;
+    }
+#else
+    (void)where;
+#endif
+    return 0;
+}
+static void vgc_ua_line(int real, uint64_t cycle, uint32_t thread, int64_t off, uintptr_t where,
+                        uintptr_t word, uintptr_t obj, uint64_t bytes, uintptr_t lr) {
+    char b[512];
+    const char* fn = 0;
+#if defined(__APPLE__)
+    Dl_info di; memset(&di, 0, sizeof di);
+    if (lr && dladdr((void*)lr, &di) && di.dli_sname) fn = di.dli_sname;
+#endif
+    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s gc=%llu kind=%s thread=%u off=%lld where=%p word=%p obj=%p bytes=%llu",
+                     (int)getpid(), vgc_ua_exe(), (unsigned long long)cycle, real ? "real" : "only", thread,
+                     (long long)off, (void*)where, (void*)word, (void*)obj, (unsigned long long)bytes);
+    if (n > 0 && n < (int)sizeof b) {
+        int m = fn ? snprintf(b + n, sizeof b - n, " frame=%s\n", fn) : snprintf(b + n, sizeof b - n, " frame=%p\n", (void*)lr);
+        if (m > 0) n += m;
+    }
+    vgc_ua_write(b, n < (int)sizeof b ? n : (int)sizeof b - 1);
+}
+
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
                              uint64_t narenas, uint64_t nspans, uint64_t lthreads,
                              uint64_t headroom_kb, uint64_t pause_us,

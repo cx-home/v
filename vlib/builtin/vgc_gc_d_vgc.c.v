@@ -286,7 +286,13 @@ fn vgc_gc_start() {
 
 	// Scan roots: stacks + globals (conservative scanning)
 	vgc_roots_par_n = vgc_roots_plan()
+	$if vgc_unaligned_audit ? {
+		vgc_ua_begin(!vgc_minor_this_cycle)
+	}
 	vgc_mark_roots()
+	$if vgc_unaligned_audit ? {
+		vgc_ua_defer = false
+	}
 	// cx-private#1910: the next cycle's selection; cx-home/v#56 lever 11: a
 	// minor's record is its own (vgc_minor_root_last_ns), the full's stays
 	if vgc_minor_this_cycle {
@@ -353,6 +359,9 @@ fn vgc_gc_start() {
 
 	// Final drain of work queue
 	vgc_drain_mark_work(0)
+	$if vgc_unaligned_audit ? {
+		vgc_ua_finish()
+	}
 	vgc_ph[5] = C.vgc_now_ns()
 	// the next cycle's parallel-mark decision (cx-home/v#16). The
 	// single-marker-equivalent work of that mark: n markers took last_ns,
@@ -2443,6 +2452,9 @@ fn vgc_roots_plan() int {
 	$if vgc_rootdiag ? {
 		return 1
 	}
+	$if vgc_unaligned_audit ? {
+		return 1
+	}
 	n := vgc_mark_nworkers_cur
 	if n <= 1 || vgc_mark_pool_n == 0 || vgc_watch_addr != 0 || !vgc_roots_par {
 		return 1
@@ -2573,6 +2585,11 @@ fn vgc_mark_roots() {
 				vgc_rd_cat = u32(10 + i)
 				vgc_rd_base = cache.stack_hi
 				vgc_rd_own = i == C.vgc_get_cache_idx()
+			}
+			$if vgc_unaligned_audit ? {
+				vgc_ua_thread = u32(i)
+				vgc_ua_base = cache.stack_hi
+				vgc_ua_own = i == C.vgc_get_cache_idx()
 			}
 			vgc_scan_thread_stack(cache.stack_lo, cache.stack_hi, cache.spill_hi, 0)
 			$if vgc_rootdiag ? {
@@ -2780,6 +2797,12 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 			at := hits[k]
 			mut val := usize(0)
 			unsafe { C.memcpy(&val, voidptr(at), sizeof(usize)) }
+			$if vgc_unaligned_audit ? {
+				// cx-home/v#74 (c): an unaligned word waits for the aligned mark
+				if vgc_ua_defer && (at & (sizeof(usize) - 1)) != 0 && vgc_ua_push(at, val) {
+					continue
+				}
+			}
 			$if vgc_rootdiag ? {
 				if vgc_rd_cat != 0 {
 					vgc_rd_shade_root(at, val, w)
@@ -2994,6 +3017,227 @@ fn vgc_rd_shade_root(addr usize, val usize, w int) {
 @[markused]
 pub fn vgc_rootdiag_top() (u32, u64, usize, i64) {
 	return vgc_rd_top_cat, vgc_rd_top_bytes, vgc_rd_top_where, vgc_rd_top_off
+}
+
+// ── -d vgc_unaligned_audit: real unaligned stack roots (cx-home/v#74 (c)) ──────
+// The operator's V74-C ruling: before the stack scan is narrowed to aligned
+// words, measure whether clang ever keeps a live pointer ONLY at an unaligned
+// stack offset on our builds (cx-home/v#60 found one: a ?cx.Node copied through
+// an untyped byte array, cx-platform-fabric#10). In this build a stop-the-world
+// full cycle (VGC_CM is forced to 0 and the root scan is serial) scans every
+// root but the stacks' unaligned words, which wait in a buffer; after the final
+// drain each waiting word is shaded and drained alone: a word that marks an
+// object no aligned root reached is an unaligned-only root (`only`: the upper
+// bound, false and real alike). The object it names is remembered (its base),
+// and when a later audited full cycle — the very next cycle, so the allocation
+// cannot have been swept and reused between them — reaches it from an aligned
+// root, the word was a real root (`real`): the program held a live reference
+// there and loaded it back. A stale word naming a dropped object never comes
+// back. `real` is a lower bound (a reference reloaded and dropped between two
+// cycles is not seen); `only` == 0 over a run is the proof the ruling asks for.
+// The audit keeps what the byte scan keeps: every waiting word is shaded.
+// Lines go to VGC_UA_LOG or stderr (vgc_ua_line, vgc_platform.h).
+const vgc_ua_cap = 65536
+const vgc_ua_ucap = 4096
+
+__global vgc_ua_defer = false
+__global vgc_ua_active = false // this cycle is audited
+__global vgc_ua_thread = u32(0)
+__global vgc_ua_base = usize(0)
+__global vgc_ua_own = false
+__global vgc_ua_n = 0
+__global vgc_ua_at = &usize(unsafe { nil })
+__global vgc_ua_val = &usize(unsafe { nil })
+__global vgc_ua_meta = &u64(unsafe { nil }) // thread << 1 | own
+__global vgc_ua_sbase = &usize(unsafe { nil })
+// the remembered objects: base, the cycle, the word's offset / address / value / frame
+__global vgc_ua_nu = 0
+__global vgc_ua_uobj = &usize(unsafe { nil })
+__global vgc_ua_uoff = &i64(unsafe { nil })
+__global vgc_ua_uwhere = &usize(unsafe { nil })
+__global vgc_ua_uword = &usize(unsafe { nil })
+__global vgc_ua_ulr = &usize(unsafe { nil })
+__global vgc_ua_uthr = &u32(unsafe { nil })
+__global vgc_ua_last_cycle = u64(0)
+
+fn C.vgc_ua_add(k int, n u64)
+fn C.vgc_ua_get(k int) u64
+fn C.vgc_ua_frame_lr(where usize) usize
+fn C.vgc_ua_line(real int, cycle u64, thread u32, off i64, where usize, word usize, obj usize, bytes u64, lr usize)
+
+// vgc_unaligned_audit_counts answers the audit's totals so far: unaligned-only
+// roots, real ones, audited cycles (0, 0, 0 outside -d vgc_unaligned_audit).
+@[markused]
+pub fn vgc_unaligned_audit_counts() (u64, u64, u64) {
+	$if vgc_unaligned_audit ? {
+		return C.vgc_ua_get(0), C.vgc_ua_get(1), C.vgc_ua_get(2)
+	}
+	return 0, 0, 0
+}
+
+fn vgc_ua_begin(full bool) {
+	$if vgc_unaligned_audit ? {
+		vgc_ua_n = 0
+		if vgc_ua_at == unsafe { nil } {
+			vgc_ua_at = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
+			vgc_ua_val = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
+			vgc_ua_meta = unsafe { &u64(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
+			vgc_ua_sbase = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
+			vgc_ua_uobj = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
+			vgc_ua_uoff = unsafe { &i64(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
+			vgc_ua_uwhere = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
+			vgc_ua_uword = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
+			vgc_ua_ulr = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
+			vgc_ua_uthr = unsafe { &u32(C.vgc_os_alloc(usize(vgc_ua_ucap) * 4)) }
+		}
+		ok := vgc_ua_at != unsafe { nil } && vgc_ua_val != unsafe { nil }
+			&& vgc_ua_meta != unsafe { nil } && vgc_ua_sbase != unsafe { nil }
+			&& vgc_ua_uobj != unsafe { nil } && vgc_ua_uoff != unsafe { nil }
+			&& vgc_ua_uwhere != unsafe { nil } && vgc_ua_uword != unsafe { nil }
+			&& vgc_ua_ulr != unsafe { nil } && vgc_ua_uthr != unsafe { nil }
+		vgc_ua_defer = full && ok
+		vgc_ua_active = vgc_ua_defer
+		// a remembered object is judged only by the very next cycle: any cycle
+		// in between (a minor, a concurrent one, an unaudited one) may have
+		// swept it and handed its address to a new object
+		if !vgc_ua_defer || vgc_heap.gc_cycle != vgc_ua_last_cycle + 1 {
+			vgc_ua_nu = 0
+		}
+	}
+}
+
+// vgc_ua_push keeps one unaligned word for after the aligned mark; false when
+// the buffer is full (the word is shaded at once, as the byte scan would)
+fn vgc_ua_push(at usize, val usize) bool {
+	$if vgc_unaligned_audit ? {
+		if vgc_ua_n >= vgc_ua_cap {
+			C.vgc_ua_add(3, 1)
+			return false
+		}
+		unsafe {
+			vgc_ua_at[vgc_ua_n] = at
+			vgc_ua_val[vgc_ua_n] = val
+			vgc_ua_meta[vgc_ua_n] = u64(vgc_ua_thread) << 1 | u64(if vgc_ua_own { 1 } else { 0 })
+			vgc_ua_sbase[vgc_ua_n] = vgc_ua_base
+		}
+		vgc_ua_n++
+		return true
+	}
+	return false
+}
+
+// vgc_ua_obj answers the base of the allocated object `val` points into (0 for
+// none) and whether it is marked
+fn vgc_ua_obj(val usize) (usize, bool, u32) {
+	if val < vgc_arena_lo || val >= vgc_arena_hi {
+		return 0, false, 0
+	}
+	span := vgc_find_span(voidptr(val))
+	if span == unsafe { nil } || !span.in_use || span.elem_size == 0 {
+		return 0, false, 0
+	}
+	idx := u32((val - span.base) / usize(span.elem_size))
+	if idx >= span.nelems || span.alloc_bits == unsafe { nil }
+		|| C.vgc_bitmap_get(span.alloc_bits, idx) == 0 {
+		return 0, false, 0
+	}
+	marked := span.mark_bits != unsafe { nil } && C.vgc_bitmap_get(span.mark_bits, idx) != 0
+	return span.base + usize(idx) * usize(span.elem_size), marked, span.elem_size
+}
+
+// vgc_ua_finish runs after the cycle's final drain (the aligned roots' mark is
+// whole): it judges the remembered objects, then shades the waiting words.
+fn vgc_ua_finish() {
+	$if vgc_unaligned_audit ? {
+		if !vgc_ua_active {
+			return
+		}
+		vgc_ua_active = false
+		cycle := vgc_heap.gc_cycle
+		C.vgc_ua_add(2, 1)
+		// (1) last cycle's unaligned-only objects an aligned root reaches now
+		mut keep := 0
+		for i in 0 .. vgc_ua_nu {
+			obj := unsafe { vgc_ua_uobj[i] }
+			base, marked, esz := vgc_ua_obj(obj)
+			if base == obj && marked {
+				C.vgc_ua_add(1, 1)
+				C.vgc_ua_line(1, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
+					unsafe { vgc_ua_uwhere[i] }, unsafe { vgc_ua_uword[i] }, obj, u64(esz),
+					unsafe { vgc_ua_ulr[i] })
+				continue
+			}
+			if base == obj {
+				// not reached by an aligned root (yet): kept for the words below
+				unsafe {
+					vgc_ua_uobj[keep] = vgc_ua_uobj[i]
+					vgc_ua_uoff[keep] = vgc_ua_uoff[i]
+					vgc_ua_uwhere[keep] = vgc_ua_uwhere[i]
+					vgc_ua_uword[keep] = vgc_ua_uword[i]
+					vgc_ua_ulr[keep] = vgc_ua_ulr[i]
+					vgc_ua_uthr[keep] = vgc_ua_uthr[i]
+				}
+				keep++
+			}
+		}
+		vgc_ua_nu = keep
+		// (2) the waiting unaligned words, one at a time
+		for k in 0 .. vgc_ua_n {
+			at := unsafe { vgc_ua_at[k] }
+			val := unsafe { vgc_ua_val[k] }
+			base, marked, esz := vgc_ua_obj(val)
+			if base != 0 && !marked {
+				meta := unsafe { vgc_ua_meta[k] }
+				thr := u32(meta >> 1)
+				own := (meta & 1) != 0
+				sb := unsafe { vgc_ua_sbase[k] }
+				off := i64(sb) - i64(at)
+				lr := if own { C.vgc_ua_frame_lr(at) } else { usize(0) }
+				C.vgc_ua_add(0, 1)
+				C.vgc_ua_line(0, cycle, thr, off, at, val, base, u64(esz), lr)
+				mut seen := false
+				for j in 0 .. vgc_ua_nu {
+					if unsafe { vgc_ua_uobj[j] } == base {
+						seen = true
+						break
+					}
+				}
+				if !seen && vgc_ua_nu < vgc_ua_ucap {
+					unsafe {
+						vgc_ua_uobj[vgc_ua_nu] = base
+						vgc_ua_uoff[vgc_ua_nu] = off
+						vgc_ua_uwhere[vgc_ua_nu] = at
+						vgc_ua_uword[vgc_ua_nu] = val
+						vgc_ua_ulr[vgc_ua_nu] = lr
+						vgc_ua_uthr[vgc_ua_nu] = thr
+					}
+					vgc_ua_nu++
+				}
+			}
+			vgc_shade(val, 0)
+			vgc_drain_mark_work(0)
+		}
+		vgc_ua_n = 0
+		// (3) a remembered object nothing marked this cycle is swept now
+		keep = 0
+		for i in 0 .. vgc_ua_nu {
+			obj := unsafe { vgc_ua_uobj[i] }
+			base, marked, _ := vgc_ua_obj(obj)
+			if base == obj && marked {
+				unsafe {
+					vgc_ua_uobj[keep] = vgc_ua_uobj[i]
+					vgc_ua_uoff[keep] = vgc_ua_uoff[i]
+					vgc_ua_uwhere[keep] = vgc_ua_uwhere[i]
+					vgc_ua_uword[keep] = vgc_ua_uword[i]
+					vgc_ua_ulr[keep] = vgc_ua_ulr[i]
+					vgc_ua_uthr[keep] = vgc_ua_uthr[i]
+				}
+				keep++
+			}
+		}
+		vgc_ua_nu = keep
+		vgc_ua_last_cycle = cycle
+	}
 }
 
 // vgc_shade_spawn_root shades an in-flight spawn-argument struct AND unconditionally
