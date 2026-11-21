@@ -5,24 +5,25 @@
 #define VGC_PLATFORM_H
 
 // cx-home/v#74 pieces 1 and 6: under -gc e (not -d vgc_byte_stack_scan) cgen puts vgc_ss_escape(&x) after
-// every local of a reference-carrying aggregate type, so that no reference of x ever sits at an unaligned
-// stack address. Clang's SROA splits a local at the edges of its typed accesses; a leading byte read on
-// its own (an option's state, a struct's tag) leaves the rest — bytes 1.. — as one piece copied by memcpy,
-// which lives in a byte array of alignment 1 (or an odd-width integer) and puts a pointer of x at +7.
-// vgc_ss_escape reads every 8-byte word of x once as a pointer (an empty asm that takes the VALUE): a
-// pointer-typed load cannot be split, so every piece SROA makes starts and ends on a word, each reference
-// is a word of its own (a register, or an aligned spill), and x stays in registers. No address is taken
-// and no memory is clobbered: the first shape of this macro took &x with a "memory" clobber, which kept
-// every such local in memory and re-read it after every call (pbm1-ab74i: +18 to +30 % instructions on
-// the ten interpreted programs). A local over VGC_SS_WORDS words keeps that shape. tcc and an
-// unoptimised build do not split; they get a no-op.
+// every local whose type clang's SROA can cut off a word (a reference that follows a field narrower than
+// a word: an option's state byte, a struct's leading tag; vgc_shadow.v). SROA cuts a local at the edges
+// of its typed accesses; the piece after such a field is copied by memcpy and lives in a byte array of
+// alignment 1, with x's references at unaligned addresses in it (cx-home/v#60).
+// vgc_ss_escape reads each 8-byte word of x as a pointer (an empty asm that takes the VALUE) on a path
+// that never runs: the frame address is never null, and the compiler does not know it. A pointer-typed
+// read cannot be split, so every piece SROA makes of x starts and ends on a word, each reference is a
+// word of its own (a register or an aligned spill), and x stays in registers; the price is one
+// never-taken branch a declaration. The first shape of this macro took &x under a "memory" clobber,
+// which kept every such local in memory and re-read it after every call (pbm1-ab74k). A local over
+// VGC_SS_WORDS words keeps that shape. tcc and an unoptimised build do not cut; they get a no-op.
 #if defined(__TINYC__) || !defined(__OPTIMIZE__)
 #define vgc_ss_escape(p) ((void)(p))
 #else
 #define VGC_SS_WORDS 16
 #define vgc_ss_w(p, i) if (sizeof(*(p)) >= 8 * ((i) + 1)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)(p) + 8 * (i))))
 #define vgc_ss_escape(p) do { \
-    if (sizeof(*(p)) > 8 * VGC_SS_WORDS) { __asm__ __volatile__("" : : "r"(p) : "memory"); } else { \
+    if (sizeof(*(p)) > 8 * VGC_SS_WORDS) { __asm__ __volatile__("" : : "r"(p) : "memory"); } \
+    else if (__builtin_expect(__builtin_frame_address(0) == (void*)0, 0)) { \
     vgc_ss_w(p, 0); vgc_ss_w(p, 1); vgc_ss_w(p, 2); vgc_ss_w(p, 3); vgc_ss_w(p, 4); vgc_ss_w(p, 5); vgc_ss_w(p, 6); vgc_ss_w(p, 7); \
     vgc_ss_w(p, 8); vgc_ss_w(p, 9); vgc_ss_w(p, 10); vgc_ss_w(p, 11); vgc_ss_w(p, 12); vgc_ss_w(p, 13); vgc_ss_w(p, 14); vgc_ss_w(p, 15); } \
   } while (0)
