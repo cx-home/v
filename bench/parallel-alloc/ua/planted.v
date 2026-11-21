@@ -44,8 +44,31 @@ fn sum7(p &u8) int {
 	return n
 }
 
+// worker_holds plants the buffer's only reference at an unaligned offset of its
+// own frame on a spawned thread and blocks until main has collected (MODE=thread)
+@[noinline]
+fn worker_holds(off int, ready chan int, done chan int) {
+	mut wslot := [16]u8{}
+	_ = hide_under_guard(mut wslot, off)
+	ready <- 1
+	_ := <-done
+	_ = wslot[0]
+}
+
 fn main() {
 	mode := os.getenv_opt('MODE') or { 'real' }
+	if mode == 'thread' {
+		woff := (os.getenv_opt('OFF') or { '3' }).int()
+		ready := chan int{cap: 1}
+		done := chan int{cap: 1}
+		t := spawn worker_holds(woff, ready, done)
+		_ := <-ready
+		gc_collect()
+		done <- 1
+		t.wait()
+		println('ua thread done')
+		return
+	}
 	off := (os.getenv_opt('OFF') or { '3' }).int()
 	gc_collect()
 	o0, r0, _ := vgc_unaligned_audit_counts()

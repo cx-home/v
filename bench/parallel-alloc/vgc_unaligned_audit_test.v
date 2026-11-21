@@ -83,3 +83,24 @@ fn test_a_real_line_names_its_aligned_witness() {
 		assert wits.any(it.contains(' word=${word} ') && !it.contains('kind=wit_heap')), 'off ${off}: no aligned stack witness holds ${word}:\n${r.output}'
 	}
 }
+
+// cx-home/v#74 piece 4: a word on another thread's stack is named by its frame
+// too (pbm1-ss74c: 4 of arm64's 7 non-round real lines were on worker thread 7
+// with frame=0x0 — the audit walked frame pointers on the collector's own stack
+// only). A worker that keeps the buffer's only reference at an unaligned offset
+// of its frame, blocked in a channel pop while main collects, is named
+// frame=main__worker_holds.
+fn test_a_worker_threads_unaligned_word_is_named_by_its_frame() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	for off in [1, 3, 7] {
+		r := os.execute('VGC_CM=0 MODE=thread OFF=${off} ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, r.output
+		lines := r.output.split_into_lines().filter(it.contains(' kind=only ')
+			&& !it.contains(' thread=0 '))
+		assert lines.len >= 1, 'off ${off}: no unaligned-only line on the worker:\n${r.output}'
+		assert lines.any(it.ends_with(' frame=main__worker_holds')), 'off ${off}: the worker\'s frame is not named:\n${r.output}'
+	}
+}
