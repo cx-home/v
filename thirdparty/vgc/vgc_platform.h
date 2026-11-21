@@ -3140,7 +3140,7 @@ static void vgc_ua_line(int real, uint64_t cycle, uint32_t thread, int64_t off, 
     if (lr && dladdr((void*)lr, &di) && di.dli_sname) fn = di.dli_sname;
 #endif
     int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s gc=%llu kind=%s thread=%u off=%lld where=%p word=%p obj=%p bytes=%llu",
-                     (int)getpid(), vgc_ua_exe(), (unsigned long long)cycle, real == 2 ? "real_round" : real ? "real" : "only", thread,
+                     (int)getpid(), vgc_ua_exe(), (unsigned long long)cycle, real == 5 ? "wit_heap" : real == 4 ? "wit_new" : real == 3 ? "wit_old" : real == 2 ? "real_round" : real ? "real" : "only", thread,
                      (long long)off, (void*)where, (void*)word, (void*)obj, (unsigned long long)bytes);
     if (n > 0 && n < (int)sizeof b) {
         int m = fn ? snprintf(b + n, sizeof b - n, " frame=%s\n", fn) : snprintf(b + n, sizeof b - n, " frame=%p\n", (void*)lr);
