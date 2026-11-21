@@ -23,7 +23,12 @@
 // -l), 4,000,000 rounds against 0, on this build against the -d
 // vgc_byte_stack_scan build (no escape): at most 4 more a round — one an
 // escape (arm64 pbm1: 82.2 with none; 96.2 with the address form, 90.2 with a
-// read of every word, 84.2 with the reads behind a branch that is never taken). macOS (otool, time -l); skipped elsewhere.
+// read of every word, 84.2 with the reads behind a branch that is never taken).
+// And cx itself: reading a word of ints as a pointer keeps that word in memory —
+// the ten interpreted programs read +5 to +15 % instructions with every word
+// read behind the branch (pbm1-guard74); and +10 an unwrap round with each
+// reference read: both cut the local into more pieces than clang makes on its
+// own. The pass reads the narrow field's word, which only moves clang's cut. macOS (otool, time -l); skipped elsewhere.
 module main
 
 import os
