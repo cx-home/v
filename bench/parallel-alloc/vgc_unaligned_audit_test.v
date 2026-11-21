@@ -104,3 +104,26 @@ fn test_a_worker_threads_unaligned_word_is_named_by_its_frame() {
 		assert lines.any(it.ends_with(' frame=main__worker_holds')), 'off ${off}: the worker\'s frame is not named:\n${r.output}'
 	}
 }
+
+// cx-home/v#74 piece 4 (x86-wit74b's first witness: the object a real line named
+// was reached in the judging cycle through a different, interior word in a live
+// frame): an object named only by a stale unaligned word, then FREED by the
+// program (an eager free) and its slot handed to a new allocation the program
+// holds, is a new object — the audit must not call the old word real
+fn test_a_freed_and_reused_slot_is_not_counted_real() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	for off in [1, 3, 7] {
+		r := os.execute('VGC_CM=0 MODE=freed OFF=${off} ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, r.output
+		lines := r.output.split_into_lines().filter(it.starts_with('ua only='))
+		assert lines.len == 1, r.output
+		d := lines[0]
+		assert d.contains('sevens=1'), 'off ${off}: no 200-byte allocation reused the freed slot (${d})'
+		assert d.all_after('only=').all_before(' ').int() >= 1, 'off ${off}: ${d}'
+		real := d.all_after('real=').all_before(' ').int()
+		assert real == 0, 'off ${off}: a freed slot reused by a new object was counted real ${real} times:\n${r.output}'
+	}
+}
