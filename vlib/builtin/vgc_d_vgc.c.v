@@ -7154,13 +7154,18 @@ fn vgc_span_release_acquisition(span &VGC_Span) {
 // with a private span of the class already, an unregistered thread, or no span.
 const vgc_cold_warm = u8(2)
 
-// cx-core-code#295: the shared span pays only when many threads start together
-// (vgc_cold_class_pack_test: 64); with fewer live threads a thread that warms a
-// class pays the class's shared span on top of its own private one (one more
-// page a class touched: cx --version +96 KB resident with a main thread and a
-// helper; vgc_cold_class_few_threads_test). Below this many live threads every
+// cx-core-code#295: with a few live threads a thread that warms a class pays
+// the class's shared span on top of its own private one (one more page a class
+// touched: cx --version +96 KB resident with a main thread and a helper;
+// vgc_cold_class_few_threads_test: three workers, four live threads). The
+// shared span is one span a class between all the threads that warm it, so
+// from four workers up it is at most a quarter of a span a class a thread —
+// the few-threads bound — while every thread that keeps one object a class
+// (thr.v's server threads) saves a span a class. cx-home/v#77: at 8 the first
+// six threads of thr.v's burst stayed private, ~1 KB a thread of its 200 on
+// dev2 (vgc_cold_class_pack_five_test). Below this many live threads every
 // class is warm.
-const vgc_cold_min_threads = u32(8)
+const vgc_cold_min_threads = u32(5)
 
 fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
 	if cache_idx < 0 {
