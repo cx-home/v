@@ -2865,7 +2865,7 @@ static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t
 // `[ua-audit] pid=P exe=E summary only=N real=M cycles=C overflow=O`.
 #include <fcntl.h>
 static int vgc_ua_fd = -2;
-static uint64_t vgc_ua_cnt[5]; // 0 only, 1 real, 2 audited cycles, 3 overflow, 4 real_round
+static uint64_t vgc_ua_cnt[6]; // 0 only, 1 real, 2 audited cycles, 3 overflow, 4 real_round, 5 real_pair
 static const char* vgc_ua_exe(void) {
 #if defined(__APPLE__)
     const char* n = getprogname();
@@ -2885,9 +2885,9 @@ static void vgc_ua_write(const char* b, int n) {
 static void vgc_ua_exit(void) {
     if (vgc_ua_cnt[2] == 0) return;
     char b[256];
-    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s summary only=%llu real=%llu cycles=%llu overflow=%llu real_round=%llu\n",
+    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s summary only=%llu real=%llu cycles=%llu overflow=%llu real_round=%llu real_pair=%llu\n",
                      (int)getpid(), vgc_ua_exe(), (unsigned long long)vgc_ua_cnt[0], (unsigned long long)vgc_ua_cnt[1],
-                     (unsigned long long)vgc_ua_cnt[2], (unsigned long long)vgc_ua_cnt[3], (unsigned long long)vgc_ua_cnt[4]);
+                     (unsigned long long)vgc_ua_cnt[2], (unsigned long long)vgc_ua_cnt[3], (unsigned long long)vgc_ua_cnt[4], (unsigned long long)vgc_ua_cnt[5]);
     vgc_ua_write(b, n < (int)sizeof b ? n : (int)sizeof b - 1);
 }
 static void vgc_ua_add(int k, uint64_t n) {
@@ -2948,7 +2948,7 @@ static void vgc_ua_line(int real, uint64_t cycle, uint32_t thread, int64_t off, 
     if (lr && dladdr((void*)lr, &di) && di.dli_sname) fn = di.dli_sname;
 #endif
     int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s gc=%llu kind=%s thread=%u off=%lld where=%p word=%p obj=%p bytes=%llu",
-                     (int)getpid(), vgc_ua_exe(), (unsigned long long)cycle, real == 5 ? "wit_heap" : real == 4 ? "wit_new" : real == 3 ? "wit_old" : real == 2 ? "real_round" : real ? "real" : "only", thread,
+                     (int)getpid(), vgc_ua_exe(), (unsigned long long)cycle, real == 6 ? "real_pair" : real == 5 ? "wit_heap" : real == 4 ? "wit_new" : real == 3 ? "wit_old" : real == 2 ? "real_round" : real ? "real" : "only", thread,
                      (long long)off, (void*)where, (void*)word, (void*)obj, (unsigned long long)bytes);
     if (n > 0 && n < (int)sizeof b) {
         int m = fn ? snprintf(b + n, sizeof b - n, " frame=%s\n", fn) : snprintf(b + n, sizeof b - n, " frame=%p\n", (void*)lr);

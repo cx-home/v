@@ -3170,6 +3170,32 @@ fn vgc_ua_obj(val usize) (usize, bool, u32) {
 	return span.base + usize(idx) * usize(span.elem_size), marked, span.elem_size
 }
 
+// vgc_ua_class answers a word's class for the real verdict (cx-home/v#74
+// piece 4): 1 round (low 24 bits 0 or 1), 2 pair (two small 32-bit integers
+// side by side: high half under 256, low half within +-64 K as a signed int —
+// x86-64's heap starts at 4 GB, so (lo, 1) and (lo, 2) land in it), 0 a word
+// with an address's shape
+fn vgc_ua_class(w u64) int {
+	if (w & u64(0xfffffe)) == 0 {
+		return 1
+	}
+	lo := i64(i32(u32(w & 0xffffffff)))
+	if (w >> 32) < 256 && lo >= -65536 && lo < 65536 {
+		return 2
+	}
+	return 0
+}
+
+// vgc_unaligned_audit_class names vgc_ua_class's answer: round, pair or pointer
+@[markused]
+pub fn vgc_unaligned_audit_class(w u64) string {
+	return match vgc_ua_class(w) {
+		1 { 'round' }
+		2 { 'pair' }
+		else { 'pointer' }
+	}
+}
+
 // vgc_ua_forget drops a remembered object the program frees (vgc_free): its
 // slot may hold a new object by the judging cycle, which an aligned root then
 // reaches without the old unaligned word having been a reference. Runs on a
@@ -3244,11 +3270,12 @@ fn vgc_ua_finish() {
 			}
 			base, marked, esz := vgc_ua_obj(obj)
 			if base == obj && marked {
-				// cx-home/v#74 piece 4: a round value (low 24 bits 0 or 1) is two
-				// small integers read across a boundary, not a sliced pointer
-				round := (unsafe { vgc_ua_uword[i] } & usize(0xfffffe)) == 0
-				C.vgc_ua_add(if round { 4 } else { 1 }, 1)
-				C.vgc_ua_line(if round { 2 } else { 1 }, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
+				// cx-home/v#74 piece 4: a round value (low 24 bits 0 or 1) or a pair
+				// of small integers is two integers read across a boundary, not a
+				// sliced pointer (vgc_unaligned_audit_class)
+				cls := vgc_ua_class(u64(unsafe { vgc_ua_uword[i] }))
+				C.vgc_ua_add(if cls == 1 { 4 } else if cls == 2 { 5 } else { 1 }, 1)
+				C.vgc_ua_line(if cls == 1 { 2 } else if cls == 2 { 6 } else { 1 }, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
 					unsafe { vgc_ua_uwhere[i] }, unsafe { vgc_ua_uword[i] }, obj, u64(esz),
 					unsafe { vgc_ua_ulr[i] })
 				vgc_ua_witness(cycle, obj, esz)
