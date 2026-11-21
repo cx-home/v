@@ -1683,8 +1683,9 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 			g.vgc_ss_refresh()
 		}
 		for pi, pt in fargtypes {
+			// (a fixed array parameter is a pointer in C: the caller's array)
 			if pi < fargs.len && pi < heap_promoted.len && !heap_promoted[pi]
-				&& g.vgc_ss_is_ref_aggregate(pt) {
+				&& !pt.starts_with('Array_fixed_') && g.vgc_ss_is_ref_aggregate(pt) {
 				ss_params << g.vgc_ss_text(pt, fargs[pi])
 			}
 		}

@@ -70,10 +70,20 @@ fn (mut g Gen) vgc_ss_is_ref_aggregate(ctype string) bool {
 	return g.vgc_ss_refs_of(ctype).len > 0
 }
 
-// vgc_ss_refs_of answers what to read of a local of C type ctype: the byte
-// offsets (C constant expressions) of its words that hold a narrow field with a
-// reference behind it, `&` alone for the address form, nothing for a type that
-// cannot be cut off a word
+// VgcSsLeaf: one leaf of a local's type — its byte offset in the local (as the
+// compiler lays it out, and as a C constant expression) and whether it is a
+// reference or a field narrower than a word
+struct VgcSsLeaf {
+	off    int
+	is_ref bool
+	expr   string
+}
+
+// vgc_ss_refs_of answers what to read of a local of C type ctype: for each word
+// to read, `<C offset expression>, <the word's offset>`; `&` alone for the
+// address form; nothing for a type that cannot be cut off a word. A word is
+// read when it holds a field narrower than a word and a reference lies behind
+// that field.
 fn (mut g Gen) vgc_ss_refs_of(ctype string) []string {
 	if r := g.vgc_ss_refs[ctype] {
 		return r
@@ -89,8 +99,26 @@ fn (mut g Gen) vgc_ss_refs_of(ctype string) []string {
 		refs << '&'
 	}
 	if typ != 0 {
-		mut pend := []string{}
-		if !g.vgc_ss_walk(typ, ctype, '0', 0, mut pend, mut refs) {
+		mut leaves := []VgcSsLeaf{}
+		if g.vgc_ss_walk(typ, ctype, 0, '0', 0, mut leaves) {
+			mut last_ref := -1
+			for l in leaves {
+				if l.is_ref && l.off > last_ref {
+					last_ref = l.off
+				}
+			}
+			mut words := []int{}
+			for l in leaves {
+				w := l.off & ~7
+				if !l.is_ref && l.off < last_ref && w !in words {
+					words << w
+					refs << '${l.expr}, ${w}'
+				}
+			}
+			if refs.len > 16 {
+				refs = ['&']
+			}
+		} else {
 			refs = ['&']
 		}
 	}
@@ -111,56 +139,137 @@ fn (mut g Gen) vgc_ss_text(ctype string, name string) string {
 	return out
 }
 
-// vgc_ss_small notes a leaf narrower than a word at offset `at`
-fn vgc_ss_small(at string, mut pend []string) {
-	if pend.len == 0 || pend.last() != at {
-		pend << at
-	}
-}
-
-// vgc_ss_refleaf: a reference at this point of the walk — every narrow field
-// passed since the last one can cut it off a word: their words are read
-fn vgc_ss_refleaf(mut pend []string, mut refs []string) {
-	for p in pend {
-		if p !in refs {
-			refs << p
-		}
-	}
-	pend.clear()
-}
-
-// vgc_ss_walk walks typ's leaves in layout order; `at` is the byte offset of
-// the value walked in the local (a C constant expression) and `cname` its C
-// type. A leaf narrower than a word goes to `pend`; a reference moves what is
-// pending to `refs`. False for what the walk cannot place — a map, a union, a
-// C type, a reordered struct, a long fixed array: the caller pins the local.
-fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, at string, depth int, mut pend []string, mut refs []string) bool {
-	if depth > 24 || refs.len > 24 {
-		return false
-	}
+// vgc_ss_size: the C size and alignment of a value of type typ, as cgen lays it
+// out. The table's type_size is not that: it answers 4 for every enum (one
+// declared `as u8` is a byte) and the error's size for an option or a result
+// ({ u8 state; IError err; u8 data[sizeof(T)]; }). 0, 0 for what it cannot lay
+// out (a packed or reordered struct, a C type).
+fn (mut g Gen) vgc_ss_size(typ_ ast.Type) (int, int) {
 	if typ_.has_flag(.option) || typ_.has_flag(.result) {
-		// { u8 state; IError err; u8 data[sizeof(T)]; } — IError: the object
-		// pointer, a u32 tag, the method table
-		vgc_ss_small(at, mut pend)
-		vgc_ss_refleaf(mut pend, mut refs)
-		vgc_ss_small('${at} + __builtin_offsetof(${cname}, err) + 8', mut pend)
 		base := typ_.clear_option_and_result()
-		if base.idx() == ast.void_type_idx || base.idx() == ast.none_type_idx || base.idx() == 0 {
-			return true
+		mut bs := 1
+		if base.idx() != ast.void_type_idx && base.idx() != ast.none_type_idx && base.idx() != 0 {
+			b, ba := g.vgc_ss_size(base)
+			if ba <= 0 {
+				return 0, 0
+			}
+			if b > bs {
+				bs = b
+			}
 		}
-		return g.vgc_ss_walk(base, g.styp(base), '${at} + __builtin_offsetof(${cname}, data)',
-			depth + 1, mut pend, mut refs)
+		return 32 + (bs + 7) / 8 * 8, 8
 	}
 	typ := g.unwrap_generic(typ_)
 	if typ.is_any_kind_of_pointer() || typ.is_ptr() || typ.has_flag(.shared_f)
 		|| typ.has_flag(.atomic_f) {
-		vgc_ss_refleaf(mut pend, mut refs)
+		return 8, 8
+	}
+	sym := g.table.sym(typ)
+	match sym.kind {
+		.alias {
+			return g.vgc_ss_size((sym.info as ast.Alias).parent_type)
+		}
+		.enum {
+			return g.table.type_size((sym.info as ast.Enum).typ)
+		}
+		.string {
+			return 16, 8
+		}
+		.array {
+			return 32, 8
+		}
+		.sum_type {
+			return 16 + 8 * (sym.info as ast.SumType).fields.len, 8
+		}
+		.interface {
+			return 24 + 8 * (sym.info as ast.Interface).fields.len, 8
+		}
+		.array_fixed {
+			info := sym.info as ast.ArrayFixed
+			es, ea := g.vgc_ss_size(info.elem_type)
+			if ea <= 0 || info.size < 0 {
+				return 0, 0
+			}
+			return es * info.size, ea
+		}
+		.struct, .map, .multi_return {
+			mut types := []ast.Type{}
+			mut is_union := false
+			if sym.kind == .multi_return {
+				types = (sym.info as ast.MultiReturn).types.clone()
+			} else {
+				ssym := if sym.kind == .map { g.table.sym(ast.map_type) } else { sym }
+				if ssym.info !is ast.Struct || ssym.language != .v {
+					return 0, 0
+				}
+				info := ssym.info as ast.Struct
+				if info.is_minify || info.is_typedef || info.attrs.contains('packed') {
+					return 0, 0
+				}
+				is_union = info.is_union
+				types = info.fields.map(it.typ)
+			}
+			mut size := 0
+			mut align := 1
+			for t in types {
+				fs, fa := g.vgc_ss_size(t)
+				if fa <= 0 {
+					return 0, 0
+				}
+				if fa > align {
+					align = fa
+				}
+				if is_union {
+					if fs > size {
+						size = fs
+					}
+				} else {
+					size = (size + fa - 1) / fa * fa + fs
+				}
+			}
+			return (size + align - 1) / align * align, align
+		}
+		else {
+			if sym.language != .v {
+				return 0, 0
+			}
+			return g.table.type_size(typ)
+		}
+	}
+}
+
+// vgc_ss_walk collects typ's leaves: `off` is the byte offset of the value
+// walked in the local, `expr` the same as a C constant expression (the pass
+// emits that one; vgc_ss_ref checks the two agree), `cname` its C type. False
+// for what the walk cannot place — a C type, a reordered struct, a long fixed
+// array of references: the caller pins the local.
+fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, depth int, mut leaves []VgcSsLeaf) bool {
+	if depth > 24 || leaves.len > 512 {
+		return false
+	}
+	if typ_.has_flag(.option) || typ_.has_flag(.result) {
+		// { u8 state; IError err; u8 data[sizeof(T)]; } — IError: the object
+		// pointer, a u32 tag, the method table (8 + 24 bytes before the value)
+		leaves << VgcSsLeaf{off, false, expr}
+		leaves << VgcSsLeaf{off + 8, true, ''}
+		leaves << VgcSsLeaf{off + 16, false, '${expr} + __builtin_offsetof(${cname}, err) + 8'}
+		base := typ_.clear_option_and_result()
+		if base.idx() == ast.void_type_idx || base.idx() == ast.none_type_idx || base.idx() == 0 {
+			return true
+		}
+		return g.vgc_ss_walk(base, g.styp(base), off + 32, '${expr} + __builtin_offsetof(${cname}, data)',
+			depth + 1, mut leaves)
+	}
+	typ := g.unwrap_generic(typ_)
+	if typ.is_any_kind_of_pointer() || typ.is_ptr() || typ.has_flag(.shared_f)
+		|| typ.has_flag(.atomic_f) {
+		leaves << VgcSsLeaf{off, true, ''}
 		return true
 	}
 	sym := g.table.sym(typ)
 	if sym.kind == .alias {
 		parent := (sym.info as ast.Alias).parent_type
-		return g.vgc_ss_walk(parent, g.styp(parent), at, depth + 1, mut pend, mut refs)
+		return g.vgc_ss_walk(parent, g.styp(parent), off, expr, depth + 1, mut leaves)
 	}
 	if sym.language != .v {
 		return false
@@ -171,79 +280,118 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, at string, depth int, mu
 			return true
 		}
 		.i8, .i16, .i32, .int, .u8, .u16, .u32, .f32, .char, .rune, .bool, .enum {
-			vgc_ss_small(at, mut pend)
+			leaves << VgcSsLeaf{off, false, expr}
 			return true
 		}
 		.voidptr, .byteptr, .charptr, .chan, .thread {
-			vgc_ss_refleaf(mut pend, mut refs)
+			leaves << VgcSsLeaf{off, true, ''}
 			return true
 		}
 		.string {
 			// { u8* str; int len; int is_lit; }
-			vgc_ss_refleaf(mut pend, mut refs)
-			vgc_ss_small('${at} + 8', mut pend)
+			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
 			return true
 		}
 		.array {
 			// { void* data; int offset; int len; int cap; flags; int element_size; }
-			vgc_ss_refleaf(mut pend, mut refs)
-			vgc_ss_small('${at} + 8', mut pend)
-			vgc_ss_small('${at} + 16', mut pend)
-			vgc_ss_small('${at} + 24', mut pend)
+			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
+			leaves << VgcSsLeaf{off + 16, false, '${expr} + 16'}
+			leaves << VgcSsLeaf{off + 24, false, '${expr} + 24'}
 			return true
 		}
 		.sum_type, .interface {
-			// a union of pointers (the object pointer), the u32 tag, (the method
-			// table: static, no reference,) then pointers to the common fields
-			vgc_ss_refleaf(mut pend, mut refs)
-			vgc_ss_small('${at} + 8', mut pend)
-			nfields := if sym.info is ast.SumType {
-				sym.info.fields.len
+			// a union of pointers (the object pointer), the u32 tag, (an
+			// interface's method table: static, no reference,) then pointers to
+			// the common fields
+			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
+			mut nfields := 0
+			mut first := 16
+			if sym.info is ast.SumType {
+				nfields = sym.info.fields.len
 			} else if sym.info is ast.Interface {
-				sym.info.fields.len
-			} else {
-				0
+				nfields = sym.info.fields.len
+				first = 24
 			}
-			if nfields > 0 {
-				vgc_ss_refleaf(mut pend, mut refs)
+			for i in 0 .. nfields {
+				leaves << VgcSsLeaf{off + first + 8 * i, true, ''}
 			}
 			return true
 		}
 		.array_fixed {
 			info := sym.info as ast.ArrayFixed
-			if info.size > 8 || info.size < 0 {
+			esize, _ := g.vgc_ss_size(info.elem_type)
+			if info.size < 0 || esize <= 0 {
+				return false
+			}
+			if !g.contains_ptr(info.elem_type) {
+				// no reference in it: a narrow field in each of its words
+				total := esize * info.size
+				if total > 4096 {
+					return false
+				}
+				for w := 0; w < total; w += 8 {
+					leaves << VgcSsLeaf{off + w, false, '${expr} + ${w}'}
+				}
+				return true
+			}
+			if info.size > 16 {
 				return false
 			}
 			ecname := g.styp(info.elem_type)
 			for i in 0 .. info.size {
-				if !g.vgc_ss_walk(info.elem_type, ecname, '${at} + ${i} * sizeof(${ecname})',
-					depth + 1, mut pend, mut refs) {
+				if !g.vgc_ss_walk(info.elem_type, ecname, off + i * esize, '${expr} + ${i} * sizeof(${ecname})',
+					depth + 1, mut leaves) {
 					return false
 				}
 			}
 			return true
 		}
-		.struct {
-			info := sym.info as ast.Struct
-			if info.is_union || info.is_minify || info.is_typedef {
+		.struct, .map {
+			// a map is the builtin struct `map`
+			ssym := if sym.kind == .map { g.table.sym(ast.map_type) } else { sym }
+			scname := if sym.kind == .map { 'map' } else { cname }
+			if ssym.info !is ast.Struct {
 				return false
 			}
+			info := ssym.info as ast.Struct
+			if info.is_minify || info.is_typedef || info.attrs.contains('packed') {
+				return false
+			}
+			mut cur := 0
 			for field in info.fields {
-				fcname := g.styp(field.typ)
-				if !g.vgc_ss_walk(field.typ, fcname, '${at} + __builtin_offsetof(${cname}, ${c_name(field.name)})',
-					depth + 1, mut pend, mut refs) {
+				fsize, falign := g.vgc_ss_size(field.typ)
+				if falign <= 0 {
 					return false
+				}
+				foff := if info.is_union { 0 } else { (cur + falign - 1) / falign * falign }
+				fcname := g.styp(field.typ)
+				if !g.vgc_ss_walk(field.typ, fcname, off + foff, '${expr} + __builtin_offsetof(${scname}, ${c_name(field.name)})',
+					depth + 1, mut leaves) {
+					return false
+				}
+				if !info.is_union {
+					cur = foff + fsize
 				}
 			}
 			return true
 		}
 		.multi_return {
 			info := sym.info as ast.MultiReturn
+			mut cur := 0
 			for i, t in info.types {
-				if !g.vgc_ss_walk(t, g.styp(t), '${at} + __builtin_offsetof(${cname}, arg${i})',
-					depth + 1, mut pend, mut refs) {
+				fsize, falign := g.vgc_ss_size(t)
+				if falign <= 0 {
 					return false
 				}
+				foff := (cur + falign - 1) / falign * falign
+				if !g.vgc_ss_walk(t, g.styp(t), off + foff, '${expr} + __builtin_offsetof(${cname}, arg${i})',
+					depth + 1, mut leaves) {
+					return false
+				}
+				cur = foff + fsize
 			}
 			return true
 		}
