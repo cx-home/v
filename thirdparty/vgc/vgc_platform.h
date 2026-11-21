@@ -3131,6 +3131,32 @@ static uintptr_t vgc_ua_frame_lr(uintptr_t where) {
 #endif
     return 0;
 }
+// the return address into the function whose frame holds `where` on ANOTHER
+// thread's stopped stack [lo, hi) (cx-home/v#74 piece 4): no walk from a live
+// frame pointer is possible there, so the frame record just below `where` is
+// searched for — an aligned slot s whose word is a saved frame pointer above
+// `where` (inside the stack, 16-aligned) and whose next word is a return
+// address dladdr names. Within 64 KB; 0 when none is found.
+static uintptr_t vgc_ua_frame_lr_any(uintptr_t where, uintptr_t lo, uintptr_t hi) {
+#if defined(__APPLE__)
+    uintptr_t s = (where & ~(uintptr_t)7);
+    uintptr_t stop = where > lo + 65536 ? where - 65536 : lo;
+    if (stop < lo) stop = lo;
+    while (s >= stop + 8 && s >= 8) {
+        s -= 8;
+        if (s + 16 > hi) continue;
+        uintptr_t fp = *(uintptr_t*)s;
+        if (fp > where && fp < hi && (fp & 15) == 0 && fp - s < (1u << 20)) {
+            uintptr_t lr = *(uintptr_t*)(s + 8);
+            Dl_info di; memset(&di, 0, sizeof di);
+            if (lr && dladdr((void*)lr, &di) && di.dli_sname) return lr;
+        }
+    }
+#else
+    (void)where; (void)lo; (void)hi;
+#endif
+    return 0;
+}
 static void vgc_ua_line(int real, uint64_t cycle, uint32_t thread, int64_t off, uintptr_t where,
                         uintptr_t word, uintptr_t obj, uint64_t bytes, uintptr_t lr) {
     char b[512];
