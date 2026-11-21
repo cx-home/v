@@ -226,9 +226,13 @@ const vgc_max_cache_chunks = 4096
 const vgc_spchk_slots = 1024
 // cx #316: words captured per safe-region register snapshot. Sized to hold a
 // full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
-// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
-// zero-fills the tail so unused slots shade nothing.
-const vgc_safe_spill_words = 40
+// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask) and, behind it, the
+// vgc_safe_frame_words words of the entry's own frames, where its prologues
+// saved the caller's callee-saved registers before reusing them
+// (cx-private#2079: those frames die before the blocking call);
+// vgc_safe_enter_spill zero-fills the tail so unused slots shade nothing.
+const vgc_safe_frame_words = 256
+const vgc_safe_spill_words = 40 + vgc_safe_frame_words
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
 
 // GC phases (translated from Go's _GCoff, _GCmark, _GCmarktermination)

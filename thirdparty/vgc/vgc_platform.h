@@ -1700,7 +1700,24 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
     if (n > reg_max) { n = reg_max; }
     const uintptr_t* w = (const uintptr_t*)&buf;
     for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }
-    for (int i = n; i < reg_max; i++) { reg_save[i] = 0; }
+    // The words of the frames between here and the region's caller, copied
+    // behind the jmp_buf words (cx-private#2079). setjmp records the registers
+    // as they are HERE: this function's prologue (and the entry's, when it is
+    // not a tail call) saved the caller's callee-saved registers in its own
+    // frame and reused them (arm64 -O2: x19..x24 hold the arguments), so the
+    // jmp_buf held the arguments while the caller's values sat in frames that
+    // die when the entry returns — the blocking call (pthread_join, a channel
+    // wait) opens its frames on them. A value the caller kept only in such a
+    // register (fa_range_groups' [par] join result in x19 across pthread_join)
+    // was in no root and the sweep freed it while live. Every callee-saved
+    // value the caller held is either still in its register (the jmp_buf) or
+    // saved in one of these frames, which lie within the copied words.
+    uintptr_t fp_hi = stack_base > sp ? stack_base : sp;
+    int i = n;
+    for (uintptr_t a = sp; i < reg_max && a + sizeof(uintptr_t) <= fp_hi; a += sizeof(uintptr_t)) {
+        reg_save[i++] = *(const volatile uintptr_t*)a;
+    }
+    for (; i < reg_max; i++) { reg_save[i] = 0; }
     // Publish LAST (seq_cst): a collector that loads safe==1 (its load is after
     // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
     // recorded range and the completed snapshot.
