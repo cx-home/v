@@ -9,14 +9,19 @@ import v.ast
 // default, -d vgc_byte_stack_scan turns it and the aligned-only scan off).
 // The collector's aligned-only stack scan (piece 2) is sound only if no live
 // reference sits at an unaligned stack offset. Those come from clang's SROA
-// slices of V aggregates (an option's `u8 data[]` copy, a struct read through a
-// leading byte). Clang cannot slice an aggregate whose address escapes, so
-// every local of a reference-carrying aggregate type gets one escape right after
-// its declaration: `vgc_ss_escape(&x)` = an empty asm that takes the address.
-// The alloca is then captured: SROA leaves it whole, its bytes are current at
-// every call, and its slot lives until its C scope ends. The intact, aligned
-// copy is in the scanned stack for as long as V can use it. No push, no pop and
-// no per-call work: those aggregates only lose registers.
+// slices of V aggregates: SROA cuts a local at the edges of its typed accesses,
+// and a field narrower than a word read on its own (an option's state byte, a
+// struct's leading tag or int) leaves what follows it as one piece that starts
+// off a word, copied by memcpy and kept in a byte array of alignment 1 — the
+// references in that piece then sit at unaligned addresses (cx-home/v#60: a
+// ?cx.Node's element pointer at sp+0x407).
+// Every local whose type can be cut that way (vgc_ss_cuttable: a reference
+// that follows a field narrower than a word) gets `vgc_ss_escape(&x)` right
+// after its declaration (vgc_platform.h): a pointer-typed read of each word of
+// x on a path that never runs. A pointer-typed read cannot be split, so every
+// piece starts and ends on a word, and x stays in registers. A string, a
+// dynamic array, a sum type, an interface without fields and a struct of
+// references followed by small fields cannot be cut off a word and get nothing.
 
 // vgc_ss_on: the shadow stack's compiler half is in force for this build.
 fn (g &Gen) vgc_ss_on() bool {
@@ -46,7 +51,8 @@ fn (mut g Gen) vgc_ss_refresh() {
 		}
 		typ := ast.idx_to_type(idx)
 		if g.contains_ptr(typ) {
-			g.vgc_ss_types[sym.cname] = true
+			cut, _ := g.vgc_ss_cuttable(typ, false, 0)
+			g.vgc_ss_types[sym.cname] = cut
 		}
 	}
 	g.vgc_ss_ntypes = n
@@ -56,12 +62,100 @@ fn (g &Gen) vgc_ss_is_ref_aggregate(ctype string) bool {
 	if ctype.starts_with('_option_') || ctype.starts_with('_result_') {
 		return true
 	}
-	// a map and a dynamic array carry their data pointer whatever the element
-	if ctype.starts_with('Map_')
-		|| (ctype.starts_with('Array_') && !ctype.starts_with('Array_fixed_')) {
+	// a map's references follow its int fields; a dynamic array's data pointer
+	// is its first word, with ints behind it: it cannot be cut off a word
+	if ctype.starts_with('Map_') {
 		return true
 	}
-	return ctype in g.vgc_ss_types
+	return g.vgc_ss_types[ctype]
+}
+
+// vgc_ss_cuttable walks typ's leaves in layout order and answers whether a
+// reference can land in a piece that starts off a word: true when a reference
+// follows a leaf narrower than a word (`small`: such a leaf was passed already;
+// the second answer is `small` after typ). Whatever it cannot place — an option
+// or result (a state byte, then an IError), a map, a union, a C type, a
+// reordered struct — is cuttable.
+fn (mut g Gen) vgc_ss_cuttable(typ_ ast.Type, small bool, depth int) (bool, bool) {
+	if depth > 24 || typ_.has_flag(.option) || typ_.has_flag(.result) {
+		return true, true
+	}
+	typ := g.unwrap_generic(typ_)
+	if typ.is_any_kind_of_pointer() || typ.is_ptr() || typ.has_flag(.shared_f)
+		|| typ.has_flag(.atomic_f) {
+		return small, small
+	}
+	sym := g.table.sym(typ)
+	if sym.kind == .alias {
+		return g.vgc_ss_cuttable((sym.info as ast.Alias).parent_type, small, depth + 1)
+	}
+	if sym.language != .v {
+		return true, true
+	}
+	match sym.kind {
+		.i64, .u64, .f64, .isize, .usize {
+			return false, small
+		}
+		.i8, .i16, .i32, .int, .u8, .u16, .u32, .f32, .char, .rune, .bool, .enum {
+			return false, true
+		}
+		.voidptr, .byteptr, .charptr, .chan, .thread, .function {
+			return small, small
+		}
+		.string, .array {
+			// the data pointer first, ints behind it
+			return small, true
+		}
+		.sum_type {
+			// a union of pointers, the u32 tag, then pointers to the common fields
+			info := sym.info as ast.SumType
+			return small || info.fields.len > 0, true
+		}
+		.interface {
+			// the object pointer, the u32 tag, the method table (static, no
+			// reference), then pointers to the interface's fields
+			info := sym.info as ast.Interface
+			return small || info.fields.len > 0, true
+		}
+		.array_fixed {
+			info := sym.info as ast.ArrayFixed
+			c1, s1 := g.vgc_ss_cuttable(info.elem_type, small, depth + 1)
+			if c1 || info.size <= 1 {
+				return c1, s1
+			}
+			return g.vgc_ss_cuttable(info.elem_type, s1, depth + 1)
+		}
+		.struct {
+			info := sym.info as ast.Struct
+			if info.is_union || info.is_minify || info.is_typedef {
+				return true, true
+			}
+			mut sm := small
+			for field in info.fields {
+				c, s2 := g.vgc_ss_cuttable(field.typ, sm, depth + 1)
+				if c {
+					return true, true
+				}
+				sm = s2
+			}
+			return false, sm
+		}
+		.multi_return {
+			info := sym.info as ast.MultiReturn
+			mut sm := small
+			for t in info.types {
+				c, s2 := g.vgc_ss_cuttable(t, sm, depth + 1)
+				if c {
+					return true, true
+				}
+				sm = s2
+			}
+			return false, sm
+		}
+		else {
+			return true, true
+		}
+	}
 }
 
 // vgc_ss_ident_end: the end of the C identifier that starts at i (i itself when none)
