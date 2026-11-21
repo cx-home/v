@@ -3073,6 +3073,10 @@ __global vgc_ua_uword = &usize(unsafe { nil })
 __global vgc_ua_ulr = &usize(unsafe { nil })
 __global vgc_ua_uthr = &u32(unsafe { nil })
 __global vgc_ua_last_cycle = u64(0)
+// each thread's stack_lo when the last audited cycle ended (the witness lines'
+// old / new split); vgc_ua_nprev entries
+const vgc_ua_nprev = 256
+__global vgc_ua_prev_lo = &usize(unsafe { nil })
 
 fn C.vgc_ua_add(k int, n u64)
 fn C.vgc_ua_get(k int) u64
@@ -3107,12 +3111,14 @@ fn vgc_ua_begin(full bool) {
 			vgc_ua_uword = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
 			vgc_ua_ulr = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
 			vgc_ua_uthr = unsafe { &u32(C.vgc_os_alloc(usize(vgc_ua_ucap) * 4)) }
+			vgc_ua_prev_lo = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_nprev) * 8)) }
 		}
 		ok := vgc_ua_at != unsafe { nil } && vgc_ua_val != unsafe { nil }
 			&& vgc_ua_meta != unsafe { nil } && vgc_ua_sbase != unsafe { nil }
 			&& vgc_ua_uobj != unsafe { nil } && vgc_ua_uoff != unsafe { nil }
 			&& vgc_ua_uwhere != unsafe { nil } && vgc_ua_uword != unsafe { nil }
 			&& vgc_ua_ulr != unsafe { nil } && vgc_ua_uthr != unsafe { nil }
+			&& vgc_ua_prev_lo != unsafe { nil }
 		vgc_ua_defer = full && ok
 		vgc_ua_active = vgc_ua_defer
 		// a remembered object is judged only by the very next cycle: any cycle
@@ -3163,6 +3169,40 @@ fn vgc_ua_obj(val usize) (usize, bool, u32) {
 	return span.base + usize(idx) * usize(span.elem_size), marked, span.elem_size
 }
 
+// vgc_ua_witness writes, after a `real` line, every aligned word of a
+// registered thread's stack that names the object (cx-home/v#74 piece 4): the
+// aligned root the judging cycle reached it from. kind=wit_old: the slot lay
+// inside the range that thread's scan covered when the previous audited cycle
+// ended; wit_new: below it (a frame deeper since, written or left unwritten);
+// wit_heap: no aligned stack word names it (a heap or register path).
+fn vgc_ua_witness(cycle u64, obj usize, esz u32) {
+	$if vgc_unaligned_audit ? {
+		mut found := false
+		for i in 0 .. vgc_heap.ncaches {
+			c := unsafe { vgc_cache(i) }
+			if !c.registered || c.stack_lo == 0 || c.stack_hi <= c.stack_lo {
+				continue
+			}
+			prev := if i < vgc_ua_nprev { unsafe { vgc_ua_prev_lo[i] } } else { usize(0) }
+			own := i == C.vgc_get_cache_idx()
+			mut at := (c.stack_lo + 7) & ~usize(7)
+			for at + 8 <= c.stack_hi {
+				v := unsafe { *(&usize(at)) }
+				if v >= obj && v < obj + usize(esz) {
+					lr := if own { C.vgc_ua_frame_lr(at) } else { usize(0) }
+					C.vgc_ua_line(if prev != 0 && at >= prev { 3 } else { 4 }, cycle, u32(i),
+						i64(c.stack_hi) - i64(at), at, v, obj, u64(esz), lr)
+					found = true
+				}
+				at += 8
+			}
+		}
+		if !found {
+			C.vgc_ua_line(5, cycle, 0, 0, 0, 0, obj, u64(esz), 0)
+		}
+	}
+}
+
 // vgc_ua_finish runs after the cycle's final drain (the aligned roots' mark is
 // whole): it judges the remembered objects, then shades the waiting words.
 fn vgc_ua_finish() {
@@ -3186,6 +3226,7 @@ fn vgc_ua_finish() {
 				C.vgc_ua_line(if round { 2 } else { 1 }, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
 					unsafe { vgc_ua_uwhere[i] }, unsafe { vgc_ua_uword[i] }, obj, u64(esz),
 					unsafe { vgc_ua_ulr[i] })
+				vgc_ua_witness(cycle, obj, esz)
 				continue
 			}
 			if base == obj {
@@ -3258,6 +3299,18 @@ fn vgc_ua_finish() {
 		}
 		vgc_ua_nu = keep
 		vgc_ua_last_cycle = cycle
+		for i in 0 .. vgc_ua_nprev {
+			mut lo := usize(0)
+			if i < vgc_heap.ncaches {
+				c := unsafe { vgc_cache(i) }
+				if c.registered && c.stack_hi > c.stack_lo {
+					lo = c.stack_lo
+				}
+			}
+			unsafe {
+				vgc_ua_prev_lo[i] = lo
+			}
+		}
 	}
 }
 
