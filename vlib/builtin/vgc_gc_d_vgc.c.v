@@ -2841,10 +2841,13 @@ fn vgc_scan_thread_stack(lo usize, hi usize, spill_hi usize, w int) {
 		// cx-home/v#74 piece 4: the audit of the shadow build reads the byte
 		// scan, so its unaligned words are counted (real / only), not dropped
 	} $else {
-		$if vgc_shadow_stack ? {
-			// cx-home/v#74 (a): the reference-carrying aggregates escape at their
-			// declaration (cgen, vgc_shadow.v), so clang keeps them whole in
-			// aligned stack slots; the machine stack is read at aligned words only.
+		$if vgc_byte_stack_scan ? {
+			// the scan of cx-home/v#60: every byte offset (below)
+		} $else {
+			// cx-home/v#74 (a), the default since piece 6: the reference-carrying
+			// aggregates escape at their declaration (cgen, vgc_shadow.v), so clang
+			// keeps them whole in aligned stack slots; the machine stack is read
+			// at aligned words only.
 			vgc_scan_range(lo, hi, w)
 			return
 		}
