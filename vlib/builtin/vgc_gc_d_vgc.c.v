@@ -3081,6 +3081,7 @@ __global vgc_ua_prev_lo = &usize(unsafe { nil })
 fn C.vgc_ua_add(k int, n u64)
 fn C.vgc_ua_get(k int) u64
 fn C.vgc_ua_frame_lr(where usize) usize
+fn C.vgc_ua_frame_lr_any(where usize, lo usize, hi usize) usize
 fn C.vgc_ua_line(real int, cycle u64, thread u32, off i64, where usize, word usize, obj usize, bytes u64, lr usize)
 
 // vgc_unaligned_audit_counts answers the audit's totals so far: unaligned-only
@@ -3189,7 +3190,7 @@ fn vgc_ua_witness(cycle u64, obj usize, esz u32) {
 			for at + 8 <= c.stack_hi {
 				v := unsafe { *(&usize(at)) }
 				if v >= obj && v < obj + usize(esz) {
-					lr := if own { C.vgc_ua_frame_lr(at) } else { usize(0) }
+					lr := if own { C.vgc_ua_frame_lr(at) } else { C.vgc_ua_frame_lr_any(at, c.stack_lo, c.stack_hi) }
 					C.vgc_ua_line(if prev != 0 && at >= prev { 3 } else { 4 }, cycle, u32(i),
 						i64(c.stack_hi) - i64(at), at, v, obj, u64(esz), lr)
 					found = true
@@ -3254,7 +3255,14 @@ fn vgc_ua_finish() {
 				own := (meta & 1) != 0
 				sb := unsafe { vgc_ua_sbase[k] }
 				off := i64(sb) - i64(at)
-				lr := if own { C.vgc_ua_frame_lr(at) } else { usize(0) }
+				lr := if own {
+					C.vgc_ua_frame_lr(at)
+				} else if thr < u32(vgc_heap.ncaches) {
+					tc := unsafe { vgc_cache(int(thr)) }
+					C.vgc_ua_frame_lr_any(at, tc.stack_lo, tc.stack_hi)
+				} else {
+					usize(0)
+				}
 				C.vgc_ua_add(0, 1)
 				C.vgc_ua_line(0, cycle, thr, off, at, val, base, u64(esz), lr)
 				mut seen := false
