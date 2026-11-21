@@ -19,10 +19,12 @@
 // call. It is for what the walk cannot place (a map, a union, a C struct).
 // tcc and an unoptimised build do not cut; they get no-ops.
 #if defined(__TINYC__) || !defined(__OPTIMIZE__)
-#define vgc_ss_ref(x, off) ((void)0)
+#define vgc_ss_ref(x, off, word) ((void)0)
 #define vgc_ss_pin(p) ((void)(p))
 #else
-#define vgc_ss_ref(x, off) do { if (__builtin_expect(__builtin_frame_address(0) == (void*)0, 0)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)&(x) + ((off) & ~(__SIZE_TYPE__)7)))); } while (0)
+// `word` is the offset the compiler computed for the word (it chose the words by its own layout of the
+// type); `off` is the field's offset as C has it. They must agree.
+#define vgc_ss_ref(x, off, word) do { _Static_assert((((off) & ~(__SIZE_TYPE__)7)) == (word) && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); if (__builtin_expect(__builtin_frame_address(0) == (void*)0, 0)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)&(x) + (word)))); } while (0)
 #define vgc_ss_pin(p) __asm__ __volatile__("" : : "r"(p) : "memory")
 #endif
 
