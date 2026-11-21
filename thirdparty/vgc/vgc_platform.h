@@ -4,29 +4,26 @@
 #ifndef VGC_PLATFORM_H
 #define VGC_PLATFORM_H
 
-// cx-home/v#74 pieces 1 and 6: under -gc e (not -d vgc_byte_stack_scan) cgen puts vgc_ss_escape(&x) after
-// every local whose type clang's SROA can cut off a word (a reference that follows a field narrower than
-// a word: an option's state byte, a struct's leading tag; vgc_shadow.v). SROA cuts a local at the edges
-// of its typed accesses; the piece after such a field is copied by memcpy and lives in a byte array of
-// alignment 1, with x's references at unaligned addresses in it (cx-home/v#60).
-// vgc_ss_escape reads each 8-byte word of x as a pointer (an empty asm that takes the VALUE) on a path
-// that never runs: the frame address is never null, and the compiler does not know it. A pointer-typed
-// read cannot be split, so every piece SROA makes of x starts and ends on a word, each reference is a
-// word of its own (a register or an aligned spill), and x stays in registers; the price is one
-// never-taken branch a declaration. The first shape of this macro took &x under a "memory" clobber,
-// which kept every such local in memory and re-read it after every call (pbm1-ab74k). A local over
-// VGC_SS_WORDS words keeps that shape. tcc and an unoptimised build do not cut; they get a no-op.
+// cx-home/v#74 pieces 1 and 6: under -gc e (not -d vgc_byte_stack_scan) cgen follows the declaration of
+// every local clang's SROA can cut off a word with vgc_ss_ref(x, off) for each word of x that holds a field
+// narrower than a word with a reference somewhere behind it (an option's state byte, its error's tag, a
+// struct's leading tag; vgc_shadow.v). SROA cuts a local at the edges of its typed accesses; the piece
+// after such a field is copied by memcpy and lives in a byte array of alignment 1, with x's references at
+// unaligned addresses in it (cx-home/v#60).
+// vgc_ss_ref reads the whole word at off (rounded down to a word) as a pointer — an empty asm that takes
+// the VALUE — on a path that never runs: the frame address is never null, and the compiler does not know
+// it. A pointer-typed read cannot be split, so the cut the narrow field makes moves to the end of its
+// word; what follows starts on a word, in a piece as large as before, and x stays in registers. The price
+// is one never-taken branch.
+// vgc_ss_pin takes &x under a "memory" clobber: x stays whole in its slot and is re-read after every
+// call. It is for what the walk cannot place (a map, a union, a C struct).
+// tcc and an unoptimised build do not cut; they get no-ops.
 #if defined(__TINYC__) || !defined(__OPTIMIZE__)
-#define vgc_ss_escape(p) ((void)(p))
+#define vgc_ss_ref(x, off) ((void)0)
+#define vgc_ss_pin(p) ((void)(p))
 #else
-#define VGC_SS_WORDS 16
-#define vgc_ss_w(p, i) if (sizeof(*(p)) >= 8 * ((i) + 1)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)(p) + 8 * (i))))
-#define vgc_ss_escape(p) do { \
-    if (sizeof(*(p)) > 8 * VGC_SS_WORDS) { __asm__ __volatile__("" : : "r"(p) : "memory"); } \
-    else if (__builtin_expect(__builtin_frame_address(0) == (void*)0, 0)) { \
-    vgc_ss_w(p, 0); vgc_ss_w(p, 1); vgc_ss_w(p, 2); vgc_ss_w(p, 3); vgc_ss_w(p, 4); vgc_ss_w(p, 5); vgc_ss_w(p, 6); vgc_ss_w(p, 7); \
-    vgc_ss_w(p, 8); vgc_ss_w(p, 9); vgc_ss_w(p, 10); vgc_ss_w(p, 11); vgc_ss_w(p, 12); vgc_ss_w(p, 13); vgc_ss_w(p, 14); vgc_ss_w(p, 15); } \
-  } while (0)
+#define vgc_ss_ref(x, off) do { if (__builtin_expect(__builtin_frame_address(0) == (void*)0, 0)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)&(x) + ((off) & ~(__SIZE_TYPE__)7)))); } while (0)
+#define vgc_ss_pin(p) __asm__ __volatile__("" : : "r"(p) : "memory")
 #endif
 
 #include <stdint.h>
