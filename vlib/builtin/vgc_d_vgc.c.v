@@ -1013,6 +1013,16 @@ __global vgc_headroom_floor_lo1 = u64(256) * 1024
 // its garbage to 0.5-1.2 MB and read 14.34 MB of peak RSS against Python 3.12's 14.11 — the quarter
 // is the term at every small size, its floor vgc_headroom_floor_lo1.
 __global vgc_one_thread_pct = u64(25)
+// The first collection's goal for one allocating thread (cx-home/v#76): by default the one-thread
+// floor, vgc_headroom_floor_lo1, so a start-up that churns garbage is collected before it carves
+// far past it (cx-home/v#56: the spans a start-up carves before its first cycle stay committed for
+// the run). VGC_FIRST_GOAL_KB (decimal KB) sets it apart from that floor, which every later cycle
+// also uses: a program whose start-up builds what it keeps runs its start-up with no cycle at all
+// when the goal is above that start-up, at the cost of the start-up's garbage (n-body built
+// --native, cx-home/v#76: three start-up cycles at the default, none at 2.5 MB or more, peak RSS
+// 9.30 -> 9.95 MB). A value above the initial headroom (vgc_headroom, 8 MB) leaves the first goal
+// there. VGC_HEADROOM_FLOOR_LO1_MB / _KB still move it with the floor when this is unset.
+__global vgc_first_goal = u64(256) * 1024
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2674,6 +2684,15 @@ pub fn vgc_init() {
 	if vgc_headroom_floor_lo1 > vgc_headroom_floor_lo {
 		vgc_headroom_floor_lo1 = vgc_headroom_floor_lo
 	}
+	// cx-home/v#76: the first collection's goal (vgc_first_goal doc)
+	vgc_first_goal = vgc_headroom_floor_lo1
+	fg_env := C.getenv(c'VGC_FIRST_GOAL_KB')
+	if fg_env != unsafe { nil } {
+		fgk := C.atoll(fg_env)
+		if fgk > 0 {
+			vgc_first_goal = u64(fgk) * 1024
+		}
+	}
 	// Parallel mark (cx-home/v#16): the marker count and the engage threshold.
 	mut mw := C.vgc_ncpu()
 	if mw > 8 {
@@ -2889,10 +2908,12 @@ pub fn vgc_init() {
 	// thread (cx-home/v#56, cx-private#1977): at the several-thread clamp (4 MB)
 	// a program's start-up carved its whole first trigger before anything was
 	// collected, and the spans stayed (json-codec 1 KB: 618 spans for a 1 MB
-	// marked set, peak RSS 16.39 MB; at 1 MB, 469 spans, 15.20 MB).
+	// marked set, peak RSS 16.39 MB; at 1 MB, 469 spans, 15.20 MB). That clamp is
+	// vgc_first_goal's default; VGC_FIRST_GOAL_KB moves the first goal alone
+	// (cx-home/v#76).
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0
-		&& vgc_headroom_floor_lo1 < vgc_heap.next_gc {
-		vgc_heap.next_gc = vgc_headroom_floor_lo1
+		&& vgc_first_goal < vgc_heap.next_gc {
+		vgc_heap.next_gc = vgc_first_goal
 	}
 	vgc_gc_last_end = C.vgc_now_ns()
 	vgc_heap.gc_phase = vgc_phase_off
