@@ -5,7 +5,8 @@ module c
 
 import v.ast
 
-// cx-home/v#74 piece 1, the shadow stack's compiler half (-gc e -d vgc_shadow_stack).
+// cx-home/v#74 piece 1, the shadow stack's compiler half (-gc e; piece 6: the
+// default, -d vgc_byte_stack_scan turns it and the aligned-only scan off).
 // The collector's aligned-only stack scan (piece 2) is sound only if no live
 // reference sits at an unaligned stack offset. Those come from clang's SROA
 // slices of V aggregates (an option's `u8 data[]` copy, a struct read through a
@@ -19,7 +20,7 @@ import v.ast
 
 // vgc_ss_on: the shadow stack's compiler half is in force for this build.
 fn (g &Gen) vgc_ss_on() bool {
-	return g.pref.gc_mode == .vgc && 'vgc_shadow_stack' in g.pref.compile_defines
+	return g.pref.gc_mode == .vgc && 'vgc_byte_stack_scan' !in g.pref.compile_defines
 }
 
 // vgc_ss_refresh fills vgc_ss_types from the table's symbols: every non-pointer
