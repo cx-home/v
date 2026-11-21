@@ -287,6 +287,7 @@ fn vgc_gc_start() {
 	// Scan roots: stacks + globals (conservative scanning)
 	vgc_roots_par_n = vgc_roots_plan()
 	$if vgc_unaligned_audit ? {
+		C.vgc_ua_stop(1)
 		vgc_ua_begin(!vgc_minor_this_cycle)
 	}
 	vgc_mark_roots()
@@ -532,7 +533,15 @@ fn vgc_gc_start() {
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 
+	$if vgc_unaligned_audit ? {
+		C.vgc_ua_stop(0)
+	}
 	vgc_stw_resume(self_idx)
+	$if vgc_unaligned_audit ? {
+		// cx-home/v#74 piece 4: the stop's lines are named (dladdr) and written
+		// only now — a thread stopped inside dlopen holds dyld's lock
+		C.vgc_ua_flush()
+	}
 
 	C.vgc_trace(12, self_idx, u64(vgc_heap.gc_cycle), 0) // GC_END
 	vgc_gc_owner = -1
@@ -3084,6 +3093,18 @@ __global vgc_ua_uwhere = &usize(unsafe { nil })
 __global vgc_ua_uword = &usize(unsafe { nil })
 __global vgc_ua_ulr = &usize(unsafe { nil })
 __global vgc_ua_uthr = &u32(unsafe { nil })
+// VGC_UA_POISON=1 (cx-home/v#74 piece 4): the exact verdict. An aligned word
+// that names a remembered object again proves nothing — a dropped 81 MB buffer
+// was named for 385 cycles by one unaligned integer and called real 5 times
+// (stale words in unwritten slots of new frames, then a plain integer inside
+// it; x86-wit74d). Under the poison an unaligned-only object is filled with
+// 0xF5 before its word is shaded (so nothing is marked THROUGH it, as the
+// aligned-only scan would have it) and stays allocated while a word names it:
+// the program that really holds it reads the pattern (its own checks fail) —
+// and a byte of it written since (wit_write) or its free (wit_free) is the
+// `real` verdict. A naming aligned word is no verdict there.
+__global vgc_ua_poison = false
+__global vgc_ua_upois = &u8(unsafe { nil }) // 1: the remembered object is poisoned
 __global vgc_ua_last_cycle = u64(0)
 // each thread's stack_lo when the last audited cycle ended (the witness lines'
 // old / new split); vgc_ua_nprev entries
@@ -3095,6 +3116,22 @@ fn C.vgc_ua_get(k int) u64
 fn C.vgc_ua_frame_lr(where usize) usize
 fn C.vgc_ua_frame_lr_any(where usize, lo usize, hi usize) usize
 fn C.vgc_ua_line(real int, cycle u64, thread u32, off i64, where usize, word usize, obj usize, bytes u64, lr usize)
+fn C.vgc_ua_stop(on int)
+fn C.vgc_ua_flush()
+fn C.vgc_ua_dladdr_in_stop() u64
+fn C.vgc_ua_poison_fill(p usize, n u64)
+fn C.vgc_ua_poison_check(p usize, n u64) i64
+
+// vgc_unaligned_audit_poisoned answers how many objects the audit poisoned
+// (VGC_UA_POISON=1) and how many frame names it asked dyld for while the world
+// was stopped (0 is the invariant; cx-home/v#74 piece 4)
+@[markused]
+pub fn vgc_unaligned_audit_poisoned() (u64, u64) {
+	$if vgc_unaligned_audit ? {
+		return C.vgc_ua_get(6), C.vgc_ua_dladdr_in_stop()
+	}
+	return 0, 0
+}
 
 // vgc_unaligned_audit_counts answers the audit's totals so far: unaligned-only
 // roots, real ones, audited cycles (0, 0, 0 outside -d vgc_unaligned_audit).
@@ -3125,13 +3162,16 @@ fn vgc_ua_begin(full bool) {
 			vgc_ua_ulr = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_ucap) * 8)) }
 			vgc_ua_uthr = unsafe { &u32(C.vgc_os_alloc(usize(vgc_ua_ucap) * 4)) }
 			vgc_ua_prev_lo = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_nprev) * 8)) }
+			vgc_ua_upois = unsafe { &u8(C.vgc_os_alloc(usize(vgc_ua_ucap))) }
+			pz := C.getenv(c'VGC_UA_POISON')
+			vgc_ua_poison = pz != unsafe { nil } && C.atoll(pz) > 0
 		}
 		ok := vgc_ua_at != unsafe { nil } && vgc_ua_val != unsafe { nil }
 			&& vgc_ua_meta != unsafe { nil } && vgc_ua_sbase != unsafe { nil }
 			&& vgc_ua_uobj != unsafe { nil } && vgc_ua_uoff != unsafe { nil }
 			&& vgc_ua_uwhere != unsafe { nil } && vgc_ua_uword != unsafe { nil }
 			&& vgc_ua_ulr != unsafe { nil } && vgc_ua_uthr != unsafe { nil }
-			&& vgc_ua_prev_lo != unsafe { nil }
+			&& vgc_ua_prev_lo != unsafe { nil } && vgc_ua_upois != unsafe { nil }
 		vgc_ua_defer = full && ok
 		vgc_ua_active = vgc_ua_defer
 		// a remembered object is judged only by the very next cycle: any cycle
@@ -3221,6 +3261,16 @@ fn vgc_ua_forget(base usize) {
 		}
 		for i in 0 .. n {
 			if unsafe { vgc_ua_uobj[i] } == base {
+				if vgc_ua_poison && unsafe { vgc_ua_upois[i] } != 0 {
+					// the program frees an object the aligned roots did not
+					// reach: it held the reference (wit_free: where = the caller)
+					w := u64(unsafe { vgc_ua_uword[i] })
+					cls := vgc_ua_class(w)
+					C.vgc_ua_add(if cls == 1 { 4 } else if cls == 2 { 5 } else { 1 }, 1)
+					C.vgc_ua_line(if cls == 1 { 2 } else if cls == 2 { 6 } else { 1 }, vgc_heap.gc_cycle, unsafe { vgc_ua_uthr[i] },
+						unsafe { vgc_ua_uoff[i] }, unsafe { vgc_ua_uwhere[i] }, usize(w), base, 0, unsafe { vgc_ua_ulr[i] })
+					C.vgc_ua_line(8, vgc_heap.gc_cycle, 0, 0, 0, 0, base, 0, usize(C.vgc_ra2()))
+				}
 				unsafe {
 					vgc_ua_uobj[i] = 0
 				}
@@ -3281,6 +3331,38 @@ fn vgc_ua_finish() {
 				continue
 			}
 			base, marked, esz := vgc_ua_obj(obj)
+			if vgc_ua_poison {
+				// the exact verdict: a poisoned object is real when a byte of it
+				// was written since; an aligned word naming it is no verdict
+				if base != obj {
+					continue
+				}
+				if unsafe { vgc_ua_upois[i] } != 0 {
+					bad := C.vgc_ua_poison_check(obj, u64(esz))
+					if bad >= 0 {
+						cls := vgc_ua_class(u64(unsafe { vgc_ua_uword[i] }))
+						C.vgc_ua_add(if cls == 1 { 4 } else if cls == 2 { 5 } else { 1 }, 1)
+						C.vgc_ua_line(if cls == 1 { 2 } else if cls == 2 { 6 } else { 1 }, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
+							unsafe { vgc_ua_uwhere[i] }, unsafe { vgc_ua_uword[i] }, obj, u64(esz),
+							unsafe { vgc_ua_ulr[i] })
+						wa := (obj + usize(bad)) & ~usize(7)
+						C.vgc_ua_line(7, cycle, 0, bad, obj + usize(bad), unsafe { *(&usize(wa)) }, obj, u64(esz), 0)
+						vgc_ua_witness(cycle, obj, esz)
+						continue
+					}
+				}
+				unsafe {
+					vgc_ua_uobj[keep] = vgc_ua_uobj[i]
+					vgc_ua_uoff[keep] = vgc_ua_uoff[i]
+					vgc_ua_uwhere[keep] = vgc_ua_uwhere[i]
+					vgc_ua_uword[keep] = vgc_ua_uword[i]
+					vgc_ua_ulr[keep] = vgc_ua_ulr[i]
+					vgc_ua_uthr[keep] = vgc_ua_uthr[i]
+					vgc_ua_upois[keep] = vgc_ua_upois[i]
+				}
+				keep++
+				continue
+			}
 			if base == obj && marked {
 				// cx-home/v#74 piece 4: a round value (low 24 bits 0 or 1) or a pair
 				// of small integers is two integers read across a boundary, not a
@@ -3343,6 +3425,15 @@ fn vgc_ua_finish() {
 						vgc_ua_uword[vgc_ua_nu] = val
 						vgc_ua_ulr[vgc_ua_nu] = lr
 						vgc_ua_uthr[vgc_ua_nu] = thr
+						vgc_ua_upois[vgc_ua_nu] = 0
+					}
+					if vgc_ua_poison {
+						// before the shade: nothing is marked through the object
+						C.vgc_ua_poison_fill(base, u64(esz))
+						C.vgc_ua_add(6, 1)
+						unsafe {
+							vgc_ua_upois[vgc_ua_nu] = 1
+						}
 					}
 					vgc_ua_nu++
 				}
@@ -3364,6 +3455,7 @@ fn vgc_ua_finish() {
 					vgc_ua_uword[keep] = vgc_ua_uword[i]
 					vgc_ua_ulr[keep] = vgc_ua_ulr[i]
 					vgc_ua_uthr[keep] = vgc_ua_uthr[i]
+					vgc_ua_upois[keep] = vgc_ua_upois[i]
 				}
 				keep++
 			}
