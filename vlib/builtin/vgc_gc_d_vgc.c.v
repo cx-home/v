@@ -590,7 +590,7 @@ fn vgc_stw_stop(self_idx int) {
 		// park from the previous back-to-back cycle is a WAKING (running) thread
 		// and is signal-suspended like any straggler (#57/#58/#63/#145).
 		_ = C.vgc_atomic_add_u32(&vgc_heap.gc_stop_seq, 1)
-		C.vgc_atomic_store_u32(&vgc_heap.gc_stop_flag, 1)
+		C.vgc_stop_flag_raise(&vgc_heap.gc_stop_flag)
 		// cx #316: threads inside a GC-safe blocking region are excluded from the
 		// park-wait target — they never reach an alloc poll while parked, so
 		// counting them only burns the plateau budget every cycle. The load of

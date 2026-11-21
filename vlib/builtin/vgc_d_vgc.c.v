@@ -86,6 +86,7 @@ fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping 
 fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
+fn C.vgc_stop_flag_raise(stop_flag &u32)
 fn C.vgc_thread_self_port() u32
 
 // cx-home/v#28: the stop-the-world is two passes over the slots — request a

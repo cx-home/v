@@ -1729,8 +1729,22 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
 // resume latency cost is bounded by the sleep quantum and only paid by wakes
 // that collided with a GC). The Dekker ordering above is unaffected — how the
 // flag-drop is awaited is irrelevant to soundness.
-static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+// The two sides of the Dekker pair (cx-private#2079): the exiting thread
+// stores safe=0, then loads gc_stop_flag (vgc_safe_exit_publish answers the
+// load); the collector stores gc_stop_flag=1 (vgc_stop_flag_raise), then loads
+// each thread's safe word. bench/parallel-alloc/vgc_safe_exit_dekker_test.v
+// runs the two on two threads.
+static inline uint32_t vgc_safe_exit_publish(uint32_t* my_safe, uint32_t* stop_flag) {
     vgc_atomic_store_u32(my_safe, 0);
+    return vgc_atomic_load_u32(stop_flag);
+}
+static inline void vgc_stop_flag_raise(uint32_t* stop_flag) {
+    vgc_atomic_store_u32(stop_flag, 1);
+}
+static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+    if (vgc_safe_exit_publish(my_safe, stop_flag) == 0) {
+        return;
+    }
     int spins = 0;
     while (vgc_atomic_load_u32(stop_flag) != 0) {
         if (++spins < 1000) {
