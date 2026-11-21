@@ -7183,13 +7183,21 @@ fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
 			break
 		}
 		if central.cold_refill == 0 {
-			// One refiller per class; the fresh carve takes the heap's own locks,
-			// so it runs outside central.lock and the others wait for it.
+			// One refiller per class; the refill takes the heap's own locks (and
+			// central.lock again for the partial list), so it runs outside
+			// central.lock and the others wait for it. cx-home/v#77 (K=20): a
+			// span on central.partial first — the private spans of the threads
+			// that ran while fewer than vgc_cold_min_threads were live, handed
+			// back by their safe-region flush one object full (thr.v's first
+			// threads, then blocked on a channel) — so the class's later cold
+			// objects fill those spans' free slots before a fresh carve
+			// (vgc_cold_class_partial_test). A popped span is claimed in flight
+			// and stamped as a fresh one is; the release below ends both.
 			unsafe {
 				vgc_heap.central[span_class].cold_refill = 1
 			}
 			C.vgc_mutex_unlock(&central.lock)
-			mut fresh := vgc_central_get_fresh(span_class)
+			mut fresh := vgc_central_get_span(span_class)
 			C.vgc_mutex_lock(&central.lock)
 			unsafe {
 				vgc_heap.central[span_class].cold_refill = 0
