@@ -8171,6 +8171,13 @@ fn vgc_free(ptr voidptr) {
 		return
 	}
 	obj_idx := u32((usize(ptr) - span.base) / usize(span.elem_size))
+	$if vgc_unaligned_audit ? {
+		// cx-home/v#74 piece 4: a freed slot handed to a new object is not the
+		// object an unaligned word named
+		if obj_idx < span.nelems {
+			vgc_ua_forget(span.base + usize(obj_idx) * usize(span.elem_size))
+		}
+	}
 	// Serialize the span-metadata mutation (alloc_bits / alloc_count / free_index)
 	// under the per-size-class central lock — the SAME lock the allocator
 	// (vgc_central_get_span) takes when it pops spans of this class off the

@@ -3182,6 +3182,27 @@ fn vgc_ua_obj(val usize) (usize, bool, u32) {
 	return span.base + usize(idx) * usize(span.elem_size), marked, span.elem_size
 }
 
+// vgc_ua_forget drops a remembered object the program frees (vgc_free): its
+// slot may hold a new object by the judging cycle, which an aligned root then
+// reaches without the old unaligned word having been a reference. Runs on a
+// mutator; the list is compacted only under the stop (vgc_ua_finish), so a
+// cleared entry (0) is skipped there.
+fn vgc_ua_forget(base usize) {
+	$if vgc_unaligned_audit ? {
+		n := vgc_ua_nu
+		if n <= 0 || vgc_ua_uobj == unsafe { nil } {
+			return
+		}
+		for i in 0 .. n {
+			if unsafe { vgc_ua_uobj[i] } == base {
+				unsafe {
+					vgc_ua_uobj[i] = 0
+				}
+			}
+		}
+	}
+}
+
 // vgc_ua_witness writes, after a `real` line, every aligned word of a
 // registered thread's stack that names the object (cx-home/v#74 piece 4): the
 // aligned root the judging cycle reached it from. kind=wit_old: the slot lay
@@ -3230,6 +3251,9 @@ fn vgc_ua_finish() {
 		mut keep := 0
 		for i in 0 .. vgc_ua_nu {
 			obj := unsafe { vgc_ua_uobj[i] }
+			if obj == 0 {
+				continue
+			}
 			base, marked, esz := vgc_ua_obj(obj)
 			if base == obj && marked {
 				// cx-home/v#74 piece 4: a round value (low 24 bits 0 or 1) is two
