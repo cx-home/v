@@ -4,7 +4,7 @@
 //
 // Shape: the probe's start-up. thr.v spawns 200 threads that each keep K
 // strings of different size classes and then block on a channel. The first
-// few threads run while fewer than vgc_cold_min_threads (8) are live, so each
+// few threads run while fewer than vgc_cold_min_threads are live, so each
 // takes a private span per class for its one object (cx-core-code#295 keeps
 // a program with a few threads off the shared span). When they block, the
 // safe-region flush (cx-home/v#36) puts those nearly empty spans on their
@@ -13,20 +13,20 @@
 // the first threads' spans stayed one object full: about 640 KB of the
 // probe's 5 MB at K=20 on pbm1, 1.20x of -gc none where the bar is 1.10.
 //
-// Here: five early workers (six live threads), one at a time, allocate one
-// object in each of twenty classes and block; then 59 workers, all started
-// together, do the same. The bar: at least 40 % of the late objects sit in a
-// span an early worker took (0 of 1,180 before the fix: the shared span was always
-// fresh; 627 of 1,180 after it, on pbm1: the late objects fill the early
-// spans' free slots first, and the rest overflow the large classes' few).
+// Here: three early workers (four live threads, under vgc_cold_min_threads),
+// one at a time, allocate one object in each of twenty classes and block;
+// then 61 workers, all started together, do the same. The bar: at least 40 %
+// of the late objects sit in a span an early worker took (none before the
+// fix: the shared span was always fresh; after it the late objects fill the
+// early spans' free slots first, and the rest overflow the large classes' few).
 //
 // Run: ./v -gc e test bench/parallel-alloc/vgc_cold_class_partial_test.v
 module main
 
 import time
 
-const early = 5
-const late = 59
+const early = 3
+const late = 61
 const sizes = [16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 640, 768, 1024,
 	1280, 1536, 2048]
 
