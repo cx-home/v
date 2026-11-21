@@ -44,12 +44,22 @@ fn sum7(p &u8) int {
 	return n
 }
 
+// scrub overwrites the dead stack below the caller (hide's frame and its
+// callees' leave the buffer's address in aligned slots)
+@[noinline]
+fn scrub() u64 {
+	mut z := [2048]u64{}
+	z[2047] = 1
+	return z[0] + z[2047]
+}
+
 // worker_holds plants the buffer's only reference at an unaligned offset of its
 // own frame on a spawned thread and blocks until main has collected (MODE=thread)
 @[noinline]
 fn worker_holds(off int, ready chan int, done chan int) {
 	mut wslot := [16]u8{}
 	_ = hide_under_guard(mut wslot, off)
+	_ = scrub()
 	ready <- 1
 	_ := <-done
 	_ = wslot[0]
