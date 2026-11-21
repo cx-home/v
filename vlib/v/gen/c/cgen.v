@@ -143,6 +143,9 @@ mut:
 	labeled_loops                        map[string]&ast.Stmt
 	contains_ptr_cache                   map[ast.Type]bool
 	vgc_ss_types                         map[string]bool // cx-home/v#74: C names of reference-carrying aggregates (-d vgc_shadow_stack)
+	vgc_ss_sym                           map[string]int      // cx-home/v#74: their type indexes
+	vgc_ss_opt                           map[string]ast.Type // cx-home/v#74: an option / result C name -> its V type
+	vgc_ss_refs                          map[string][]string // cx-home/v#74: a C type -> the references to read of a local of it (vgc_ss_refs_of)
 	vgc_ss_ntypes                        int
 	boehm_keep_gen                       shared map[string]bool
 	inner_loop                           &ast.Stmt = unsafe { nil }
@@ -2149,6 +2152,7 @@ fn (mut g Gen) register_option(t ast.Type) string {
 	if !is_unresolved_generic {
 		g.options[base] = styp
 	}
+	g.vgc_ss_opt[styp] = resolved_t
 	return if !t.has_flag(.option_mut_param_t) { styp } else { '${styp}*' }
 }
 
@@ -2161,6 +2165,7 @@ fn (mut g Gen) register_result(t ast.Type) string {
 	if !is_unresolved_generic {
 		g.results[base] = styp
 	}
+	g.vgc_ss_opt[styp] = resolved_t
 	return styp
 }
 

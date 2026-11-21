@@ -1685,7 +1685,7 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 		for pi, pt in fargtypes {
 			if pi < fargs.len && pi < heap_promoted.len && !heap_promoted[pi]
 				&& g.vgc_ss_is_ref_aggregate(pt) {
-				ss_params << fargs[pi]
+				ss_params << g.vgc_ss_text(pt, fargs[pi])
 			}
 		}
 		ss_body := g.out.cut_to(vgc_ss_pos)
