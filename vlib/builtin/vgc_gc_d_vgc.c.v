@@ -3179,8 +3179,11 @@ fn vgc_ua_finish() {
 			obj := unsafe { vgc_ua_uobj[i] }
 			base, marked, esz := vgc_ua_obj(obj)
 			if base == obj && marked {
-				C.vgc_ua_add(1, 1)
-				C.vgc_ua_line(1, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
+				// cx-home/v#74 piece 4: a round value (low 24 bits 0 or 1) is two
+				// small integers read across a boundary, not a sliced pointer
+				round := (unsafe { vgc_ua_uword[i] } & usize(0xfffffe)) == 0
+				C.vgc_ua_add(if round { 4 } else { 1 }, 1)
+				C.vgc_ua_line(if round { 2 } else { 1 }, cycle, unsafe { vgc_ua_uthr[i] }, unsafe { vgc_ua_uoff[i] },
 					unsafe { vgc_ua_uwhere[i] }, unsafe { vgc_ua_uword[i] }, obj, u64(esz),
 					unsafe { vgc_ua_ulr[i] })
 				continue
