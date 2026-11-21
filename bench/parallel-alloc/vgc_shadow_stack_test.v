@@ -1,4 +1,5 @@
-// vgc_shadow_stack_test.v — -d vgc_shadow_stack finds a thread's live
+// vgc_shadow_stack_test.v — the -gc e build (cx-home/v#74 piece 6: the default
+// since the audit's count; -d vgc_byte_stack_scan is the old scan) finds a thread's live
 // references precisely and stops reading roots out of the bytes of live frames
 // (cx-home/v#74, option (a): the shadow stack, after option (c)'s count failed
 // on x86-64 with real=133).
@@ -32,7 +33,7 @@ fn build() string {
 	src := os.join_path(@DIR, 'ss', 'shadow.v')
 	exe := os.join_path(os.vtmp_dir(), 'vgc_ss_shadow_${os.getpid()}')
 	r :=
-		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -enable-globals -d vgc_shadow_stack -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -enable-globals -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert r.exit_code == 0, r.output
 	return exe
 }
