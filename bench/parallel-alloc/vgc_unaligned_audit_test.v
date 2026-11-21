@@ -14,6 +14,7 @@
 module main
 
 import os
+import strconv
 
 fn build() string {
 	src := os.join_path(@DIR, 'ua', 'planted.v')
@@ -125,5 +126,48 @@ fn test_a_freed_and_reused_slot_is_not_counted_real() {
 		assert d.all_after('only=').all_before(' ').int() >= 1, 'off ${off}: ${d}'
 		real := d.all_after('real=').all_before(' ').int()
 		assert real == 0, 'off ${off}: a freed slot reused by a new object was counted real ${real} times:\n${r.output}'
+	}
+}
+
+// cx-home/v#74 piece 4: a word that is two small 32-bit integers side by side
+// (high half under 256, low half within +-64 K as a signed int) is its own
+// class, `pair`, counted real_pair apart from real. On x86-64 the heap starts
+// at 4 GB, so (lo, 1) and (lo, 2) land in it: x86-wit74b's real lines on
+// 0x1ffffffff had ALIGNED witnesses holding the same 0x1ffffffff — the integer
+// pair (-1, 1) in an aligned slot, not a reloaded pointer; 0x200000100 /
+// 0x200000204 are (0x100, 2) / (0x204, 2). The round class (low 24 bits 0 or
+// 1) stays as it was; a word with a real address shape stays `pointer`.
+fn test_the_audit_classes_small_integer_pairs_apart() {
+	src := os.join_path(@DIR, 'ua', 'classify.v')
+	exe := os.join_path(os.vtmp_dir(), 'vgc_ua_classify_${os.getpid()}')
+	b := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -d vgc_unaligned_audit -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	assert b.exit_code == 0, b.output
+	defer {
+		os.rm(exe) or {}
+	}
+	want := {
+		'0x1ffffffff':  'pair'
+		'0x200000100':  'pair'
+		'0x200000204':  'pair'
+		'0x7000000070': 'pair'
+		'0x1fffffe00':  'pair'
+		'0x7000000001': 'round'
+		'0x220000000':  'round'
+		'0x16ef24101':  'pointer'
+		'0x1ff228320':  'pointer'
+		'0x11fffe500':  'pointer'
+		'0x1481f0000':  'pointer'
+	}
+	mut args := []string{}
+	for k, _ in want {
+		args << (strconv.parse_uint(k[2..], 16, 64) or { 0 }).str()
+	}
+	r := os.execute('${os.quoted_path(exe)} ${args.join(' ')}')
+	assert r.exit_code == 0, r.output
+	lines := r.output.split_into_lines()
+	mut i := 0
+	for k, v in want {
+		assert lines[i].all_after(' ') == v, '${k}: ${lines[i]} (want ${v})'
+		i++
 	}
 }
