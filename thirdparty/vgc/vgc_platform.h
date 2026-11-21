@@ -5,14 +5,27 @@
 #define VGC_PLATFORM_H
 
 // cx-home/v#74 pieces 1 and 6: under -gc e (not -d vgc_byte_stack_scan) cgen puts vgc_ss_escape(&x) after
-// every local of a reference-carrying aggregate type. The empty asm takes the
-// address, so clang keeps the aggregate whole in its stack slot (no SROA slices
-// at unaligned offsets) and current at every call. tcc does not slice; it gets
-// a no-op.
-#if defined(__TINYC__)
+// every local of a reference-carrying aggregate type, so that no reference of x ever sits at an unaligned
+// stack address. Clang's SROA splits a local at the edges of its typed accesses; a leading byte read on
+// its own (an option's state, a struct's tag) leaves the rest — bytes 1.. — as one piece copied by memcpy,
+// which lives in a byte array of alignment 1 (or an odd-width integer) and puts a pointer of x at +7.
+// vgc_ss_escape reads every 8-byte word of x once as a pointer (an empty asm that takes the VALUE): a
+// pointer-typed load cannot be split, so every piece SROA makes starts and ends on a word, each reference
+// is a word of its own (a register, or an aligned spill), and x stays in registers. No address is taken
+// and no memory is clobbered: the first shape of this macro took &x with a "memory" clobber, which kept
+// every such local in memory and re-read it after every call (pbm1-ab74i: +18 to +30 % instructions on
+// the ten interpreted programs). A local over VGC_SS_WORDS words keeps that shape. tcc and an
+// unoptimised build do not split; they get a no-op.
+#if defined(__TINYC__) || !defined(__OPTIMIZE__)
 #define vgc_ss_escape(p) ((void)(p))
 #else
-#define vgc_ss_escape(p) __asm__ __volatile__("" : : "r"(p) : "memory")
+#define VGC_SS_WORDS 16
+#define vgc_ss_w(p, i) if (sizeof(*(p)) >= 8 * ((i) + 1)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)(p) + 8 * (i))))
+#define vgc_ss_escape(p) do { \
+    if (sizeof(*(p)) > 8 * VGC_SS_WORDS) { __asm__ __volatile__("" : : "r"(p) : "memory"); } else { \
+    vgc_ss_w(p, 0); vgc_ss_w(p, 1); vgc_ss_w(p, 2); vgc_ss_w(p, 3); vgc_ss_w(p, 4); vgc_ss_w(p, 5); vgc_ss_w(p, 6); vgc_ss_w(p, 7); \
+    vgc_ss_w(p, 8); vgc_ss_w(p, 9); vgc_ss_w(p, 10); vgc_ss_w(p, 11); vgc_ss_w(p, 12); vgc_ss_w(p, 13); vgc_ss_w(p, 14); vgc_ss_w(p, 15); } \
+  } while (0)
 #endif
 
 #include <stdint.h>
