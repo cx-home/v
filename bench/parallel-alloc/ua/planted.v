@@ -33,6 +33,15 @@ fn read_back(slot [16]u8, off int) &u8 {
 	return unsafe { &u8(voidptr(p)) }
 }
 
+// read_word answers the planted word as an integer (MODE=stale: an aligned
+// word that names the buffer and is never used as a reference)
+@[noinline]
+fn read_word(slot [16]u8, off int) u64 {
+	mut p := u64(0)
+	unsafe { C.memcpy(&p, &slot[off], 8) }
+	return p
+}
+
 @[noinline]
 fn sum7(p &u8) int {
 	mut n := 0
@@ -102,7 +111,8 @@ fn main() {
 		gc_collect()
 		done <- 1
 		t.wait()
-		println('ua thread done')
+		_, dl := vgc_unaligned_audit_poisoned()
+		println('ua thread done dl=${dl}')
 		return
 	}
 	off := (os.getenv_opt('OFF') or { '3' }).int()
@@ -115,6 +125,12 @@ fn main() {
 	if mode == 'real' {
 		held := read_back(slot, off)
 		slot = [16]u8{}
+		if os.getenv('VGC_UA_POISON') == '1' {
+			// the program that really holds the buffer writes to it
+			unsafe {
+				held[100] = 1
+			}
+		}
 		gc_collect()
 		sevens = sum7(held)
 	} else if mode == 'freed' {
@@ -129,10 +145,19 @@ fn main() {
 		gc_collect()
 		sevens = if reused.len == 200 { 1 } else { 0 }
 		keep.clear()
+	} else if mode == 'stale' {
+		// the word's VALUE sits in an aligned local across the next collections
+		// and is never used as a reference: a stale word in a frame's unwritten
+		// slot, or an integer that happens to name the dropped buffer
+		junk := read_word(slot, off)
+		gc_collect()
+		gc_collect()
+		sevens = int(junk & 1)
 	} else {
 		gc_collect()
 		gc_collect()
 	}
 	o1, r1, c1 := vgc_unaligned_audit_counts()
-	println('ua only=${o1 - o0} real=${r1 - r0} cycles=${c1} sevens=${sevens} slot=${slot[0]}')
+	pz, dl := vgc_unaligned_audit_poisoned()
+	println('ua only=${o1 - o0} real=${r1 - r0} cycles=${c1} sevens=${sevens} slot=${slot[0]} poison=${pz} dl=${dl}')
 }
