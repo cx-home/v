@@ -3049,7 +3049,9 @@ pub fn vgc_rootdiag_top() (u32, u64, usize, i64) {
 // cycles is not seen); `only` == 0 over a run is the proof the ruling asks for.
 // The audit keeps what the byte scan keeps: every waiting word is shaded.
 // Lines go to VGC_UA_LOG or stderr (vgc_ua_line, vgc_platform.h).
-const vgc_ua_cap = 65536
+// the defer buffer's words: VGC_UA_CAP overrides the 65,536 (cx-home/v#74 piece 4:
+// overflow=0 needs room for every unaligned heap-pointing word a full cycle sees)
+__global vgc_ua_cap = 65536
 const vgc_ua_ucap = 4096
 
 __global vgc_ua_defer = false
@@ -3091,6 +3093,10 @@ fn vgc_ua_begin(full bool) {
 	$if vgc_unaligned_audit ? {
 		vgc_ua_n = 0
 		if vgc_ua_at == unsafe { nil } {
+			cap_env := C.getenv(c'VGC_UA_CAP')
+			if cap_env != unsafe { nil } && C.atoll(cap_env) > 0 {
+				vgc_ua_cap = int(C.atoll(cap_env))
+			}
 			vgc_ua_at = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
 			vgc_ua_val = unsafe { &usize(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
 			vgc_ua_meta = unsafe { &u64(C.vgc_os_alloc(usize(vgc_ua_cap) * 8)) }
