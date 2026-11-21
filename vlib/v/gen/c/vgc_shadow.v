@@ -55,6 +55,11 @@ fn (g &Gen) vgc_ss_is_ref_aggregate(ctype string) bool {
 	if ctype.starts_with('_option_') || ctype.starts_with('_result_') {
 		return true
 	}
+	// a map and a dynamic array carry their data pointer whatever the element
+	if ctype.starts_with('Map_')
+		|| (ctype.starts_with('Array_') && !ctype.starts_with('Array_fixed_')) {
+		return true
+	}
 	return ctype in g.vgc_ss_types
 }
 
@@ -116,7 +121,7 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 		if pending != '' {
 			depth = vgc_ss_depth_delta(line, depth)
 			if depth <= 0 && line.trim_right(' \t').ends_with(';') {
-				out << line + ' vgc_ss_escape(&${pending});'
+				out << vgc_ss_append(line, pending)
 				pending = ''
 				depth = 0
 			} else {
@@ -146,8 +151,8 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 		}
 		name := line[ns..ne]
 		rest := line[ne..]
-		if rest == ';' {
-			out << line + ' vgc_ss_escape(&${name});'
+		if rest == ';' || rest.starts_with('; /*') || rest.starts_with('; //') {
+			out << vgc_ss_append(line, name)
 			continue
 		}
 		if !rest.starts_with(' = ') {
@@ -155,8 +160,8 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 			continue
 		}
 		d := vgc_ss_depth_delta(rest, 0)
-		if d == 0 && rest.trim_right(' \t').ends_with(';') {
-			out << line + ' vgc_ss_escape(&${name});'
+		if d == 0 && (rest.trim_right(' \t').ends_with(';') || rest.contains('; /*')) {
+			out << vgc_ss_append(line, name)
 		} else if d > 0 {
 			pending = name
 			depth = d
@@ -166,4 +171,14 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 		}
 	}
 	return out.join('\n')
+}
+
+// vgc_ss_append adds the escape after the declaration's statement: at the line's
+// end, or before a trailing `//` comment (which would swallow it)
+fn vgc_ss_append(line string, name string) string {
+	esc := ' vgc_ss_escape(&${name});'
+	if ci := line.last_index('; //') {
+		return line[..ci + 1] + esc + line[ci + 1..]
+	}
+	return line + esc
 }
