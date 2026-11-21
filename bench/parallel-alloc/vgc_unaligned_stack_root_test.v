@@ -1,3 +1,4 @@
+// vtest vflags: -d vgc_byte_stack_scan
 // vgc_unaligned_stack_root_test.v — a live object whose only reference is a
 // pointer at an unaligned offset of a thread's stack survives a collection
 // (cx-home/v#60).
@@ -19,6 +20,11 @@
 // before the collection (vgc_dead_stack_test.v). After gc_collect the buffer's
 // span is still in use and the buffer still reads 7s after the next allocation
 // of its size.
+//
+// cx-home/v#74 piece 6: the -gc e build reads the stack at aligned words (cgen
+// keeps every reference-carrying aggregate whole in an aligned slot); a pointer
+// hidden as raw bytes in a [16]u8 is what no such scheme sees, so this test is
+// the -d vgc_byte_stack_scan build's (the vflags line above).
 //
 // Run: ./v test bench/parallel-alloc/vgc_unaligned_stack_root_test.v
 module main

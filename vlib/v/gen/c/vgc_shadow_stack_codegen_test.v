@@ -1,8 +1,10 @@
-// cx-home/v#74 piece 1: under -gc e -d vgc_shadow_stack every local of a
+// cx-home/v#74 pieces 1 and 6: under -gc e (the default; -d vgc_byte_stack_scan
+// turns it off) every local of a
 // reference-carrying aggregate type (an option temporary, a string, a struct
 // with a pointer, a by-value aggregate parameter) is followed by
 // vgc_ss_escape(&name), so clang keeps it whole in an aligned slot; a scalar
-// local and a pointer-free struct are not; the default build emits no escape.
+// local and a pointer-free struct are not; the -d vgc_byte_stack_scan build emits
+// no escape.
 import os
 
 const vgc_ss_codegen_vexe = @VEXE
@@ -29,7 +31,7 @@ fn fn_body(c string, head string) string {
 }
 
 fn test_shadow_build_escapes_reference_carrying_locals_only() {
-	c := gen_c('-d vgc_shadow_stack')
+	c := gen_c('')
 	main_body := fn_body(c, 'void main__main(void) {')
 	assert main_body != '', c
 	assert main_body.contains('string name = '), main_body
@@ -44,7 +46,7 @@ fn test_shadow_build_escapes_reference_carrying_locals_only() {
 	assert !keep_body.contains('vgc_ss_escape(&f)'), keep_body
 }
 
-fn test_default_build_emits_no_escape() {
-	c := gen_c('')
-	assert !c.contains('vgc_ss_escape(&'), 'the default -gc e build carries an escape'
+fn test_the_byte_scan_build_emits_no_escape() {
+	c := gen_c('-d vgc_byte_stack_scan')
+	assert !c.contains('vgc_ss_escape(&'), 'the -d vgc_byte_stack_scan build carries an escape'
 }
