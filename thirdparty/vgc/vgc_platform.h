@@ -1733,13 +1733,21 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
 // stores safe=0, then loads gc_stop_flag (vgc_safe_exit_publish answers the
 // load); the collector stores gc_stop_flag=1 (vgc_stop_flag_raise), then loads
 // each thread's safe word. bench/parallel-alloc/vgc_safe_exit_dekker_test.v
-// runs the two on two threads.
+// runs the two on two threads. Each side's store and its load of the other's
+// word need a full fence between them: a release store and an acquire load give
+// no store->load order (arm64: STLR then LDAPR; x86-64: a plain store then a
+// plain load), so both sides could read the other's old value — the collector
+// safe==1, the thread gc_stop_flag==0 — and the thread ran through mark and
+// sweep unscanned, the sweep freeing what it allocated meanwhile (g1q6's
+// fa_range_groups `parts`, 1 run in 30 on pbm1).
 static inline uint32_t vgc_safe_exit_publish(uint32_t* my_safe, uint32_t* stop_flag) {
     vgc_atomic_store_u32(my_safe, 0);
+    vgc_atomic_fence();
     return vgc_atomic_load_u32(stop_flag);
 }
 static inline void vgc_stop_flag_raise(uint32_t* stop_flag) {
     vgc_atomic_store_u32(stop_flag, 1);
+    vgc_atomic_fence();
 }
 static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
     if (vgc_safe_exit_publish(my_safe, stop_flag) == 0) {
