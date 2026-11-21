@@ -142,6 +142,8 @@ mut:
 	tmp_var_ptr                          map[string]bool   // indicates if the tmp var passed to or_block() is a ptr
 	labeled_loops                        map[string]&ast.Stmt
 	contains_ptr_cache                   map[ast.Type]bool
+	vgc_ss_types                         map[string]bool // cx-home/v#74: C names of reference-carrying aggregates (-d vgc_shadow_stack)
+	vgc_ss_ntypes                        int
 	boehm_keep_gen                       shared map[string]bool
 	inner_loop                           &ast.Stmt = unsafe { nil }
 	cur_indexexpr                        []int          // list of nested indexexpr which generates array_set/map_set

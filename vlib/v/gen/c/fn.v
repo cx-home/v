@@ -1649,6 +1649,9 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 	defer {
 		g.indent = prev_indent
 	}
+	// cx-home/v#74 piece 1: the body's reference-carrying aggregates escape (vgc_shadow.v)
+	vgc_ss := g.vgc_ss_on()
+	vgc_ss_pos := g.out.len
 	g.stmts(node.stmts)
 	g.inside_ternary = prev_inside_ternary
 	if node.is_noreturn {
@@ -1673,6 +1676,20 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 		} else {
 			g.writeln('\treturn ${default_expr};')
 		}
+	}
+	if vgc_ss {
+		mut ss_params := []string{}
+		if g.vgc_ss_ntypes == 0 {
+			g.vgc_ss_refresh()
+		}
+		for pi, pt in fargtypes {
+			if pi < fargs.len && pi < heap_promoted.len && !heap_promoted[pi]
+				&& g.vgc_ss_is_ref_aggregate(pt) {
+				ss_params << fargs[pi]
+			}
+		}
+		ss_body := g.out.cut_to(vgc_ss_pos)
+		g.write(g.vgc_ss_escapes(ss_body, ss_params))
 	}
 	g.writeln('}')
 	if g.pref.printfn_list.len > 0 && g.last_fn_c_name in g.pref.printfn_list {

@@ -4,6 +4,17 @@
 #ifndef VGC_PLATFORM_H
 #define VGC_PLATFORM_H
 
+// cx-home/v#74 piece 1: under -d vgc_shadow_stack cgen puts vgc_ss_escape(&x) after
+// every local of a reference-carrying aggregate type. The empty asm takes the
+// address, so clang keeps the aggregate whole in its stack slot (no SROA slices
+// at unaligned offsets) and current at every call. tcc does not slice; it gets
+// a no-op.
+#if defined(__TINYC__)
+#define vgc_ss_escape(p) ((void)(p))
+#else
+#define vgc_ss_escape(p) __asm__ __volatile__("" : : "r"(p) : "memory")
+#endif
+
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
