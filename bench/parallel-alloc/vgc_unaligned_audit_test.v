@@ -171,3 +171,85 @@ fn test_the_audit_classes_small_integer_pairs_apart() {
 		i++
 	}
 }
+
+// cx-home/v#74 piece 4 (x86-wit74d, pbm1-ss74d): an aligned word that names a
+// remembered object again is not a reload. x86-wit74d's 81,788,936-byte buffer
+// was named by one unaligned integer for 385 cycles after the program dropped
+// it and was called real 5 times: stale exact-base words in unwritten slots of
+// new collect_frames frames, then a plain integer (0x1a17f070f) inside it — and
+// the 33 objects it points to were called real with it in one cycle (wit_heap).
+// MODE=stale holds the planted word's VALUE in an aligned integer local across
+// the judging cycle and never uses it. Under VGC_UA_POISON=1 the unaligned-only
+// object is filled with a pattern when it is found; only a write to it or its
+// free is `real`. The stale word is `only`, poisoned, and not real.
+fn test_under_the_poison_an_aligned_word_that_only_names_the_object_is_not_real() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	for off in [1, 3, 7] {
+		r := os.execute('VGC_CM=0 VGC_UA_POISON=1 MODE=stale OFF=${off} ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, r.output
+		lines := r.output.split_into_lines().filter(it.starts_with('ua only='))
+		assert lines.len == 1, r.output
+		d := lines[0]
+		println('vgc_unaligned_audit poison stale off=${off}: ${d}')
+		assert d.all_after('only=').all_before(' ').int() >= 1, 'off ${off}: ${d}'
+		assert d.all_after('poison=').all_before(' ').int() >= 1, 'off ${off}: the unaligned-only buffer was not poisoned (${d})'
+		real := d.all_after('real=').all_before(' ').int()
+		assert real == 0, 'off ${off}: a word that only names the dropped buffer was counted real ${real} times:\n${r.output}'
+	}
+}
+
+// ... and the program that really holds the buffer only at an unaligned offset
+// is caught twice over: it reads the pattern (no seven is left — its own checks
+// fail), and its write to the buffer is the real verdict, with a wit_write line
+// naming the byte.
+fn test_under_the_poison_a_real_unaligned_root_reads_the_pattern_and_its_write_is_real() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	for off in [1, 3, 7] {
+		r := os.execute('VGC_CM=0 VGC_UA_POISON=1 MODE=real OFF=${off} ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, r.output
+		lines := r.output.split_into_lines().filter(it.starts_with('ua only='))
+		assert lines.len == 1, r.output
+		d := lines[0]
+		println('vgc_unaligned_audit poison real off=${off}: ${d}')
+		assert d.all_after('real=').all_before(' ').int() >= 1, 'off ${off}: the written buffer was not counted real:\n${r.output}'
+		assert d.all_after('sevens=').all_before(' ').int() == 0, 'off ${off}: the holder did not read the pattern (${d})'
+		assert r.output.contains(' kind=wit_write '), 'off ${off}: no wit_write line:\n${r.output}'
+	}
+}
+
+// ... and a free of a poisoned object is a use too (the program held it).
+fn test_under_the_poison_a_free_of_an_unaligned_only_object_is_real() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	for off in [1, 3, 7] {
+		r := os.execute('VGC_CM=0 VGC_UA_POISON=1 MODE=freed OFF=${off} ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, r.output
+		d := r.output.split_into_lines().filter(it.starts_with('ua only='))[0]
+		assert d.all_after('real=').all_before(' ').int() >= 1, 'off ${off}: the freed poisoned buffer was not counted real:\n${r.output}'
+		assert r.output.contains(' kind=wit_free '), 'off ${off}: no wit_free line:\n${r.output}'
+	}
+}
+
+// cx-home/v#74 piece 4 (pbm1-ss74d's hang, 33 minutes): the audit named a
+// worker's frame with dladdr while the world was stopped, and a thread the stop
+// suspended inside dlopen held dyld's loaders lock. A line written under the
+// stop now waits and is named after the world restarts: the count of dladdr
+// calls under the stop is 0, and the worker's frame is still named.
+fn test_the_audit_asks_dyld_for_no_name_while_the_world_is_stopped() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute('VGC_CM=0 MODE=thread OFF=3 ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	assert r.output.contains('ua thread done dl=0'), r.output
+	assert r.output.split_into_lines().any(it.contains(' kind=only ') && it.ends_with(' frame=main__worker_holds')), r.output
+}
