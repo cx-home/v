@@ -44,6 +44,32 @@ fn sum7(p &u8) int {
 	return n
 }
 
+// hide_small plants a 200-byte buffer's only reference at an unaligned offset
+@[noinline]
+fn hide_small(mut slot [16]u8, off int) {
+	b := []u8{len: 200, init: 5}
+	p := u64(voidptr(b.data))
+	unsafe { C.memcpy(&slot[off], &p, 8) }
+}
+
+// free_and_reuse frees the planted buffer (the program's own eager free, as
+// V's -autofree / cx's Perceus frees do) and allocates 200-byte buffers until
+// one lands at its address; answers that buffer (MODE=freed)
+@[noinline]
+fn free_and_reuse(slot [16]u8, off int, mut keep [][]u8) []u8 {
+	mut p := u64(0)
+	unsafe { C.memcpy(&p, &slot[off], 8) }
+	unsafe { free(voidptr(p)) }
+	for _ in 0 .. 100000 {
+		b := []u8{len: 200, init: 9}
+		if u64(voidptr(b.data)) == p {
+			return b
+		}
+		keep << b
+	}
+	return []u8{}
+}
+
 // scrub overwrites the dead stack below the caller (hide's frame and its
 // callees' leave the buffer's address in aligned slots)
 @[noinline]
@@ -91,6 +117,18 @@ fn main() {
 		slot = [16]u8{}
 		gc_collect()
 		sevens = sum7(held)
+	} else if mode == 'freed' {
+		mut s2 := [16]u8{}
+		hide_small(mut s2, off)
+		_ = scrub()
+		gc_collect()
+		mut keep := [][]u8{}
+		reused := free_and_reuse(s2, off, mut keep)
+		s2 = [16]u8{}
+		_ = scrub()
+		gc_collect()
+		sevens = if reused.len == 200 { 1 } else { 0 }
+		keep.clear()
 	} else {
 		gc_collect()
 		gc_collect()
