@@ -59,3 +59,27 @@ fn test_a_planted_unaligned_false_word_is_not_counted_real() {
 		assert real == 0, 'off ${off}: a word naming an object nothing reads again was counted real ${real} times'
 	}
 }
+
+// cx-home/v#74 piece 4: a `real` line is followed by the aligned stack word that
+// reached the object in the judging cycle (its witness): kind=wit_old when that
+// slot lay inside the range the previous cycle scanned, wit_new when below it
+// (a deeper frame since), wit_heap when no aligned stack word names the object
+// (a heap path). A planted reload names the aligned local the program read the
+// word back into, with the same value.
+fn test_a_real_line_names_its_aligned_witness() {
+	exe := build()
+	defer {
+		os.rm(exe) or {}
+	}
+	for off in [1, 3, 7] {
+		r := os.execute('VGC_CM=0 MODE=real OFF=${off} ${os.quoted_path(exe)}')
+		assert r.exit_code == 0, r.output
+		lines := r.output.split_into_lines()
+		reals := lines.filter(it.contains(' kind=real '))
+		assert reals.len >= 1, r.output
+		word := reals[0].all_after(' word=').all_before(' ')
+		wits := lines.filter(it.contains(' kind=wit_'))
+		assert wits.len >= 1, 'off ${off}: no witness line after the real line:\n${r.output}'
+		assert wits.any(it.contains(' word=${word} ') && !it.contains('kind=wit_heap')), 'off ${off}: no aligned stack witness holds ${word}:\n${r.output}'
+	}
+}
