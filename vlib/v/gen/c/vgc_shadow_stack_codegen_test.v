@@ -5,9 +5,10 @@
 // byte and its error's tag, the leading tag of a struct with a buffer, the same
 // for such a struct passed by value. A type that cannot be cut that way gets
 // nothing: a string (the data pointer is the first word), a struct whose one
-// reference comes before its ints, a scalar, a pointer-free struct. A map gets
-// vgc_ss_pin(&m), the address form. The -d vgc_byte_stack_scan build emits
-// neither.
+// reference comes before its ints, a scalar, a pointer-free struct. A union's
+// members lie over each other (cx.Node: a kind byte, flags, then a union of an
+// int, a string and pointers — one read, of the kind's word). The -d
+// vgc_byte_stack_scan build emits none.
 import os
 
 const vgc_ss_codegen_vexe = @VEXE
@@ -39,9 +40,9 @@ fn test_the_build_reads_the_words_whose_narrow_field_can_cut_a_reference_off_a_w
 	assert main_body != '', c
 	// Wide { tag u8; buf []u8 }: the tag's word
 	assert main_body.contains('main__Wide w = '), main_body
-	assert main_body.contains(' vgc_ss_ref(w, 0 + __builtin_offsetof(main__Wide, tag));'), main_body
+	assert main_body.contains(' vgc_ss_ref(w, 0 + __builtin_offsetof(main__Wide, tag), 0);'), main_body
 	// ?Wide: the state byte's word, the error's tag, the value's tag
-	assert main_body.contains('_option_main__Wide _t1 = main__find(count); vgc_ss_ref(_t1, 0); vgc_ss_ref(_t1, 0 + __builtin_offsetof(_option_main__Wide, err) + 8); vgc_ss_ref(_t1, 0 + __builtin_offsetof(_option_main__Wide, data) + __builtin_offsetof(main__Wide, tag));'), main_body
+	assert main_body.contains('_option_main__Wide _t1 = main__find(count); vgc_ss_ref(_t1, 0, 0); vgc_ss_ref(_t1, 0 + __builtin_offsetof(_option_main__Wide, err) + 8, 16); vgc_ss_ref(_t1, 0 + __builtin_offsetof(_option_main__Wide, data) + __builtin_offsetof(main__Wide, tag), 32);'), main_body
 	// the data pointer is a string's first word; Lean's one reference comes
 	// before its ints
 	assert main_body.contains('string name = '), main_body
@@ -50,10 +51,11 @@ fn test_the_build_reads_the_words_whose_narrow_field_can_cut_a_reference_off_a_w
 	assert !main_body.contains('vgc_ss_ref(l,') && !main_body.contains('vgc_ss_pin(&l)'), main_body
 	assert !main_body.contains('vgc_ss_ref(count,') && !main_body.contains('vgc_ss_pin(&count)'), main_body
 	assert !main_body.contains('vgc_ss_ref(f,') && !main_body.contains('vgc_ss_pin(&f)'), main_body
-	// a map is pinned whole (every map operation takes its address anyway)
-	assert main_body.contains(' vgc_ss_pin(&m);'), main_body
+	// a map (the builtin struct: ints, then its buffers): its narrow words
+	assert main_body.contains(' vgc_ss_ref(m, 0 + __builtin_offsetof(map, key_bytes), 0);'), main_body
+	assert !main_body.contains('vgc_ss_pin('), main_body
 	keep_body := fn_body(c, 'int main__keep(main__Wide w, main__Lean l, main__Flat f) {')
-	assert keep_body.contains('vgc_ss_ref(w, 0 + __builtin_offsetof(main__Wide, tag));'), keep_body
+	assert keep_body.contains('vgc_ss_ref(w, 0 + __builtin_offsetof(main__Wide, tag), 0);'), keep_body
 	assert !keep_body.contains('vgc_ss_ref(l,') && !keep_body.contains('vgc_ss_ref(f,'), keep_body
 	assert !c.contains('vgc_ss_escape('), 'the address-of-everything escape is gone'
 }
