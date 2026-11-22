@@ -12,6 +12,10 @@
 //   - an object whose only reference sits in a page of that table written just
 //     before the collections survives them, and the collections fault in no
 //     page of the table beyond the one written.
+//   - cx-home/v#85: the same two holds for a 128 MB table — more pages than
+//     one 1,024-page mincore block on 4 KB and on 16 KB pages. The first shape
+//     asked only when a range fit one block and scanned it whole otherwise, so
+//     with 4 KB pages (x86-64) even the 8 MB table was read on every cycle.
 //
 // Run: ./v -gc e test bench/parallel-alloc/vgc_data_touched_test.v
 module main
@@ -21,6 +25,9 @@ module main
 fn C.vgc_dt_get(i int) voidptr
 fn C.vgc_dt_set(i int, p voidptr)
 fn C.vgc_dt_resident_pages() int
+fn C.vgc_dt_huge_get(i int) voidptr
+fn C.vgc_dt_huge_set(i int, p voidptr)
+fn C.vgc_dt_huge_resident_pages() int
 
 @[heap]
 struct Payload {
@@ -88,5 +95,44 @@ fn test_an_object_held_only_from_a_freshly_written_page_survives() {
 	after := C.vgc_dt_resident_pages()
 	if before >= 0 {
 		assert after <= before + 1, 'the collections faulted ${after - before - 1} more page(s) of the table in'
+	}
+}
+
+@[noinline]
+fn park_huge_payload(slot int) {
+	mut p := &Payload{
+		tag:   0xbeef_feed
+		cells: []u64{len: 4096, init: u64(index) * 5 + 1}
+	}
+	C.vgc_dt_huge_set(slot, voidptr(p))
+}
+
+// cx-home/v#85
+fn test_a_table_larger_than_one_block_stays_out_of_core_and_roots_its_one_written_page() {
+	before := C.vgc_dt_huge_resident_pages()
+	if before >= 0 {
+		for _ in 0 .. 4 {
+			_ := churn()
+			gc_collect()
+		}
+		mid := C.vgc_dt_huge_resident_pages()
+		assert mid <= before, 'the collections faulted ${mid - before} untouched page(s) of the 128 MB .bss table in (before ${before}, after ${mid})'
+	}
+	slot := 9_000_000 // past the table's first blocks on either page size
+	park_huge_payload(slot)
+	_ := scrub_stack()
+	for _ in 0 .. 8 {
+		_ := churn()
+		gc_collect()
+	}
+	p := unsafe { &Payload(C.vgc_dt_huge_get(slot)) }
+	assert p.tag == 0xbeef_feed, 'the payload held from the 128 MB .bss table was swept: tag ${p.tag:x}'
+	assert p.cells.len == 4096
+	for i in 0 .. p.cells.len {
+		assert p.cells[i] == u64(i) * 5 + 1, 'cell ${i} was reused: ${p.cells[i]}'
+	}
+	after := C.vgc_dt_huge_resident_pages()
+	if before >= 0 {
+		assert after <= before + 1, 'the collections faulted ${after - before - 1} more page(s) of the 128 MB table in'
 	}
 }
