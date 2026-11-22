@@ -84,7 +84,8 @@ fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, spill_hi &usize, stack_base usize)
 fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping on gc_stop_flag
 fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
-fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
+fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, entry_regs &usize, reg_save &usize, reg_max int) // cx #316 safe regions
+fn C.vgc_safe_region_enter_capture() // the safe region's entry: its callee-saved registers, then vgc_safe_region_enter_with
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_stop_flag_raise(stop_flag &u32)
 fn C.vgc_thread_self_port() u32
@@ -226,13 +227,13 @@ const vgc_max_cache_chunks = 4096
 const vgc_spchk_slots = 1024
 // cx #316: words captured per safe-region register snapshot. Sized to hold a
 // full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
-// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask) and, behind it, the
-// vgc_safe_frame_words words of the entry's own frames, where its prologues
-// saved the caller's callee-saved registers before reusing them
-// (cx-private#2079: those frames die before the blocking call);
-// vgc_safe_enter_spill zero-fills the tail so unused slots shade nothing.
-const vgc_safe_frame_words = 256
-const vgc_safe_spill_words = 40 + vgc_safe_frame_words
+// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask) plus the caller's
+// frame-pointer word (VGC_ENTRY_REGS); the tail is zero-filled so unused
+// slots shade nothing. It lives in every thread's record for the thread's
+// whole life (vgc_safe_region_record_size_test): the snapshot is taken where
+// the registers are still the caller's (vgc_safe_region_enter's first
+// statement), so no frame words need copying behind it.
+const vgc_safe_spill_words = 40
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
 
 // GC phases (translated from Go's _GCoff, _GCmark, _GCmarktermination)
@@ -8740,7 +8741,22 @@ pub fn vgc_perturb() {
 // carried across exit). Cheap: setjmp + a bounded word copy + one seq_cst
 // store — suitable for a per-park hot path. No-op for unregistered threads
 // (they are invisible to the collector anyway).
+// The register snapshot is taken in C, at the first statement of
+// vgc_safe_region_enter_capture (VGC_ENTRY_REGS in vgc_platform.h), where the
+// callee-saved registers are still the caller's; this wrapper takes no
+// argument and only calls it. The frames below the caller die when the entry
+// returns; the snapshot holds the caller's registers for the region in the
+// record's 40 words (vgc_safe_region_callee_saved_test,
+// vgc_safe_region_record_size_test).
 fn vgc_safe_region_enter() {
+	C.vgc_safe_region_enter_capture()
+}
+
+// vgc_safe_region_enter_with is the rest of the entry, under a fixed C name
+// for vgc_safe_region_enter_capture: entry_regs is its snapshot
+// (vgc_safe_spill_words words).
+@[export: 'vgc_safe_region_enter_with']
+fn vgc_safe_region_enter_with(entry_regs voidptr) {
 	cache_idx := C.vgc_get_cache_idx()
 	if cache_idx < 0 {
 		return
@@ -8748,7 +8764,7 @@ fn vgc_safe_region_enter() {
 	vgc_safe_cache_flush(cache_idx)
 	unsafe {
 		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe, &vgc_cache(cache_idx).stack_lo,
-			&vgc_cache(cache_idx).stack_hi, vgc_cache(cache_idx).stack_base,
+			&vgc_cache(cache_idx).stack_hi, vgc_cache(cache_idx).stack_base, &usize(entry_regs),
 			&vgc_cache(cache_idx).safe_regs[0], vgc_safe_spill_words)
 	}
 }
