@@ -47,12 +47,18 @@ static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
 #define vgc_ss_refn(x, off, word, T, n) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); if (__builtin_constant_p(*(const T*)((const char*)&(x) + (word) - (n)))) { __asm__ __volatile__(""); } } while (0)
 #endif
 #if defined(__clang__)
-/* The word that ends where the reference starts, read as a pointer: the piece SROA leaves before the
-   reference is then an integer piece (a tag byte or a string's is_lit and its padding, read back through
-   integer registers), where a float or a double read left a floating-point piece every read of the tag
-   paid for with a move between the register files (kn5/kn9/kn10, 11-22: k-nucleotide 1.076 as a float,
-   1.062 as a pointer). A pointer read is as unsplittable to SROA as a double. */
-#define vgc_ss_refp(x, off, word) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); __builtin_assume(!__builtin_constant_p((uintptr_t)*(void *const *)((const char*)&(x) + (word) - 8) + (uintptr_t)(long long)vgc_ss_unknown)); } while (0)
+/* The reference's own word, read as a pointer (word = where the reference starts; the half word / the
+   word before it, read as a float / a double, was the shape until 11-22). To SROA a pointer read is as
+   unsplittable as a double, and a typed pointer access at the reference's word makes its slice a pointer
+   slot — aligned, or promoted — whatever the narrow fields before it do; the piece before the reference
+   is then an integer piece (a tag byte or a string's is_lit and its padding, read back through integer
+   registers), where the float / double read left a floating-point piece that every read of the tag paid
+   for with a move between the register files (k-nucleotide 1.076 as a float against 1.062 as a pointer,
+   kn5 / kn9 / kn10 11-22). The read is at word, never at the local's first byte: a read of the parameter's
+   first word at a function's entry is a second read of the tag's address to clang's inliner, five points
+   that keep cx.Node.scalar_value (cost 220, threshold 225) out of line at 1,192 call sites against 107
+   (kn15–18, 11-22); a read at word costs it nothing (vgc_shadow_stack_cost_test). */
+#define vgc_ss_refp(x, off, word) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); __builtin_assume(!__builtin_constant_p((uintptr_t)*(void *const *)((const char*)&(x) + (word)) + (uintptr_t)(long long)vgc_ss_unknown)); } while (0)
 #define vgc_ss_ref4(x, off, word) vgc_ss_refp(x, off, word)
 #define vgc_ss_ref8(x, off, word) vgc_ss_refp(x, off, word)
 #else
