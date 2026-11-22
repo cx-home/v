@@ -443,6 +443,10 @@ mut:
 	alloc_flushed u64
 	alloc_gen   u32 // the collection cycle this thread last allocated in (cx-home/v#16: the pacer counts allocating threads)
 	gen_bytes   u64 // flushed bytes this thread allocated since the last stop (alloc_gen's ~1 MB)
+	// cx-home/v#77: a thread registered after a stop that left the one-thread
+	// 1 MB flush in force flushes at the cycle's scaled flush instead
+	// (vgc_acct_flush_late) until the next stop; 0 = the global vgc_acct_flush_cur
+	late_flush u64
 	// cx-private#1910: bytes of the objects this thread's alloc-black hook marked
 	// during the concurrent middle (the cycle's births), flushed into
 	// vgc_cm_born every vgc_cm_born_flush bytes; summed and reset at the
@@ -3014,6 +3018,13 @@ fn vgc_register_thread_opt(wait bool) bool {
 		vgc_cache(idx).alloc_delta = 0
 		vgc_cache(idx).alloc_flushed = 0
 		vgc_cache(idx).gen_bytes = 0
+		// cx-home/v#77: born after a one-thread stop, this thread flushes at the
+		// scaled flush, so n late threads hold at most n of it unseen, not n MB
+		vgc_cache(idx).late_flush = if vgc_acct_flush_late < vgc_acct_flush_cur {
+			vgc_acct_flush_late
+		} else {
+			u64(0)
+		}
 		vgc_cache(idx).next_free_p1 = 0
 		vgc_cache(idx).cov_safe = false
 		vgc_cache(idx).cov_req = false
@@ -7535,6 +7546,13 @@ const vgc_acct_flush = u64(1) << 20
 __global vgc_acct_flush_cur = u64(1048576)
 // vgc_acct_flush (a plain cast: a const or a shift leaves the global untyped in files checked before this one)
 __global vgc_acct_flush_div = u64(16)
+// cx-home/v#77: the flush a thread registered since the last stop uses — the
+// cycle's budget / vgc_acct_flush_div, at least vgc_acct_flush_min — whatever
+// the stop set vgc_acct_flush_cur to. A stop that one thread allocated in keeps
+// the 1 MB flush for the threads it saw; the workers that arrive after it are
+// not that one stream (a daemon's 110 connection threads each held up to 1 MB
+// the pacer never saw: 0 collections against a 256 KB headroom).
+__global vgc_acct_flush_late = u64(1048576)
 // the threads that allocated vgc_acct_flush_min or more between the last two
 // stops (counted at the stop's fold of their deltas)
 __global vgc_acct_threads = int(0)
@@ -7564,7 +7582,9 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_cache(cache_idx).live_delta += i64(live_sz)
 		vgc_cache(cache_idx).alloc_delta += total_n
-		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush_cur {
+		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush_cur
+		|| (vgc_cache(cache_idx).late_flush != 0
+		&& vgc_cache(cache_idx).alloc_delta >= vgc_cache(cache_idx).late_flush) {
 			// cx-home/v#16 / cx-private#1916: the pacer counts a thread as
 			// allocating this cycle once it has allocated ~1 MB: a server's
 			// many request threads that each allocate a little no longer scale

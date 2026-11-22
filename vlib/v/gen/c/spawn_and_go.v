@@ -394,6 +394,11 @@ fn (mut g Gen) spawn_and_go_expr(node ast.SpawnExpr, mode SpawnGoMode) {
 		if is_spawn && g.pref.prealloc && wrapper_return_type == ast.void_type {
 			g.gowrappers.writeln('\tvoid* thread_prealloc_scope = builtin__prealloc_scope_begin();')
 		}
+		// cx-home/v#80: under the young regime the result store into the return box
+		// carries the write barrier (non-windows, non-prealloc, a result with a pointer)
+		vgc_ret_wb := wrapper_return_type != ast.void_type && g.pref.os != .windows
+			&& !g.pref.prealloc && g.pref.gc_mode == .vgc
+			&& 'vgc_concurrent' in g.pref.compile_defines && g.contains_ptr(wrapper_return_type)
 		if wrapper_return_type != ast.void_type {
 			if g.pref.os == .windows {
 				g.gowrappers.write_string('\t*((${wrapper_s_ret_typ}*)(arg->ret_ptr)) = ')
@@ -422,7 +427,15 @@ fn (mut g Gen) spawn_and_go_expr(node ast.SpawnExpr, mode SpawnGoMode) {
 				$if tinyc && arm64 {
 					g.gowrappers.write_string('\t${wrapper_s_ret_typ} tcc_bug_tmp_var = ')
 				} $else {
-					g.gowrappers.write_string('\t*ret_ptr = ')
+					if vgc_ret_wb {
+						// cx-home/v#80: the box was allocated (and pinned) before the
+						// call, so a minor cycle during the call can have marked it
+						// old. The result lands in a stack temporary first (a stop
+						// scans it), then the box takes it between two barrier gates.
+						g.gowrappers.write_string('\t${wrapper_s_ret_typ} vgc_ret_tmp = ')
+					} else {
+						g.gowrappers.write_string('\t*ret_ptr = ')
+					}
 				}
 			}
 		} else {
@@ -514,6 +527,15 @@ fn (mut g Gen) spawn_and_go_expr(node ast.SpawnExpr, mode SpawnGoMode) {
 		$if tinyc && arm64 {
 			if g.pref.os != .windows && wrapper_return_type != ast.void_type {
 				g.gowrappers.writeln('\t*ret_ptr = tcc_bug_tmp_var;')
+			}
+		}
+		if vgc_ret_wb {
+			$if !(tinyc && arm64) {
+				g.gowrappers.writeln('\tvgc_wb_gate((void*)ret_ptr);')
+				g.gowrappers.writeln('\t*ret_ptr = vgc_ret_tmp;')
+				g.gowrappers.writeln('\tvgc_wb_gate_again((void*)ret_ptr);')
+			} $else {
+				g.gowrappers.writeln('\tvgc_wb_gate_again((void*)ret_ptr);')
 			}
 		}
 		if is_spawn && g.pref.prealloc {

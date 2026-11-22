@@ -5312,6 +5312,21 @@ fn vgc_update_trigger() {
 	// workers). One allocating thread hides at most one flush (the pacer
 	// triggers at most 1 MB late) and a smaller flush only adds its collections
 	// (fasta 1M: 527 -> 773, summed pause 56 -> 80 ms).
+	vgc_acct_flush_late = vgc_acct_flush
+	if vgc_acct_flush_div > 0 && goal > marked {
+		mut lf := (goal - marked) / vgc_acct_flush_div
+		if lf < vgc_acct_flush_min {
+			lf = vgc_acct_flush_min
+		}
+		if lf < vgc_acct_flush {
+			vgc_acct_flush_late = lf
+		}
+	}
+	for li in 0 .. vgc_heap.ncaches {
+		unsafe {
+			vgc_cache(li).late_flush = 0
+		}
+	}
 	vgc_acct_flush_cur = vgc_acct_flush
 	if vgc_acct_flush_div > 0 && vgc_acct_threads > 1 && goal > marked {
 		mut f := (goal - marked) / vgc_acct_flush_div
