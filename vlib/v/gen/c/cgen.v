@@ -2335,6 +2335,29 @@ fn (mut g Gen) thread_array_wait_return_type(thread_ret_type ast.Type) ast.Type 
 	return return_type
 }
 
+// thread_wait_store writes an array waiter's store of the joined value `rhs`
+// into the answer array's slot i (cx-core-code#279). The answer array is
+// allocated before the joins and lives across them, so a cycle during a join
+// can make it old (a minor cycle's sticky mark) or scan it (a concurrent
+// middle); a raw store after that sets no card and dirties no span, and the
+// result's young objects are reached from nothing the next cycle traces. Under
+// -gc e with vgc_concurrent, a result with a pointer lands in a stack temporary
+// first (a stop scans it), then the store runs between two barrier gates on the
+// buffer, as the spawn wrapper's store into its return box does (cx-home/v#80):
+// the card is set before the store and again after it, so a stop between the
+// gate and the store still finds it.
+fn (mut g Gen) thread_wait_store(payload_type ast.Type, payload_styp string, rhs string) {
+	if g.pref.gc_mode == .vgc && !g.pref.prealloc && 'vgc_concurrent' in g.pref.compile_defines
+		&& g.contains_ptr(payload_type) {
+		g.gowrappers.writeln('\t\t${payload_styp} vgc_wait_tmp = ${rhs};')
+		g.gowrappers.writeln('\t\tvgc_wb_gate((void*)res.data);')
+		g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = vgc_wait_tmp;')
+		g.gowrappers.writeln('\t\tvgc_wb_gate_again((void*)res.data);')
+		return
+	}
+	g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = ${rhs};')
+}
+
 fn (mut g Gen) register_thread_array_wait_call(thread_ret_type ast.Type) string {
 	payload_type := thread_ret_type.clear_option_and_result()
 	is_plain_void := thread_ret_type == ast.void_type
@@ -2394,7 +2417,7 @@ ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 			g.gowrappers.writeln('\t\t\tcontinue;')
 			g.gowrappers.writeln('\t\t}')
 			if !is_void_payload {
-				g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = *((${payload_styp}*)waited.data);')
+				g.thread_wait_store(payload_type, payload_styp, '*((${payload_styp}*)waited.data)')
 			}
 			g.gowrappers.writeln('\t}')
 			g.gowrappers.writeln('\tif (has_failure) {')
@@ -2430,7 +2453,7 @@ ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 			g.gowrappers.writeln('\t\t\tcontinue;')
 			g.gowrappers.writeln('\t\t}')
 			if !is_void_payload {
-				g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = *((${payload_styp}*)waited.data);')
+				g.thread_wait_store(payload_type, payload_styp, '*((${payload_styp}*)waited.data)')
 			}
 			g.gowrappers.writeln('\t}')
 			g.gowrappers.writeln('\tif (has_failure) {')
@@ -2455,7 +2478,7 @@ ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 			g.gowrappers.writeln('\t}')
 		} else {
 			payload_styp := g.styp(payload_type)
-			g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = ${waiter_fn_name}(t);')
+			g.thread_wait_store(payload_type, payload_styp, '${waiter_fn_name}(t)')
 			g.gowrappers.writeln('\t}')
 			g.gowrappers.writeln('\treturn res;')
 		}
@@ -2525,7 +2548,7 @@ ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 			g.gowrappers.writeln('\t\t\tcontinue;')
 			g.gowrappers.writeln('\t\t}')
 			if !is_void_payload {
-				g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = *((${payload_styp}*)waited.data);')
+				g.thread_wait_store(payload_type, payload_styp, '*((${payload_styp}*)waited.data)')
 			}
 			g.gowrappers.writeln('\t}')
 			g.gowrappers.writeln('\tif (has_failure) {')
@@ -2561,7 +2584,7 @@ ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 			g.gowrappers.writeln('\t\t\tcontinue;')
 			g.gowrappers.writeln('\t\t}')
 			if !is_void_payload {
-				g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = *((${payload_styp}*)waited.data);')
+				g.thread_wait_store(payload_type, payload_styp, '*((${payload_styp}*)waited.data)')
 			}
 			g.gowrappers.writeln('\t}')
 			g.gowrappers.writeln('\tif (has_failure) {')
@@ -2586,7 +2609,7 @@ ${ret_styp} ${fn_name}(${thread_arr_typ} a) {')
 			g.gowrappers.writeln('\t}')
 		} else {
 			payload_styp := g.styp(payload_type)
-			g.gowrappers.writeln('\t\t((${payload_styp}*)res.data)[i] = ${waiter_fn_name}(t);')
+			g.thread_wait_store(payload_type, payload_styp, '${waiter_fn_name}(t)')
 			g.gowrappers.writeln('\t}')
 			g.gowrappers.writeln('\treturn res;')
 		}
