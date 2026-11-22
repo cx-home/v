@@ -2147,9 +2147,20 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   // register file captured; 0 ONLY if the target is genuinely GONE (dead port)
   // or — the impossible-by-construction capture failure — after resuming it, so
   // a live thread is never left frozen NOR reported covered.
+  // cx-private#2078: the settle runs only for a slot whose request returned 1,
+  // i.e. after a thread_suspend that SUCCEEDED, and the resume loop resumes
+  // only the slots whose settle returned 1. So every return 0 below must
+  // thread_resume first — a suspend no return pairs is a thread frozen for the
+  // process's life (pbm1: 121 threads held in time.sleep's nanosleep for hours,
+  // the world running). thread_resume on a genuinely dead port fails harmlessly.
   static inline int vgc_suspend_settle(int idx, uint32_t t) {
       vgc_susp* s = vgc_susp_at(idx);
-      if (s == 0 || __atomic_load_n(&s->port, __ATOMIC_ACQUIRE) != t || vgc_test_settle_take(1, t)) return 0;
+      if (s == 0) return 0; // the request found no record either: it suspended nothing
+      if (__atomic_load_n(&s->port, __ATOMIC_ACQUIRE) != t || vgc_test_settle_take(1, t)) {
+          vgc_say(0xdead8, (uint64_t)t); // record no longer names the target: resume, report uncovered
+          thread_resume((thread_act_t)t);
+          return 0;
+      }
       // Kernel-authoritative settle: suspend_count is already > 0, so once the
       // target is observed off-CPU it cannot be dispatched again until resume.
       // Unbounded for a live thread (never scan a maybe-running mutator), loud
@@ -2160,8 +2171,9 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
           kern_return_t kr = thread_info((thread_act_t)t, THREAD_BASIC_INFO, (thread_info_t)&info, &cnt);
           if (vgc_test_settle_take(2, t)) kr = KERN_INVALID_ARGUMENT;
           if (kr != KERN_SUCCESS) {
-              vgc_say(0xdead5, (uint64_t)t); // port died under us: nothing to scan or resume
+              vgc_say(0xdead5, (uint64_t)t); // thread_info failed: resume (a no-op on a dead port), report uncovered
               __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
+              thread_resume((thread_act_t)t);
               return 0;
           }
           if (info.run_state != TH_STATE_RUNNING) break; // off-CPU => user context frozen
