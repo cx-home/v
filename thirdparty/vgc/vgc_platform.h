@@ -5,26 +5,29 @@
 #define VGC_PLATFORM_H
 
 // cx-home/v#74 pieces 1 and 6: under -gc e (not -d vgc_byte_stack_scan) cgen follows the declaration of
-// every local clang's SROA can cut off a word with vgc_ss_ref(x, off) for each word of x that holds a field
-// narrower than a word with a reference somewhere behind it (an option's state byte, its error's tag, a
-// struct's leading tag; vgc_shadow.v). SROA cuts a local at the edges of its typed accesses; the piece
-// after such a field is copied by memcpy and lives in a byte array of alignment 1, with x's references at
-// unaligned addresses in it (cx-home/v#60).
-// vgc_ss_ref reads the whole word at off (rounded down to a word) as a pointer — an empty asm that takes
-// the VALUE — on a path that never runs: the frame address is never null, and the compiler does not know
-// it. A pointer-typed read cannot be split, so the cut the narrow field makes moves to the end of its
-// word; what follows starts on a word, in a piece as large as before, and x stays in registers. The price
-// is one never-taken branch.
+// every local clang's SROA can cut off a word with vgc_ss_ref(x, off, word) for the first reference of x
+// behind each run of fields narrower than a word (an option's error behind its state byte, its value's
+// buffer behind the error's tag and the value's own tag; vgc_shadow.v). SROA cuts a local at the edges of
+// its typed accesses; the piece after a narrow field is copied by memcpy and lives in a byte array of
+// alignment 1, with x's references at unaligned addresses in it (cx-home/v#60).
+// vgc_ss_ref makes the one byte before the reference's word the operand of __builtin_constant_p. That is
+// a read of the byte as far as SROA is concerned — a one-byte read cannot be split, so a cut falls where
+// the reference's word starts and the piece that holds the reference starts on a word — and it is no code
+// at all: the question is answered "no" late in the pipeline, after the passes that cut locals, and the
+// read goes with it. The byte is padding or the end of the narrow field: the narrow fields stay values of
+// their own, the pieces stay as large as clang makes them, x stays in registers, nothing has to be
+// computed where x is declared. (Every shape that put a real use of x at its declaration — its address,
+// its words read as pointers, with or without a branch around them — cost the interpreter 13 to 30 %.)
+// `word` is the offset the compiler computed for the reference (it chose the cuts by its own layout of
+// the type); `off` is the same in C's terms. They must agree, or the build stops.
 // vgc_ss_pin takes &x under a "memory" clobber: x stays whole in its slot and is re-read after every
-// call. It is for what the walk cannot place (a map, a union, a C struct).
+// call. It is for what the walk cannot place (a C struct, a packed struct).
 // tcc and an unoptimised build do not cut; they get no-ops.
 #if defined(__TINYC__) || !defined(__OPTIMIZE__)
 #define vgc_ss_ref(x, off, word) ((void)0)
 #define vgc_ss_pin(p) ((void)(p))
 #else
-// `word` is the offset the compiler computed for the word (it chose the words by its own layout of the
-// type); `off` is the field's offset as C has it. They must agree.
-#define vgc_ss_ref(x, off, word) do { _Static_assert((((off) & ~(__SIZE_TYPE__)7)) == (word) && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); if (__builtin_expect(__builtin_frame_address(0) == (void*)0, 0)) __asm__ __volatile__("" : : "r"(*(void* const*)((const char*)&(x) + (word)))); } while (0)
+#define vgc_ss_ref(x, off, word) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); if (__builtin_constant_p(*(const unsigned char*)((const char*)&(x) + (word) - 1))) { __asm__ __volatile__(""); } } while (0)
 #define vgc_ss_pin(p) __asm__ __volatile__("" : : "r"(p) : "memory")
 #endif
 

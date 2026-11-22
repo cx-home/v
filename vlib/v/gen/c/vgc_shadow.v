@@ -16,19 +16,22 @@ import v.ast
 // references in that piece then sit at unaligned addresses (cx-home/v#60: a
 // ?cx.Node's element pointer at sp+0x407).
 // Every local whose type can be cut that way gets, right after its declaration,
-// `vgc_ss_ref(x, <offset>)` for each word of x that holds a field narrower than
-// a word with a reference somewhere behind it (vgc_ss_walk; vgc_platform.h): a
-// pointer-typed read of that whole word, on a path that never runs. A
-// pointer-typed read cannot be split, so the cut the narrow field makes moves to
-// the end of its word: what follows starts on a word, as large a piece as
-// before, and x stays in registers. (Reading every word, or each reference,
-// cuts x into more pieces than clang makes on its own, and every move of x then
-// costs more: pbm1-guard74 read +5 to +15 % instructions on cx that way.)
+// `vgc_ss_ref(x, <offset of a reference>)` for the first reference of x behind
+// each run of narrow fields (vgc_ss_walk; vgc_platform.h): the ONE BYTE just
+// before that reference's word, as the operand of __builtin_constant_p. To SROA
+// that is a read of the byte, and a one-byte read cannot be split: a cut falls
+// on the word where the reference starts, so the piece that holds the reference
+// starts on a word. To the machine it is nothing — the question is answered
+// late, after the passes that cut locals. The byte is padding or the last byte
+// of the narrow field: x's narrow fields stay values of their own, its pieces
+// are as large as clang makes them, x stays in registers, and nothing has to be
+// computed where x is declared. (Every shape with a real use of x at its
+// declaration cost cx 13 to 30 %: pbm1-ab74k / ab74z / ab74u / ab74c.)
 // A string, a dynamic array, a sum type, an interface without fields and a
 // struct of references followed by small fields cannot be cut off a word and get
-// nothing; a map, a union, a C struct and anything the walk cannot place get
-// `vgc_ss_pin(&x)`, the address under a memory clobber (x then stays whole in
-// its slot, at the price of its registers).
+// nothing; a C struct, a packed or reordered struct and a long fixed array of
+// references get `vgc_ss_pin(&x)`, the address under a memory clobber (x then
+// stays whole in its slot, at the price of its registers).
 
 // vgc_ss_on: the shadow stack's compiler half is in force for this build.
 fn (g &Gen) vgc_ss_on() bool {
@@ -79,11 +82,10 @@ struct VgcSsLeaf {
 	expr   string
 }
 
-// vgc_ss_refs_of answers what to read of a local of C type ctype: for each word
-// to read, `<C offset expression>, <the word's offset>`; `&` alone for the
-// address form; nothing for a type that cannot be cut off a word. A word is
-// read when it holds a field narrower than a word and a reference lies behind
-// that field.
+// vgc_ss_refs_of answers where to cut a local of C type ctype: for each
+// reference that is the first one behind a field narrower than a word,
+// `<its C offset expression>, <its offset>`; `&` alone for the address form;
+// nothing for a type that cannot be cut off a word.
 fn (mut g Gen) vgc_ss_refs_of(ctype string) []string {
 	if r := g.vgc_ss_refs[ctype] {
 		return r
@@ -101,18 +103,30 @@ fn (mut g Gen) vgc_ss_refs_of(ctype string) []string {
 	if typ != 0 {
 		mut leaves := []VgcSsLeaf{}
 		if g.vgc_ss_walk(typ, ctype, 0, '0', 0, mut leaves) {
-			mut last_ref := -1
-			for l in leaves {
-				if l.is_ref && l.off > last_ref {
-					last_ref = l.off
+			// in layout order (a narrow field before a reference at the same
+			// offset: a union's members): the first reference behind a narrow
+			// field gets the cut, and what follows it is on a word again until
+			// the next narrow field
+			leaves.sort_with_compare(fn (a &VgcSsLeaf, b &VgcSsLeaf) int {
+				if a.off != b.off {
+					return a.off - b.off
 				}
-			}
-			mut words := []int{}
+				return int(a.is_ref) - int(b.is_ref)
+			})
+			mut dirty := false
+			mut cuts := []int{}
 			for l in leaves {
-				w := l.off & ~7
-				if !l.is_ref && l.off < last_ref && w !in words {
-					words << w
-					refs << '${l.expr}, ${w}'
+				if !l.is_ref {
+					dirty = true
+				} else if dirty {
+					dirty = false
+					if l.off >= 8 && l.off !in cuts && l.expr != '' {
+						cuts << l.off
+						refs << '${l.expr}, ${l.off}'
+					} else if l.expr == '' {
+						refs = ['&']
+						break
+					}
 				}
 			}
 			if refs.len > 16 {
@@ -251,7 +265,7 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, de
 		// { u8 state; IError err; u8 data[sizeof(T)]; } — IError: the object
 		// pointer, a u32 tag, the method table (8 + 24 bytes before the value)
 		leaves << VgcSsLeaf{off, false, expr}
-		leaves << VgcSsLeaf{off + 8, true, ''}
+		leaves << VgcSsLeaf{off + 8, true, '${expr} + __builtin_offsetof(${cname}, err)'}
 		leaves << VgcSsLeaf{off + 16, false, '${expr} + __builtin_offsetof(${cname}, err) + 8'}
 		base := typ_.clear_option_and_result()
 		if base.idx() == ast.void_type_idx || base.idx() == ast.none_type_idx || base.idx() == 0 {
@@ -263,7 +277,7 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, de
 	typ := g.unwrap_generic(typ_)
 	if typ.is_any_kind_of_pointer() || typ.is_ptr() || typ.has_flag(.shared_f)
 		|| typ.has_flag(.atomic_f) {
-		leaves << VgcSsLeaf{off, true, ''}
+		leaves << VgcSsLeaf{off, true, expr}
 		return true
 	}
 	sym := g.table.sym(typ)
@@ -284,18 +298,18 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, de
 			return true
 		}
 		.voidptr, .byteptr, .charptr, .chan, .thread {
-			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off, true, expr}
 			return true
 		}
 		.string {
 			// { u8* str; int len; int is_lit; }
-			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off, true, expr}
 			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
 			return true
 		}
 		.array {
 			// { void* data; int offset; int len; int cap; flags; int element_size; }
-			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off, true, expr}
 			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
 			leaves << VgcSsLeaf{off + 16, false, '${expr} + 16'}
 			leaves << VgcSsLeaf{off + 24, false, '${expr} + 24'}
@@ -305,7 +319,7 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, de
 			// a union of pointers (the object pointer), the u32 tag, (an
 			// interface's method table: static, no reference,) then pointers to
 			// the common fields
-			leaves << VgcSsLeaf{off, true, ''}
+			leaves << VgcSsLeaf{off, true, expr}
 			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
 			mut nfields := 0
 			mut first := 16
@@ -316,7 +330,7 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, de
 				first = 24
 			}
 			for i in 0 .. nfields {
-				leaves << VgcSsLeaf{off + first + 8 * i, true, ''}
+				leaves << VgcSsLeaf{off + first + 8 * i, true, '${expr} + ${first + 8 * i}'}
 			}
 			return true
 		}
@@ -444,6 +458,7 @@ fn vgc_ss_depth_delta(line string, depth int) int {
 // parameters; they go to the body's first line.
 fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 	g.vgc_ss_refresh()
+	touched := vgc_ss_touched(body)
 	lines := body.split('\n')
 	mut out := []string{cap: lines.len + params.len}
 	mut pending := ''
@@ -452,7 +467,16 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 	for line in lines {
 		if first && params.len > 0 {
 			// the body text starts right after the function's opening `{`
-			out << '\t' + params.map(it.trim_left(' ')).join(' ')
+			mut pesc := []string{}
+			for p in params {
+				pname := p.all_before('\x01')
+				if pname in touched {
+					pesc << p.all_after('\x01').trim_left(' ')
+				}
+			}
+			if pesc.len > 0 {
+				out << '\t' + pesc.join(' ')
+			}
 			first = false
 		}
 		first = false
@@ -487,6 +511,12 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 			out << line
 			continue
 		}
+		if line[ns..ne] !in touched {
+			// the function only moves this local (no field of it is named, its
+			// address is not taken): clang has no narrow access to cut it at
+			out << line
+			continue
+		}
 		name := g.vgc_ss_text(ctype, line[ns..ne])
 		rest := line[ne..]
 		if rest == ';' || rest.starts_with('; /*') || rest.starts_with('; //') {
@@ -511,6 +541,35 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 		}
 	}
 	return out.join('\n')
+}
+
+// vgc_ss_touched answers the identifiers of a function body's C text that are
+// followed by `.` (a field of the local is named) or preceded by `&` (its
+// address is taken). SROA cuts a local only at typed accesses to parts of it; a
+// local the function declares, assigns, passes and returns whole is one piece.
+fn vgc_ss_touched(body string) map[string]bool {
+	mut out := map[string]bool{}
+	n := body.len
+	mut i := 0
+	for i < n {
+		c := body[i]
+		if c == `.` && i > 0 && i + 1 < n && (body[i + 1].is_letter() || body[i + 1] == `_`) {
+			mut j := i
+			for j > 0 && (body[j - 1].is_letter() || body[j - 1].is_digit() || body[j - 1] == `_`) {
+				j--
+			}
+			if j < i && !body[j].is_digit() {
+				out[body[j..i]] = true
+			}
+		} else if c == `&` && i + 1 < n && (body[i + 1].is_letter() || body[i + 1] == `_`) {
+			e := vgc_ss_ident_end(body, i + 1)
+			out[body[i + 1..e]] = true
+			i = e
+			continue
+		}
+		i++
+	}
+	return out
 }
 
 // vgc_ss_append adds the escape text after the declaration's statement: at the

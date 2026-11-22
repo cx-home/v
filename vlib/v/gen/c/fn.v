@@ -1686,7 +1686,7 @@ fn (mut g Gen) gen_fn_decl(node &ast.FnDecl, skip bool) {
 			// (a fixed array parameter is a pointer in C: the caller's array)
 			if pi < fargs.len && pi < heap_promoted.len && !heap_promoted[pi]
 				&& !pt.starts_with('Array_fixed_') && g.vgc_ss_is_ref_aggregate(pt) {
-				ss_params << g.vgc_ss_text(pt, fargs[pi])
+				ss_params << fargs[pi] + '\x01' + g.vgc_ss_text(pt, fargs[pi])
 			}
 		}
 		ss_body := g.out.cut_to(vgc_ss_pos)
