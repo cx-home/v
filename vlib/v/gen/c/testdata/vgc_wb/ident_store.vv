@@ -1,0 +1,74 @@
+// ident_store.vv — vgc_wb_ident_store_test.v's program: stores whose target is an
+// identifier that C reaches through a pointer.
+@[heap]
+struct Rec {
+	n int
+}
+
+struct Slot {
+mut:
+	r  &Rec = unsafe { nil }
+	id int
+}
+
+struct Plain {
+mut:
+	a int
+	b int
+}
+
+// `*s = v` into the caller's memory
+@[noinline]
+fn put(mut s Slot, v Slot) {
+	s = v
+}
+
+// a mut parameter with no pointer: the control (no gate)
+@[noinline]
+fn put_plain(mut s Plain, v Plain) {
+	s = v
+}
+
+// `for mut e in a` writes the array's buffer
+@[noinline]
+fn put_each(mut a []Slot, r &Rec) {
+	for mut e in a {
+		e = Slot{
+			r: unsafe { r }
+		}
+	}
+}
+
+// an auto-heap local: `*box = v` and `box->r = v` into its heap box
+@[noinline]
+fn boxed(r &Rec) []&Slot {
+	mut box := Slot{}
+	mut keep := []&Slot{len: 1}
+	keep[0] = &box
+	box = Slot{
+		r: unsafe { r }
+	}
+	box.r = unsafe { r }
+	return keep
+}
+
+// a plain local: the stack (no gate)
+@[noinline]
+fn local(r &Rec) int {
+	mut s := Slot{}
+	s = Slot{
+		r: unsafe { r }
+	}
+	return s.id
+}
+
+fn main() {
+	r := &Rec{1}
+	mut h := &Slot{}
+	put(mut h, Slot{ r: r })
+	mut p := Plain{}
+	put_plain(mut p, Plain{1, 2})
+	mut a := []Slot{len: 2}
+	put_each(mut a, r)
+	println(boxed(r).len + local(r) + p.a + a.len)
+}
