@@ -46,8 +46,19 @@ static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
 #else
 #define vgc_ss_refn(x, off, word, T, n) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); if (__builtin_constant_p(*(const T*)((const char*)&(x) + (word) - (n)))) { __asm__ __volatile__(""); } } while (0)
 #endif
+#if defined(__clang__)
+/* The word that ends where the reference starts, read as a pointer: the piece SROA leaves before the
+   reference is then an integer piece (a tag byte or a string's is_lit and its padding, read back through
+   integer registers), where a float or a double read left a floating-point piece every read of the tag
+   paid for with a move between the register files (kn5/kn9/kn10, 11-22: k-nucleotide 1.076 as a float,
+   1.062 as a pointer). A pointer read is as unsplittable to SROA as a double. */
+#define vgc_ss_refp(x, off, word) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); __builtin_assume(!__builtin_constant_p((uintptr_t)*(void *const *)((const char*)&(x) + (word) - 8) + (uintptr_t)(long long)vgc_ss_unknown)); } while (0)
+#define vgc_ss_ref4(x, off, word) vgc_ss_refp(x, off, word)
+#define vgc_ss_ref8(x, off, word) vgc_ss_refp(x, off, word)
+#else
 #define vgc_ss_ref4(x, off, word) vgc_ss_refn(x, off, word, float, 4)
 #define vgc_ss_ref8(x, off, word) vgc_ss_refn(x, off, word, double, 8)
+#endif
 #define vgc_ss_pin(p) __asm__ __volatile__("" : : "r"(p) : "memory")
 #endif
 

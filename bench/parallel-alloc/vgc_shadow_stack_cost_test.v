@@ -61,7 +61,8 @@ fn frame_loads(exe string) (int, string) {
 	mut hits := []string{}
 	for line in body {
 		l := line.replace('\t', ' ')
-		arm := (l.contains(' ldr ') || l.contains(' ldur ')) && (l.contains('[sp') || l.contains('[x29'))
+		arm := (l.contains(' ldr ') || l.contains(' ldur '))
+			&& (l.contains('[sp') || l.contains('[x29'))
 		x86 := l.contains(' mov') && (l.contains('(%rsp),') || l.contains('(%rbp),'))
 		if arm || x86 {
 			n++
@@ -78,7 +79,8 @@ fn test_a_string_held_across_calls_is_not_read_back_from_the_frame() {
 	}
 	src := os.join_path(@DIR, 'ss', 'kept.v')
 	exe := os.join_path(os.vtmp_dir(), 'vgc_ss_kept_${os.getpid()}')
-	b := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	b :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert b.exit_code == 0, b.output
 	defer {
 		os.rm(exe) or {}
@@ -90,7 +92,8 @@ fn test_a_string_held_across_calls_is_not_read_back_from_the_frame() {
 	assert n == 0, 'main__spin reads ${n} values back from its frame — the escape pass pinned its strings to memory:\n${hits}'
 	i_esc := instr_a_round(exe)
 	// the byte-scan build (no escape at all) is the reference: 0 there too
-	b2 := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -d vgc_byte_stack_scan -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	b2 :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -d vgc_byte_stack_scan -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert b2.exit_code == 0, b2.output
 	n2, hits2 := frame_loads(exe)
 	assert n2 == 0, 'the reference build reads ${n2} values back from the frame: the test has lost its shape\n${hits2}'
@@ -117,7 +120,8 @@ fn test_an_unwrap_chain_costs_no_more_than_without_its_escapes() {
 	}
 	src := os.join_path(@DIR, 'ss', 'chain.v')
 	exe := os.join_path(os.vtmp_dir(), 'vgc_ss_chain_${os.getpid()}')
-	b := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	b :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert b.exit_code == 0, b.output
 	defer {
 		os.rm(exe) or {}
@@ -125,12 +129,61 @@ fn test_an_unwrap_chain_costs_no_more_than_without_its_escapes() {
 	r := os.execute(os.quoted_path(exe))
 	assert r.exit_code == 0 && r.output.contains('chain acc=true'), r.output
 	i_esc := instr_a_round(exe)
-	b2 := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -d vgc_byte_stack_scan -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	b2 :=
+		os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -d vgc_byte_stack_scan -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
 	assert b2.exit_code == 0, b2.output
 	i_ref := instr_a_round(exe)
 	println('vgc_shadow_stack_cost: a chain round retires ${i_esc:.1f} instructions, ${i_ref:.1f} without the escapes')
 	assert i_ref > 50.0, 'the reference round retires ${i_ref:.1f} instructions: the test has lost its shape'
 	assert i_esc <= i_ref * 1.02, 'a chain round retires ${i_esc:.1f} instructions with its escapes and ${i_ref:.1f} without: more than 2 % over'
+}
+
+// A by-value parameter's escape must not lift the function's inline cost: the
+// interpreter's small methods on cx.Node (a by-value receiver) are folded into
+// hundreds of callers, and clang's threshold is a handful of points above
+// their cost (cx.Node.scalar_value: 220 against 225). An escape at the
+// function's entry that reads the receiver's first word costs five points —
+// the receiver's tag byte, read later at the same address, is counted a
+// second time — and the method is called out of line from every caller
+// (1,192 call sites against 107, k-nucleotide 6 % over the pinned V; kn15–18,
+// 11-22). ss/method.v is that shape; the cost is read from clang's own inline
+// remark, with and without the escapes.
+fn test_a_by_value_receivers_escape_costs_the_method_no_inline_cost() {
+	if os.user_os() != 'macos' {
+		eprintln('skipped: the disassembly read is macOS otool')
+		return
+	}
+	exe := os.join_path(os.vtmp_dir(), 'vgc_ss_method_${os.getpid()}')
+	defer { os.rm(exe) or {} }
+	cost_esc, out_esc := build_method(exe, '')
+	r := os.execute('otool -tV ${os.quoted_path(exe)}')
+	assert r.exit_code == 0, r.output
+	bl := r.output.split_into_lines().filter(it.contains('\tbl\t')
+		&& it.ends_with('_main__Node_value'))
+	cost_ref, out_ref := build_method(exe + '_ref', '-d vgc_byte_stack_scan')
+	os.rm(exe + '_ref') or {}
+	println('vgc_shadow_stack_cost: clang inlines main__Node_value at cost ${cost_esc} with the escapes, ${cost_ref} without')
+	assert cost_ref > 0, 'no inline remark for main__Node_value without the escapes:\n${out_ref}'
+	assert cost_esc > 0, 'no inline remark for main__Node_value with the escapes:\n${out_esc}'
+	assert cost_esc == cost_ref, 'the escapes lift main__Node_value\'s inline cost from ${cost_ref} to ${cost_esc}: an escape on a by-value parameter must cost the inliner nothing'
+	assert bl.len == 0, 'main__Node_value is called out of line at ${bl.len} sites:\n${bl.join('\n')}'
+}
+
+// build_method builds ss/method.v -prod with flags and answers clang's inline
+// cost of main__Node_value at its first call site (0 when no remark names it)
+// and the compiler's output
+fn build_method(exe string, flags string) (int, string) {
+	src := os.join_path(os.dir(@FILE), 'ss', 'method.v')
+	cmd := '${os.quoted_path(@VEXE)} -prod -gc e ${flags} -show-c-output -cflags "-Rpass=inline -Rpass-missed=inline" -o ${os.quoted_path(exe)} ${os.quoted_path(src)}'
+	r := os.execute(cmd)
+	assert r.exit_code == 0, '${cmd}\n${r.output}'
+	for line in r.output.split_into_lines() {
+		if !line.contains("'main__Node_value'") || !line.contains('cost=') {
+			continue
+		}
+		return line.all_after('cost=').all_before(',').int(), r.output
+	}
+	return 0, r.output
 }
 
 // instr_a_round answers the instructions the program retires for one round of
