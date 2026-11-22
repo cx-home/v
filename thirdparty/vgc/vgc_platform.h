@@ -270,7 +270,13 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
 // ============================================================
 // Thread-local storage
 // ============================================================
-#if (defined(__TINYC__) || defined(VGC_FORCE_TLS_BY_KEY)) && !defined(_WIN32)
+#if (defined(__TINYC__) || defined(VGC_FORCE_TLS_BY_KEY) || defined(__APPLE__)) && !defined(_WIN32)
+  // cx-home/v#77: macOS takes this path under every compiler. A __thread variable
+  // there is a dyld thread-local variable, and dyld mallocs the image's block on
+  // each thread's first access — the only libc allocation a -gc e thread makes,
+  // which the nano allocator spread over per-CPU blocks (~350 KB resident for
+  // the plain probe's 200 threads on an M5 Max; vgc_thread_tls_malloc_test). A
+  // pthread key's value lives in the thread's own TSD slots.
   // tcc has no working __thread off Windows: on Linux it does not parse it
   // ("';' expected (got int)", cx-private#1889), and where it compiles it the
   // variable is not per-thread, so every thread read and wrote ONE cache index
@@ -284,13 +290,45 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
   static pthread_key_t _vgc_key_cache_idx;
   static pthread_key_t _vgc_key_alloc_held;
   static pthread_once_t _vgc_tls_once = PTHREAD_ONCE_INIT;
+  #if defined(__APPLE__) && !defined(__TINYC__)
+  // The allocator reads the index several times an allocation: past the first
+  // initialisation the read is one acquire load and the thread's TSD slot read
+  // inline — the base register libpthread's own pthread_getspecific reads
+  // (_os_tsd_get_direct: TPIDRRO_EL0 on arm64, %gs on x86_64; the Go runtime
+  // reads its g the same way on darwin). Through pthread_once and the
+  // pthread_getspecific call the alloc loop ran 12–33 % slower than __thread.
+  static volatile int _vgc_tls_ready = 0;
+  static inline void* _vgc_tsd_get(pthread_key_t k) {
+    #if defined(__aarch64__) || defined(__arm64__)
+      uintptr_t tsd;
+      __asm__("mrs %0, TPIDRRO_EL0" : "=r"(tsd));
+      return ((void**)(tsd & ~(uintptr_t)7))[k];
+    #elif defined(__x86_64__)
+      void* v;
+      __asm__("mov %%gs:%1, %0" : "=r"(v) : "m"(*(void**)((uintptr_t)k * sizeof(void*))));
+      return v;
+    #else
+      return pthread_getspecific(k);
+    #endif
+  }
+  #endif
   static void _vgc_tls_init(void) {
       pthread_key_create(&_vgc_key_cache_idx, 0);
       pthread_key_create(&_vgc_key_alloc_held, 0);
+  #if defined(__APPLE__) && !defined(__TINYC__)
+      __atomic_store_n(&_vgc_tls_ready, 1, __ATOMIC_RELEASE);
+  #endif
   }
   static inline int vgc_get_cache_idx(void) {
+  #if defined(__APPLE__) && !defined(__TINYC__)
+      if (__builtin_expect(__atomic_load_n(&_vgc_tls_ready, __ATOMIC_ACQUIRE) == 0, 0))
+  #endif
       pthread_once(&_vgc_tls_once, _vgc_tls_init);
+  #if defined(__APPLE__) && !defined(__TINYC__)
+      return (int)(intptr_t)_vgc_tsd_get(_vgc_key_cache_idx) - 1;
+  #else
       return (int)(intptr_t)pthread_getspecific(_vgc_key_cache_idx) - 1;
+  #endif
   }
   static inline void vgc_set_cache_idx(int idx) {
       pthread_once(&_vgc_tls_once, _vgc_tls_init);
@@ -323,6 +361,11 @@ static inline unsigned long long vgc_ull(uint64_t v) { return (unsigned long lon
       _vgc_tls_ready();
       TlsSetValue(_vgc_tls_cache_idx, (void*)(intptr_t)(idx + 1));
   }
+  #if defined(__APPLE__) && !defined(__TINYC__)
+    // The diagnostic per-thread words below (vgc_perturb's draw) stay __thread:
+    // dyld instantiates the block only when a thread first touches one.
+    #define VGC_TLS __thread
+  #endif
 #else
   // cx-home/v#20: only msvc reads __declspec(thread). mingw gcc and clang IGNORE
   // the attribute (a warning V's -w hides), so _vgc_cache_idx was ONE process
