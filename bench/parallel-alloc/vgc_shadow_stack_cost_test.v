@@ -100,6 +100,39 @@ fn test_a_string_held_across_calls_is_not_read_back_from_the_frame() {
 	assert i_esc <= i_ref + 2.0, 'an unwrap round retires ${i_esc:.1f} instructions with its four escapes and ${i_ref:.1f} without: an escape must cost nothing where the local is declared'
 }
 
+// An escape must also cost nothing to the passes that run before its question
+// is answered. ss/chain.v: six option unwraps of a struct with a leading byte in
+// one function, each read by field (twelve escaped locals, eighteen escapes). With the escape a
+// branch around an empty asm (c02a90108f) the round retired 147.0 instructions
+// against 106.2 without escapes on arm64 pbm1: the
+// inliner charged a load, a branch and a call for each, and the asm was a call
+// that may write memory to every pass until the question was lowered. cx read
+// that as cx__mk_scalar, code__is_err_value and 1,200 other call sites no
+// longer inlined, n-body 1.092. The round may cost 2 % more than the build
+// without escapes, the bar the interpreted programs are held to.
+fn test_an_unwrap_chain_costs_no_more_than_without_its_escapes() {
+	$if !macos {
+		eprintln('skipped: instructions retired are read from macOS time -l')
+		return
+	}
+	src := os.join_path(@DIR, 'ss', 'chain.v')
+	exe := os.join_path(os.vtmp_dir(), 'vgc_ss_chain_${os.getpid()}')
+	b := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	assert b.exit_code == 0, b.output
+	defer {
+		os.rm(exe) or {}
+	}
+	r := os.execute(os.quoted_path(exe))
+	assert r.exit_code == 0 && r.output.contains('chain acc=true'), r.output
+	i_esc := instr_a_round(exe)
+	b2 := os.execute('${os.quoted_path(@VEXE)} -gc e -cc cc -prod -d vgc_byte_stack_scan -o ${os.quoted_path(exe)} ${os.quoted_path(src)}')
+	assert b2.exit_code == 0, b2.output
+	i_ref := instr_a_round(exe)
+	println('vgc_shadow_stack_cost: a chain round retires ${i_esc:.1f} instructions, ${i_ref:.1f} without the escapes')
+	assert i_ref > 50.0, 'the reference round retires ${i_ref:.1f} instructions: the test has lost its shape'
+	assert i_esc <= i_ref * 1.02, 'a chain round retires ${i_esc:.1f} instructions with its escapes and ${i_ref:.1f} without: more than 2 % over'
+}
+
 // instr_a_round answers the instructions the program retires for one round of
 // unwrap: its count at 4,000,000 rounds less its count at 0, a round
 fn instr_a_round(exe string) f64 {
