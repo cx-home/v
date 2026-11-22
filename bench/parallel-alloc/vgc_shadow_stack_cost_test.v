@@ -21,14 +21,13 @@
 // with a leading byte out of an option ROUNDS times without allocating; four
 // escaped locals a round. The program's instructions retired (/usr/bin/time
 // -l), 4,000,000 rounds against 0, on this build against the -d
-// vgc_byte_stack_scan build (no escape): at most 4 more a round — one an
-// escape (arm64 pbm1: 82.2 with none; 96.2 with the address form, 90.2 with a
-// read of every word, 84.2 with the reads behind a branch that is never taken).
-// And cx itself: reading a word of ints as a pointer keeps that word in memory —
-// the ten interpreted programs read +5 to +15 % instructions with every word
-// read behind the branch (pbm1-guard74); and +10 an unwrap round with each
-// reference read: both cut the local into more pieces than clang makes on its
-// own. The pass reads the narrow field's word, which only moves clang's cut. macOS (otool, time -l); skipped elsewhere.
+// vgc_byte_stack_scan build (no escape): at most 2 more a round (arm64 pbm1:
+// 82.2 with none; 96.2 with each local's address taken, 90.2 with every word
+// read as a pointer, 84.2-86.0 with fewer words read, behind a branch or not,
+// 85.2 with one byte read — and 83.1 with that byte only asked about).
+// cx itself decides (ten interpreted programs, instructions retired against
+// the pinned V): every shape that uses the local for real where it is declared
+// read +13 to +30 % at worst. macOS (otool, time -l); skipped elsewhere.
 module main
 
 import os
@@ -98,7 +97,7 @@ fn test_a_string_held_across_calls_is_not_read_back_from_the_frame() {
 	i_ref := instr_a_round(exe)
 	println('vgc_shadow_stack_cost: an unwrap round retires ${i_esc:.1f} instructions, ${i_ref:.1f} without the escapes')
 	assert i_ref > 10.0, 'the reference round retires ${i_ref:.1f} instructions: the test has lost its shape'
-	assert i_esc <= i_ref + 4.0, 'an unwrap round retires ${i_esc:.1f} instructions with its four escapes and ${i_ref:.1f} without: an escape must cost a branch, not a read of every word'
+	assert i_esc <= i_ref + 2.0, 'an unwrap round retires ${i_esc:.1f} instructions with its four escapes and ${i_ref:.1f} without: an escape must cost nothing where the local is declared'
 }
 
 // instr_a_round answers the instructions the program retires for one round of
