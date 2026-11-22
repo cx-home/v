@@ -673,8 +673,30 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 					base := g.expr_string(left.expr)
 					g.writeln('vgc_wb_gate((voidptr)(${base}));')
 				}
-			} else if left.expr in [ast.SelectorExpr, ast.IndexExpr] {
+			} else if left.expr in [ast.SelectorExpr, ast.IndexExpr, ast.Ident] {
+				// an Ident owner is a value struct whose C name is a pointer when it is
+				// a mut parameter or an auto-heap local (the Ident case below);
+				// otherwise it is the stack and the Ident case emits nothing
 				g.gen_cm_write_barrier(left.expr, left.expr_type)
+			}
+		}
+		ast.Ident {
+			// https://github.com/cx-home/v/issues/83: `x = v` where C reaches `x`
+			// through a pointer — a `mut` parameter of a value type (or a `for mut`
+			// element), written `*x = v` into the caller's memory, which may be a
+			// field of a heap object or an array element; an auto-heap local,
+			// written `*x = v` into its heap box. The store lands in a heap object
+			// as surely as `*p = v` does, so it takes the same gate on the
+			// pointer. A plain local is the stack, a root every stop scans.
+			// a mut parameter's type carries the reference C passes it by: the
+			// stored value is the referent (a `mut s Plain` holds no pointer)
+			stored := if left_type.is_ptr() && ast.Expr(left).is_auto_deref_var() {
+				left_type.deref()
+			} else {
+				left_type
+			}
+			if g.contains_ptr(stored) && g.cm_ident_is_deref_store(left) {
+				g.writeln('vgc_wb_gate((voidptr)(${g.ident_cname(left)}));')
 			}
 		}
 		ast.PrefixExpr {
@@ -742,6 +764,27 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 		}
 		else {}
 	}
+}
+
+// cm_ident_is_deref_store: an assignment to identifier `e` is a store through
+// the pointer its C name holds (gen_cm_write_barrier's Ident case) — a variable
+// that is auto-deref (a `mut` parameter or a `for mut` element of a value type)
+// or auto-heap (boxed on the heap, cgen reaching it as `*x`). A global is in the
+// data segment and a closure's inherited variable in its context struct; neither
+// is reached through the variable's own C name.
+fn (mut g Gen) cm_ident_is_deref_store(e ast.Ident) bool {
+	if e.kind != .variable || e.obj !is ast.Var {
+		return false
+	}
+	v := e.obj as ast.Var
+	if v.is_inherited || v.is_static {
+		return false
+	}
+	if v.typ.has_flag(.shared_f) {
+		return false
+	}
+	return v.is_auto_deref || g.resolved_ident_is_auto_deref(e)
+		|| g.resolved_ident_is_auto_heap_not_stack(e)
 }
 
 // cm_is_stack_farray: a fixed array local to the function being generated,
