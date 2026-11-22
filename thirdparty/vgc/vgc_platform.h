@@ -1859,6 +1859,28 @@ static inline void vgc_install_thread_exit(int idx) {
 
 // ============================================================
 // Per-slot suspend records (cx-home/v#27, v#28, cx-core-code#116)
+// Test hook (cx-private#2078, vgc_settle_resume_test): the next settle of the
+// thread whose suspend handle is `t` takes one of its failure returns — mode 1
+// the record no longer naming the target, mode 2 thread_info failing — once.
+// Unset (mode 0) it costs the settle one load. darwin settles read it.
+static volatile int vgc_test_settle_mode = 0;
+static volatile uint32_t vgc_test_settle_port = 0;
+static volatile int vgc_test_settle_taken = 0;
+static inline void vgc_test_settle_fail(int mode, uint32_t t) {
+    __atomic_store_n(&vgc_test_settle_port, t, __ATOMIC_RELAXED);
+    __atomic_store_n(&vgc_test_settle_mode, mode, __ATOMIC_RELEASE);
+}
+static inline int vgc_test_settle_fail_taken(void) {
+    return __atomic_load_n(&vgc_test_settle_taken, __ATOMIC_ACQUIRE);
+}
+static inline int vgc_test_settle_take(int mode, uint32_t t) {
+    if (__builtin_expect(__atomic_load_n(&vgc_test_settle_mode, __ATOMIC_ACQUIRE) != mode, 1)) return 0;
+    if (t == 0 || __atomic_load_n(&vgc_test_settle_port, __ATOMIC_RELAXED) != t) return 0;
+    __atomic_store_n(&vgc_test_settle_mode, 0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&vgc_test_settle_taken, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
 // One record per mutator slot, indexed by the slot's cache index (the V layer's
 // idx), in chunks of VGC_SUSP_CHUNK records allocated with vgc_os_alloc on
 // demand (vgc_susp_chunk_ensure, called under cache_lock from the V-side
@@ -2125,9 +2147,20 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
   // register file captured; 0 ONLY if the target is genuinely GONE (dead port)
   // or — the impossible-by-construction capture failure — after resuming it, so
   // a live thread is never left frozen NOR reported covered.
+  // cx-private#2078: the settle runs only for a slot whose request returned 1,
+  // i.e. after a thread_suspend that SUCCEEDED, and the resume loop resumes
+  // only the slots whose settle returned 1. So every return 0 below must
+  // thread_resume first — a suspend no return pairs is a thread frozen for the
+  // process's life (pbm1: 121 threads held in time.sleep's nanosleep for hours,
+  // the world running). thread_resume on a genuinely dead port fails harmlessly.
   static inline int vgc_suspend_settle(int idx, uint32_t t) {
       vgc_susp* s = vgc_susp_at(idx);
-      if (s == 0 || __atomic_load_n(&s->port, __ATOMIC_ACQUIRE) != t) return 0;
+      if (s == 0) return 0; // the request found no record either: it suspended nothing
+      if (__atomic_load_n(&s->port, __ATOMIC_ACQUIRE) != t || vgc_test_settle_take(1, t)) {
+          vgc_say(0xdead8, (uint64_t)t); // record no longer names the target: resume, report uncovered
+          thread_resume((thread_act_t)t);
+          return 0;
+      }
       // Kernel-authoritative settle: suspend_count is already > 0, so once the
       // target is observed off-CPU it cannot be dispatched again until resume.
       // Unbounded for a live thread (never scan a maybe-running mutator), loud
@@ -2135,9 +2168,12 @@ static inline int vgc_thread_regs(int idx, uintptr_t* sp_out, uintptr_t* regs, i
       for (uint64_t spins = 1;; spins++) {
           struct thread_basic_info info;
           mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
-          if (thread_info((thread_act_t)t, THREAD_BASIC_INFO, (thread_info_t)&info, &cnt) != KERN_SUCCESS) {
-              vgc_say(0xdead5, (uint64_t)t); // port died under us: nothing to scan or resume
+          kern_return_t kr = thread_info((thread_act_t)t, THREAD_BASIC_INFO, (thread_info_t)&info, &cnt);
+          if (vgc_test_settle_take(2, t)) kr = KERN_INVALID_ARGUMENT;
+          if (kr != KERN_SUCCESS) {
+              vgc_say(0xdead5, (uint64_t)t); // thread_info failed: resume (a no-op on a dead port), report uncovered
               __atomic_store_n(&s->port, 0, __ATOMIC_RELEASE);
+              thread_resume((thread_act_t)t);
               return 0;
           }
           if (info.run_state != TH_STATE_RUNNING) break; // off-CPU => user context frozen
