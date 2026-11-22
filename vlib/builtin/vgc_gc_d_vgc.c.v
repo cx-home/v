@@ -1863,6 +1863,18 @@ fn vgc_gc_start_concurrent() {
 		vgc_rescan_dirty_spans(false)
 		vgc_perm_rescan_ns = C.vgc_now_ns() - t_rescan1
 	}
+	// https://github.com/cx-home/v/issues/84: no card survives into the middle.
+	// A card set between cycles (the permanent regime's gate covers the
+	// permanent spans' address range, so non-permanent spans inside it too; the
+	// young regime's cards) made the generated gate return before vgc_wb_store
+	// for every store into that page during the middle, so the span was never
+	// dirtied and, being no permanent span, its card was never read: the store
+	// was lost. The permanent spans' cards were taken just above, and this cycle
+	// traces every other object, so none is needed; in the middle the barrier
+	// dirties spans and sets no card.
+	if vgc_perm_on != 0 || vgc_young_mode != 0 {
+		vgc_cards_clear()
+	}
 	t_resume1 := C.vgc_now_ns()
 	vgc_cm_stop1_ns = t_resume1 - vgc_gc_t0
 	vgc_stw_resume(self_idx)
