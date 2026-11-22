@@ -84,8 +84,10 @@ fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, spill_hi &usize, stack_base usize)
 fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping on gc_stop_flag
 fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
-fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
+fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, entry_regs &usize, reg_save &usize, reg_max int) // cx #316 safe regions
+fn C.vgc_safe_region_enter_capture() // the safe region's entry: its callee-saved registers, then vgc_safe_region_enter_with
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
+fn C.vgc_stop_flag_raise(stop_flag &u32)
 fn C.vgc_thread_self_port() u32
 
 // cx-home/v#28: the stop-the-world is two passes over the slots — request a
@@ -227,8 +229,14 @@ const vgc_spchk_slots = 1024
 // every callee-saved register setjmp spills on every supported target
 // (darwin arm64 = 24 words of jmp_buf, darwin x86_64 = 19, glibc x86_64 = 8
 // registers + the mask flag, glibc aarch64 = 22 registers + the flag, Win64 =
-// 32 words); vgc_spill_regs / vgc_safe_enter_spill copy the first words of
-// the jmp_buf and zero-fill the tail so unused slots shade nothing.
+// 32 words); vgc_spill_regs copies the first words of the jmp_buf and
+// zero-fills the tail so unused slots shade nothing. The safe region's entry
+// snapshot (VGC_ENTRY_REGS, VGC_ENTRY_WORDS = this) takes 18 words on arm64
+// and 5-7 on x86-64 plus the caller's frame-pointer word, setjmp's first words
+// elsewhere. It lives in every thread's record for the thread's whole life
+// (vgc_safe_region_record_size_test): the snapshot is taken where the
+// registers are still the caller's (vgc_safe_region_enter's first statement),
+// so no frame words need copying behind it.
 // cx-home/v#77: 32, not 40 — what glibc's jmp_buf holds past its 23rd word
 // is the signal mask (128 B), which plain setjmp there does not even save
 // and which is never a root; 64 B a thread off the slot.
@@ -8843,7 +8851,22 @@ pub fn vgc_perturb() {
 // carried across exit). Cheap: setjmp + a bounded word copy + one seq_cst
 // store — suitable for a per-park hot path. No-op for unregistered threads
 // (they are invisible to the collector anyway).
+// The register snapshot is taken in C, at the first statement of
+// vgc_safe_region_enter_capture (VGC_ENTRY_REGS in vgc_platform.h), where the
+// callee-saved registers are still the caller's; this wrapper takes no
+// argument and only calls it. The frames below the caller die when the entry
+// returns; the snapshot holds the caller's registers for the region in the
+// record's 40 words (vgc_safe_region_callee_saved_test,
+// vgc_safe_region_record_size_test).
 fn vgc_safe_region_enter() {
+	C.vgc_safe_region_enter_capture()
+}
+
+// vgc_safe_region_enter_with is the rest of the entry, under a fixed C name
+// for vgc_safe_region_enter_capture: entry_regs is its snapshot
+// (vgc_safe_spill_words words).
+@[export: 'vgc_safe_region_enter_with']
+fn vgc_safe_region_enter_with(entry_regs voidptr) {
 	cache_idx := C.vgc_get_cache_idx()
 	if cache_idx < 0 {
 		return
@@ -8851,7 +8874,7 @@ fn vgc_safe_region_enter() {
 	vgc_safe_cache_flush(cache_idx)
 	unsafe {
 		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe, &vgc_cache(cache_idx).stack_lo,
-			&vgc_cache(cache_idx).stack_hi, vgc_cache(cache_idx).stack_base,
+			&vgc_cache(cache_idx).stack_hi, vgc_cache(cache_idx).stack_base, &usize(entry_regs),
 			&vgc_cache(cache_idx).safe_regs[0], vgc_safe_spill_words)
 	}
 }

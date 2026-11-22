@@ -1688,8 +1688,9 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
 // anything newly observed is either a non-pointer (over-retention at worst) or
 // an already-reachable pointer.
 //
-// The callee-saved registers are spilled via setjmp exactly like
-// vgc_park_spill, but copied OFF-STACK into reg_save (this thread's slot in
+// The callee-saved registers are captured at the entry's first statement
+// (VGC_ENTRY_REGS below: asm on arm64 / x86-64, setjmp elsewhere), not in
+// this function, and copied OFF-STACK into reg_save (this thread's slot in
 // vgc_heap.caches[]): unlike the parker — whose frame stays alive across the
 // whole spin — THIS frame dies when enter returns and the blocking call's
 // frames reuse its addresses, so a stack-resident spill would be overwritten
@@ -1724,31 +1725,147 @@ static inline uintptr_t vgc_spill_regs(uintptr_t* regs, int reg_max) {
     vgc_keep_alive(&buf);
     return sp;
 }
-static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
-                                        uintptr_t* range_hi, uintptr_t stack_base,
-                                        uintptr_t* reg_save, int reg_max) {
-    jmp_buf buf;
-    memset(&buf, 0, sizeof(buf)); // deterministic tail below (unused slots shade nothing)
-    VGC_SPILL_SETJMP(buf);
-    // Real SP, not the frame pointer: the spilled-register jmp_buf lives below
-    // the frame pointer and must be inside the recorded range (see vgc_real_sp).
-    uintptr_t sp = vgc_real_sp();
-    if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
-    if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
-    else { *range_lo = stack_base; *range_hi = sp; }
+// VGC_ENTRY_REGS(regs, reg_max): the calling function's callee-saved registers
+// AS THE FUNCTION WAS ENTERED, into regs[0..reg_max) (reg_max >= 19; the tail
+// zeroed, unused words shade nothing). Its one user is
+// vgc_safe_region_enter_capture below: the FIRST statement of a function that
+// takes no argument, with no call before it (regs is left uninitialised — a
+// zeroing call before the capture made clang x86-64 hold the buffer's address
+// in rbx across the bzero), whose caller blocks after it returns.
+//
+// Why not a setjmp: setjmp records the registers as they are at the call, and
+// by then the compiler may have moved a value into a callee-saved register —
+// anything it needs after the call (clang -O2 arm64 put the buffer's own
+// address in x19 before the _setjmp; the earlier vgc_safe_enter_spill had its
+// six arguments in x19..x24). The caller's values were then only in the
+// prologue's save slots, in a frame that dies before the blocking call opens
+// its frames on it (vgc_safe_region_callee_saved_test: a block held in x19
+// across pthread_join freed). Here an asm statement stores the callee-saved
+// registers itself and DECLARES THEM CLOBBERED: the compiler may keep no value
+// in them across the statement, so nothing before it in a function with no
+// argument (the address operand is pinned to a scratch register) has given
+// them a value, and the prologue only stored them. What it captures:
+//   arm64 (AAPCS64, darwin and linux): x19..x28 and d8..d15 (18 words);
+//   x86-64 SysV: rbx, r12..r15 (5 words); Win64 also rdi and rsi;
+// then one more word, the caller's frame pointer (x29 / rbp): it cannot be
+// named as a clobber where frames keep it, and where frames omit it (x86-64
+// -fomit-frame-pointer) rbp is a general callee-saved register; using
+// __builtin_frame_address(0) gives this function a frame record whose first
+// word is the caller's x29 / rbp as it was at entry.
+// Other targets (i386, riscv64, msvc x64) keep a setjmp at the first statement,
+// the e8e77367bb snapshot taken earlier: not proven against the hoist above.
+#define VGC_ENTRY_WORDS 32 // = vgc_safe_spill_words (vlib/builtin)
+static inline void vgc_entry_regs_tail(uintptr_t* regs, int k, int reg_max, uintptr_t caller_fp) {
+    int i = k;
+    if (i < reg_max) { regs[i++] = caller_fp; }
+    for (; i < reg_max; i++) { regs[i] = 0; }
+}
+static inline void vgc_entry_regs_copy(uintptr_t* regs, int reg_max, const uintptr_t* w,
+                                       size_t buf_bytes, uintptr_t caller_fp) {
     // jmp_buf is int[] on macOS: count WORDS of its byte size (a bare
     // sizeof(buf)/sizeof(uintptr_t) trips clang's -Wsizeof-array-div under -cstrict).
-    size_t buf_bytes = sizeof(buf);
     int n = (int)(buf_bytes / sizeof(uintptr_t));
     if (n > reg_max) { n = reg_max; }
-    const uintptr_t* w = (const uintptr_t*)&buf;
-    for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }
-    for (int i = n; i < reg_max; i++) { reg_save[i] = 0; }
+    for (int i = 0; i < n; i++) { regs[i] = w[i]; }
+    vgc_entry_regs_tail(regs, n, reg_max, caller_fp);
+}
+#if defined(_MSC_VER) && !defined(__clang__)
+  #define VGC_CALLER_FP() ((uintptr_t)0)
+#else
+  #define VGC_CALLER_FP() (*(const volatile uintptr_t*)__builtin_frame_address(0))
+#endif
+#if (defined(__aarch64__) || defined(__arm64__)) && (defined(__GNUC__) || defined(__clang__))
+  #define VGC_ENTRY_REGS(regs, reg_max) do { \
+        register uintptr_t* vgc_entry_p_ __asm__("x9") = (uintptr_t*)(regs); \
+        __asm__ __volatile__( \
+            "stp x19, x20, [%0, #0]\n\t" \
+            "stp x21, x22, [%0, #16]\n\t" \
+            "stp x23, x24, [%0, #32]\n\t" \
+            "stp x25, x26, [%0, #48]\n\t" \
+            "stp x27, x28, [%0, #64]\n\t" \
+            "stp d8, d9, [%0, #80]\n\t" \
+            "stp d10, d11, [%0, #96]\n\t" \
+            "stp d12, d13, [%0, #112]\n\t" \
+            "stp d14, d15, [%0, #128]\n\t" \
+            : : "r"(vgc_entry_p_) \
+            : "memory", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", \
+              "x28", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"); \
+        vgc_entry_regs_tail((uintptr_t*)(regs), 18, (int)(reg_max), VGC_CALLER_FP()); \
+    } while (0)
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && defined(_WIN64)
+  #define VGC_ENTRY_REGS(regs, reg_max) do { \
+        __asm__ __volatile__( \
+            "movq %%rbx, 0(%0)\n\t" "movq %%r12, 8(%0)\n\t" "movq %%r13, 16(%0)\n\t" \
+            "movq %%r14, 24(%0)\n\t" "movq %%r15, 32(%0)\n\t" \
+            "movq %%rdi, 40(%0)\n\t" "movq %%rsi, 48(%0)\n\t" \
+            : : "a"((uintptr_t*)(regs)) \
+            : "memory", "rbx", "r12", "r13", "r14", "r15", "rdi", "rsi"); \
+        vgc_entry_regs_tail((uintptr_t*)(regs), 7, (int)(reg_max), VGC_CALLER_FP()); \
+    } while (0)
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+  #define VGC_ENTRY_REGS(regs, reg_max) do { \
+        __asm__ __volatile__( \
+            "movq %%rbx, 0(%0)\n\t" "movq %%r12, 8(%0)\n\t" "movq %%r13, 16(%0)\n\t" \
+            "movq %%r14, 24(%0)\n\t" "movq %%r15, 32(%0)\n\t" \
+            : : "a"((uintptr_t*)(regs)) \
+            : "memory", "rbx", "r12", "r13", "r14", "r15"); \
+        vgc_entry_regs_tail((uintptr_t*)(regs), 5, (int)(reg_max), VGC_CALLER_FP()); \
+    } while (0)
+#else
+  #define VGC_ENTRY_REGS(regs, reg_max) do { \
+        jmp_buf vgc_entry_buf_; \
+        memset(&vgc_entry_buf_, 0, sizeof(vgc_entry_buf_)); \
+        VGC_SPILL_SETJMP(vgc_entry_buf_); \
+        vgc_entry_regs_copy((uintptr_t*)(regs), (int)(reg_max), \
+            (const uintptr_t*)&vgc_entry_buf_, sizeof(vgc_entry_buf_), VGC_CALLER_FP()); \
+        vgc_keep_alive(&vgc_entry_buf_); \
+    } while (0)
+#endif
+// vgc_safe_region_enter_capture: the GC-safe region's entry (vgc_safe_region_enter
+// is a one-call wrapper over it). The snapshot is taken in THIS frame, first,
+// into an uninitialised buffer, and handed to the rest of the entry
+// (vgc_safe_region_enter_with, in vlib/builtin), which copies it into the
+// thread's record; this frame and every one below it die before the caller's
+// blocking call, so the record's copy is what the collector scans.
+void vgc_safe_region_enter_with(void* entry_regs);
+#if defined(__has_attribute)
+  #if __has_attribute(uninitialized)
+    #define VGC_ENTRY_UNINIT __attribute__((uninitialized))
+  #endif
+#endif
+#ifndef VGC_ENTRY_UNINIT
+  #define VGC_ENTRY_UNINIT
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
+  __declspec(noinline) static void vgc_safe_region_enter_capture(void) {
+#else
+  __attribute__((noinline)) static void vgc_safe_region_enter_capture(void) {
+#endif
+    // uninitialized: -gc e builds pass -ftrivial-auto-var-init=zero, whose
+    // zeroing call would come before the capture (VGC_ENTRY_REGS fills every word)
+    VGC_ENTRY_UNINIT uintptr_t regs[VGC_ENTRY_WORDS];
+    VGC_ENTRY_REGS(regs, VGC_ENTRY_WORDS);
+    vgc_safe_region_enter_with(regs);
+    vgc_keep_alive(regs);
+}
+// vgc_safe_enter_spill records the region's stack range from HERE (the frames
+// above lie within it) and publishes entry_regs, the VGC_ENTRY_WORDS words
+// vgc_safe_region_enter_capture took, into the thread's record (reg_save).
+static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
+                                        uintptr_t* range_hi, uintptr_t stack_base,
+                                        const uintptr_t* entry_regs,
+                                        uintptr_t* reg_save, int reg_max) {
+    uintptr_t sp = vgc_real_sp();
+    if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
+    else { *range_lo = stack_base; *range_hi = sp; }
+    int n = reg_max < VGC_ENTRY_WORDS ? reg_max : VGC_ENTRY_WORDS;
+    int i = 0;
+    for (; i < n; i++) { reg_save[i] = entry_regs[i]; }
+    for (; i < reg_max; i++) { reg_save[i] = 0; }
     // Publish LAST (seq_cst): a collector that loads safe==1 (its load is after
     // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
     // recorded range and the completed snapshot.
     vgc_atomic_store_u32(my_safe, 1);
-    vgc_keep_alive(&buf);
 }
 
 // Leave the safe region. The order is load-bearing (the classic Dekker pairing
@@ -1772,8 +1889,30 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
 // resume latency cost is bounded by the sleep quantum and only paid by wakes
 // that collided with a GC). The Dekker ordering above is unaffected — how the
 // flag-drop is awaited is irrelevant to soundness.
-static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+// The two sides of the Dekker pair (cx-private#2079): the exiting thread
+// stores safe=0, then loads gc_stop_flag (vgc_safe_exit_publish answers the
+// load); the collector stores gc_stop_flag=1 (vgc_stop_flag_raise), then loads
+// each thread's safe word. bench/parallel-alloc/vgc_safe_exit_dekker_test.v
+// runs the two on two threads. Each side's store and its load of the other's
+// word need a full fence between them: a release store and an acquire load give
+// no store->load order (arm64: STLR then LDAPR; x86-64: a plain store then a
+// plain load), so both sides could read the other's old value — the collector
+// safe==1, the thread gc_stop_flag==0 — and the thread ran through mark and
+// sweep unscanned, the sweep freeing what it allocated meanwhile (g1q6's
+// fa_range_groups `parts`, 1 run in 30 on pbm1).
+static inline uint32_t vgc_safe_exit_publish(uint32_t* my_safe, uint32_t* stop_flag) {
     vgc_atomic_store_u32(my_safe, 0);
+    vgc_atomic_fence();
+    return vgc_atomic_load_u32(stop_flag);
+}
+static inline void vgc_stop_flag_raise(uint32_t* stop_flag) {
+    vgc_atomic_store_u32(stop_flag, 1);
+    vgc_atomic_fence();
+}
+static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+    if (vgc_safe_exit_publish(my_safe, stop_flag) == 0) {
+        return;
+    }
     int spins = 0;
     while (vgc_atomic_load_u32(stop_flag) != 0) {
         if (++spins < 1000) {
