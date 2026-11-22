@@ -21,15 +21,31 @@
 // around them — cost the interpreter 13 to 30 %; an asm there costs inlining.)
 // `word` is the offset the compiler computed for the reference (it chose the cuts by its own layout of
 // the type); `off` is the same in C's terms. They must agree, or the build stops.
+// The question's only reader is an assumption (clang): `the read plus vgc_ss_unknown is not a constant`.
+// Values that only feed an assumption are free to the inliner and are no code, and an assumption is not
+// a call that may write memory — a branch around an empty asm was both (a load, a branch and a call
+// charged for every escape: cx__mk_scalar, code__is_err_value and 1,200 other call sites of cx were no
+// longer inlined, n-body 1.092 against the pinned V). The assumption must hold whatever the local
+// holds, or it is undefined behaviour: asked of the read alone it is false wherever the compiler knows
+// the local's bytes (a tag stored from a literal) and the function's body is deleted. vgc_ss_unknown is
+// a double the compiler cannot know — external, weak, and written by vgc_init from the stack pointer —
+// so the sum is never a constant and the answer is always "no". (An operand with a side effect — a
+// call, a volatile read — makes clang drop the whole assumption, and the read with it.)
 // vgc_ss_pin takes &x under a "memory" clobber: x stays whole in its slot and is re-read after every
 // call. It is for what the walk cannot place (a C struct, a packed struct).
 // tcc and an unoptimised build do not cut; they get no-ops.
+__attribute__((weak)) double vgc_ss_unknown;
+static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
 #if defined(__TINYC__) || !defined(__OPTIMIZE__)
 #define vgc_ss_ref4(x, off, word) ((void)0)
 #define vgc_ss_ref8(x, off, word) ((void)0)
 #define vgc_ss_pin(p) ((void)(p))
 #else
+#if defined(__clang__)
+#define vgc_ss_refn(x, off, word, T, n) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); __builtin_assume(!__builtin_constant_p(*(const T*)((const char*)&(x) + (word) - (n)) + (T)vgc_ss_unknown)); } while (0)
+#else
 #define vgc_ss_refn(x, off, word, T, n) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); if (__builtin_constant_p(*(const T*)((const char*)&(x) + (word) - (n)))) { __asm__ __volatile__(""); } } while (0)
+#endif
 #define vgc_ss_ref4(x, off, word) vgc_ss_refn(x, off, word, float, 4)
 #define vgc_ss_ref8(x, off, word) vgc_ss_refn(x, off, word, double, 8)
 #define vgc_ss_pin(p) __asm__ __volatile__("" : : "r"(p) : "memory")

@@ -119,6 +119,7 @@ fn C.vgc_ra0() voidptr // #58 freering: __builtin_return_address(0) of the calli
 fn C.vgc_ra1() voidptr // #58 freering: one frame up (the codegen free/drop site)
 fn C.vgc_ra2() voidptr // #58 freering: two frames up
 fn C.vgc_ra_anchor() voidptr // #58 freering: text-segment anchor for ASLR slide
+fn C.vgc_ss_unknown_set(v f64)
 fn C.vgc_real_sp() usize // actual SP register (see vgc_platform.h)
 fn C.vgc_captured_regs_contain(val usize) int // #58 forensic: parked-regs search
 fn C.vgc_slot_is_acked(idx int) int // #58 forensic: is this slot parked in the suspend handler?
@@ -2607,6 +2608,9 @@ fn vgc_atfork_child() {
 
 @[markused]
 pub fn vgc_init() {
+	// cx-home/v#74 piece 5: the escapes ask about a sum with this double; it must
+	// not be a value the compiler can know (vgc_platform.h, vgc_ss_refn)
+	C.vgc_ss_unknown_set(f64(C.vgc_real_sp()))
 	// cx-home/v#56 lever 10: the gate's table of chunk card tables
 	vgc_wb_cards = C.vgc_chunk_cards_table()
 	C.vgc_init_size_tables()
