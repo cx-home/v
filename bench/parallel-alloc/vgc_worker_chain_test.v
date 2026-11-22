@@ -31,19 +31,34 @@ fn build_fixture() string {
 	return exe
 }
 
-// FreeBSD caps a process at kern.threads.max_threads_per_proc threads (1,500
-// by default): the sizes are clamped there (see vgc_spawn_roots_many_live_test.v).
-fn thread_limit() int {
+// The largest N a box can run: FreeBSD caps a process at
+// kern.threads.max_threads_per_proc threads (1,500 by default), macOS at
+// kern.num_taskthreads (8,192 on the x86-64 box, 16,384 on the arm64 ones;
+// cx-home/v#86: N=10000 answered EAGAIN at thread ~8,190 there). The sizes
+// are clamped 64 under the limit (the main thread, the runtime's own) and
+// the clamp is printed with the limit — never a silent pass at a smaller N.
+struct ThreadLimit {
+	n    int
+	name string
+}
+
+fn thread_limit() ThreadLimit {
+	mut key := ''
 	$if freebsd {
-		r := os.execute('sysctl -n kern.threads.max_threads_per_proc')
+		key = 'kern.threads.max_threads_per_proc'
+	} $else $if macos {
+		key = 'kern.num_taskthreads'
+	}
+	if key != '' {
+		r := os.execute('sysctl -n ${key}')
 		if r.exit_code == 0 {
 			limit := r.output.trim_space().int()
-			if limit > 0 {
-				return limit - 64
+			if limit > 64 {
+				return ThreadLimit{limit - 64, '${key}=${limit}'}
 			}
 		}
 	}
-	return 1 << 30
+	return ThreadLimit{1 << 30, ''}
 }
 
 fn test_chain_of_thousands_of_parked_workers() {
@@ -51,10 +66,14 @@ fn test_chain_of_thousands_of_parked_workers() {
 	defer {
 		os.rm(exe) or {}
 	}
-	limit := thread_limit()
+	lim := thread_limit()
+	limit := lim.n
 	mut done := []int{}
 	for want in chain_sizes {
 		n := if want > limit { limit } else { want }
+		if n < want {
+			println('N=${want}: sized to N=${n} on this box (${lim.name}: ${limit} threads after 64 for the runtime)')
+		}
 		if n in done {
 			continue
 		}
