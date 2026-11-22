@@ -17,15 +17,18 @@ import v.ast
 // ?cx.Node's element pointer at sp+0x407).
 // Every local whose type can be cut that way gets, right after its declaration,
 // `vgc_ss_ref(x, <offset of a reference>)` for the first reference of x behind
-// each run of narrow fields (vgc_ss_walk; vgc_platform.h): the ONE BYTE just
-// before that reference's word, as the operand of __builtin_constant_p. To SROA
-// that is a read of the byte, and a one-byte read cannot be split: a cut falls
-// on the word where the reference starts, so the piece that holds the reference
-// starts on a word. To the machine it is nothing — the question is answered
-// late, after the passes that cut locals. The byte is padding or the last byte
-// of the narrow field: x's narrow fields stay values of their own, its pieces
-// are as large as clang makes them, x stays in registers, and nothing has to be
-// computed where x is declared. (Every shape with a real use of x at its
+// each run of narrow fields (vgc_ss_walk; vgc_platform.h): the half word or the
+// word that ends where that reference starts, as the operand of
+// __builtin_constant_p. To SROA that is a float or a double read, which cannot
+// be split: a cut falls on the word where the reference starts, so the piece
+// that holds the reference starts on a word. To the machine it is nothing — the
+// question is answered late, after the passes that cut locals. The read covers
+// the last narrow field before the reference (a string's is_lit, a kind byte
+// and the padding behind it, a state byte's word): that field and its padding
+// become one piece, as when the function reads the field itself, and no piece
+// of padding is left to copy on its own (a ONE-byte read left one: pbm1-ab74ks,
+// +16 % on n-body from the locals read by field alone). x stays in registers,
+// and nothing has to be computed where x is declared. (Every shape with a real use of x at its
 // declaration cost cx 13 to 30 %: pbm1-ab74k / ab74z / ab74u / ab74c.)
 // A string, a dynamic array, a sum type, an interface without fields and a
 // struct of references followed by small fields cannot be cut off a word and get
@@ -115,14 +118,21 @@ fn (mut g Gen) vgc_ss_refs_of(ctype string) []string {
 			})
 			mut dirty := false
 			mut cuts := []int{}
+			mut last_small := -1
 			for l in leaves {
 				if !l.is_ref {
 					dirty = true
+					last_small = l.off
 				} else if dirty {
 					dirty = false
 					if l.off >= 8 && l.off !in cuts && l.expr != '' {
 						cuts << l.off
-						refs << '${l.expr}, ${l.off}'
+						// the read ends at the reference and covers the last narrow
+						// field before it: the upper half of the word when that field
+						// starts there (a string's is_lit, a kind byte at +4), else the
+						// whole word (a state byte, an array's element_size)
+						n := if last_small >= l.off - 4 { 4 } else { 8 }
+						refs << '${n}(@, ${l.expr}, ${l.off})'
 					} else if l.expr == '' {
 						refs = ['&']
 						break
@@ -148,7 +158,7 @@ fn (mut g Gen) vgc_ss_text(ctype string, name string) string {
 	}
 	mut out := ''
 	for r in refs {
-		out += ' vgc_ss_ref(${name}, ${r});'
+		out += ' vgc_ss_ref${r.replace('@', name)};'
 	}
 	return out
 }
@@ -305,14 +315,15 @@ fn (mut g Gen) vgc_ss_walk(typ_ ast.Type, cname string, off int, expr string, de
 			// { u8* str; int len; int is_lit; }
 			leaves << VgcSsLeaf{off, true, expr}
 			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
+			leaves << VgcSsLeaf{off + 12, false, '${expr} + 12'}
 			return true
 		}
 		.array {
 			// { void* data; int offset; int len; int cap; flags; int element_size; }
 			leaves << VgcSsLeaf{off, true, expr}
-			leaves << VgcSsLeaf{off + 8, false, '${expr} + 8'}
-			leaves << VgcSsLeaf{off + 16, false, '${expr} + 16'}
-			leaves << VgcSsLeaf{off + 24, false, '${expr} + 24'}
+			for o in [8, 12, 16, 20, 24] {
+				leaves << VgcSsLeaf{off + o, false, '${expr} + ${o}'}
+			}
 			return true
 		}
 		.sum_type, .interface {
