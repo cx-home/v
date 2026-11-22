@@ -86,6 +86,7 @@ fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping 
 fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
 fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
+fn C.vgc_stop_flag_raise(stop_flag &u32)
 fn C.vgc_thread_self_port() u32
 
 // cx-home/v#28: the stop-the-world is two passes over the slots — request a
@@ -225,9 +226,13 @@ const vgc_max_cache_chunks = 4096
 const vgc_spchk_slots = 1024
 // cx #316: words captured per safe-region register snapshot. Sized to hold a
 // full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
-// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
-// zero-fills the tail so unused slots shade nothing.
-const vgc_safe_spill_words = 40
+// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask) and, behind it, the
+// vgc_safe_frame_words words of the entry's own frames, where its prologues
+// saved the caller's callee-saved registers before reusing them
+// (cx-private#2079: those frames die before the blocking call);
+// vgc_safe_enter_spill zero-fills the tail so unused slots shade nothing.
+const vgc_safe_frame_words = 256
+const vgc_safe_spill_words = 40 + vgc_safe_frame_words
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
 
 // GC phases (translated from Go's _GCoff, _GCmark, _GCmarktermination)

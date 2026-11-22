@@ -1743,7 +1743,24 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
     if (n > reg_max) { n = reg_max; }
     const uintptr_t* w = (const uintptr_t*)&buf;
     for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }
-    for (int i = n; i < reg_max; i++) { reg_save[i] = 0; }
+    // The words of the frames between here and the region's caller, copied
+    // behind the jmp_buf words (cx-private#2079). setjmp records the registers
+    // as they are HERE: this function's prologue (and the entry's, when it is
+    // not a tail call) saved the caller's callee-saved registers in its own
+    // frame and reused them (arm64 -O2: x19..x24 hold the arguments), so the
+    // jmp_buf held the arguments while the caller's values sat in frames that
+    // die when the entry returns — the blocking call (pthread_join, a channel
+    // wait) opens its frames on them. A value the caller kept only in such a
+    // register (fa_range_groups' [par] join result in x19 across pthread_join)
+    // was in no root and the sweep freed it while live. Every callee-saved
+    // value the caller held is either still in its register (the jmp_buf) or
+    // saved in one of these frames, which lie within the copied words.
+    uintptr_t fp_hi = stack_base > sp ? stack_base : sp;
+    int i = n;
+    for (uintptr_t a = sp; i < reg_max && a + sizeof(uintptr_t) <= fp_hi; a += sizeof(uintptr_t)) {
+        reg_save[i++] = *(const volatile uintptr_t*)a;
+    }
+    for (; i < reg_max; i++) { reg_save[i] = 0; }
     // Publish LAST (seq_cst): a collector that loads safe==1 (its load is after
     // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
     // recorded range and the completed snapshot.
@@ -1772,8 +1789,30 @@ static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
 // resume latency cost is bounded by the sleep quantum and only paid by wakes
 // that collided with a GC). The Dekker ordering above is unaffected — how the
 // flag-drop is awaited is irrelevant to soundness.
-static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+// The two sides of the Dekker pair (cx-private#2079): the exiting thread
+// stores safe=0, then loads gc_stop_flag (vgc_safe_exit_publish answers the
+// load); the collector stores gc_stop_flag=1 (vgc_stop_flag_raise), then loads
+// each thread's safe word. bench/parallel-alloc/vgc_safe_exit_dekker_test.v
+// runs the two on two threads. Each side's store and its load of the other's
+// word need a full fence between them: a release store and an acquire load give
+// no store->load order (arm64: STLR then LDAPR; x86-64: a plain store then a
+// plain load), so both sides could read the other's old value — the collector
+// safe==1, the thread gc_stop_flag==0 — and the thread ran through mark and
+// sweep unscanned, the sweep freeing what it allocated meanwhile (g1q6's
+// fa_range_groups `parts`, 1 run in 30 on pbm1).
+static inline uint32_t vgc_safe_exit_publish(uint32_t* my_safe, uint32_t* stop_flag) {
     vgc_atomic_store_u32(my_safe, 0);
+    vgc_atomic_fence();
+    return vgc_atomic_load_u32(stop_flag);
+}
+static inline void vgc_stop_flag_raise(uint32_t* stop_flag) {
+    vgc_atomic_store_u32(stop_flag, 1);
+    vgc_atomic_fence();
+}
+static inline void vgc_safe_exit_handshake(uint32_t* my_safe, uint32_t* stop_flag) {
+    if (vgc_safe_exit_publish(my_safe, stop_flag) == 0) {
+        return;
+    }
     int spins = 0;
     while (vgc_atomic_load_u32(stop_flag) != 0) {
         if (++spins < 1000) {
