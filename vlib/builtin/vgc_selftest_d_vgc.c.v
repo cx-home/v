@@ -76,7 +76,7 @@ pub fn vgc_residual4_selftest() u32 {
 	// install in THIS thread's mcache slot (save + restore; no allocation in the window)
 	saved_slot := unsafe { vgc_cache(idx).alloc[sc] }
 	unsafe {
-		vgc_cache(idx).alloc[sc] = span
+		vgc_cache(idx).alloc[sc] = vgc_cache_span_id(span)
 	}
 	vgc_protect_cached_spans()
 	stamped := span.sweep_gen
@@ -281,7 +281,7 @@ pub fn vgc_inflight_selftest() u32 {
 		// the slot store, then the stamp and the claim bit released
 		saved := unsafe { vgc_cache(idx).alloc[sc] }
 		unsafe {
-			vgc_cache(idx).alloc[sc] = s
+			vgc_cache(idx).alloc[sc] = vgc_cache_span_id(s)
 		}
 		vgc_span_release_acquisition(s)
 		unsafe {

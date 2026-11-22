@@ -223,11 +223,16 @@ const vgc_cache_chunk_mask = vgc_cache_chunk_slots - 1
 const vgc_max_cache_chunks = 4096
 // #58 -d vgc_spcheck shadow tables (diagnostic only): the first 1,024 slots.
 const vgc_spchk_slots = 1024
-// cx #316: words captured per safe-region register snapshot. Sized to hold a
-// full jmp_buf on every supported target (darwin arm64 = 24 words, darwin
-// x86_64 = 19, glibc x86_64 = 25 incl. saved sigmask); vgc_safe_enter_spill
-// zero-fills the tail so unused slots shade nothing.
-const vgc_safe_spill_words = 40
+// cx #316: words captured per safe-region register snapshot. Sized to hold
+// every callee-saved register setjmp spills on every supported target
+// (darwin arm64 = 24 words of jmp_buf, darwin x86_64 = 19, glibc x86_64 = 8
+// registers + the mask flag, glibc aarch64 = 22 registers + the flag, Win64 =
+// 32 words); vgc_spill_regs / vgc_safe_enter_spill copy the first words of
+// the jmp_buf and zero-fill the tail so unused slots shade nothing.
+// cx-home/v#77: 32, not 40 — what glibc's jmp_buf holds past its 23rd word
+// is the signal mask (128 B), which plain setjmp there does not even save
+// and which is never a root; 64 B a thread off the slot.
+const vgc_safe_spill_words = 32
 const vgc_tiny_size = 16 // tiny allocator threshold (no-pointer objects < 16 bytes)
 
 // GC phases (translated from Go's _GCoff, _GCmark, _GCmarktermination)
@@ -371,7 +376,12 @@ mut:
 @[aligned: 128]
 struct VGC_Cache {
 mut:
-	alloc [136]&VGC_Span // one span per span class (68 scan + 68 noscan)
+	// One span per span class (68 scan + 68 noscan), named by its allspans slot
+	// + 1 (0 = none; vgc_cache_span / vgc_cache_span_id). cx-home/v#77: a slot
+	// a span keeps for life (cx-home/v#15), so the u32 names the same
+	// descriptor a pointer would at half the bytes: 544 B a thread instead of
+	// 1,088, every one of them resident for every live thread.
+	alloc [136]u32
 	// Tiny allocator for objects < 16 bytes without pointers
 	// Translated from Go's mcache.tiny
 	tiny        usize
@@ -481,7 +491,10 @@ mut:
 	// cx-home/v#77: objects this thread has carved per class from the class's
 	// shared span (vgc_cold_alloc); at vgc_cold_warm the class is warm and takes
 	// a private span. A reused slot keeps its counts (its next thread starts warm).
-	cold [136]u8
+	// Two bits a class, four classes a byte (vgc_cold_count / vgc_cold_bump):
+	// a count never passes vgc_cold_warm (2), and 34 B instead of 136 keeps the
+	// slot at nine 128-byte lines (vgc_thread_slot_size_test).
+	cold [34]u8
 }
 
 // cx-private#1910: the stash covers the size classes' span sizes (vgc_class_npages
@@ -513,6 +526,29 @@ fn vgc_cache(idx int) &VGC_Cache {
 	return unsafe {
 		&(&VGC_Cache(C.vgc_cache_chunk(idx >> vgc_cache_chunk_shift)))[idx & vgc_cache_chunk_mask]
 	}
+}
+
+// vgc_cache_span answers the span slot c caches for span class sc, nil when
+// none (cx-home/v#77: VGC_Cache.alloc holds allspans slot + 1). allspans is
+// reserved once at its cap and never moves (VGC_Heap.allspans), and a
+// descriptor keeps its slot for life, so the load is as stable as the
+// pointer was.
+@[inline]
+fn vgc_cache_span(c &VGC_Cache, sc int) &VGC_Span {
+	i := unsafe { c.alloc[sc] }
+	if i == 0 {
+		return unsafe { nil }
+	}
+	return unsafe { vgc_heap.allspans[i - 1] }
+}
+
+// vgc_cache_span_id is what VGC_Cache.alloc stores for span s (0 for nil).
+@[inline]
+fn vgc_cache_span_id(s &VGC_Span) u32 {
+	if s == unsafe { nil } {
+		return 0
+	}
+	return s.slot + 1
 }
 
 // vgc_cache_chunk_ensure makes slot idx addressable: allocates its cache chunk
@@ -2943,10 +2979,9 @@ fn vgc_register_thread_opt(wait bool) bool {
 				// so it starts warm: the cold-class carve (cx-home/v#77) is for
 				// threads started together, and a thread that warms a class pays
 				// the shared span AND its own (one more page a class touched).
+				mut mc := unsafe { vgc_cache(idx) }
 				for c in 0 .. 136 {
-					unsafe {
-						vgc_cache(idx).cold[c] = vgc_cold_warm
-					}
+					vgc_cold_set(mut mc, c, vgc_cold_warm)
 				}
 			}
 		}
@@ -2993,7 +3028,7 @@ fn vgc_register_thread_opt(wait bool) bool {
 	// refills from central fresh.
 	unsafe {
 		for c in 0 .. 136 {
-			vgc_cache(idx).alloc[c] = nil
+			vgc_cache(idx).alloc[c] = 0
 		}
 		vgc_cache(idx).tiny = 0
 		vgc_cache(idx).tiny_offset = 0
@@ -7152,7 +7187,24 @@ fn vgc_span_release_acquisition(span &VGC_Span) {
 // full shared span is dropped as a full cache span is (B18) and swept normally.
 // Returns nil (the caller takes its private path) for a warm class, a thread
 // with a private span of the class already, an unregistered thread, or no span.
-const vgc_cold_warm = u8(2)
+const vgc_cold_warm = u8(2) // at most 3: VGC_Cache.cold keeps two bits a class
+
+// vgc_cold_count answers class sc's cold count in c (VGC_Cache.cold).
+@[inline]
+fn vgc_cold_count(c &VGC_Cache, sc int) u8 {
+	return (unsafe { c.cold[sc >> 2] } >> u8((sc & 3) * 2)) & 3
+}
+
+// vgc_cold_set stores class sc's cold count n (0..3) in c. Only the owner
+// writes its slot's counts (registration under cache_lock before the thread
+// runs, then the thread itself).
+@[inline]
+fn vgc_cold_set(mut c VGC_Cache, sc int, n u8) {
+	shift := u8((sc & 3) * 2)
+	unsafe {
+		c.cold[sc >> 2] = (c.cold[sc >> 2] & ~(u8(3) << shift)) | ((n & 3) << shift)
+	}
+}
 
 // cx-core-code#295: with a few live threads a thread that warms a class pays
 // the class's shared span on top of its own private one (one more page a class
@@ -7172,13 +7224,13 @@ fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
 		return unsafe { nil }, unsafe { nil }
 	}
 	mut c := unsafe { vgc_cache(cache_idx) }
-	if unsafe { c.alloc[span_class] } != unsafe { nil } || c.cold[span_class] >= vgc_cold_warm {
+	if unsafe { c.alloc[span_class] } != 0 || vgc_cold_count(c, span_class) >= vgc_cold_warm {
 		return unsafe { nil }, unsafe { nil }
 	}
 	if C.vgc_atomic_load_u32(&vgc_heap.live_threads) < vgc_cold_min_threads {
 		return unsafe { nil }, unsafe { nil }
 	}
-	c.cold[span_class]++
+	vgc_cold_set(mut c, span_class, vgc_cold_count(c, span_class) + 1)
 	central := unsafe { &vgc_heap.central[span_class] }
 	mut span := unsafe { &VGC_Span(nil) }
 	for {
@@ -7248,7 +7300,7 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 		}
 		return orphan
 	}
-	span := unsafe { vgc_cache(cache_idx).alloc[span_class] }
+	span := vgc_cache_span(vgc_cache(cache_idx), span_class)
 	if span != unsafe { nil } {
 		// Check if span has free objects
 		if span.alloc_count < span.nelems {
@@ -7279,7 +7331,7 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 		new_span = vgc_central_get_span(span_class)
 	}
 	unsafe {
-		vgc_cache(cache_idx).alloc[span_class] = new_span
+		vgc_cache(cache_idx).alloc[span_class] = vgc_cache_span_id(new_span)
 	}
 	if new_span != unsafe { nil } {
 		// The cache slot now protects the span (vgc_protect_cached_spans):
@@ -8830,12 +8882,12 @@ fn vgc_safe_cache_flush(cache_idx int) {
 fn vgc_cache_spans_release(cache_idx int) {
 	mut c := unsafe { vgc_cache(cache_idx) }
 	for sc in 0 .. 136 {
-		if unsafe { c.alloc[sc] } == unsafe { nil } {
+		if unsafe { c.alloc[sc] } == 0 {
 			continue
 		}
 		central := unsafe { &vgc_heap.central[sc] }
 		C.vgc_mutex_lock(&central.lock)
-		mut s := unsafe { c.alloc[sc] }
+		mut s := vgc_cache_span(c, sc)
 		if s != unsafe { nil } {
 			if s.in_use && s.alloc_count < s.nelems && s.on_central == 0 && s.class_idx != 0 {
 				unsafe {
@@ -8849,7 +8901,7 @@ fn vgc_cache_spans_release(cache_idx int) {
 				}
 			}
 			unsafe {
-				c.alloc[sc] = nil
+				c.alloc[sc] = 0
 			}
 		}
 		C.vgc_mutex_unlock(&central.lock)
@@ -8876,7 +8928,7 @@ fn vgc_safe_cache_quarantine(cache_idx int) {
 	mut c := unsafe { vgc_cache(cache_idx) }
 	mut any := false
 	for sc in 0 .. 136 {
-		s := unsafe { c.alloc[sc] }
+		s := vgc_cache_span(c, sc)
 		if s != unsafe { nil } && s.in_use && s.alloc_count < s.nelems && s.class_idx != 0 {
 			any = true
 			break
@@ -8914,7 +8966,7 @@ fn vgc_quarantine_word(mut c VGC_Cache, v usize) {
 		return
 	}
 	spc := int(span.class_idx) * 2 + if span.noscan { 1 } else { 0 } // the span class (vgc_central_get_fresh)
-	if unsafe { c.alloc[spc] } != span {
+	if unsafe { c.alloc[spc] } != span.slot + 1 {
 		return
 	}
 	idx := u32((v - span.base) / usize(span.elem_size))

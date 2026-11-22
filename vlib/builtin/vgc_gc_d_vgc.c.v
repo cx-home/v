@@ -878,7 +878,7 @@ fn vgc_safe_cache_drain_stw() {
 		}
 		for sc in 0 .. 136 {
 			unsafe {
-				c.alloc[sc] = nil
+				c.alloc[sc] = 0
 			}
 		}
 		c.tiny = 0
@@ -2364,7 +2364,7 @@ fn vgc_protect_cached_spans() {
 			continue
 		}
 		for sc in 0 .. 136 {
-			s := unsafe { c.alloc[sc] }
+			mut s := vgc_cache_span(c, sc)
 			if s != unsafe { nil } {
 				unsafe {
 					s.sweep_gen = u32(vgc_heap.gc_cycle)
@@ -2430,10 +2430,10 @@ fn vgc_fixup_caches() {
 			}
 		}
 		for sc in 0 .. 136 {
-			span := unsafe { c.alloc[sc] }
+			span := vgc_cache_span(c, sc)
 			if span != unsafe { nil } && !span.in_use {
 				unsafe {
-					c.alloc[sc] = nil
+					c.alloc[sc] = 0
 				}
 			}
 		}
@@ -5523,7 +5523,7 @@ fn vgc_orphan_state(o usize) string {
 	for i in 0 .. vgc_heap.ncaches {
 		c := unsafe { vgc_cache(i) }
 		for sc in 0 .. 136 {
-			if unsafe { c.alloc[sc] } == span {
+			if unsafe { c.alloc[sc] } == vgc_cache_span_id(span) {
 				cached << '${i}.${sc}${if c.registered { '' } else { 'x' }}'
 			}
 		}
