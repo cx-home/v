@@ -45,7 +45,7 @@ fn vgc_srt_worker() {
 	for i in 0 .. 256 {
 		canary[i] = u64(i + 1) * 0x9e3779b97f4a7c15
 	}
-	vgc_safe_region_enter()
+	vgc_safe_region_enter(C.vgc_caller_sp())
 	C.vgc_atomic_store_u32(&vgc_srt_stage, 1)
 	// "Blocked": a tight non-allocating spin — the shape that, without a safe
 	// region, never reaches an alloc poll and is mach-suspended as a straggler

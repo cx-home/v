@@ -84,7 +84,8 @@ fn C.vgc_install_thread_exit(idx int)
 fn C.vgc_park_spill(stop_flag &u32, stop_seq &u32, stopped_count &u32, my_stopped &u32, my_park_seq &u32, range_lo &usize, range_hi &usize, spill_hi &usize, stack_base usize)
 fn C.vgc_wake_flag_waiters(flag &u32) // cx-private#1893: wake parkers sleeping on gc_stop_flag
 fn C.vgc_spill_regs(regs &usize, reg_max int) usize // cx-private#1886: own registers + SP
-fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int) // cx #316 safe regions
+fn C.vgc_safe_enter_spill(my_safe &u32, range_lo &usize, range_hi &usize, stack_base usize, reg_save &usize, reg_max int, outer usize, heap_lo usize, heap_hi usize) int // cx #316 safe regions, cx-home/v#88
+fn C.vgc_caller_sp() usize // the caller's SP at the call (vgc_platform.h)
 fn C.vgc_safe_exit_handshake(my_safe &u32, stop_flag &u32)
 fn C.vgc_thread_self_port() u32
 
@@ -223,6 +224,9 @@ const vgc_cache_chunk_mask = vgc_cache_chunk_slots - 1
 const vgc_max_cache_chunks = 4096
 // #58 -d vgc_spcheck shadow tables (diagnostic only): the first 1,024 slots.
 const vgc_spchk_slots = 1024
+// cx-home/v#88: a safe region's snapshot now keeps only the HEAP words (inside the
+// arenas' span) of the callee-saved registers and of the dying entry frames
+// (vgc_safe_enter_spill), so the words below count heap words, not jmp_buf words.
 // cx #316: words captured per safe-region register snapshot. Sized to hold
 // every callee-saved register setjmp spills on every supported target
 // (darwin arm64 = 24 words of jmp_buf, darwin x86_64 = 19, glibc x86_64 = 8
@@ -426,9 +430,9 @@ mut:
 	// gc_stop_flag) makes a waking thread either visible as a straggler or
 	// blocked until the world resumes — there is no stale-flag window.
 	safe u32 // atomic
-	// Callee-saved register snapshot taken at region entry (setjmp words copied
-	// OFF-STACK — the enter frame dies before the blocking call, so an on-stack
-	// spill would be overwritten; see vgc_safe_enter_spill). Shaded by
+	// Callee-saved register snapshot taken at region entry, copied OFF-STACK with
+	// the heap words of the entry frames (they die before the blocking call, which
+	// overwrites them; see vgc_safe_enter_spill, cx-home/v#88). Shaded by
 	// vgc_scan_suspended_roots for safe-covered threads; also conservatively
 	// covered by the vgc_heap data-segment scan.
 	safe_regs [vgc_safe_spill_words]usize
@@ -3194,8 +3198,9 @@ fn vgc_native_unpin(p voidptr) {
 // vgc_native_safe_enter / vgc_native_safe_exit: the GC-safe blocking region
 // (cx #316) under fixed C names; the contract is vgc_safe_region_enter's.
 @[export: 'vgc_native_safe_enter']
+@[noinline]
 fn vgc_native_safe_enter() {
-	vgc_safe_region_enter()
+	vgc_safe_region_enter(C.vgc_caller_sp())
 }
 
 @[export: 'vgc_native_safe_exit']
@@ -8840,20 +8845,39 @@ pub fn vgc_perturb() {
 // recorded prefix + snapshot, both immutable for the region's duration by the
 // caller contract (documented in full at vgc_safe_enter_spill in
 // vgc_platform.h: no allocation, no GC-pointer stores, no new GC references
-// carried across exit). Cheap: setjmp + a bounded word copy + one seq_cst
-// store — suitable for a per-park hot path. No-op for unregistered threads
-// (they are invisible to the collector anyway).
-fn vgc_safe_region_enter() {
+// carried across exit). Cheap: a register capture, a filtered copy of a few
+// hundred bytes of stack and one seq_cst store — suitable for a per-park hot
+// path. No-op for unregistered threads (they are invisible to the collector
+// anyway). `outer` is vgc_caller_sp() of the entry point the region's caller
+// called (gc_safe_region_enter, vgc_native_safe_enter): the frames below it die
+// when enter returns, and what they saved of the caller's callee-saved registers
+// goes into the snapshot (cx-home/v#88).
+fn vgc_safe_region_enter(outer usize) {
 	cache_idx := C.vgc_get_cache_idx()
 	if cache_idx < 0 {
 		return
 	}
 	vgc_safe_cache_flush(cache_idx)
-	unsafe {
+	published := unsafe {
 		C.vgc_safe_enter_spill(&vgc_cache(cache_idx).safe, &vgc_cache(cache_idx).stack_lo,
 			&vgc_cache(cache_idx).stack_hi, vgc_cache(cache_idx).stack_base,
-			&vgc_cache(cache_idx).safe_regs[0], vgc_safe_spill_words)
+			&vgc_cache(cache_idx).safe_regs[0], vgc_safe_spill_words, outer, vgc_arena_lo,
+			vgc_arena_hi)
 	}
+	if published == 0 {
+		C.vgc_atomic_add_u64(&vgc_safe_unpublished, 1)
+	}
+}
+
+// cx-home/v#88: the regions whose snapshot did not fit (more heap words in the
+// registers and the entry frames than vgc_safe_spill_words); each ran as an
+// ordinary mutator, suspended and scanned in full by the stops it met.
+__global vgc_safe_unpublished = u64(0)
+
+// vgc_safe_unpublished_count: how many GC-safe regions were entered without being
+// published as safe (vgc_safe_region_enter; cx-home/v#88)
+pub fn vgc_safe_unpublished_count() u64 {
+	return C.vgc_atomic_load_u64(&vgc_safe_unpublished)
 }
 
 // vgc_safe_cache_flush hands this thread's cached spans to the other threads as

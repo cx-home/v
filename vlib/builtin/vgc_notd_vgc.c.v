@@ -47,7 +47,7 @@ fn vgc_memory_use() usize {
 	return 0
 }
 
-fn vgc_safe_region_enter() {
+fn vgc_safe_region_enter(outer usize) {
 }
 
 fn vgc_safe_region_exit() {
@@ -90,6 +90,7 @@ fn C.vgc_atomic_cas_u32(ptr &u32, expected &u32, desired u32) bool
 fn C.vgc_say(tag u64, v u64)
 fn C.vgc_get_cache_idx() int
 fn C.vgc_clear_dead_stack(limit_lo usize, limit_hi usize)
+fn C.vgc_caller_sp() usize
 
 // cx-home/v#72: gc_collect (cx-home/v#51), gc_total_allocated (cx-home/v#56) and
 // gc_thread_allocated (cx-home/v#62) read these in their `$if vgc ? {}` arms.

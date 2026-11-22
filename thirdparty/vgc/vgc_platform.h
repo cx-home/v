@@ -1724,31 +1724,130 @@ static inline uintptr_t vgc_spill_regs(uintptr_t* regs, int reg_max) {
     vgc_keep_alive(&buf);
     return sp;
 }
-static inline void vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
-                                        uintptr_t* range_hi, uintptr_t stack_base,
-                                        uintptr_t* reg_save, int reg_max) {
+// vgc_caller_sp(): the stack pointer the CALLER of the function this is written in
+// had at the call (the function's canonical frame address). On arm64 and x86-64 (and
+// i386) the frame record — saved frame pointer, then the return address — sits at the
+// frame address, so the caller's SP is two words above it; on msvc the return-address
+// slot is one word below it. Everything a callee saves of its caller's registers is
+// below this address.
+#if defined(_MSC_VER) && !defined(__clang__)
+  #define vgc_caller_sp() ((uintptr_t)_AddressOfReturnAddress() + sizeof(void*))
+#else
+  #define vgc_caller_sp() ((uintptr_t)__builtin_frame_address(0) + 2 * sizeof(void*))
+#endif
+
+// VGC_CAPTURE_CS(p): store the calling thread's callee-saved registers, as they are at
+// this point, into p[0 .. VGC_CS_WORDS) — without a call, so no function between the
+// region's caller and the capture has to keep anything of its own in them (setjmp is a
+// call: the function that makes it must keep its live values in callee-saved registers
+// across it, and loads them there BEFORE the setjmp reads them, cx-home/v#88). Where
+// there is no capture (tcc, msvc, other targets) VGC_CS_WORDS is 0 and the spill takes
+// the registers with setjmp into its own frame, which the window copy below covers.
+#if (defined(__aarch64__) || defined(__arm64__)) && (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
+  #define VGC_CS_WORDS 19
+  #define VGC_CAPTURE_CS(p) __asm__ __volatile__( \
+      "stp x19, x20, [%0, #0]\n\t" "stp x21, x22, [%0, #16]\n\t" \
+      "stp x23, x24, [%0, #32]\n\t" "stp x25, x26, [%0, #48]\n\t" \
+      "stp x27, x28, [%0, #64]\n\t" "str x29, [%0, #80]\n\t" \
+      "stp d8, d9, [%0, #88]\n\t" "stp d10, d11, [%0, #104]\n\t" \
+      "stp d12, d13, [%0, #120]\n\t" "stp d14, d15, [%0, #136]\n\t" \
+      : : "r"(p) : "memory")
+#elif defined(__x86_64__) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
+  #define VGC_CS_WORDS 6
+  #define VGC_CAPTURE_CS(p) __asm__ __volatile__( \
+      "movq %%rbx, 0(%0)\n\t" "movq %%rbp, 8(%0)\n\t" "movq %%r12, 16(%0)\n\t" \
+      "movq %%r13, 24(%0)\n\t" "movq %%r14, 32(%0)\n\t" "movq %%r15, 40(%0)\n\t" \
+      : : "r"(p) : "memory")
+#elif defined(__x86_64__) && defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
+  // Windows x64: rbx, rbp, rdi, rsi, r12-r15 and xmm6-xmm15 (both halves) are callee-saved
+  #define VGC_CS_WORDS 28
+  #define VGC_CAPTURE_CS(p) __asm__ __volatile__( \
+      "movq %%rbx, 0(%0)\n\t" "movq %%rbp, 8(%0)\n\t" "movq %%rdi, 16(%0)\n\t" \
+      "movq %%rsi, 24(%0)\n\t" "movq %%r12, 32(%0)\n\t" "movq %%r13, 40(%0)\n\t" \
+      "movq %%r14, 48(%0)\n\t" "movq %%r15, 56(%0)\n\t" \
+      "movdqu %%xmm6, 64(%0)\n\t" "movdqu %%xmm7, 80(%0)\n\t" "movdqu %%xmm8, 96(%0)\n\t" \
+      "movdqu %%xmm9, 112(%0)\n\t" "movdqu %%xmm10, 128(%0)\n\t" "movdqu %%xmm11, 144(%0)\n\t" \
+      "movdqu %%xmm12, 160(%0)\n\t" "movdqu %%xmm13, 176(%0)\n\t" "movdqu %%xmm14, 192(%0)\n\t" \
+      "movdqu %%xmm15, 208(%0)\n\t" \
+      : : "r"(p) : "memory")
+#else
+  #define VGC_CS_WORDS 0
+#endif
+
+// vgc_safe_enter_spill records a GC-safe region's roots and publishes safe=1. `outer`
+// is vgc_caller_sp() of the region's entry point (gc_safe_region_enter,
+// vgc_native_safe_enter): the SP of the frame that stays live across the region.
+// cx-home/v#88: the roots are (1) the entry-time stack prefix [sp, stack_base], (2) the
+// callee-saved registers as captured here, and (3) a copy of the stack words
+// [sp, outer) — the frames of the entry functions and of this spill, which die when
+// enter returns and which the blocking call's frames overwrite. Every value of the
+// caller's callee-saved registers that a function between the caller and here saved
+// before using the register for itself is in (3); the rest are still in the registers
+// and are in (2). Without (3) a caller's heap pointer kept in a callee-saved register
+// across the blocking call (a compiled loop joining threads) was scanned nowhere.
+// The snapshot is reg_save[0 .. reg_max): of (2) and (3) only the words that fall in
+// [heap_lo, heap_hi) — the arenas' span, the only words vgc_shade does not ignore; an
+// object the caller holds exists at entry, so it is inside the span read here. Heap
+// words that do not fit are not published: answers 0, safe stays 0, and the thread is
+// an ordinary mutator for this region (a blocked straggler the stop suspends and scans
+// in full — sound, without the safe region's saving). Answers 1 when published.
+static inline int vgc_safe_enter_spill(uint32_t* my_safe, uintptr_t* range_lo,
+                                       uintptr_t* range_hi, uintptr_t stack_base,
+                                       uintptr_t* reg_save, int reg_max, uintptr_t outer,
+                                       uintptr_t heap_lo, uintptr_t heap_hi) {
+#if VGC_CS_WORDS > 0
+    uintptr_t cs[VGC_CS_WORDS];
+    VGC_CAPTURE_CS(cs);
+#else
     jmp_buf buf;
-    memset(&buf, 0, sizeof(buf)); // deterministic tail below (unused slots shade nothing)
-    VGC_SPILL_SETJMP(buf);
-    // Real SP, not the frame pointer: the spilled-register jmp_buf lives below
-    // the frame pointer and must be inside the recorded range (see vgc_real_sp).
+    memset(&buf, 0, sizeof(buf));
+    VGC_SPILL_SETJMP(buf); // the registers land in buf, inside the window
+#endif
+    // Real SP, not the frame pointer: the captured registers live below the frame
+    // pointer and must be inside the window (see vgc_real_sp).
     uintptr_t sp = vgc_real_sp();
+#if VGC_CS_WORDS == 0
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
+#endif
+    sp &= ~(uintptr_t)(sizeof(uintptr_t) - 1);
     if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
     else { *range_lo = stack_base; *range_hi = sp; }
-    // jmp_buf is int[] on macOS: count WORDS of its byte size (a bare
-    // sizeof(buf)/sizeof(uintptr_t) trips clang's -Wsizeof-array-div under -cstrict).
-    size_t buf_bytes = sizeof(buf);
-    int n = (int)(buf_bytes / sizeof(uintptr_t));
-    if (n > reg_max) { n = reg_max; }
-    const uintptr_t* w = (const uintptr_t*)&buf;
-    for (int i = 0; i < n; i++) { reg_save[i] = w[i]; }
+    int n = 0;
+    int fits = 1;
+#if VGC_CS_WORDS > 0
+    for (int i = 0; i < VGC_CS_WORDS; i++) {
+        uintptr_t v = cs[i];
+        if (v >= heap_lo && v < heap_hi) {
+            if (n == reg_max) { fits = 0; break; }
+            reg_save[n++] = v;
+        }
+    }
+#endif
+    if (fits && outer > sp) {
+        const uintptr_t* w = (const uintptr_t*)sp;
+        size_t words = (size_t)(outer - sp) / sizeof(uintptr_t);
+        for (size_t i = 0; i < words; i++) {
+            uintptr_t v = w[i];
+            if (v >= heap_lo && v < heap_hi) {
+                if (n == reg_max) { fits = 0; break; }
+                reg_save[n++] = v;
+            }
+        }
+    }
     for (int i = n; i < reg_max; i++) { reg_save[i] = 0; }
+#if VGC_CS_WORDS > 0
+    vgc_keep_alive(cs);
+#else
+    vgc_keep_alive(&buf);
+#endif
+    if (!fits) {
+        return 0;
+    }
     // Publish LAST (seq_cst): a collector that loads safe==1 (its load is after
     // its own seq_cst store of gc_stop_flag) is guaranteed to observe the
     // recorded range and the completed snapshot.
     vgc_atomic_store_u32(my_safe, 1);
-    vgc_keep_alive(&buf);
+    return 1;
 }
 
 // Leave the safe region. The order is load-bearing (the classic Dekker pairing

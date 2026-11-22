@@ -5,7 +5,8 @@
 // runs two full collections. After the region the object must still be allocated. The control
 // rounds hold nothing (the address stays disguised), and their objects must be freed: that shows
 // the collections ran and the measure sees a freed object.
-// Prints: done covered=C held_freed=H control_freed=F rounds=R
+// Prints: done covered=C held_freed=H control_freed=F rounds=R unpublished=U (U: regions that
+// ran as ordinary mutators because their snapshot did not fit; cx-home/v#88)
 module main
 
 import os
@@ -75,5 +76,5 @@ fn main() {
 			control_freed++
 		}
 	}
-	println('done covered=${C.vgc_srr_covered()} held_freed=${held_freed} control_freed=${control_freed} rounds=${rounds}')
+	println('done covered=${C.vgc_srr_covered()} held_freed=${held_freed} control_freed=${control_freed} rounds=${rounds} unpublished=${vgc_safe_unpublished_count()}')
 }

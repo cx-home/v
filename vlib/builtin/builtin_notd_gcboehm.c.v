@@ -104,10 +104,12 @@ pub fn gc_unpin(p voidptr) {
 // progress (the world-resume handshake), so the region can never leak a
 // running mutator into a live mark/sweep. NOP under boehm/none and for
 // GC-unregistered threads.
-@[markused]
+@[markused; noinline]
 pub fn gc_safe_region_enter() {
 	$if vgc ? {
-		vgc_safe_region_enter()
+		// cx-home/v#88: the frames below this caller's SP die when the region is
+		// entered; never inlined, so the bound is this function's caller's SP
+		vgc_safe_region_enter(C.vgc_caller_sp())
 	}
 }
 

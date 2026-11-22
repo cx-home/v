@@ -48,6 +48,9 @@ fn run(flags string) {
 	}
 	assert lines[0].contains(' control_freed=20 '), 'the control kept its objects: the measure cannot see a freed object: ${lines[0]}'
 	assert lines[0].contains(' held_freed=0 '), 'objects held only in a callee-saved register across a GC-safe region were freed while live: ${lines[0]}'
+	// the regions ran published (safe): a region that fell back to an ordinary mutator is
+	// suspended and scanned in full, and would pass without the snapshot being right
+	assert lines[0].ends_with(' unpublished=0'), 'a GC-safe region ran unpublished (its snapshot did not fit): ${lines[0]}'
 }
 
 fn test_an_object_held_in_a_callee_saved_register_across_a_safe_region_survives_at_o2() {
