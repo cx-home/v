@@ -4,6 +4,17 @@
 #ifndef VGC_PLATFORM_H
 #define VGC_PLATFORM_H
 
+// cx-home/v#74 piece 1: under -d vgc_shadow_stack cgen puts vgc_ss_escape(&x) after
+// every local of a reference-carrying aggregate type. The empty asm takes the
+// address, so clang keeps the aggregate whole in its stack slot (no SROA slices
+// at unaligned offsets) and current at every call. tcc does not slice; it gets
+// a no-op.
+#if defined(__TINYC__)
+#define vgc_ss_escape(p) ((void)(p))
+#else
+#define vgc_ss_escape(p) __asm__ __volatile__("" : : "r"(p) : "memory")
+#endif
+
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -2891,11 +2902,16 @@ static void vgc_rd_report(uint64_t cycle, uint32_t cat, uintptr_t where, int64_t
 // line goes to VGC_UA_LOG (appended, O_APPEND: every process a run starts writes
 // to the one file the environment names) or to stderr without it. A line is
 // `[ua-audit] pid=P exe=E gc=N kind=only|real thread=T off=O where=W word=V
-// obj=B bytes=X frame=F`; at exit, when any cycle was audited, one summary line
+// obj=B bytes=X frame=F` (real_round: a real word whose value has its low 24 bits
+// 0 or 1 — two small integers read across a word boundary naming a long-lived
+// object at an arena or 16 MB start, cx-home/v#74 piece 4; counted apart); at exit, when any cycle was audited, one summary line
 // `[ua-audit] pid=P exe=E summary only=N real=M cycles=C overflow=O`.
 #include <fcntl.h>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#endif
 static int vgc_ua_fd = -2;
-static uint64_t vgc_ua_cnt[4]; // 0 only, 1 real, 2 audited cycles, 3 overflow
+static uint64_t vgc_ua_cnt[8]; // 0 only, 1 real, 2 audited cycles, 3 overflow, 4 real_round, 5 real_pair, 6 poisoned objects
 static const char* vgc_ua_exe(void) {
 #if defined(__APPLE__)
     const char* n = getprogname();
@@ -2912,12 +2928,66 @@ static void vgc_ua_write(const char* b, int n) {
     }
     if (n > 0) (void)!write(vgc_ua_fd, b, (size_t)n);
 }
+// A line's fields, kept while the world is stopped (cx-home/v#74 piece 4,
+// pbm1-ss74d's hang): naming a frame is dladdr, which takes dyld's loaders
+// lock, and a thread the stop suspended inside dlopen holds that lock for the
+// whole stop — the collector waited on it for 33 minutes. So a line written
+// under the stop waits here, and vgc_ua_flush names and writes it once the
+// world runs again. vgc_ua_dladdr_stopped counts dladdr calls made between
+// vgc_ua_stop(1) and vgc_ua_stop(0): 0 is the invariant.
+typedef struct { int kind; uint32_t thread; uint64_t cycle; int64_t off; uintptr_t where, word, obj; uint64_t bytes; uintptr_t lr; } vgc_ua_rec;
+#define VGC_UA_PEND_CAP 16384
+static vgc_ua_rec* vgc_ua_pend;
+static int vgc_ua_npend;
+static volatile int vgc_ua_pend_busy;
+static int vgc_ua_stopped;
+static uint64_t vgc_ua_dladdr_stopped;
+static void vgc_ua_stop(int on) { vgc_ua_stopped = on; }
+static uint64_t vgc_ua_dladdr_in_stop(void) { return vgc_ua_dladdr_stopped; }
+static const char* vgc_ua_kind(int k) {
+    switch (k) {
+    case 0: return "only"; case 1: return "real"; case 2: return "real_round"; case 3: return "wit_old";
+    case 4: return "wit_new"; case 5: return "wit_heap"; case 6: return "real_pair"; case 7: return "wit_write";
+    case 8: return "wit_free"; case 9: return "poison";
+    }
+    return "?";
+}
+static void vgc_ua_emit(const vgc_ua_rec* r, int name) {
+    char b[512];
+    const char* fn = 0;
+#if defined(__APPLE__)
+    if (name && r->lr) {
+        if (vgc_ua_stopped) vgc_ua_dladdr_stopped++;
+        Dl_info di; memset(&di, 0, sizeof di);
+        if (dladdr((void*)r->lr, &di) && di.dli_sname) fn = di.dli_sname;
+    }
+#endif
+    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s gc=%llu kind=%s thread=%u off=%lld where=%p word=%p obj=%p bytes=%llu",
+                     (int)getpid(), vgc_ua_exe(), (unsigned long long)r->cycle, vgc_ua_kind(r->kind), r->thread,
+                     (long long)r->off, (void*)r->where, (void*)r->word, (void*)r->obj, (unsigned long long)r->bytes);
+    if (n > 0 && n < (int)sizeof b) {
+        int m = fn ? snprintf(b + n, sizeof b - n, " frame=%s\n", fn) : snprintf(b + n, sizeof b - n, " frame=%p\n", (void*)r->lr);
+        if (m > 0) n += m;
+    }
+    vgc_ua_write(b, n < (int)sizeof b ? n : (int)sizeof b - 1);
+}
+// writes the lines the last stop left, each frame named (the world runs)
+static void vgc_ua_flush(void) {
+    if (!vgc_ua_pend) return;
+    while (__sync_lock_test_and_set(&vgc_ua_pend_busy, 1)) { }
+    int n = vgc_ua_npend;
+    for (int i = 0; i < n; i++) vgc_ua_emit(&vgc_ua_pend[i], 1);
+    vgc_ua_npend = 0;
+    __sync_lock_release(&vgc_ua_pend_busy);
+}
 static void vgc_ua_exit(void) {
     if (vgc_ua_cnt[2] == 0) return;
-    char b[256];
-    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s summary only=%llu real=%llu cycles=%llu overflow=%llu\n",
+    vgc_ua_flush();
+    char b[320];
+    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s summary only=%llu real=%llu cycles=%llu overflow=%llu real_round=%llu real_pair=%llu poison=%llu\n",
                      (int)getpid(), vgc_ua_exe(), (unsigned long long)vgc_ua_cnt[0], (unsigned long long)vgc_ua_cnt[1],
-                     (unsigned long long)vgc_ua_cnt[2], (unsigned long long)vgc_ua_cnt[3]);
+                     (unsigned long long)vgc_ua_cnt[2], (unsigned long long)vgc_ua_cnt[3], (unsigned long long)vgc_ua_cnt[4], (unsigned long long)vgc_ua_cnt[5],
+                     (unsigned long long)vgc_ua_cnt[6]);
     vgc_ua_write(b, n < (int)sizeof b ? n : (int)sizeof b - 1);
 }
 static void vgc_ua_add(int k, uint64_t n) {
@@ -2943,22 +3013,71 @@ static uintptr_t vgc_ua_frame_lr(uintptr_t where) {
 #endif
     return 0;
 }
+// the return address into the function whose frame holds `where` on ANOTHER
+// thread's stopped stack [lo, hi) (cx-home/v#74 piece 4): no walk from a live
+// frame pointer is possible there, so the frame record just below `where` is
+// searched for — an aligned slot s whose word is a saved frame pointer above
+// `where` (inside the stack, 16-aligned) and whose next word is a return
+// address inside the program's own text (the main image's __TEXT, read from
+// its header: no dyld call, the world is stopped). Within 64 KB; 0 when none
+// is found.
+static uintptr_t vgc_ua_frame_lr_any(uintptr_t where, uintptr_t lo, uintptr_t hi) {
+#if defined(__APPLE__)
+    static uintptr_t tlo, thi;
+    if (!thi) {
+        const struct mach_header_64* mh = (const struct mach_header_64*)_NSGetMachExecuteHeader();
+        unsigned long tsz = 0;
+        uint8_t* t = mh ? getsegmentdata(mh, "__TEXT", &tsz) : 0;
+        if (t && tsz) { tlo = (uintptr_t)t; thi = tlo + tsz; } else { tlo = 1; thi = 1; }
+    }
+    uintptr_t s = (where & ~(uintptr_t)7);
+    uintptr_t stop = where > lo + 65536 ? where - 65536 : lo;
+    if (stop < lo) stop = lo;
+    while (s >= stop + 8 && s >= 8) {
+        s -= 8;
+        if (s + 16 > hi) continue;
+        uintptr_t fp = *(uintptr_t*)s;
+        if (fp > where && fp < hi && (fp & 15) == 0 && fp - s < (1u << 20)) {
+            uintptr_t lr = *(uintptr_t*)(s + 8);
+            if (lr >= tlo && lr < thi) return lr;
+        }
+    }
+#else
+    (void)where; (void)lo; (void)hi;
+#endif
+    return 0;
+}
 static void vgc_ua_line(int real, uint64_t cycle, uint32_t thread, int64_t off, uintptr_t where,
                         uintptr_t word, uintptr_t obj, uint64_t bytes, uintptr_t lr) {
-    char b[512];
-    const char* fn = 0;
-#if defined(__APPLE__)
-    Dl_info di; memset(&di, 0, sizeof di);
-    if (lr && dladdr((void*)lr, &di) && di.dli_sname) fn = di.dli_sname;
-#endif
-    int n = snprintf(b, sizeof b, "[ua-audit] pid=%d exe=%s gc=%llu kind=%s thread=%u off=%lld where=%p word=%p obj=%p bytes=%llu",
-                     (int)getpid(), vgc_ua_exe(), (unsigned long long)cycle, real ? "real" : "only", thread,
-                     (long long)off, (void*)where, (void*)word, (void*)obj, (unsigned long long)bytes);
-    if (n > 0 && n < (int)sizeof b) {
-        int m = fn ? snprintf(b + n, sizeof b - n, " frame=%s\n", fn) : snprintf(b + n, sizeof b - n, " frame=%p\n", (void*)lr);
-        if (m > 0) n += m;
+    vgc_ua_rec r = { real, thread, cycle, off, where, word, obj, bytes, lr };
+    if (!vgc_ua_stopped) { // a mutator's line (a free of a poisoned object): the world runs
+        vgc_ua_emit(&r, 1);
+        return;
     }
-    vgc_ua_write(b, n < (int)sizeof b ? n : (int)sizeof b - 1);
+    if (!vgc_ua_pend) {
+        void* m = mmap(0, sizeof(vgc_ua_rec) * VGC_UA_PEND_CAP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (m != MAP_FAILED) vgc_ua_pend = (vgc_ua_rec*)m;
+    }
+    if (vgc_ua_pend && !__sync_lock_test_and_set(&vgc_ua_pend_busy, 1)) {
+        int full = vgc_ua_npend >= VGC_UA_PEND_CAP;
+        if (!full) vgc_ua_pend[vgc_ua_npend++] = r;
+        __sync_lock_release(&vgc_ua_pend_busy);
+        if (!full) return;
+    }
+    vgc_ua_emit(&r, 0); // no room, or the last flush is still writing: the raw address
+}
+// the audit's poison (VGC_UA_POISON=1): fills [p, p+n) with the pattern, or
+// answers the offset of the first byte that is no longer the pattern (-1: whole)
+static void vgc_ua_poison_fill(uintptr_t p, uint64_t n) { memset((void*)p, 0xF5, (size_t)n); }
+static int64_t vgc_ua_poison_check(uintptr_t p, uint64_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w; memcpy(&w, b + i, 8);
+        if (w != 0xF5F5F5F5F5F5F5F5ULL) break;
+    }
+    for (; i < n; i++) if (b[i] != 0xF5) return (int64_t)i;
+    return -1;
 }
 
 static void vgc_gctrace_line(uint64_t cycle, uint64_t marked, uint64_t goal,
