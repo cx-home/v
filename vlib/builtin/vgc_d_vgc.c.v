@@ -542,6 +542,23 @@ fn vgc_cache_span(c &VGC_Cache, sc int) &VGC_Span {
 	return unsafe { vgc_heap.allspans[i - 1] }
 }
 
+// vgc_cache_span_ready is the allocation fast path's one read of the slot:
+// the span cached for class sc when it still has a free object, else nil
+// (the caller then takes vgc_cold_alloc / vgc_cache_get_span, which answer
+// the same span in that case — the fast path only skips their calls and
+// their second vgc_cache lookup; cx-home/v#77 pays the allspans load here).
+@[inline]
+fn vgc_cache_span_ready(cache_idx int, sc int) &VGC_Span {
+	if cache_idx < 0 {
+		return unsafe { nil }
+	}
+	s := vgc_cache_span(vgc_cache(cache_idx), sc)
+	if s != unsafe { nil } && s.alloc_count < s.nelems {
+		return s
+	}
+	return unsafe { nil }
+}
+
 // vgc_cache_span_id is what VGC_Cache.alloc stores for span s (0 for nil).
 @[inline]
 fn vgc_cache_span_id(s &VGC_Span) u32 {
@@ -7400,12 +7417,15 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 	}
 
 	span_class := int(class_idx) * 2 // scan variant
-	// cx-home/v#77: a cold class carves from the class's shared span first.
-	cold_ptr, cold_span := vgc_cold_alloc(cache_idx, span_class)
-	mut span := if cold_ptr != unsafe { nil } {
-		cold_span
-	} else {
-		vgc_cache_get_span(cache_idx, span_class)
+	// cx-home/v#77: the cached span when it has room (vgc_cache_span_ready, the
+	// one slot read), else a cold class carves from the class's shared span
+	// first, else the slow path refills the slot.
+	mut cold_ptr := unsafe { voidptr(nil) }
+	mut span := vgc_cache_span_ready(cache_idx, span_class)
+	if span == unsafe { nil } {
+		cp, cs := vgc_cold_alloc(cache_idx, span_class)
+		cold_ptr = cp
+		span = if cp != unsafe { nil } { cs } else { vgc_cache_get_span(cache_idx, span_class) }
 	}
 	if span == unsafe { nil } {
 		// Out of span space: the pacer is heap_live-driven, so under thread-churn
@@ -7861,12 +7881,15 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 	}
 
 	span_class := int(class_idx) * 2 + 1 // noscan variant
-	// cx-home/v#77: a cold class carves from the class's shared span first.
-	cold_ptr, cold_span := vgc_cold_alloc(cache_idx, span_class)
-	mut span := if cold_ptr != unsafe { nil } {
-		cold_span
-	} else {
-		vgc_cache_get_span(cache_idx, span_class)
+	// cx-home/v#77: the cached span when it has room (vgc_cache_span_ready, the
+	// one slot read), else a cold class carves from the class's shared span
+	// first, else the slow path refills the slot.
+	mut cold_ptr := unsafe { voidptr(nil) }
+	mut span := vgc_cache_span_ready(cache_idx, span_class)
+	if span == unsafe { nil } {
+		cp, cs := vgc_cold_alloc(cache_idx, span_class)
+		cold_ptr = cp
+		span = if cp != unsafe { nil } { cs } else { vgc_cache_get_span(cache_idx, span_class) }
 	}
 	if span == unsafe { nil } {
 		// Out of span space — reclaim + retry before OOM (see the scan-path note
