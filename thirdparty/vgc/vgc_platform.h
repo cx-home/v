@@ -3411,8 +3411,9 @@ static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
 // collector's heap (mmapped at run time). Linux is left out: its mincore has
 // no paged-out bit (a swapped page reads as not resident), and its zero-fill
 // read maps the shared zero page anyway (no RSS cost). Any failure — mincore
-// refusing the range, more pages than the vector, more runs than `max` — falls
-// back to the whole range, the scan before this change.
+// refusing the range — falls back to the whole range, the scan before this
+// change (cx-home/v#85: more pages than one vector, or more runs than `max`,
+// no longer does).
 // cx-home/v#15 lever 5: darwin's mincore costs ~0.46 us a page (one
 // vm_map_page_range_info walk per page: 94 pages took 41-44 us on dev2, 1 page
 // 0.6 us), so asking about every page of the data segment each cycle was most
@@ -3421,36 +3422,55 @@ static inline int vgc_static_tables(uintptr_t* los, uintptr_t* his) {
 // without asking: scanning a page is always sound (the scan is conservative;
 // a page that left core is only read back in), so only the pages not yet seen
 // touched are asked about, one mincore call per run of them.
-static inline vgc_tc_window* vgc_tc_window_for(uintptr_t base, uintptr_t top, uintptr_t ps) {
+// cx-home/v#85: the range is asked about in BLOCKS of 1,024 pages, each block
+// aligned to 1,024 pages of address, and a window is one such block. The first
+// shape asked only when the whole range fit one 1,024-entry vector and scanned
+// it whole otherwise — "more pages than the vector" was a fallback, and with
+// 4 KB pages (x86-64) an 8 MB .bss table is 2,048 pages, so every collection
+// read the whole table and faulted all of it in (vgc_data_touched_test: 2,047
+// untouched pages in core; with 16 KB pages the same table is 512 pages and
+// fit, and a 16 MB one would not have). A window is taken only once its block
+// shows a touched page, so a large untouched table uses none. More runs than
+// `max` no longer falls back to the whole range either: the last run is grown
+// over the gap (scanning more is always sound), which costs the gap's pages
+// and not the range's.
+static inline vgc_tc_window* vgc_tc_window_find(uintptr_t wbase) {
     for (int i = 0; i < vgc_tc_nwindows; i++) {
-        vgc_tc_window* w = &vgc_tc_windows[i];
-        if (base >= w->base && top <= w->base + 1024 * ps) return w;
+        if (vgc_tc_windows[i].base == wbase) return &vgc_tc_windows[i];
     }
-    if (vgc_tc_nwindows < 8 && top - base <= 1024 * ps) {
+    return 0;
+}
+static inline vgc_tc_window* vgc_tc_window_take(uintptr_t wbase) {
+    if (vgc_tc_nwindows < (int)(sizeof(vgc_tc_windows) / sizeof(vgc_tc_windows[0]))) {
         vgc_tc_window* w = &vgc_tc_windows[vgc_tc_nwindows++];
-        w->base = base; // bits are zero: a static, and never reused
+        w->base = wbase; // bits are zero: a static, and never reused
         return w;
     }
-    return 0; // no room: every page of the range is asked about, as before
+    return 0; // no room: every page of the block is asked about each cycle
 }
 #if defined(__APPLE__) && defined(MINCORE_PAGED_OUT)
 static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los, uintptr_t* his, int max) {
     if (hi <= lo || max < 1) {
         return 0;
     }
-    uintptr_t ps = (uintptr_t)getpagesize();
-    uintptr_t base = lo & ~(ps - 1);
-    uintptr_t npages = (hi - base + ps - 1) / ps;
+    const uintptr_t ps = (uintptr_t)getpagesize();
+    const uintptr_t blk = 1024 * ps;
+    const uintptr_t end = (hi + ps - 1) & ~(ps - 1);
     unsigned char vec[1024];
-    int asked = npages <= sizeof(vec);
-    if (asked) {
-        // the collector or the markers, under the stop (vgc_mark_roots,
-        // vgc_roots_data_slice): the window table under vgc_tc_lock
-        vgc_mutex_lock(&vgc_tc_lock);
-        vgc_tc_window* w = vgc_tc_window_for(base, base + npages * ps, ps);
-        uintptr_t off = w ? (base - w->base) / ps : 0;
+    int n = 0;
+    int asked = 1;
+    // the collector or the markers, under the stop (vgc_mark_roots,
+    // vgc_roots_data_slice): the window table under vgc_tc_lock
+    vgc_mutex_lock(&vgc_tc_lock);
+    uintptr_t base = lo & ~(ps - 1);
+    while (base < end && asked) {
+        const uintptr_t wbase = base & ~(blk - 1);
+        const uintptr_t top = (end - wbase > blk) ? wbase + blk : end;
+        const uintptr_t npages = (top - base) / ps; // 1..1024
+        const uintptr_t off = (base - wbase) / ps;
+        vgc_tc_window* w = vgc_tc_window_find(wbase);
         uintptr_t i = 0;
-        while (i < npages && asked) {
+        while (i < npages) {
             if (w && ((w->bits[(off + i) >> 6] >> ((off + i) & 63)) & 1)) {
                 vec[i++] = MINCORE_INCORE; // seen touched before
                 continue;
@@ -3463,21 +3483,19 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
                 asked = 0;
                 break;
             }
-            if (w) {
-                for (uintptr_t k = i; k < j; k++) {
-                    if (vec[k] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) {
-                        w->bits[(off + k) >> 6] |= (uint64_t)1 << ((off + k) & 63);
-                    }
+            for (uintptr_t k = i; k < j; k++) {
+                if (vec[k] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) {
+                    if (!w) w = vgc_tc_window_take(wbase);
+                    if (!w) break;
+                    w->bits[(off + k) >> 6] |= (uint64_t)1 << ((off + k) & 63);
                 }
             }
             i = j;
         }
-        vgc_mutex_unlock(&vgc_tc_lock);
-    }
-    if (asked) {
-        int n = 0;
-        int overflow = 0;
-        for (uintptr_t i = 0; i < npages; i++) {
+        if (!asked) {
+            break;
+        }
+        for (i = 0; i < npages; i++) {
             if ((vec[i] & (MINCORE_INCORE | MINCORE_PAGED_OUT)) == 0) {
                 continue; // never touched since exec: all zeros
             }
@@ -3492,15 +3510,16 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
                 his[n] = phi;
                 n++;
             } else {
-                overflow = 1;
-                break;
+                his[n - 1] = phi; // out of runs: the last one grows over the gap
             }
         }
-        if (!overflow) {
-            return n;
-        }
+        base = top;
     }
-    los[0] = lo;
+    vgc_mutex_unlock(&vgc_tc_lock);
+    if (asked) {
+        return n;
+    }
+    los[0] = lo; // mincore refused the range: scanned whole, as before
     his[0] = hi;
     return 1;
 }
