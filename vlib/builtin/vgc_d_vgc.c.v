@@ -106,6 +106,8 @@ fn C.vgc_susp_chunk_bounds(ci int, lo &usize, hi &usize) int // chunk ci's suspe
 fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
 fn C.vgc_thread_regs(idx int, sp_out &usize, regs &usize, max int) int
 fn C.vgc_run_gc_spilled(range_lo &usize, range_hi &usize, spill_hi &usize, stack_base usize)
+fn C.vgc_preheap_guard_once() // cx-home/v#90: guard the free pages the thread's pre-heap words name, before the heap's first mapping
+fn C.vgc_preheap_guarded() int
 fn C.vgc_clear_dead_stack(limit_lo usize, limit_hi usize) // cx-home/v#51: zero the dead stack below the caller
 fn C.vgc_num_cpus() int
 fn C.vgc_phys_mem() u64 // physical RAM in bytes; 0 = unknown (cx #282 default ceiling)
@@ -6463,6 +6465,9 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 			C.vgc_mutex_unlock(&vgc_heap.lock)
 			return unsafe { nil }, false
 		}
+		// cx-home/v#90: before the heap's first mapping, no arena may be mapped
+		// over a page the thread's registers or stack already name (vgc_platform.h)
+		C.vgc_preheap_guard_once()
 		asize := if nbytes > vgc_arena_size { nbytes } else { vgc_arena_size }
 		mut mem := unsafe { nil }
 		if vgc_test_arena_hint != 0 {
@@ -6681,6 +6686,7 @@ fn vgc_test_arena_map(asize usize) voidptr {
 // (cx-home/v#56 lever 7; the doc at vgc_nursery_base): nothing is committed
 // until the bump reaches it. A failed reservation leaves the nursery off.
 fn vgc_nursery_reserve_range() {
+	C.vgc_preheap_guard_once() // cx-home/v#90, as the carve's mapping
 	mem := C.vgc_os_reserve_aligned(vgc_nursery_reserve, vgc_page_size)
 	if mem == unsafe { nil } {
 		return

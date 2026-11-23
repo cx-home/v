@@ -1579,6 +1579,78 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t* s
     vgc_keep_alive(&buf);
 }
 
+// cx-home/v#90: the words a thread holds before the heap's first mapping. The
+// trampoline above spills the collecting thread's callee-saved registers every
+// cycle, and a register main never writes keeps what the process start left in
+// it for the life of the process: darwin x86-64's dyld leaves r13 naming a page
+// it had freed, the heap's first arena was mapped over it in more runs than not,
+// and in about one in eight the span carved at that page held vgc_perm_test's
+// transient, rooted for good (9,375 KB). Before the first mapping no word can
+// reference the heap, so vgc_preheap_guard takes the registers (a setjmp, as
+// the trampoline does) and every word from that buffer to the stack's top, and
+// maps one PROT_NONE page at each page they name that is FREE: no arena can be
+// mapped over it, so those words never name a heap object. A page already
+// mapped (an image, dyld's data, the stack) is left alone; the stack's own
+// addresses are skipped. Once, under the heap lock (vgc_preheap_guard_once,
+// before the carve's or the nursery's mapping); at most VGC_PREHEAP_PAGES pages
+// and VGC_PREHEAP_BYTES of stack. inherited_regs/inherited.v reads the registers.
+#define VGC_PREHEAP_PAGES 64
+#define VGC_PREHEAP_BYTES (256 * 1024)
+static int vgc_preheap_ran = 0;
+static int vgc_preheap_pages = 0;
+#if defined(_WIN32)
+  static inline void vgc_preheap_guard_once(void) { vgc_preheap_ran = 1; }
+#else
+  static inline int vgc_preheap_guard_page(uintptr_t pg, size_t ps) {
+    #if defined(MAP_FIXED_NOREPLACE)
+      void* p = mmap((void*)pg, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    #else
+      void* p = mmap((void*)pg, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    #endif
+      if (p == MAP_FAILED) return 0;
+      // a hint the kernel did not take: the page is mapped already
+      if ((uintptr_t)p != pg) { munmap(p, ps); return 0; }
+      return 1;
+  }
+  __attribute__((noinline)) static int vgc_preheap_guard(void) {
+      jmp_buf buf;
+      setjmp(buf);
+      uintptr_t from = ((uintptr_t)&buf + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1);
+      uintptr_t to = (uintptr_t)&buf + sizeof(buf);
+      uintptr_t slo = 0, shi = 0;
+      if (vgc_get_stack_bounds(&slo, &shi) && from >= slo && from < shi) {
+          to = shi - from > VGC_PREHEAP_BYTES ? from + VGC_PREHEAP_BYTES : shi;
+      } else {
+          slo = 0; shi = 0;
+      }
+      size_t ps = (size_t)getpagesize();
+      uintptr_t seen[VGC_PREHEAP_PAGES];
+      int nseen = 0, got = 0;
+      for (uintptr_t a = from; a + sizeof(uintptr_t) <= to && nseen < VGC_PREHEAP_PAGES; a += sizeof(uintptr_t)) {
+          uintptr_t v = *(volatile uintptr_t*)a;
+          if (v < 0x10000) continue;
+      #if UINTPTR_MAX > 0xFFFFFFFFu
+          if (v >= (uintptr_t)0x800000000000ull) continue; // above user space
+      #endif
+          if (v >= slo && v < shi) continue; // this thread's stack
+          uintptr_t pg = v & ~(uintptr_t)(ps - 1);
+          int dup = 0;
+          for (int i = 0; i < nseen; i++) { if (seen[i] == pg) { dup = 1; break; } }
+          if (dup) continue;
+          seen[nseen++] = pg;
+          got += vgc_preheap_guard_page(pg, ps);
+      }
+      vgc_keep_alive(&buf);
+      return got;
+  }
+  static inline void vgc_preheap_guard_once(void) {
+      if (vgc_preheap_ran) return;
+      vgc_preheap_ran = 1;
+      vgc_preheap_pages = vgc_preheap_guard();
+  }
+#endif
+static inline int vgc_preheap_guarded(void) { return vgc_preheap_pages; }
+
 // cx-home/v#51: the frames between a collection's caller and the trampoline
 // above (gc_collect and the runtime calls under it, the jmp_buf whose signal
 // mask setjmp leaves unwritten) are carved out of stack that earlier calls at
