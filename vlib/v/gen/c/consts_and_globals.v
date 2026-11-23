@@ -775,9 +775,17 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 				def_builder.write_string(' = ${g.expr_string(field.expr)}')
 			} else if (field.expr.is_literal() && should_init) || cinit
 				|| (field.expr is ast.ArrayInit && field.expr.is_fixed)
-				|| (is_simple_unsafe_expr && should_init) {
+				|| (is_simple_unsafe_expr && should_init)
+				|| (should_init && field.typ != ast.string_type && field.expr !is ast.StructInit
+				&& g.global_const_expr_is_c_const(field.expr)) {
 				// Simple literals can be initialized right away in global scope in C.
 				// e.g. `int myglobal = 10;`
+				// So can any C constant expression (`usize(0)`, `&u8(unsafe { nil })`):
+				// assigned in `_vinit` instead, the statement ran after every earlier
+				// module's consts and overwrote what they had already stored through
+				// the global (builtin's consts allocate before the collector's
+				// globals' statements: `vgc_arena_lo = usize(0)` dropped the first
+				// arena from the heap's address range; vgc_heap_vinit_kept_test.v).
 				def_builder.write_string(' = ${g.expr_string(field.expr)}')
 			} else {
 				// More complex expressions need to be moved to `_vinit()`
@@ -790,7 +798,20 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// zero: `x = (T){…}` builds the whole T as a stack temporary
 					// in `_vinit` at -O0 (vgc_heap: ~2 MB, cx-home/v#32 — a 2 MB
 					// stack overflowed in `_vinit`); memset writes the same zeros
-					init = '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 3z'
+					if should_init {
+						// The definition is here, and its static storage starts
+						// zero: no `_vinit` statement at all. A memset in
+						// `_vinit` ran AFTER every earlier module's consts, and
+						// wiped what they had already stored through the global:
+						// builtin's consts allocate before `vgc_heap`'s
+						// statement, so the collector forgot their spans
+						// (6 spans, 49,152 B carved still mapped;
+						// vgc_heap_vinit_kept_test.v).
+						def_builder.write_string(' = {0}')
+						init = '\t// ${final_c_name}: zero from its definition // global 3z'
+					} else {
+						init = '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 3z'
+					}
 				} else {
 					init = '\t${final_c_name} = ${g.expr_string(field.expr)}; // global 3'
 				}

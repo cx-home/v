@@ -1,7 +1,10 @@
 // vtest vflags: -enable-globals -no-skip-unused
-// cx-home/v#32: a global struct whose every field defaults to zero is zeroed in
-// `_vinit` with memset, not built as a stack temporary of the whole struct (at
-// -O0 vgc_heap's ~2 MB temporary overflowed a 2 MB stack in `_vinit`).
+// cx-home/v#32: a global struct whose every field defaults to zero is never built
+// as a stack temporary of the whole struct in `_vinit` (at -O0 vgc_heap's ~2 MB
+// temporary overflowed a 2 MB stack in `_vinit`). `big = Big{}` is zero from its
+// C definition, with no `_vinit` statement (a statement there ran after earlier
+// consts and wiped their stores: vgc_heap_vinit_kept_test.v); `big2` keeps the
+// `_vinit` memset.
 struct Big {
 mut:
 	a    int
