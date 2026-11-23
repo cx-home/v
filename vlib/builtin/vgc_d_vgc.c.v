@@ -77,6 +77,7 @@ fn C.vgc_get_class_size(cls int) u32
 fn C.vgc_get_class_npages(cls int) u32
 fn C.vgc_get_class_nobjs(cls int) u32
 fn C.vgc_init_size_tables()
+fn C.vgc_start_ladder_on() int // 1 while the size tables answer the start-up ladder (vgc_platform.h)
 fn C.vgc_mutex_lock(lk &u32)
 fn C.vgc_mutex_unlock(lk &u32)
 fn C.vgc_start_thread(f voidptr)
@@ -7162,10 +7163,28 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	unsafe {
 		vgc_span_init(mut new_span, class_idx, noscan)
 	}
+	if C.vgc_start_ladder_on() != 0 {
+		vgc_start_ladder_check()
+	}
 	// (vgc_span_alloc already stamped new_span.sweep_gen = gc_cycle before publishing
 	// it in allspans; span_init does not touch sweep_gen, so it is still protected.)
 
 	return new_span
+}
+
+// The start-up ladder's bound (vgc_platform.h): a start-up that has carved this
+// much leaves the ladder for the exact tables, so a module initialiser that
+// builds a large heap of small objects pays the ladder's rounding (at most each
+// object's own size again) on no more than this. The ladder's saving is the
+// page a span class it no longer touches would have carved, so past a heap of
+// this size the rounding costs more than the pages save. Read on a fresh
+// span's carve only, while the ladder is on.
+const vgc_start_ladder_limit = u64(512) * 1024
+
+fn vgc_start_ladder_check() {
+	if vgc_carved_probe() >= vgc_start_ladder_limit {
+		C.vgc_init_size_tables()
+	}
 }
 
 // (vgc_central_return_span is gone — it had NO callers, which meant nothing
