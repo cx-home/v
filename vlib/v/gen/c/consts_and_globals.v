@@ -158,7 +158,7 @@ fn (mut g Gen) const_decl(node ast.ConstDecl) {
 				} else if (field.expr is ast.CastExpr || field.expr is ast.InfixExpr)
 					&& (field.typ.is_number() || field.typ.is_bool()) && !field.typ.is_ptr()
 					&& !field.typ.has_flag(.option) && !field.typ.has_flag(.result)
-					&& global_number_c_const(field.expr, 0) {
+					&& g.number_c_const(field.expr) {
 					// cx-home/cx-core-code#268: a number const whose value is a C
 					// constant expression (`usize(64) * 1024 * 1024`) is initialised
 					// on its definition, not in `_vinit` — the allocator runs before
@@ -890,7 +890,36 @@ fn (mut g Gen) global_static_number(typ ast.Type, expr ast.Expr) bool {
 	if expr !is ast.CastExpr && expr !is ast.InfixExpr && expr !is ast.ParExpr {
 		return false
 	}
-	return global_number_c_const(expr, 0)
+	return g.number_c_const(expr)
+}
+
+// number_c_const: `expr` is a C constant expression as V writes it — the AST
+// check, and no call in its C text: V writes a shift as `v__lshift_*` /
+// `v__rshift_*`, an integer `/` or `%` as `VSAFE_DIV_*` / `VSAFE_MOD_*` and,
+// with overflow checks on, `+ - *` as `builtin__overflow__*`, none of which a
+// C static initializer takes (cx-home/cx-core-code#268: libcx's build refused
+// rand's `1.0 / f64(u32(1) << 23)` and core's `i64(1) << 53` there)
+fn (mut g Gen) number_c_const(expr ast.Expr) bool {
+	return global_number_c_const(expr, 0) && !c_text_has_call(g.expr_string(expr))
+}
+
+// c_text_has_call reports whether the C text `s` calls something: a `(` whose
+// nearest non-space character before it ends a name (`f(`), not a cast or a
+// group (`((u64)(1))`)
+fn c_text_has_call(s string) bool {
+	for i := 0; i < s.len; i++ {
+		if s[i] != `(` {
+			continue
+		}
+		mut j := i - 1
+		for j >= 0 && s[j] == ` ` {
+			j--
+		}
+		if j >= 0 && (s[j].is_letter() || s[j].is_digit() || s[j] == `_`) {
+			return true
+		}
+	}
+	return false
 }
 
 // global_number_c_const: number literals, and casts, parentheses, unary minus
