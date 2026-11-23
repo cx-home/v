@@ -1,3 +1,3 @@
-memset(&big, 0, sizeof(main__Big)); // global 3z
-memset(&big2, 0, sizeof(main__Big)); // global 5z
+// big: all zero bytes, static storage (global 3z)
+// big2: all zero bytes, static storage (global 5z)
 .n = 5

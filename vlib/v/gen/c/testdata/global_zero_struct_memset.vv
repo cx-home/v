@@ -2,6 +2,8 @@
 // cx-home/v#32: a global struct whose every field defaults to zero is zeroed in
 // `_vinit` with memset, not built as a stack temporary of the whole struct (at
 // -O0 vgc_heap's ~2 MB temporary overflowed a 2 MB stack in `_vinit`).
+// cx-home/cx-core-code#268: nor with memset — its static storage is already
+// zero, and the memset made every page of it resident at start-up.
 struct Big {
 mut:
 	a    int
