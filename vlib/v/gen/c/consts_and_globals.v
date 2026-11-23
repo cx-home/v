@@ -775,7 +775,8 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 				def_builder.write_string(' = ${g.expr_string(field.expr)}')
 			} else if (field.expr.is_literal() && should_init) || cinit
 				|| (field.expr is ast.ArrayInit && field.expr.is_fixed)
-				|| (is_simple_unsafe_expr && should_init) {
+				|| (is_simple_unsafe_expr && should_init)
+				|| (should_init && g.global_static_number(field.typ, field.expr)) {
 				// Simple literals can be initialized right away in global scope in C.
 				// e.g. `int myglobal = 10;`
 				def_builder.write_string(' = ${g.expr_string(field.expr)}')
@@ -789,8 +790,14 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// `__global x = T{}` of a T whose every field defaults to
 					// zero: `x = (T){…}` builds the whole T as a stack temporary
 					// in `_vinit` at -O0 (vgc_heap: ~2 MB, cx-home/v#32 — a 2 MB
-					// stack overflowed in `_vinit`); memset writes the same zeros
-					init = '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 3z'
+					// stack overflowed in `_vinit`). Nothing is written: its
+					// storage is static, which C zero-fills, and the zero-fill
+					// pages stay out of core until the program writes them — a
+					// memset here made all of them resident (builtin's vgc_heap,
+					// 390,744 B, in every program) and, run after `_vinit`'s
+					// first allocations, wiped the heap they had set up
+					// (cx-home/cx-core-code#268)
+					init = '\t// ${final_c_name}: all zero bytes, static storage (global 3z)'
 				} else {
 					init = '\t${final_c_name} = ${g.expr_string(field.expr)}; // global 3'
 				}
@@ -816,9 +823,11 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// memcpy the default in, mirroring the `{E_STRUCT}` path above.
 					if g.table.final_sym(field.typ).kind == .struct
 						&& g.global_zero_default(field.typ, 0) {
-						// every field of the struct defaults to zero: memset, not a
-						// stack temporary of the whole struct (cx-home/v#32)
-						init += '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 5z'
+						// every field of the struct defaults to zero: no stack
+						// temporary of the whole struct (cx-home/v#32) and no
+						// memset — static storage is zero-filled, and untouched
+						// it stays out of core (cx-home/cx-core-code#268)
+						init += '\t// ${final_c_name}: all zero bytes, static storage (global 5z)'
 					} else if g.table.final_sym(field.typ).kind == .array_fixed {
 						init += '\tmemcpy(${final_c_name}, (${styp}[]){${default_initializer}}, sizeof(${styp})); // global 5'
 					} else {
@@ -837,6 +846,66 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			def:       def_builder.str()
 			init:      init
 			dep_names: g.table.dependent_names_in_expr(field.expr)
+		}
+	}
+}
+
+// global_static_number reports whether a global of a number or bool type is
+// initialised with a C constant expression (`usize(0)`, `u64(32) * 1024`), or
+// one of a pointer type with a nil cast (`&voidptr(unsafe { nil })`):
+// then its definition carries the value, as a literal's does, and `_vinit`
+// does not assign it. builtin's collector globals are such, and `_vinit`'s
+// first allocations run the collector before `_vinit` reaches them: assigned
+// there, they were set back under a heap already set up (its arena range,
+// nursery and barrier bounds zeroed under live arenas), which only the memset
+// of vgc_heap that followed made consistent (cx-home/cx-core-code#268).
+fn (mut g Gen) global_static_number(typ ast.Type, expr ast.Expr) bool {
+	if typ.has_flag(.option) || typ.has_flag(.result) || typ.has_flag(.shared_f)
+		|| typ.has_flag(.atomic_f) {
+		return false
+	}
+	if typ.is_ptr() || typ.is_pointer() {
+		// `&T(unsafe { nil })`: a nil pointer
+		return expr is ast.CastExpr && !expr.has_arg && global_zero_expr(expr.expr)
+	}
+	if !(typ.is_number() || typ.is_bool()) {
+		return false
+	}
+	if expr !is ast.CastExpr && expr !is ast.InfixExpr && expr !is ast.ParExpr {
+		return false
+	}
+	return global_number_c_const(expr, 0)
+}
+
+// global_number_c_const: number literals, and casts, parentheses, unary minus
+// or `~` and arithmetic over them — nothing a C static initializer can refuse
+// (no C. names, no consts, no calls)
+fn global_number_c_const(e ast.Expr, depth int) bool {
+	if depth > 32 {
+		return false
+	}
+	return match e {
+		ast.IntegerLiteral, ast.FloatLiteral, ast.BoolLiteral, ast.CharLiteral {
+			true
+		}
+		ast.CastExpr {
+			!e.has_arg && (e.typ.is_number() || e.typ.is_bool()) && !e.typ.is_ptr()
+				&& global_number_c_const(e.expr, depth + 1)
+		}
+		ast.ParExpr {
+			global_number_c_const(e.expr, depth + 1)
+		}
+		ast.PrefixExpr {
+			e.op in [.minus, .bit_not] && global_number_c_const(e.right, depth + 1)
+		}
+		ast.InfixExpr {
+			e.op in [.plus, .minus, .mul, .div, .mod, .left_shift, .right_shift, .amp, .pipe, .xor]
+				&& e.left_type != ast.string_type && e.right_type != ast.string_type
+				&& global_number_c_const(e.left, depth + 1)
+				&& global_number_c_const(e.right, depth + 1)
+		}
+		else {
+			false
 		}
 	}
 }
