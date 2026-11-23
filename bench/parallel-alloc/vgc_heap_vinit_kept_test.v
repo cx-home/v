@@ -15,6 +15,14 @@
 // error_sentinel's object and whether a span owns it. Red on 394a12489 (the
 // cgen before the fix): `arena=-1 span=no carved=8192`.
 //
+// The arenas _vinit leaves: one, of the full arena size, and main's first small
+// request shares it. A const of the collector that _vinit assigns read 0 while
+// builtin's consts allocated (vgc_arena_size: each of those carves mapped an
+// arena of its own size, one page, full at once, so a program began with two
+// such arenas plus the one main's first request mapped); cgen now gives an
+// integer const whose initialiser is a C constant its value in its C definition.
+// Red on 92a68f3ef: `arenas=2 small=2`.
+//
 // Run: ./v -gc e test bench/parallel-alloc/vgc_heap_vinit_kept_test.v
 module main
 
@@ -33,4 +41,5 @@ fn test_builtin_consts_objects_stay_in_the_heaps_books() {
 	out := run.output.trim_space()
 	println(out)
 	assert out.starts_with('arena=0 span=yes '), out
+	assert out.ends_with(' arenas=1 small=0'), out
 }

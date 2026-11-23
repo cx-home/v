@@ -149,6 +149,17 @@ fn (mut g Gen) const_decl(node ast.ConstDecl) {
 							continue
 						}
 					}
+					// An integer const the evaluator above leaves alone (a usize or
+					// isize one: `usize(64) * 1024 * 1024`) whose initialiser C
+					// folds gets its value in its C definition, as such a __global
+					// does (global_decl): a _vinit statement left it 0 for the
+					// _vinit statements before it, and builtin's consts allocate
+					// there, so the collector read its own sizes as 0.
+					if field.typ.is_int() && g.const_expr_is_c_int_const(field.expr) {
+						g.const_decl_write_precomputed(field.mod, g.styp(field.typ), const_name,
+							field.name, '(${g.expr_string(field.expr)})')
+						continue
+					}
 				}
 				if field.is_simple_define_const() {
 					// "Simple" expressions are not going to need multiple statements,
@@ -533,6 +544,41 @@ fn (mut g Gen) global_const_expr_is_c_const(expr ast.Expr) bool {
 		}
 		ast.UnsafeExpr {
 			return g.global_const_expr_is_c_const(expr.expr)
+		}
+		else {
+			return false
+		}
+	}
+}
+
+// const_expr_is_c_int_const answers whether cgen writes integer expression `expr`
+// as a C integer constant expression: integer and character literals, a
+// #define const, a cast to an integer type, and the operators cgen writes as C's
+// own (+ - * & | ^, unary - and ~). A shift, a division and a modulo are not:
+// cgen writes them as calls or checked macros (v__lshift_usize, VSAFE_DIV_*).
+fn (mut g Gen) const_expr_is_c_int_const(expr ast.Expr) bool {
+	match expr {
+		ast.CharLiteral, ast.IntegerLiteral {
+			return true
+		}
+		ast.CastExpr {
+			return !expr.has_arg && expr.typ.is_int() && g.const_expr_is_c_int_const(expr.expr)
+		}
+		ast.Ident {
+			return expr.obj is ast.ConstField && expr.obj.is_simple_define_const()
+				&& expr.obj.expr is ast.IntegerLiteral
+		}
+		ast.InfixExpr {
+			if expr.op !in [.plus, .minus, .mul, .amp, .pipe, .xor] {
+				return false
+			}
+			return g.const_expr_is_c_int_const(expr.left) && g.const_expr_is_c_int_const(expr.right)
+		}
+		ast.ParExpr {
+			return g.const_expr_is_c_int_const(expr.expr)
+		}
+		ast.PrefixExpr {
+			return expr.op in [.minus, .bit_not] && g.const_expr_is_c_int_const(expr.right)
 		}
 		else {
 			return false
