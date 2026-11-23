@@ -1,3 +1,7 @@
-memset(&big, 0, sizeof(main__Big)); // global 3z
-memset(&big2, 0, sizeof(main__Big)); // global 5z
+// big: all zero bytes, static storage (global 3z)
+// big2: all zero bytes, static storage (global 5z)
 .n = 5
+cfg_floor = ((u64)(32)) * 1024; // global 6
+cfg_zero = ((usize)(0)); // global 6
+cfg_neg = ((int)(-1)); // global 6
+cfg_ptr = ((u64*)(((void*)0))); // global 6
