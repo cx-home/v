@@ -789,8 +789,14 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// `__global x = T{}` of a T whose every field defaults to
 					// zero: `x = (T){…}` builds the whole T as a stack temporary
 					// in `_vinit` at -O0 (vgc_heap: ~2 MB, cx-home/v#32 — a 2 MB
-					// stack overflowed in `_vinit`); memset writes the same zeros
-					init = '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 3z'
+					// stack overflowed in `_vinit`). Nothing is written: its
+					// storage is static, which C zero-fills, and the zero-fill
+					// pages stay out of core until the program writes them — a
+					// memset here made all of them resident (builtin's vgc_heap,
+					// 390,744 B, in every program) and, run after `_vinit`'s
+					// first allocations, wiped the heap they had set up
+					// (cx-home/cx-core-code#268)
+					init = '\t// ${final_c_name}: all zero bytes, static storage (global 3z)'
 				} else {
 					init = '\t${final_c_name} = ${g.expr_string(field.expr)}; // global 3'
 				}
@@ -816,9 +822,11 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 					// memcpy the default in, mirroring the `{E_STRUCT}` path above.
 					if g.table.final_sym(field.typ).kind == .struct
 						&& g.global_zero_default(field.typ, 0) {
-						// every field of the struct defaults to zero: memset, not a
-						// stack temporary of the whole struct (cx-home/v#32)
-						init += '\tmemset(&${final_c_name}, 0, sizeof(${styp})); // global 5z'
+						// every field of the struct defaults to zero: no stack
+						// temporary of the whole struct (cx-home/v#32) and no
+						// memset — static storage is zero-filled, and untouched
+						// it stays out of core (cx-home/cx-core-code#268)
+						init += '\t// ${final_c_name}: all zero bytes, static storage (global 5z)'
 					} else if g.table.final_sym(field.typ).kind == .array_fixed {
 						init += '\tmemcpy(${final_c_name}, (${styp}[]){${default_initializer}}, sizeof(${styp})); // global 5'
 					} else {
