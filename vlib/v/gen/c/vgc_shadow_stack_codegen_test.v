@@ -76,3 +76,39 @@ fn test_the_byte_scan_build_emits_no_escape() {
 	c := gen_c('-d vgc_byte_stack_scan')
 	assert !c.contains('vgc_ss_ref') && !c.contains('vgc_ss_pin('), 'the -d vgc_byte_stack_scan build carries an escape'
 }
+
+// cx-home/v#74 lever 3 (a38-w13): a by-value parameter the body reads ONLY at
+// narrow fields laid out before its first cut (a kind byte, a flag) gets no
+// escape. Its reference bytes are never read in the function, so there is no
+// read of them to protect, and its escape — one llvm.assume per inlined call —
+// sat in every block of a caller's `a.is_x() && a.is_y()` chain, where it keeps
+// clang's SimplifyCFG from folding the chain into one branch: each term halved
+// the block frequency below, until the calls behind it fell under the
+// cold-call-site threshold (45) and were no longer inlined (cx's
+// code__CRun_exec_path: cx.Node.map_shape_or_nil / map_shaped_vals, n-body
+// 1.028 against the pinned V). A parameter whose union or buffer is read, or
+// that is passed or copied whole, keeps its escape.
+const vgc_ss_narrow_src = "struct Node {\n\tkind u8\n\tflags u8\n\tbuf []u8\n}\n\nfn (n Node) is_leaf() bool {\n\treturn n.kind == 1 && n.flags == 0\n}\n\nfn (n Node) size() int {\n\treturn n.buf.len\n}\n\nfn (n Node) passed() int {\n\treturn size_of(n)\n}\n\nfn size_of(n Node) int {\n\treturn if n.kind == 2 { n.buf.len } else { 0 }\n}\n\nfn main() {\n\tn := Node{kind: 1, buf: []u8{len: 3}}\n\tprintln(n.is_leaf())\n\tprintln(n.size() + n.passed())\n}\n"
+
+fn test_a_parameter_read_only_at_narrow_fields_before_its_cut_gets_no_escape() {
+	tmp_dir := os.join_path(os.vtmp_dir(), 'vgc_ss_narrow_${os.getpid()}')
+	os.mkdir_all(tmp_dir) or { panic(err) }
+	src := os.join_path(os.real_path(tmp_dir), 'vgc_ss_narrow.vv')
+	os.write_file(src, vgc_ss_narrow_src) or { panic(err) }
+	cmd := '${os.quoted_path(vgc_ss_codegen_vexe)} -gc e -o - ${os.quoted_path(src)}'
+	res := os.execute(cmd)
+	os.rmdir_all(tmp_dir) or {}
+	assert res.exit_code == 0, '${cmd}\n${res.output}'
+	c := res.output
+	leaf := fn_body(c, 'bool main__Node_is_leaf(main__Node n) {')
+	assert leaf != '', c
+	assert !leaf.contains('vgc_ss_ref') && !leaf.contains('vgc_ss_pin('), leaf
+	size := fn_body(c, 'int main__Node_size(main__Node n) {')
+	assert size.contains('vgc_ss_ref8(n, 0 + __builtin_offsetof(main__Node, buf), 8);'), size
+	passed := fn_body(c, 'int main__Node_passed(main__Node n) {')
+	assert passed != '', c
+	// n is passed whole (and names no field): one piece to clang, nothing to cut
+	assert !passed.contains('vgc_ss_ref8(n,'), passed
+	size_of := fn_body(c, 'int main__size_of(main__Node n) {')
+	assert size_of.contains('vgc_ss_ref8(n, 0 + __builtin_offsetof(main__Node, buf), 8);'), size_of
+}
