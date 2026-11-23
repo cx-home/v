@@ -169,7 +169,10 @@ const vgc_page_size = 8192
 const vgc_max_small_size = u32(32768) // objects > this are "large"
 const vgc_num_classes = 68
 const vgc_num_span_classes = 136 // 68 * 2 (scan + noscan variants)
-const vgc_arena_size = usize(64) * 1024 * 1024 // 64MB per arena
+// The arena size in MB: a plain literal, so the consts derived from it are C
+// constants that hold their values in _vinit's window too (vgc_frame_pages).
+const vgc_arena_mb = 64
+const vgc_arena_size = usize(vgc_arena_mb) * 1024 * 1024 // 64MB per arena
 const vgc_pages_per_arena = vgc_arena_size / vgc_page_size
 // free_spans pool bound: spans of 1..vgc_max_pooled_pages pages (INCLUSIVE — the
 // free_spans array carries 8193 slots so a fully-coalesced 64 MB arena pools too)
@@ -4260,7 +4263,10 @@ const vgc_large_round_min = 256
 // it in place. The rule holds at the arena ceiling too, where an arena of
 // the other kind with room is the last resort before a failed carve, as an
 // owned arena is (vgc_arena_pick).
-const vgc_frame_pages = u32(vgc_arena_size / vgc_page_size / 4)
+// (vgc_arena_size / vgc_page_size / 4, written from vgc_arena_mb so the
+// compiler computes it: a usize quotient was a _vinit statement, 0 while
+// builtin's consts allocated.)
+const vgc_frame_pages = u32(vgc_arena_mb * 1024 * 1024 / vgc_page_size / 4)
 
 @[inline]
 fn vgc_frame_request(npages u32) bool {

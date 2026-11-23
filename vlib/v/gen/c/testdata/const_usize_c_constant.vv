@@ -1,0 +1,14 @@
+// A usize const whose initialiser C folds holds its value in its C definition,
+// not by a `_vinit` statement: a statement left it 0 for the `_vinit`
+// statements before it (builtin's consts allocate there, and the collector read
+// its arena size as 0: vgc_heap_vinit_kept_test.v). A shift or a division is
+// written as a call or a checked macro, so such a const stays a `_vinit`
+// statement.
+const arena_mb = 64
+const arena_size = usize(arena_mb) * 1024 * 1024
+const reserve = usize(16) * 1024 * 1024 * 1024
+const shifted = usize(1) << 13
+
+fn main() {
+	println(arena_size + reserve + shifted)
+}

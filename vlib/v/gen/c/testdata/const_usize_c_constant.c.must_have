@@ -1,0 +1,3 @@
+static const usize _const_main__arena_size = (((usize)(_const_main__arena_mb)) * 1024 * 1024); // precomputed2
+static const usize _const_main__reserve = (((usize)(16)) * 1024 * 1024 * 1024); // precomputed2
+static usize _const_main__shifted; // inited later
