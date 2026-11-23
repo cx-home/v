@@ -57,8 +57,13 @@ static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
    kn5 / kn9 / kn10 11-22). The read is at word, never at the local's first byte: a read of the parameter's
    first word at a function's entry is a second read of the tag's address to clang's inliner, five points
    that keep cx.Node.scalar_value (cost 220, threshold 225) out of line at 1,192 call sites against 107
-   (kn15–18, 11-22); a read at word costs it nothing (vgc_shadow_stack_cost_test). */
-#define vgc_ss_refp(x, off, word) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); __builtin_assume(!__builtin_constant_p((uintptr_t)*(void *const *)((const char*)&(x) + (word)) + (uintptr_t)(long long)vgc_ss_unknown)); } while (0)
+   (kn15–18, 11-22); a read at word costs it nothing (vgc_shadow_stack_cost_test). The read is a DOUBLE,
+   not a pointer (a1e3e080e6): SROA promotes a slice as the one type every access agrees on, else as an
+   integer with a conversion at each access; a pointer read agrees with nothing but a pointer, so a
+   receiver's union word read as f64 in a float-only caller (n-body) became an integer slot with a move
+   between the register files at every read, where a double read agrees with the double, converts
+   free to an integer (a bitcast) and to a pointer (an inttoptr) — never worse than no escape. */
+#define vgc_ss_refp(x, off, word) do { _Static_assert((off) == (word) && (word) >= 8 && (word) % 8 == 0 && (word) + 8 <= sizeof(x), "vgc_ss_ref: the compiler's layout of this local's type is not C's"); __builtin_assume(!__builtin_constant_p(*(const double *)((const char*)&(x) + (word)) + vgc_ss_unknown)); } while (0)
 #define vgc_ss_ref4(x, off, word) vgc_ss_refp(x, off, word)
 #define vgc_ss_ref8(x, off, word) vgc_ss_refp(x, off, word)
 #else
