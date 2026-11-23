@@ -3,7 +3,48 @@
 // that can be found in the LICENSE file.
 module c
 
+import os
 import v.ast
+
+// PROBE (cx-home/v#74 experiment 2, 11-22; VGC_SS_PARAMREAD=1): a by-value
+// parameter's escape is dropped where the body names the member that holds the
+// cut (`n.u.` for cx.Node's union word): the function then has a typed access
+// at the cut itself. An UPPER BOUND on what the rule can gain — a narrow member
+// of a union (n.u.b, a bool) also matches; the sound rule reads the access's
+// width.
+const vgc_ss_paramread = os.getenv('VGC_SS_PARAMREAD') != ''
+
+// vgc_ss_param_unread answers the escape statements of esc whose cut's first
+// member the body does not name on pname ('' when none is left)
+fn vgc_ss_param_unread(esc string, pname string, body string) string {
+	mut out := []string{}
+	for st in esc.split(';') {
+		t := st.trim_space()
+		if t == '' {
+			continue
+		}
+		mut keep := true
+		if i := t.index('__builtin_offsetof(') {
+			rest := t[i + '__builtin_offsetof('.len..]
+			m := rest.all_after(', ').all_before(')')
+			key := '${pname}.${m}'
+			mut k := 0
+			for {
+				j := body.index_after(key, k) or { break }
+				e := j + key.len
+				if e < body.len && body[e] in [`.`, `)`, `,`, `;`, ` `, `-`, `[`] {
+					keep = false
+					break
+				}
+				k = e
+			}
+		}
+		if keep {
+			out << t + ';'
+		}
+	}
+	return out.join(' ')
+}
 
 // cx-home/v#74 piece 1, the shadow stack's compiler half (-gc e; piece 6: the
 // default, -d vgc_byte_stack_scan turns it and the aligned-only scan off).
@@ -482,7 +523,15 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 			for p in params {
 				pname := p.all_before('\x01')
 				if pname in touched {
-					pesc << p.all_after('\x01').trim_left(' ')
+					esc := p.all_after('\x01').trim_left(' ')
+					if vgc_ss_paramread {
+						kept := vgc_ss_param_unread(esc, pname, body)
+						if kept != '' {
+							pesc << kept
+						}
+					} else {
+						pesc << esc
+					}
 				}
 			}
 			if pesc.len > 0 {
