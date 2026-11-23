@@ -789,7 +789,8 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			}
 			if g.pref.translated {
 				def_builder.write_string(' = ${g.expr_string(field.expr)}')
-			} else if (field.expr.is_literal() && should_init) || cinit
+			} else if (field.expr.is_literal() && should_init
+				&& !g.global_number_call(field.typ, field.expr)) || cinit
 				|| (field.expr is ast.ArrayInit && field.expr.is_fixed)
 				|| (is_simple_unsafe_expr && should_init)
 				|| (should_init && g.global_static_number(field.typ, field.expr)) {
@@ -901,6 +902,15 @@ fn (mut g Gen) global_static_number(typ ast.Type, expr ast.Expr) bool {
 // rand's `1.0 / f64(u32(1) << 23)` and core's `i64(1) << 53` there)
 fn (mut g Gen) number_c_const(expr ast.Expr) bool {
 	return global_number_c_const(expr, 0) && !c_text_has_call(g.expr_string(expr))
+}
+
+// global_number_call: a number or bool global whose literal value V writes
+// with a call (`u64(1) << 40` is `v__lshift_u64(…)`, `int(100) / 7` is
+// `VSAFE_DIV_int(…)`): not a C static initializer, so `_vinit` assigns it
+// (cx-home/cx-core-code#268)
+fn (mut g Gen) global_number_call(typ ast.Type, expr ast.Expr) bool {
+	return (typ.is_number() || typ.is_bool()) && !typ.is_ptr()
+		&& c_text_has_call(g.expr_string(expr))
 }
 
 // c_text_has_call reports whether the C text `s` calls something: a `(` whose
