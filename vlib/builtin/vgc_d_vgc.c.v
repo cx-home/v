@@ -7431,7 +7431,7 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 	mut cold_ptr := unsafe { voidptr(nil) }
 	mut span := vgc_cache_span_ready(cache_idx, span_class)
 	if span == unsafe { nil } {
-		cp, cs := vgc_cold_alloc(cache_idx, span_class)
+		cp, mut cs := vgc_cold_alloc(cache_idx, span_class)
 		cold_ptr = cp
 		span = if cp != unsafe { nil } { cs } else { vgc_cache_get_span(cache_idx, span_class) }
 	}
@@ -7895,7 +7895,7 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 	mut cold_ptr := unsafe { voidptr(nil) }
 	mut span := vgc_cache_span_ready(cache_idx, span_class)
 	if span == unsafe { nil } {
-		cp, cs := vgc_cold_alloc(cache_idx, span_class)
+		cp, mut cs := vgc_cold_alloc(cache_idx, span_class)
 		cold_ptr = cp
 		span = if cp != unsafe { nil } { cs } else { vgc_cache_get_span(cache_idx, span_class) }
 	}
