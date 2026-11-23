@@ -163,15 +163,19 @@ fn test_a_by_value_receivers_escape_costs_the_method_no_inline_cost() {
 	cost_ref, out_ref := build_method(exe + '_ref', '-d vgc_byte_stack_scan')
 	os.rm(exe + '_ref') or {}
 	println('vgc_shadow_stack_cost: clang inlines main__Node_value at cost ${cost_esc} with the escapes, ${cost_ref} without')
-	assert cost_ref > 0, 'no inline remark for main__Node_value without the escapes:\n${out_ref}'
-	assert cost_esc > 0, 'no inline remark for main__Node_value with the escapes:\n${out_esc}'
+	// (the cost is a signed score: -40 on x86-64, 25 on arm64 — a missing
+	// remark is the sentinel, not a sign)
+	assert cost_ref != no_inline_remark, 'no inline remark for main__Node_value without the escapes:\n${out_ref}'
+	assert cost_esc != no_inline_remark, 'no inline remark for main__Node_value with the escapes:\n${out_esc}'
 	assert cost_esc == cost_ref, 'the escapes lift main__Node_value\'s inline cost from ${cost_ref} to ${cost_esc}: an escape on a by-value parameter must cost the inliner nothing'
 	assert bl.len == 0, 'main__Node_value is called out of line at ${bl.len} sites:\n${bl.join('\n')}'
 }
 
 // build_method builds ss/method.v -prod with flags and answers clang's inline
-// cost of main__Node_value at its first call site (0 when no remark names it)
-// and the compiler's output
+// cost of main__Node_value at its first call site (no_inline_remark when no
+// remark names it) and the compiler's output
+const no_inline_remark = -1_000_000
+
 fn build_method(exe string, flags string) (int, string) {
 	src := os.join_path(os.dir(@FILE), 'ss', 'method.v')
 	cmd := '${os.quoted_path(@VEXE)} -prod -gc e ${flags} -show-c-output -cflags "-Rpass=inline -Rpass-missed=inline" -o ${os.quoted_path(exe)} ${os.quoted_path(src)}'
@@ -183,7 +187,7 @@ fn build_method(exe string, flags string) (int, string) {
 		}
 		return line.all_after('cost=').all_before(',').int(), r.output
 	}
-	return 0, r.output
+	return no_inline_remark, r.output
 }
 
 // instr_a_round answers the instructions the program retires for one round of
