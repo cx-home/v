@@ -462,6 +462,81 @@ fn vgc_ss_depth_delta(line string, depth int) int {
 	return d
 }
 
+// vgc_ss_narrow_fields: the top-level fields of the struct of C type ctype that
+// carry no reference and are laid out wholly before its first cut (a kind byte,
+// a flag; cx-home/v#74 lever 3). A by-value parameter the body reads only at
+// such fields gets no escape (vgc_ss_reads_only): its reference bytes are never
+// read in the function, so no read of them needs the cut, and the escape's
+// llvm.assume — one per inlined call — sat in every block of a caller's
+// `a.is_x() && a.is_y()` chain, where clang's SimplifyCFG cannot fold the chain
+// into one branch past it: each term halved the block frequency below until
+// the calls there fell under the cold-call-site threshold (45) and stayed out of
+// line (cx's code__CRun_exec_path, n-body 1.028 against the pinned V).
+fn (mut g Gen) vgc_ss_narrow_fields(ctype string) []string {
+	refs := g.vgc_ss_refs_of(ctype)
+	if refs.len == 0 || refs[0] == '&' {
+		return []
+	}
+	first_cut := refs[0].all_after_last(', ').all_before(')').int()
+	idx := g.vgc_ss_sym[ctype] or { return [] }
+	sym := g.table.sym(ast.idx_to_type(idx))
+	if sym.kind != .struct || sym.info !is ast.Struct {
+		return []
+	}
+	info := sym.info as ast.Struct
+	if info.is_minify || info.is_typedef || info.attrs.contains('packed') || info.is_union {
+		return []
+	}
+	mut off := 0
+	mut out := []string{}
+	for f in info.fields {
+		sz, al := g.vgc_ss_size(f.typ)
+		if al <= 0 || sz <= 0 {
+			break
+		}
+		off = (off + al - 1) / al * al
+		if off + sz > first_cut {
+			break
+		}
+		if !g.contains_ptr(f.typ) {
+			out << c_name(f.name)
+		}
+		off += sz
+	}
+	return out
+}
+
+// vgc_ss_reads_only: every use of the identifier pname in body is `pname.F`
+// with F one of fields (a use in a string, a call, an assignment, `&pname` or
+// `pname.G` for any other G answers false)
+fn vgc_ss_reads_only(body string, pname string, fields []string) bool {
+	if fields.len == 0 {
+		return false
+	}
+	mut k := 0
+	for {
+		j := body.index_after(pname, k) or { break }
+		e := j + pname.len
+		k = e
+		if j > 0 && (body[j - 1].is_letter() || body[j - 1].is_digit() || body[j - 1] == `_`
+			|| body[j - 1] == `.` || (body[j - 1] == `>` && j > 1 && body[j - 2] == `-`)) {
+			// part of another identifier, or a field named pname of something else
+			continue
+		}
+		if e < body.len && (body[e].is_letter() || body[e].is_digit() || body[e] == `_`) {
+			continue
+		}
+		if e + 1 < body.len && body[e] == `.` {
+			fe := vgc_ss_ident_end(body, e + 1)
+			if body[e + 1..fe] in fields {
+				continue
+			}
+		}
+		return false
+	}
+	return true
+}
+
 // vgc_ss_escapes rewrites a function body's C text: after every declaration
 // `<tabs>T name;` or `<tabs>T name = ...;` (one line, or one statement over
 // several lines) of a type T that can be cut off a word, it appends T's escape
@@ -480,9 +555,13 @@ fn (mut g Gen) vgc_ss_escapes(body string, params []string) string {
 			// the body text starts right after the function's opening `{`
 			mut pesc := []string{}
 			for p in params {
-				pname := p.all_before('\x01')
+				parts := p.split('\x01')
+				pname := parts[0]
 				if pname in touched {
-					pesc << p.all_after('\x01').trim_left(' ')
+					if parts.len > 2 && vgc_ss_reads_only(body, pname, parts[2].split(',')) {
+						continue
+					}
+					pesc << parts[1].trim_left(' ')
 				}
 			}
 			if pesc.len > 0 {
