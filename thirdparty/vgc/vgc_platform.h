@@ -28,13 +28,15 @@
 // longer inlined, n-body 1.092 against the pinned V). The assumption must hold whatever the local
 // holds, or it is undefined behaviour: asked of the read alone it is false wherever the compiler knows
 // the local's bytes (a tag stored from a literal) and the function's body is deleted. vgc_ss_unknown is
-// a double the compiler cannot know — external, weak, and written by vgc_init from the stack pointer —
-// so the sum is never a constant and the answer is always "no". (An operand with a side effect — a
-// call, a volatile read — makes clang drop the whole assumption, and the read with it.)
+// a double the compiler cannot know — weak (a link may replace it), and written by vgc_init from the
+// stack pointer — so the sum is never a constant and the answer is always "no". (An operand with a
+// side effect — a call, a volatile read — makes clang drop the whole assumption, and the read with it.)
+// It is hidden: an exported weak definition is one dyld coalesces across every loaded image at each
+// launch, and a built cx executable must export none (cx-private#1934, cx-home/v#74 reopened).
 // vgc_ss_pin takes &x under a "memory" clobber: x stays whole in its slot and is re-read after every
 // call. It is for what the walk cannot place (a C struct, a packed struct).
 // tcc and an unoptimised build do not cut; they get no-ops.
-__attribute__((weak)) double vgc_ss_unknown;
+__attribute__((weak, visibility("hidden"))) double vgc_ss_unknown;
 static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
 #if defined(__TINYC__) || !defined(__OPTIMIZE__)
 #define vgc_ss_ref4(x, off, word) ((void)0)
