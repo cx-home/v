@@ -5,3 +5,4 @@ cfg_floor = ((u64)(32)) * 1024; // global 6
 cfg_zero = ((usize)(0)); // global 6
 cfg_neg = ((int)(-1)); // global 6
 cfg_ptr = ((u64*)(((void*)0))); // global 6
+_const_main__cfg_const = ((usize)(64)) * 1024; // number const

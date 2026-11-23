@@ -155,6 +155,22 @@ fn (mut g Gen) const_decl(node ast.ConstDecl) {
 					// only the ones which are inited later, so it's safe to use expr_string
 					g.const_decl_simple_define(field.mod, field.name, const_name,
 						g.expr_string(field_expr))
+				} else if (field.expr is ast.CastExpr || field.expr is ast.InfixExpr)
+					&& (field.typ.is_number() || field.typ.is_bool()) && !field.typ.is_ptr()
+					&& !field.typ.has_flag(.option) && !field.typ.has_flag(.result)
+					&& global_number_c_const(field.expr, 0) {
+					// cx-home/cx-core-code#268: a number const whose value is a C
+					// constant expression (`usize(64) * 1024 * 1024`) is initialised
+					// on its definition, not in `_vinit` — the allocator runs before
+					// `_vinit` assigns it (builtin's vgc_arena_size read 0 there, and
+					// _vinit's first allocations carved arenas of the wrong size)
+					styp := g.styp(field.typ)
+					val := g.expr_string(field.expr)
+					g.global_const_defs[name] = GlobalConstDef{
+						mod:       field.mod
+						def:       '${g.static_non_parallel}${styp} ${const_name} = ${val}; // number const'
+						dep_names: g.table.dependent_names_in_expr(field_expr)
+					}
 				} else if field.expr is ast.CastExpr {
 					if field.expr.expr is ast.ArrayInit {
 						if field.expr.expr.is_fixed {
