@@ -1105,11 +1105,29 @@ static inline uint32_t vgc_get_class_size(int cls) { return vgc_class_sizes[cls]
 static inline uint32_t vgc_get_class_npages(int cls) { return vgc_class_npages[cls]; }
 static inline uint32_t vgc_get_class_nobjs(int cls) { return vgc_class_nobjs[cls]; }
 
-static void vgc_init_size_tables(void) {
+// The start-up ladder (cx-home/v: the start-up carve). A span class's first
+// span is a whole page, so a program whose module initialisers touch many size
+// classes once each carved a page apiece for a few hundred bytes of objects (a
+// start-up touching 64 span classes carved 62 pages for 21 KB of objects,
+// vgc_start_carve_test). Until vgc_init() runs — module consts, globals and
+// init() functions, all in _vinit — the tables answer only the power-of-two
+// classes (8, 16, 32 .. 32768: 13 rungs), so start-up objects share at most 13
+// span classes a scan kind; each object takes at most twice its size. vgc_init()
+// builds the exact tables before main, so nothing main allocates is affected.
+// A start-up that carves vgc_start_ladder_limit bytes leaves the ladder at
+// once (vgc_start_ladder_check), which bounds what the rounding can cost.
+static int vgc_start_ladder = 0; // 1 while the tables answer the ladder
+
+static inline int vgc_is_rung(int cls) {
+    uint32_t s = vgc_class_sizes[cls];
+    return cls >= 67 || (s & (s - 1)) == 0;
+}
+
+static void vgc_build_size_tables(int ladder) {
     int cls = 1;
     for (int i = 0; i < 129; i++) {
         uint32_t size = (uint32_t)i * 8; // index (size+7)>>3 == i covers sizes (i-1)*8+1 .. i*8
-        while (cls < 67 && vgc_class_sizes[cls] < size) {
+        while (cls < 67 && (vgc_class_sizes[cls] < size || (ladder && !vgc_is_rung(cls)))) {
             cls++;
         }
         vgc_s2c8[i] = (uint8_t)cls;
@@ -1117,12 +1135,20 @@ static void vgc_init_size_tables(void) {
     cls = 33;
     for (int i = 0; i < 249; i++) {
         uint32_t size = 1024 + (uint32_t)i * 128; // index i covers 1024+(i-1)*128+1 .. 1024+i*128
-        while (cls < 67 && vgc_class_sizes[cls] < size) {
+        while (cls < 67 && (vgc_class_sizes[cls] < size || (ladder && !vgc_is_rung(cls)))) {
             cls++;
         }
         vgc_s2c128[i] = (uint8_t)cls;
     }
+    vgc_start_ladder = ladder;
 }
+
+// The exact tables: every size takes the smallest class that holds it.
+static void vgc_init_size_tables(void) {
+    vgc_build_size_tables(0);
+}
+
+static inline int vgc_start_ladder_on(void) { return vgc_start_ladder; }
 
 // cx-private cx-core-code#63: the size-class tables are pure data, built
 // before main by a load-time constructor — vgc_init() runs only AFTER _vinit()
@@ -1130,15 +1156,16 @@ static void vgc_init_size_tables(void) {
 // module initialisers made saw empty tables, vgc_size_class answered 0, and
 // each small object took the large path: a whole 8 KB page apiece (a cx
 // process carved ~1,000 such pages, ~8 MB, for ~160 KB of start-up objects).
-// vgc_init() still calls vgc_init_size_tables(); building them twice is idempotent.
+// The constructor builds the start-up ladder (above); vgc_init() builds the
+// exact tables.
 #if defined(__GNUC__) || defined(__clang__) || defined(__TINYC__)
 __attribute__((constructor)) static void vgc_size_tables_ctor(void) {
-    vgc_init_size_tables();
+    vgc_build_size_tables(1);
 }
 #elif defined(_MSC_VER)
 // cx-home/v#22: msvc has no constructor attribute; the CRT runs every pointer
 // in .CRT$XCU before main, the same point a GCC constructor runs.
-static void __cdecl vgc_size_tables_ctor(void) { vgc_init_size_tables(); }
+static void __cdecl vgc_size_tables_ctor(void) { vgc_build_size_tables(1); }
 #pragma section(".CRT$XCU", read)
 __declspec(allocate(".CRT$XCU")) static void (__cdecl* vgc__size_tables_ctor_p)(void) = vgc_size_tables_ctor;
 #endif
