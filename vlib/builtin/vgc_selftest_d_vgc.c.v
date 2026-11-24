@@ -389,6 +389,47 @@ pub fn vgc_mark_backoff_selftest() u32 {
 				}
 			}
 		}
+		// cx-private#1923 (json-codec 1 MB at k=28, 30 mutators): a four-marker
+		// probe at the start-up's 2 MB mark lost against gc 0's sub-MB
+		// baseline, so the plan held two markers for 32 cycles — the whole run,
+		// whose 150-220 MB marks took 24-39 ms on two markers (46 % of the wall
+		// stopped) — and the back-off's cycles, parallel, never moved the
+		// one-marker baseline. A rate per KB judged on a small marked set says
+		// nothing of one many times its size: (5) the back-off ends, without
+		// judging that cycle, once the marked set reaches vgc_mark_regrow times
+		// the probe's; (6) a set grown less keeps it.
+		if rc == 0 {
+			small_kb := u64(2048)
+			small := (small_kb - 1) * 1024
+			vgc_mark_rate1_cm = 145
+			vgc_mark_n_target = 0
+			vgc_mark_backoff = 0
+			vgc_mark_lost_rate = 0
+			vgc_mark_nworkers_cur = 4
+			vgc_mark_last_ns = 400 * small_kb
+			vgc_mark_adapt(small)
+			if vgc_mark_n_target != 2 || vgc_mark_backoff != 32 {
+				rc = 5 // the small probe did not lose: the case is not set up
+			} else {
+				// (6) twice the set: still the back-off's two markers
+				vgc_mark_nworkers_cur = 2
+				vgc_mark_last_ns = 300 * small_kb * 2
+				vgc_mark_adapt(small * 2)
+				if vgc_mark_n_target != 2 || vgc_mark_backoff != 31 {
+					rc = 6
+				} else {
+					// (5) a hundred times the set, two markers, 150 ns/KB (no
+					// better than the stale baseline): the back-off ends and
+					// this cycle is not judged (no new back-off)
+					big_kb := small_kb * 100
+					vgc_mark_last_ns = 150 * big_kb
+					vgc_mark_adapt((big_kb - 1) * 1024)
+					if vgc_mark_n_target != 0 || vgc_mark_backoff != 0 {
+						rc = 7
+					}
+				}
+			}
+		}
 		vgc_mark_nworkers_cur = s_ncur
 		vgc_mark_last_ns = s_last
 		vgc_mark_rate1 = s_r1
