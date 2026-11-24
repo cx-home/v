@@ -2783,6 +2783,10 @@ pub fn vgc_init() {
 		mw = vgc_max_markers
 	}
 	vgc_mark_workers_cfg = mw
+	pexit_env := C.getenv(c'VGC_PACE_EXIT_STOPS')
+	if pexit_env != unsafe { nil } {
+		vgc_pace_exit_stops = int(C.atoll(pexit_env))
+	}
 	pt_env := C.getenv(c'VGC_HEADROOM_PER_THREAD')
 	if pt_env != unsafe { nil } {
 		vgc_headroom_per_thread = C.atoll(pt_env) != 0
@@ -7748,6 +7752,11 @@ __global vgc_acct_threads_prev = int(0)
 // cx-private#2040: vgc_scale_threads' answer at the last cycle (vgc_update_trigger)
 __global vgc_scale_last = int(0)
 __global vgc_paced_one = true
+// https://github.com/cx-home/cx-platform-store/issues/29: the stops in a row that read one thread
+// (vgc_pace_quiet_next), and how many of them a cycle that paced as several waits for before the
+// quarter comes back (vgc_pace_exit; VGC_PACE_EXIT_STOPS, default 8; 2 or less is the counts' rule)
+__global vgc_pace_quiet = int(0)
+__global vgc_pace_exit_stops = int(8)
 // cx-home/v#62: the last cycle's pacing answer and stamp count, for VGC_GCTRACE's pace line
 __global vgc_trace_pace_nt = int(0)
 __global vgc_trace_pace_one = true
