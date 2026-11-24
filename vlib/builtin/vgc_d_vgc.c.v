@@ -77,6 +77,8 @@ fn C.vgc_get_class_size(cls int) u32
 fn C.vgc_get_class_npages(cls int) u32
 fn C.vgc_get_class_nobjs(cls int) u32
 fn C.vgc_init_size_tables()
+fn C.vgc_ctrace_on() int
+fn C.vgc_ctrace4(tag &char, a u64, b u64, c u64, d u64)
 fn C.vgc_start_ladder_on() int // 1 while the size tables answer the start-up ladder (vgc_platform.h)
 fn C.vgc_mutex_lock(lk &u32)
 fn C.vgc_mutex_unlock(lk &u32)
@@ -2625,6 +2627,9 @@ pub fn vgc_init() {
 	// exact tables were back (64 span classes: 483,328 B for 21 KB of objects,
 	// vgc_start_carve_test). The first fresh span carved past the bound leaves
 	// the ladder (vgc_start_ladder_check), as during _vinit.
+	if C.vgc_ctrace_on() != 0 {
+		C.vgc_ctrace4(c'I', vgc_carved_probe(), 0, 0, 0)
+	}
 	vgc_start_ladder_check()
 	// cx #973: cache the data-segment root ranges while still single-threaded
 	// (the collector must never take the loader lock under STW — see
@@ -6162,10 +6167,16 @@ fn vgc_span_alloc_floor(npages u32, floor u32) &VGC_Span {
 	for _ in 0 .. 4 {
 		span, waited := vgc_span_alloc_once(npages, floor, true)
 		if !waited {
+			if C.vgc_ctrace_on() != 0 {
+				C.vgc_ctrace4(c'S', u64(npages), u64(floor), 0, vgc_carved_probe())
+			}
 			return span
 		}
 	}
 	last, _ := vgc_span_alloc_once(npages, floor, false)
+	if C.vgc_ctrace_on() != 0 {
+		C.vgc_ctrace4(c'S', u64(npages), u64(floor), 0, vgc_carved_probe())
+	}
 	return last
 }
 
@@ -7175,6 +7186,9 @@ fn vgc_central_get_fresh(span_class int) &VGC_Span {
 	unsafe {
 		vgc_span_init(mut new_span, class_idx, noscan)
 	}
+	if C.vgc_ctrace_on() != 0 {
+		C.vgc_ctrace4(c'C', u64(class_idx), u64(noscan), u64(npages), vgc_carved_probe())
+	}
 	if C.vgc_start_ladder_on() != 0 {
 		vgc_start_ladder_check()
 	}
@@ -7457,6 +7471,9 @@ fn vgc_malloc_typed_opts(n usize, ptrmap u64, ptr_words u8, zero_fill bool) void
 
 	vgc_ensure_registered()
 	cache_idx := C.vgc_get_cache_idx()
+	if C.vgc_ctrace_on() != 0 {
+		C.vgc_ctrace4(c'A', u64(n), u64(if n > usize(vgc_max_small_size) { 0 } else { C.vgc_size_class(u32(n)) }), 0, u64(cache_idx + 1))
+	}
 
 	// Large allocation (> 32KB) - get dedicated span
 	if n > usize(vgc_max_small_size) {
@@ -7845,6 +7862,9 @@ fn vgc_malloc_noscan_opts(n usize, zero_fill bool) voidptr {
 
 	vgc_ensure_registered()
 	cache_idx := C.vgc_get_cache_idx()
+	if C.vgc_ctrace_on() != 0 {
+		C.vgc_ctrace4(c'A', u64(n), u64(if n > usize(vgc_max_small_size) { 0 } else { C.vgc_size_class(u32(n)) }), 1, u64(cache_idx + 1))
+	}
 
 	if n > usize(vgc_max_small_size) {
 		vgc_maybe_gc()
@@ -8007,6 +8027,9 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 	npages := vgc_large_round(exact)
 	vgc_large_demand_note(npages)
 	mut span := vgc_span_alloc_floor(npages, exact)
+	if C.vgc_ctrace_on() != 0 {
+		C.vgc_ctrace4(c'L', u64(n), u64(npages), u64(noscan), vgc_carved_probe())
+	}
 	if span == unsafe { nil } {
 		// Reclaim + retry before OOM (see vgc_collect_and_retry_span).
 		// MUST mirror vgc_collect_and_retry_span: after force_collect, WAIT for any

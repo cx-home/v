@@ -3169,6 +3169,19 @@ static void vgc__wdec(uint64_t v) {
     while (v > 0 && i > 0) { b[--i] = (char)('0' + (v % 10)); v /= 10; }
     (void)!write(2, b + i, 24 - i);
 }
+// cx-private#2068 diag (closer-2068/carve-diag, not for main): VGC_CARVE_TRACE=1
+// writes one line per allocation ("A n cls ns t") and per fresh span
+// ("C cls ns np carved") / large span ("L n np carved") / any span carve
+// ("S np carved"), and "I carved" at vgc_init — read by getenv lazily, so
+// _vinit's allocations are traced too.
+static int vgc_ctrace_v = -1;
+static inline int vgc_ctrace_on(void) {
+    if (vgc_ctrace_v < 0) { const char* e = getenv("VGC_CARVE_TRACE"); vgc_ctrace_v = (e && e[0] == '1') ? 1 : 0; }
+    return vgc_ctrace_v;
+}
+static void vgc_ctrace4(const char* tag, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    vgc__ws(tag); vgc__ws(" "); vgc__wdec(a); vgc__ws(" "); vgc__wdec(b); vgc__ws(" "); vgc__wdec(c); vgc__ws(" "); vgc__wdec(d); vgc__ws("\n");
+}
 // cx-home/v#46 (-d vgc_rootdiag): one heavy root word on stderr. A data word is
 // named by its symbol (dladdr, darwin); a word on the collecting thread's own
 // stack by the function whose frame holds it: the frame-pointer chain is walked
