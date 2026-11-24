@@ -1114,10 +1114,12 @@ static inline uint32_t vgc_get_class_nobjs(int cls) { return vgc_class_nobjs[cls
 // vgc_start_carve_test). Until vgc_init() runs — module consts, globals and
 // init() functions, all in _vinit — the tables answer only the power-of-two
 // classes (8, 16, 32 .. 32768: 13 rungs), so start-up objects share at most 13
-// span classes a scan kind; each object takes at most twice its size. vgc_init()
-// builds the exact tables before main, so nothing main allocates is affected.
-// A start-up that carves vgc_start_ladder_limit bytes leaves the ladder at
-// once (vgc_start_ladder_check), which bounds what the rounding can cost.
+// span classes a scan kind; each object takes at most twice its size. The
+// ladder stays on into main while the heap is under vgc_start_ladder_limit
+// (cx-private#2068: a program's own start-up in main touched the exact classes
+// a page each); a start-up that carves vgc_start_ladder_limit bytes, before or
+// after vgc_init(), leaves the ladder at its next fresh span
+// (vgc_start_ladder_check), which bounds what the rounding can cost.
 static int vgc_start_ladder = 0; // 1 while the tables answer the ladder
 
 static inline int vgc_is_rung(int cls) {
