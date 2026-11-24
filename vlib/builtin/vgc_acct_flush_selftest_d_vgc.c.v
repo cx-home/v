@@ -123,7 +123,7 @@ pub fn vgc_acct_flush_selftest() u32 {
 		_ = unsafe { malloc_noscan(64) }
 	}
 	vgc_force_collect()
-	one := vgc_acct_flush_cur
+	one := C.vgc_acct_flush_cur_get()
 	if vgc_acct_flush_div > 0 && one != vgc_acct_flush {
 		C.printf(c'vgc_acct_flush_selftest: one allocating thread set the flush to %llu B\n', one)
 		vgc_aft_sink = usize(live)
@@ -155,7 +155,7 @@ pub fn vgc_acct_flush_selftest() u32 {
 			}
 		}
 		vgc_force_collect()
-		scaled := vgc_acct_flush_cur
+		scaled := C.vgc_acct_flush_cur_get()
 		if vgc_acct_flush_div == 0 || scaled < vgc_acct_flush {
 			break
 		}

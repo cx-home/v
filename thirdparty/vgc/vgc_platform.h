@@ -2226,10 +2226,34 @@ static volatile int vgc_susp_hwm = 0;
 // global vgc_heap after the module initialisers' first allocations registered
 // the main thread, and a pointer table inside it would be wiped under main's
 // TLS index (vgc_init re-registers main afterwards; see VGC_Heap).
-static void* volatile vgc_cache_chunk_tab[VGC_SUSP_MAX_CHUNKS];
+// cx-private#2040: aligned to Apple Silicon's 128-byte line — every allocation
+// reads entry 0 (vgc_cache), so no variable a thread writes may share its line.
+static void* volatile vgc_cache_chunk_tab[VGC_SUSP_MAX_CHUNKS] __attribute__((aligned(128)));
 static volatile int vgc_ncache_chunk_cnt = 0;
 static inline void* vgc_cache_chunk(int ci) { return vgc_cache_chunk_tab[ci]; }
 static inline int vgc_ncache_chunks(void) { return vgc_ncache_chunk_cnt; }
+// cx-private#2040: the per-allocation flush threshold (the V layer's
+// vgc_acct_flush_cur / vgc_acct_flush_late; vgc_update_trigger sets both at a
+// stop) on a 128-byte line of its own. vgc_acct_alloc reads flush_cur on EVERY
+// allocation; as a V __global it sat on one line with counters the mutators
+// write (vgc_pool_kind_steps, vgc_arena_of_scans, vgc_pool_aged_steps,
+// vgc_gc_owner), so each such write evicted it from every other core and their
+// next allocation stalled on the load — cx [par 16] sql-roundtrips' symbolized
+// profile on dev2: vgc_acct_alloc 0.05 -> 0.26 G cycles per 1M units, the
+// stalled instruction that load. Padded to the full line, aligned to it, and
+// constant-initialised (valid before _vinit). volatile: without it -prod splits
+// the static struct into its two words and drops the padding (the next
+// variable then shares the line again).
+typedef struct vgc_acct_line_t {
+    uint64_t flush_cur;
+    uint64_t flush_late;
+    char pad[128 - 2 * sizeof(uint64_t)];
+} __attribute__((aligned(128))) vgc_acct_line_t;
+static volatile vgc_acct_line_t vgc_acct_line = { 1048576u, 1048576u, {0} };
+static inline uint64_t vgc_acct_flush_cur_get(void) { return vgc_acct_line.flush_cur; }
+static inline void vgc_acct_flush_cur_set(uint64_t v) { vgc_acct_line.flush_cur = v; }
+static inline uint64_t vgc_acct_flush_late_get(void) { return vgc_acct_line.flush_late; }
+static inline void vgc_acct_flush_late_set(uint64_t v) { vgc_acct_line.flush_late = v; }
 static inline vgc_susp* vgc_susp_at(int idx) {
     if (idx < 0) return 0;
     int ci = idx >> VGC_SUSP_CHUNK_SHIFT;

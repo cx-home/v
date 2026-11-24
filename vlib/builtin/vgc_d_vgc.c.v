@@ -102,6 +102,11 @@ fn C.vgc_suspend_settle(idx int, t u32) int // 1 = target acked/parked, register
 fn C.vgc_resume_slot(idx int, t u32)
 fn C.vgc_cache_chunk(ci int) voidptr // chunk ci of the mutator slot table (cx-home/v#27)
 fn C.vgc_ncache_chunks() int
+// cx-private#2040: the flush threshold on its own 128-byte line (vgc_platform.h vgc_acct_line)
+fn C.vgc_acct_flush_cur_get() u64
+fn C.vgc_acct_flush_cur_set(v u64)
+fn C.vgc_acct_flush_late_get() u64
+fn C.vgc_acct_flush_late_set(v u64)
 fn C.vgc_susp_reset_all() // cx-private#1910: the fork child's suspend records, cleared
 fn C.vgc_susp_chunk_bounds(ci int, lo &usize, hi &usize) int // chunk ci's suspend records to the high-water mark (scanned by vgc_mark_roots)
 fn C.vgc_cache_chunks_ensure(idx int, slot_size usize) int // 1 = slot idx's cache + suspend records are addressable
@@ -696,7 +701,16 @@ mut:
 	// large marked set via the GOGC term) can push the goal far past the adaptive
 	// default, so an alloc-heavy [par] workload needs far more than the old fixed
 	// 262144. vgc_span_alloc fails loudly (never silently) past cap.
+	// cx-private#2040: every allocation reads allspans (vgc_cache_span), so it
+	// sits between two 128-byte pads (Apple Silicon's line; vgc_heap is only
+	// 8-aligned): no layout puts it on a line with the central entries before
+	// it or nspans / free_spans_lock after it, which threads write on every
+	// span refill. In one layout (V cx-patches-0.18 b32992fb2a plus 352 bytes
+	// of globals moved out) free_spans_lock shared its line and 16 threads paid
+	// ~4 cycles an allocation more (bench/parallel-alloc/vgc_alloc_scale_test).
+	line_pad_allspans_lo [16]u64
 	allspans &&VGC_Span = unsafe { nil }
+	line_pad_allspans_hi [16]u64
 	// cx-home/v#15: one bit per allspans slot, set while that span is in use, so
 	// the collector's per-cycle walks (clear, sweep, count) visit the in-use
 	// descriptors only — pooled spans stay registered (their slots are kept for
@@ -755,6 +769,12 @@ mut:
 	// between would strand main's TLS index on a nil chunk. The
 	// table is not a root (vgc_os_alloc memory is outside the arenas); the
 	// chunks are scanned to ncaches by vgc_mark_roots, as the fixed array was.
+	// cx-private#2040: ncaches (vgc_ensure_registered) and gc_phase
+	// (vgc_alloc_black_hook) are read on every allocation, and heap_live /
+	// total_alloc below are atomics every thread adds to at each accounting
+	// flush: a 128-byte pad on each side keeps the read group off their lines
+	// and off whatever precedes it, in any layout.
+	line_pad_hot_lo [16]u64
 	ncaches      int // high-water mark of slots ever used
 	live_threads u32 // atomic-ish (guarded by cache_lock): currently-registered mutators
 	free_head_p1 int // reclaimed slots, threaded through VGC_Cache.next_free_p1 (index+1; 0 = none); reused before growing ncaches
@@ -764,6 +784,7 @@ mut:
 	gc_enabled u32 // atomic: 1 = GC enabled
 	sweep_gen  u32 // current sweep generation
 	wb_enabled u32 // atomic: write barrier enabled
+	line_pad_hot_hi [16]u64 // cx-private#2040: see line_pad_hot_lo
 	// GC metrics (translated from Go's gcController)
 	heap_live   u64 // atomic: bytes of live heap objects (actual object bytes)
 	heap_marked u64 // bytes marked in last cycle
@@ -3084,8 +3105,8 @@ fn vgc_register_thread_opt(wait bool) bool {
 		vgc_cache(idx).gen_bytes = 0
 		// cx-home/v#77: born after a one-thread stop, this thread flushes at the
 		// scaled flush, so n late threads hold at most n of it unseen, not n MB
-		vgc_cache(idx).late_flush = if vgc_acct_flush_late < vgc_acct_flush_cur {
-			vgc_acct_flush_late
+		vgc_cache(idx).late_flush = if C.vgc_acct_flush_late_get() < C.vgc_acct_flush_cur_get() {
+			C.vgc_acct_flush_late_get()
 		} else {
 			u64(0)
 		}
@@ -5593,7 +5614,14 @@ fn vgc_new_span_desc() &VGC_Span {
 // pointer bump + a rare bulk mmap.
 @[inline]
 fn vgc_alloc_span_meta() &VGC_Span {
-	asz := (usize(sizeof(VGC_Span)) + 15) & ~usize(15)
+	// cx-private#2040: each descriptor on whole 128-byte lines (Apple Silicon's;
+	// the slab is page-aligned). The allocation fast path writes its span's
+	// descriptor on every allocation (the alloc_buf bit, alloc_count,
+	// free_index); packed at 16 bytes, the tail of one thread's descriptor
+	// shared a line with the head of the next carve's — another thread's — and
+	// each allocation evicted the other's (the [par 16] fixture,
+	// bench/parallel-alloc/vgc_alloc_scale_test: the stall on the head's load).
+	asz := (usize(sizeof(VGC_Span)) + 127) & ~usize(127)
 	if vgc_heap.span_meta_cur == 0 || vgc_heap.span_meta_cur + asz > vgc_heap.span_meta_end {
 		chunk := usize(1) * 1024 * 1024 // 1 MB slab ≈ thousands of descriptors per mmap
 		csz := if asz > chunk { asz } else { chunk }
@@ -7665,7 +7693,8 @@ const vgc_acct_flush = u64(1) << 20
 // fixed 1 MB, n threads could hold n MB the pacer had not seen: four csv workers
 // against a 1 MB budget carved ~400 spans past the goal before a collection
 // (17.5 MB peak against one worker's 14.0). VGC_ACCT_FLUSH_DIV=0 keeps 1 MB.
-__global vgc_acct_flush_cur = u64(1048576)
+// (cx-private#2040: kept in C as vgc_acct_line.flush_cur — C.vgc_acct_flush_cur_get /
+// _set — on a 128-byte line no mutator-written variable shares; starts at 1 MB)
 // vgc_acct_flush (a plain cast: a const or a shift leaves the global untyped in files checked before this one)
 __global vgc_acct_flush_div = u64(16)
 // cx-home/v#77: the flush a thread registered since the last stop uses — the
@@ -7674,7 +7703,7 @@ __global vgc_acct_flush_div = u64(16)
 // the 1 MB flush for the threads it saw; the workers that arrive after it are
 // not that one stream (a daemon's 110 connection threads each held up to 1 MB
 // the pacer never saw: 0 collections against a 256 KB headroom).
-__global vgc_acct_flush_late = u64(1048576)
+// (cx-private#2040: vgc_acct_line.flush_late — C.vgc_acct_flush_late_get / _set; starts at 1 MB)
 // the threads that allocated vgc_acct_flush_min or more between the last two
 // stops (counted at the stop's fold of their deltas)
 __global vgc_acct_threads = int(0)
@@ -7706,7 +7735,7 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_cache(cache_idx).live_delta += i64(live_sz)
 		vgc_cache(cache_idx).alloc_delta += total_n
-		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush_cur
+		if vgc_cache(cache_idx).alloc_delta >= C.vgc_acct_flush_cur_get()
 		|| (vgc_cache(cache_idx).late_flush != 0
 		&& vgc_cache(cache_idx).alloc_delta >= vgc_cache(cache_idx).late_flush) {
 			// cx-home/v#16 / cx-private#1916: the pacer counts a thread as
@@ -7743,7 +7772,7 @@ fn vgc_acct_free(sz u64) {
 	}
 	unsafe {
 		vgc_cache(idx).live_delta -= i64(sz)
-		if vgc_cache(idx).live_delta <= -i64(vgc_acct_flush_cur) {
+		if vgc_cache(idx).live_delta <= -i64(C.vgc_acct_flush_cur_get()) {
 			C.vgc_atomic_sub_u64(&vgc_heap.heap_live, u64(-vgc_cache(idx).live_delta))
 			vgc_cache(idx).live_delta = 0
 		}
