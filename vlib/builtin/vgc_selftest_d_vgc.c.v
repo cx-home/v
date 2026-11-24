@@ -715,6 +715,58 @@ pub fn vgc_mark_held_selftest() u32 {
 	return 0
 }
 
+// vgc_mark_plan_work_selftest — https://github.com/cx-home/cx-platform-reference/issues/15.
+// The marker plan reads the previous mark's work; a parallel cycle's work is its
+// markers times its wall, and that counts every marker's idle spin on an emptied grey
+// set, so a small mark the floor put on four markers read over the line and the next
+// cycle went back to one marker (one per ms over the line), whose work read under the
+// line again: the count flapped 1/4 every other cycle. cx's CSV -> sqlite3 bulk load
+// (one interpreter thread, 4 MB marked, 594 cycles a million rows) marked 935 us on one
+// marker and 372 us on four: 320 of its cycles ran on one, 408 ms of 520 ms of stops
+// were the mark; four on every cycle stops 327 ms. vgc_mark_plan_work answers the work
+// the plan reads: after a parallel cycle, the one-marker equivalent (the one-marker
+// rate times the marked set) when that is under the line and under the parallel work,
+// else the work as recorded. A mark over the line keeps one marker per ms of its work.
+// Driven by bench/parallel-alloc/vgc_mark_plan_work_test.v. 0 = ok; n = the failed case.
+pub fn vgc_mark_plan_work_selftest() u32 {
+	ms := u64(1000) * 1000
+	us := u64(1000)
+	mb := u64(1024) * 1024
+	marked := 4 * mb
+	// the one-marker rate of the bulk load: 935 us over 4 MB, ~228 ns/KB
+	rate1 := u64(228)
+	// four markers at 372 us: 1488 us of work as recorded, ~935 us one-marker equivalent
+	w := vgc_mark_plan_work(4 * 372 * us, 4, rate1, marked, ms)
+	if w >= ms || w < 900 * us {
+		return 1
+	}
+	// planned from it the stop (two held, free CPUs, paced as one) keeps four markers,
+	// as it does after a one-marker cycle of the same mark: no flap
+	if vgc_mark_plan_count(8, w, ms, 2, 24, true, 0, marked, false) != 4
+		|| vgc_mark_plan_count(8, 935 * us, ms, 2, 24, true, 0, marked, false) != 4 {
+		return 2
+	}
+	// a one-marker cycle's work is read as recorded
+	if vgc_mark_plan_work(1300 * us, 1, rate1, marked, ms) != 1300 * us {
+		return 3
+	}
+	// a mark whose one-marker equivalent is over the line keeps its recorded work:
+	// one marker per ms (8 markers x 1.25 ms of a 10 ms mark at ~244 ns/KB over 40 MB)
+	if vgc_mark_plan_work(10 * ms, 8, 244, 40 * mb, ms) != 10 * ms {
+		return 4
+	}
+	// no one-marker rate yet, or line 0 (VGC_MARK_PAR_MIN_US=0): the recorded work
+	if vgc_mark_plan_work(1488 * us, 4, 0, marked, ms) != 1488 * us
+		|| vgc_mark_plan_work(1488 * us, 4, rate1, marked, 0) != 1488 * us {
+		return 5
+	}
+	// the equivalent never raises the work: a parallel cycle that read less keeps it
+	if vgc_mark_plan_work(600 * us, 4, rate1, marked, ms) != 600 * us {
+		return 6
+	}
+	return 0
+}
+
 // vgc_uaf_foreign_selftest — cx-private#2011. The passive UAF oracle
 // (vgc_uaf_check_buf) bounds an address by [vgc_arena_lo, vgc_arena_hi), the
 // span of the arenas. On Linux glibc's per-thread malloc arenas are mmaps that
