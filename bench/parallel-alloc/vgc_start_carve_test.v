@@ -47,3 +47,22 @@ fn test_touching_64_span_classes_at_start_up_carves_at_most_the_bar() {
 	println('64 span classes at start-up carve ${cost} B (bar ${carve_bar})')
 	assert cost <= carve_bar, '64 span classes carved ${cost} B at start-up (bar ${carve_bar})'
 }
+
+// cx-private#2068: a program's own start-up in main — cx's built program reads
+// its payload and marks its first start-up point in main, after vgc_init() —
+// carves a page per span class it touches once vgc_init() has put back the
+// exact size tables, though its heap is still far under the ladder's bound
+// (vgc_start_ladder_limit). The same 64 span classes touched by main, against
+// main touching none, carve at most the same bar.
+fn test_touching_64_span_classes_in_main_under_the_ladder_bound_carves_at_most_the_bar() {
+	src := os.join_path(@DIR, 'start_carve', 'cells.v')
+	with, wout := carved_by(src, '-d start_carve_main')
+	without, cout := carved_by(src, '-d start_carve_main -d start_carve_control')
+	println('cells in main: ${wout}')
+	println('control:       ${cout}')
+	assert wout.ends_with('cells=64'), wout
+	assert with >= without, '${wout} / ${cout}'
+	cost := with - without
+	println('64 span classes touched by main carve ${cost} B (bar ${carve_bar})')
+	assert cost <= carve_bar, '64 span classes touched by main carved ${cost} B (bar ${carve_bar})'
+}
