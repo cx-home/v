@@ -21,6 +21,12 @@ fn C.vgc_get_class_size(cls int) u32
 
 const max_small = u32(32768)
 
+// The start-up ladder (cx-private#2068) answers power-of-two classes until the
+// heap carves its bound; these tests read the exact tables.
+fn testsuite_begin() {
+	vgc_start_ladder_leave()
+}
+
 fn slot_bytes(n u32) u32 {
 	return C.vgc_get_class_size(int(C.vgc_size_class(n)))
 }

@@ -2619,7 +2619,13 @@ pub fn vgc_init() {
 	C.vgc_ss_unknown_set(f64(C.vgc_real_sp()))
 	// cx-home/v#56 lever 10: the gate's table of chunk card tables
 	vgc_wb_cards = C.vgc_chunk_cards_table()
-	C.vgc_init_size_tables()
+	// cx-private#2068: the start-up ladder outlives _vinit while the heap is
+	// under its bound — a program's own start-up in main (cx: the payload read
+	// to its first mark) carved a page per exact class it touched once the
+	// exact tables were back (64 span classes: 483,328 B for 21 KB of objects,
+	// vgc_start_carve_test). The first fresh span carved past the bound leaves
+	// the ladder (vgc_start_ladder_check), as during _vinit.
+	vgc_start_ladder_check()
 	// cx #973: cache the data-segment root ranges while still single-threaded
 	// (the collector must never take the loader lock under STW — see
 	// vgc_cache_data_segments / vgc_mark_roots), and register the fork-vs-STW
@@ -7191,6 +7197,12 @@ fn vgc_start_ladder_check() {
 	if vgc_carved_probe() >= vgc_start_ladder_limit {
 		C.vgc_init_size_tables()
 	}
+}
+
+// vgc_start_ladder_leave puts back the exact size tables now, whatever the heap
+// has carved (tests that read the exact classes: vgc_size_class_test.v).
+pub fn vgc_start_ladder_leave() {
+	C.vgc_init_size_tables()
 }
 
 // (vgc_central_return_span is gone — it had NO callers, which meant nothing
