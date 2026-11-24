@@ -606,6 +606,50 @@ fn (mut g Gen) const_expr_is_c_int_const(expr ast.Expr) bool {
 	}
 }
 
+// global_c_value_calls reports whether the C text cgen writes for a global's
+// value calls something: V writes a shift as `v__lshift_*` / `v__rshift_*`, an
+// integer `/` or `%` as `VSAFE_DIV_*` / `VSAFE_MOD_*` and, with overflow checks
+// on, `+ - *` as `builtin__overflow__*`. A C static initializer refuses a call
+// (cc: "initializer element is not a compile-time constant"), so such a value
+// is assigned in `_vinit` (cx-home/cx-core-code#268:
+// vlib/v/tests/consts/const_number_c_expr_call_test.v)
+fn (mut g Gen) global_c_value_calls(expr ast.Expr) bool {
+	match expr {
+		ast.CastExpr, ast.InfixExpr, ast.ParExpr, ast.PrefixExpr, ast.UnsafeExpr {
+			return c_text_has_call(g.expr_string(expr))
+		}
+		else {
+			return false
+		}
+	}
+}
+
+// c_text_has_call reports whether C text `s` calls something: a `(` whose
+// nearest non-space character before it ends a name (`f(`) other than
+// `sizeof` / `_Alignof`, not a cast or a group (`((u64)(1))`)
+fn c_text_has_call(s string) bool {
+	for i := 0; i < s.len; i++ {
+		if s[i] != `(` {
+			continue
+		}
+		mut j := i - 1
+		for j >= 0 && s[j] == ` ` {
+			j--
+		}
+		if j < 0 || !(s[j].is_letter() || s[j].is_digit() || s[j] == `_`) {
+			continue
+		}
+		mut k := j
+		for k >= 0 && (s[k].is_letter() || s[k].is_digit() || s[k] == `_`) {
+			k--
+		}
+		if s[k + 1..j + 1] !in ['sizeof', '_Alignof', '__alignof__'] {
+			return true
+		}
+	}
+	return false
+}
+
 fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 	// was static used here to to make code optimizable? it was removed when
 	// 'extern' was used to fix the duplicate symbols with usecache && clang
@@ -839,11 +883,11 @@ fn (mut g Gen) global_decl(node ast.GlobalDecl) {
 			}
 			if g.pref.translated {
 				def_builder.write_string(' = ${g.expr_string(field.expr)}')
-			} else if (field.expr.is_literal() && should_init) || cinit
-				|| (field.expr is ast.ArrayInit && field.expr.is_fixed)
+			} else if (field.expr.is_literal() && should_init && !g.global_c_value_calls(field.expr))
+				|| cinit || (field.expr is ast.ArrayInit && field.expr.is_fixed)
 				|| (is_simple_unsafe_expr && should_init)
 				|| (should_init && field.typ != ast.string_type && field.expr !is ast.StructInit
-				&& g.global_const_expr_is_c_const(field.expr)) {
+				&& g.global_const_expr_is_c_const(field.expr) && !g.global_c_value_calls(field.expr)) {
 				// Simple literals can be initialized right away in global scope in C.
 				// e.g. `int myglobal = 10;`
 				// So can any C constant expression (`usize(0)`, `&u8(unsafe { nil })`):
