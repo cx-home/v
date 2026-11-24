@@ -3885,6 +3885,18 @@ fn vgc_walk_adapt(walked_ns u64) {
 // than nine tenths of it — a loaded box where the markers get no cores, or one
 // preempted marker holding the cycle's tail — halves the marker count for the
 // next 32 parallel cycles, then the configured count is tried again.
+// cx-private#1923: a probe judged on a small marked set says nothing of a set
+// many times its size (the per-KB rate of a 2 MB mark is mostly the stop's fixed
+// cost). json-codec 1 MB at k=28 lost its four-marker probe at the start-up's
+// 2 MB mark against gc 0's sub-MB baseline, and the plan held two markers for the
+// whole run (22 cycles of a 32-cycle back-off): its 150-220 MB marks took 24-39 ms
+// on two markers, 46 % of the wall stopped. The back-off's cycles are parallel,
+// so cx-home/v#52's way out (one-marker cycles moving the baseline) never came.
+// Once the marked set reaches vgc_mark_regrow times the probe's, the back-off
+// ends and that cycle — run on the back-off's count, not the plan's — is not
+// judged; the next cycle plans the configured count and is judged afresh.
+const vgc_mark_regrow = u64(8)
+
 fn vgc_mark_adapt(marked u64) {
 	// cx-home/v#56 lever 11: a minor cycle takes no part — its mark covers the
 	// young set and the dirty cards, not the marked set the rate divides by
@@ -3919,6 +3931,13 @@ fn vgc_mark_adapt(marked u64) {
 		if vgc_mark_backoff == 0 {
 			vgc_mark_n_target = 0
 		}
+	}
+	if vgc_mark_backoff > 0 && vgc_mark_lost_kb > 0 && kb >= vgc_mark_lost_kb * vgc_mark_regrow {
+		vgc_mark_backoff = 0
+		vgc_mark_n_target = 0
+		vgc_mark_lost_rate = 0
+		vgc_mark_lost_kb = 0
+		return
 	}
 	if vgc_mark_nworkers_cur <= 1 {
 		if cm {
@@ -3959,6 +3978,7 @@ fn vgc_mark_adapt(marked u64) {
 		vgc_mark_backoff = 32
 		vgc_mark_lost_rate = rate
 		vgc_mark_lost_cm = cm
+		vgc_mark_lost_kb = kb
 	}
 }
 

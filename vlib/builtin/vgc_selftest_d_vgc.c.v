@@ -331,6 +331,7 @@ pub fn vgc_mark_backoff_selftest() u32 {
 		s_bo := vgc_mark_backoff
 		s_lost := vgc_mark_lost_rate
 		s_lostcm := vgc_mark_lost_cm
+		s_lostkb := vgc_mark_lost_kb
 		s_cm := vgc_cm_this_cycle
 		mut rc := u32(0)
 		kb := u64(20000) // marked = 20000 KB less a byte: kb = marked / 1024 + 1
@@ -438,6 +439,7 @@ pub fn vgc_mark_backoff_selftest() u32 {
 		vgc_mark_backoff = s_bo
 		vgc_mark_lost_rate = s_lost
 		vgc_mark_lost_cm = s_lostcm
+		vgc_mark_lost_kb = s_lostkb
 		vgc_cm_this_cycle = s_cm
 		return rc
 	}

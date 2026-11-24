@@ -1716,6 +1716,9 @@ __global vgc_mark_backoff = int(0)
 // cx-home/v#52: the losing probe's rate and kind (0 = none): a back-off ends
 // early once the one-marker baseline shows the probe won after all
 __global vgc_mark_lost_rate = u64(0)
+// cx-private#1923: the marked KB the losing probe was judged on (0 = none): a
+// back-off ends once the marked set reaches vgc_mark_regrow times it
+__global vgc_mark_lost_kb = u64(0)
 __global vgc_mark_lost_cm = false
 // parallel cycles left at the reduced count
 
@@ -2552,6 +2555,7 @@ fn vgc_atfork_child() {
 	vgc_mark_n_target = 0
 	vgc_mark_last_work_ns = 0
 	vgc_mark_backoff = 0
+	vgc_mark_lost_kb = 0
 	vgc_mark_lost_rate = 0
 	vgc_rescan_nworkers_cur = 1
 	vgc_rescan_last_work_ns = 0
