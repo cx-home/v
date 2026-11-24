@@ -2245,6 +2245,7 @@ fn vgc_walk_clear(w int, n int) {
 fn vgc_walk_count(w int, n int) {
 	nb := u32((vgc_heap.nspans + 7) / 8)
 	mut total := u64(0)
+	mut large_noscan := u64(0)
 	for {
 		w1 := C.vgc_atomic_add_u32(&vgc_walk_cursor, vgc_walk_chunk)
 		w0 := w1 - vgc_walk_chunk
@@ -2271,10 +2272,14 @@ fn vgc_walk_count(w int, n int) {
 					count = span.nelems
 				}
 				total += u64(count) * u64(span.elem_size)
+				if span.class_idx == 0 && span.noscan {
+					large_noscan += u64(count) * u64(span.elem_size)
+				}
 			}
 		}
 	}
 	vgc_walk_sum[w * 16] = total
+	vgc_walk_sum[w * 16 + 1] = large_noscan
 }
 
 // One walker's share of the sweep: the per-span bit work, and the span's
@@ -5124,12 +5129,16 @@ fn vgc_count_marked() u64 {
 	// cx-home/v#16: on the pool when the table is large (vgc_walk_count)
 	for w in 0 .. vgc_max_markers {
 		vgc_walk_sum[w * 16] = 0
+		vgc_walk_sum[w * 16 + 1] = 0
 	}
 	vgc_walk_run(vgc_pool_phase_count)
 	mut total := u64(0)
+	mut large_noscan := u64(0)
 	for w in 0 .. vgc_max_markers {
 		total += vgc_walk_sum[w * 16]
+		large_noscan += vgc_walk_sum[w * 16 + 1]
 	}
+	vgc_marked_large_noscan = large_noscan // https://github.com/cx-home/cx-private/issues/2052
 	return total
 }
 
@@ -5545,7 +5554,19 @@ fn vgc_update_trigger() {
 	}
 	vgc_gc_last_end = now
 
-	mut extra := marked * gc_percent / 100
+	// https://github.com/cx-home/cx-private/issues/2052: the marked bytes in large
+	// pointer-free spans count at vgc_large_noscan_pct %, the rest at GOGC %
+	// (vgc_large_noscan_pct doc, vgc_d_vgc.c.v)
+	mut lns := vgc_marked_large_noscan
+	if lns > marked {
+		lns = marked
+	}
+	mut extra := (marked - lns) * gc_percent / 100
+	if vgc_large_noscan_pct < gc_percent {
+		extra += lns * vgc_large_noscan_pct / 100
+	} else {
+		extra += lns * gc_percent / 100
+	}
 	// one allocating thread: the GOGC term at vgc_one_thread_pct (cx-home/v#56)
 	if one && vgc_one_thread_small(marked) && vgc_headroom_adaptive_floor && !vgc_headroom_pinned {
 		extra = vgc_one_thread_term(marked) * gc_percent / 100

@@ -1025,6 +1025,16 @@ __global vgc_headroom_cap = u64(64 * 1024 * 1024)
 // (dev2, the same build): json-codec 1 MB peak 153 → 73 MB, 1 KB 88 → 47 MB.
 // VGC_HEADROOM_LIVE_PCT overrides (decimal; 0 removes the bound).
 __global vgc_headroom_live_pct = u64(100)
+// The GOGC term over large pointer-free objects (https://github.com/cx-home/cx-private/issues/2052):
+// a large noscan span's object costs its mark one bit and its sweep one span,
+// whatever its size, so the goal grows by vgc_large_noscan_pct % of those bytes,
+// not GOGC %: cx's regex-redux substitution chain (one fresh ~25-50 MB string a
+// step, the last one dropped) ran 7 cycles at a 2x goal and peaked 246 MB for
+// 96-120 MB marked at fasta 2.5 M. vgc_count_marked sums those bytes
+// (vgc_marked_large_noscan, the walkers' vgc_walk_sum[w * 16 + 1]).
+// VGC_LARGE_NOSCAN_PCT overrides (decimal; GOGC's 100 restores the old goal).
+__global vgc_large_noscan_pct = u64(25)
+__global vgc_marked_large_noscan = u64(0)
 // Whether the per-thread floor (floor x the allocating threads, cx-home/v#16)
 // is capped at 4 x the marked set (cx-private#1910): set by the overhead band
 // in vgc_update_trigger — true after a cycle read cheap (< ~0.25 % overhead),
@@ -2680,6 +2690,13 @@ pub fn vgc_init() {
 		lp := C.atoll(live_env)
 		if lp >= 0 {
 			vgc_headroom_live_pct = u64(lp)
+		}
+	}
+	lnp_env := C.getenv(c'VGC_LARGE_NOSCAN_PCT')
+	if lnp_env != unsafe { nil } {
+		lnp := C.atoll(lnp_env)
+		if lnp >= 0 {
+			vgc_large_noscan_pct = u64(lnp)
 		}
 	}
 	floor_env := C.getenv(c'VGC_HEADROOM_LIVE_FLOOR_MB')
