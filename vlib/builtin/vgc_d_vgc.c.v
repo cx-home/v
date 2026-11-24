@@ -5271,6 +5271,23 @@ fn vgc_pool_compensate(nbytes u64) {
 		vgc_compensate_cursor_page = 0
 	}
 	mut done := u64(0)
+	// cx-private#2052 (k-nucleotide): idle oversized spans first. A buffer over
+	// the arena size that regrows a little larger each time (a hash table's
+	// arrays) never fits the one it freed, and vgc_pool_compensate_arena skips
+	// oversized arenas (one span, no runs), so each dropped one stayed resident
+	// in free_oversized until vgc_pool_trim's age gate (2 full cycles) passed
+	// while the next mapped a fresh arena beside it: 3.57x the last buffer on
+	// vgc_oversized_regrow_test (the copy's floor ~2x). One decommit per span,
+	// whole; it stays pooled (cold) and reusable as a trimmed one.
+	mut o := vgc_heap.free_oversized
+	for o != unsafe { nil } && done < nbytes {
+		nxt := o.next // capture: a decommit re-pushes o at the list head
+		if !o.decommitted {
+			done += u64(o.npages) * u64(vgc_page_size)
+			vgc_pool_trim_decommit(mut o)
+		}
+		o = unsafe { nxt }
+	}
 	for done < nbytes && vgc_compensate_cursor_arena < vgc_heap.narenas {
 		took, next, finished := vgc_pool_compensate_arena(vgc_compensate_cursor_arena,
 			vgc_compensate_cursor_page, nbytes - done)
