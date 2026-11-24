@@ -113,3 +113,7 @@ fn test_many_workers_keep_their_headroom_after_the_ramp() {
 	eprintln('median stopped share ${shares[1]:.1f}%')
 	assert small <= 3, 'small=${small} of paced=${paced}: cycles paced from 14+ workers over 64 KB fell under 32 MB of headroom after the ramp'
 }
+
+fn test_the_per_thread_headroom_reads_the_threads_over_64_kb_at_two_stops() {
+	assert vgc_scale_threads_selftest() == 0
+}

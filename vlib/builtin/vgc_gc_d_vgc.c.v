@@ -5229,6 +5229,72 @@ pub fn vgc_limit_selftest() u32 {
 // 256 MB -> 1.4 MB in one cycle). Several allocating threads keep GOGC=100, as the doc at
 // vgc_one_thread_pct says; the stamp still decides the per-thread scaling (cx-home/v#16,
 // cx-private#1916).
+// vgc_scale_threads answers the threads the per-thread headroom scales by (cx-home/v#16:
+// the flat cap x ceil(n / 4), the floor x n; vgc_update_trigger). nt is the ~1 MB stamp's
+// count; acct and prev the threads over 64 KB at this stop and the stop before; last this
+// answer at the cycle before. Two or more over 64 KB at both stops: the larger of the two
+// counts; at neither: nt; one reading on the other side keeps last (vgc_pace_one_thread's
+// rule) — never under nt. cx-private#2040: the stamp fed itself — once the goal is small,
+// 28 batch workers each allocate a few hundred KB between two stops, the stamp counts none,
+// the floor is not scaled and the goal stays small; and one stop that reads few threads over
+// 64 KB (a back-to-back stop: 5 of 28, or 0 of 16) cut a 256 MB headroom to 11-16 MB in one
+// cycle. template-render at [par 28] on dev2 (V 377e4407eb): 24 of the 68 cycles paced with
+// 14+ workers over 64 KB at both stops ran under 32 MB of headroom (pace nt=0 acct=28), 17
+// more after one low reading; 183 ms of its 0.97 s stopped. A server's few threads over 64 KB
+// at a stop (2-7 of 87; vgc_pace_one_thread's doc) scale it by those few.
+fn vgc_scale_threads(nt int, acct int, prev int, last int) int {
+	mut n := nt
+	if acct > 1 && prev > 1 {
+		n = acct
+		if prev > n {
+			n = prev
+		}
+	} else if acct > 1 || prev > 1 {
+		n = last
+	}
+	if n < nt {
+		n = nt
+	}
+	return n
+}
+
+// vgc_scale_threads_selftest checks vgc_scale_threads (bench/parallel-alloc/
+// vgc_many_workers_pause_test.v): 0 = ok, else the number of the first failed case.
+pub fn vgc_scale_threads_selftest() u32 {
+	// the stamp counted none of 28 workers over 64 KB at two stops
+	if vgc_scale_threads(0, 28, 28, 0) != 28 {
+		return 1
+	}
+	// a back-to-back stop that read 5 of 28: the larger count
+	if vgc_scale_threads(0, 5, 28, 28) != 28 {
+		return 2
+	}
+	// one that read none of 16: the answer before stands
+	if vgc_scale_threads(0, 0, 16, 16) != 16 {
+		return 3
+	}
+	// the first reading of several after one thread: the answer before (the stamp's)
+	if vgc_scale_threads(0, 28, 1, 0) != 0 {
+		return 4
+	}
+	// neither stop read several: the stamp's count
+	if vgc_scale_threads(1, 0, 0, 9) != 1 {
+		return 5
+	}
+	// never under the stamp's count
+	if vgc_scale_threads(12, 4, 3, 0) != 12 {
+		return 6
+	}
+	if vgc_scale_threads(3, 1, 28, 0) != 3 {
+		return 7
+	}
+	// a server: few over 64 KB at two stops
+	if vgc_scale_threads(0, 2, 7, 1) != 7 {
+		return 8
+	}
+	return 0
+}
+
 fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle u64) bool {
 	if cycle == 0 {
 		return true
@@ -5270,6 +5336,13 @@ fn vgc_update_trigger() {
 	if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
 		nt = vgc_alloc_threads()
 	}
+	// cx-private#2040: the per-thread scaling below reads the threads that allocated
+	// (vgc_scale_threads), not the ~1 MB stamp alone; nt stays the stamp for the trace
+	mut nts := nt
+	if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
+		nts = vgc_scale_threads(nt, vgc_acct_threads, vgc_acct_threads_prev, vgc_scale_last)
+	}
+	vgc_scale_last = nts
 	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
 	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev,
 		int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_paced_one, u64(vgc_heap.gc_cycle))
@@ -5371,8 +5444,8 @@ fn vgc_update_trigger() {
 			// cx-home/v#16: the threads that allocated this cycle scale the flat
 			// cap too — x ceil(nt / 4), at most x4 (eight threads: 128 MB; the
 			// reference, Python's multiprocessing, spends eight heaps).
-			if nt > 4 {
-				mut mult := u64((nt + 3) / 4)
+			if nts > 4 {
+				mut mult := u64((nts + 3) / 4)
 				if mult > 4 {
 					mult = 4
 				}
@@ -5391,7 +5464,7 @@ fn vgc_update_trigger() {
 				}
 			}
 			mut floor := afloor
-			if vgc_headroom_per_thread && nt > 1 {
+			if vgc_headroom_per_thread && nts > 1 {
 				// cx-home/v#16: floor x the threads that allocated this cycle —
 				// cx-private#1910 (integrator ruling 08:19:47Z 10-11): only up to
 				// 4 x the marked set WHILE the collections are cheap. The
@@ -5408,7 +5481,7 @@ fn vgc_update_trigger() {
 				// cycle) to 8 MB of headroom against 32-40: 2.5-2.8x the
 				// collections and 79k -> 57-62k req/s on a quiet box
 				// (cx-private#1910 PERF-EVID, 2026-10-11).
-				floor *= u64(nt)
+				floor *= u64(nts)
 				if vgc_headroom_floor_capped {
 					mut cap := marked * 4
 					if cap < afloor {

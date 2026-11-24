@@ -7656,6 +7656,8 @@ __global vgc_acct_threads = int(0)
 // cx-home/v#62: vgc_acct_threads of the stop before, and the previous cycle's pacing answer
 // (vgc_pace_one_thread; a program starts as one thread)
 __global vgc_acct_threads_prev = int(0)
+// cx-private#2040: vgc_scale_threads' answer at the last cycle (vgc_update_trigger)
+__global vgc_scale_last = int(0)
 __global vgc_paced_one = true
 // cx-home/v#62: the last cycle's pacing answer and stamp count, for VGC_GCTRACE's pace line
 __global vgc_trace_pace_nt = int(0)
