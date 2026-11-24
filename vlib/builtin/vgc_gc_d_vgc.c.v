@@ -5295,6 +5295,38 @@ pub fn vgc_scale_threads_selftest() u32 {
 	return 0
 }
 
+// vgc_pace_exit answers whether a cycle paces as one allocating thread, given `one`, the counts'
+// answer (vgc_pace_one_thread), was_one, the previous cycle's answer, and quiet, the stops in a
+// row that read one thread (vgc_pace_quiet_next): after several, the quarter comes back only at
+// k quiet stops in a row (https://github.com/cx-home/cx-platform-store/issues/29). The counts'
+// own rule leaves several at the second agreeing quiet stop. A columnar store's put-docs batch
+// (the interpreter thread and 2-4 workers: part write, lineage seal) under the quarter (headroom
+// = marked / 4, ~1.5 MB on a 6 MB live set) has intervals so short that the workers stay under
+// 64 KB between stops; two quiet stops come at once, the quarter comes back, and its short
+// intervals keep it: VGC_GCTRACE=2 read one=1 in 272 of 306 cycles (fields rows) and 411 of 440
+// (attrs rows), and which shape escaped through the overhead band changed from run to run (attrs
+// 196 cycles, then 440, same binary), so the fields/attrs ratio read 1.13-1.30 against a bar of
+// 1.10. At VGC_ONE_THREAD_PCT=100 both paced alike (147 / 187 cycles): 1.077 wall, 1.088 user.
+// Entering several is unchanged (two agreeing readings; one burst keeps one), so a program that
+// runs one allocating thread never pays it; a program that ran several pays at most k cycles of
+// GOGC=100 after its last worker stops. k <= 2 is the counts' own rule. VGC_PACE_EXIT_STOPS sets k.
+// Graded by vgc_pace_exit_selftest (bench/parallel-alloc/vgc_pace_exit_test.v).
+fn vgc_pace_exit(one bool, was_one bool, quiet int, k int) bool {
+	if !one || was_one {
+		return one
+	}
+	return quiet >= k || k <= 2
+}
+
+// vgc_pace_quiet_next is the quiet-stop count after a stop that stamped nt threads and counted
+// acct over 64 KB (vgc_pace_exit): one more when both are at most one, else 0.
+fn vgc_pace_quiet_next(quiet int, nt int, acct int) int {
+	if nt <= 1 && acct <= 1 {
+		return quiet + 1
+	}
+	return 0
+}
+
 fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle u64) bool {
 	if cycle == 0 {
 		return true
@@ -5346,8 +5378,11 @@ fn vgc_update_trigger() {
 	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
 	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev,
 		int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_paced_one, u64(vgc_heap.gc_cycle))
-	vgc_paced_one = counts_one
-	one := counts_one
+	// https://github.com/cx-home/cx-platform-store/issues/29: after several, k quiet stops in a
+	// row before the quarter comes back (vgc_pace_exit)
+	vgc_pace_quiet = vgc_pace_quiet_next(vgc_pace_quiet, nt, vgc_acct_threads)
+	one := vgc_heap.gc_cycle == 0 || vgc_pace_exit(counts_one, vgc_paced_one, vgc_pace_quiet, vgc_pace_exit_stops)
+	vgc_paced_one = one
 	vgc_trace_pace_nt = nt
 	vgc_trace_pace_one = one
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
