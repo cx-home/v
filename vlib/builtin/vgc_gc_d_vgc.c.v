@@ -3612,7 +3612,19 @@ fn vgc_mark_plan() int {
 	if vgc_mark_workers_cfg <= 1 || vgc_mark_forked {
 		return 1
 	}
-	last_work := vgc_mark_last_work() // cx-home/v#56 lever 11: of this cycle's kind
+	mut last_work := vgc_mark_last_work() // cx-home/v#56 lever 11: of this cycle's kind
+	// https://github.com/cx-home/cx-platform-reference/issues/15: after a parallel full, a
+	// small mark's one-marker equivalent (vgc_mark_plan_work)
+	if !vgc_minor_this_cycle {
+		mut rate1 := vgc_mark_rate1
+		$if vgc_concurrent ? {
+			if vgc_cm_this_cycle {
+				rate1 = vgc_mark_rate1_cm
+			}
+		}
+		last_work = vgc_mark_plan_work(last_work, vgc_mark_nworkers_cur, rate1,
+			C.vgc_atomic_load_u64(&vgc_heap.heap_marked), vgc_mark_par_min_ns)
+	}
 	live := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
 	free_cpus := vgc_stop_weighed_cpus(last_work, vgc_mark_par_min_ns)
 	total := vgc_mark_plan_count(vgc_mark_workers_cfg, last_work, vgc_mark_par_min_ns,
@@ -3622,6 +3634,30 @@ fn vgc_mark_plan() int {
 		return 1
 	}
 	return vgc_pool_ensure(total)
+}
+
+// vgc_mark_plan_work answers the previous mark's work the marker plan reads
+// (https://github.com/cx-home/cx-platform-reference/issues/15). A parallel cycle records its
+// markers times its wall (the flap that planning from the wall made, above vgc_ph[5]'s
+// record), and that counts each marker's idle spin on an emptied grey set: four markers
+// over a 4 MB mark read 372 us, recorded as 1488 us, over the line, where one marker
+// takes 935 us, under it. So a small mark the under-the-line floor put on four markers
+// planned the next cycle on one, whose work put it back on four: cx's CSV -> sqlite3
+// bulk load ran 320 of 594 cycles on one marker (408 ms of its 520 ms of stops in the
+// mark; four on every cycle: 327 ms). After a parallel cycle (`n_last` > 1) the plan
+// reads the one-marker equivalent — the one-marker rate (`rate1`, ns per KB,
+// vgc_mark_adapt's baseline) times the marked set — when it is under the line and under
+// the recorded work; else the recorded work. A mark over the line keeps one marker per
+// ms of its recorded work, as before; no rate yet or line 0 change nothing.
+fn vgc_mark_plan_work(work u64, n_last int, rate1 u64, marked u64, line u64) u64 {
+	if n_last <= 1 || rate1 == 0 || line == 0 {
+		return work
+	}
+	est := rate1 * (marked / 1024 + 1)
+	if est < line && est < work {
+		return est
+	}
+	return work
 }
 
 // vgc_mark_plan_count answers the markers a stop fields (before the pool is
