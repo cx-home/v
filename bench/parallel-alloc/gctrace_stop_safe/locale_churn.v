@@ -2,6 +2,10 @@
 // threads each allocate small arrays (collections run all the time) and format an integer
 // through libc's snprintf, whose formatter takes libc's locale lock (localeconv_l), ROUNDS
 // times; at VGC_GCTRACE=2 every collection writes its trace lines while the world is stopped.
+// A worker keeps going past ROUNDS until MIN_CYCLES collections have completed (gc_cycles(),
+// read every 1024 rounds), so every collection the test counts ran under the churn whatever the
+// pacer's spacing: with cx-private#2040's pacing (f6a5dfee04) the 8 workers finish ROUNDS sooner
+// and an 8-core x86 box saw 85-116 collections a run against 168-244 on 377e4407eb.
 // It prints the collections it saw complete (gc_cycles()) and `done`.
 module main
 
@@ -10,10 +14,13 @@ import time
 
 fn C.snprintf(buf &u8, n usize, fmt &char, ...voidptr) int
 
-fn work(rounds int, seed int, out chan u64) {
+fn work(rounds int, min_cycles u64, seed int, out chan u64) {
 	mut buf := [64]u8{}
 	mut sink := u64(0)
-	for i in 0 .. rounds {
+	for i := 0; true; i++ {
+		if i >= rounds && i % 1024 == 0 && gc_cycles() >= min_cycles {
+			break
+		}
 		t := []int{len: 64, init: index + i + seed}
 		sink += u64(t[i % 64])
 		n := unsafe { C.snprintf(&buf[0], 64, c'%d %d', i, seed) }
@@ -44,12 +51,13 @@ fn forcer(done chan bool) {
 fn main() {
 	threads := os.getenv_opt('THREADS') or { '8' }.int()
 	rounds := os.getenv_opt('ROUNDS') or { '400000' }.int()
+	min_cycles := u64(os.getenv_opt('MIN_CYCLES') or { '150' }.int())
 	out := chan u64{cap: threads}
 	done := chan bool{cap: 1}
 	f := spawn forcer(done)
 	mut hs := []thread{}
 	for s in 0 .. threads {
-		hs << spawn work(rounds, s, out)
+		hs << spawn work(rounds, min_cycles, s, out)
 	}
 	hs.wait()
 	done <- true
