@@ -1311,3 +1311,41 @@ pub fn vgc_mutex_selftest_unlock(lk &u32) {
 pub fn vgc_selftest_thread_cpu_ns() u64 {
 	return C.vgc_thread_cpu_ns()
 }
+
+// vgc_pace_exit_selftest — https://github.com/cx-home/cx-platform-store/issues/29. After a cycle
+// that paced as several (was_one false), the counts' one-thread answer (vgc_pace_one_thread)
+// takes effect only once `quiet` stops in a row read one thread (at most one stamped and at most
+// one over 64 KB), quiet >= k; before that the cycle stays several. A cycle that already paced as
+// one stays one, and an answer of several is several, whatever quiet reads. 0 = pass, else the
+// failed check. Driven by bench/parallel-alloc/vgc_pace_exit_test.v. Arguments: one (the counts'
+// answer), was_one (the previous cycle's answer), quiet, k.
+pub fn vgc_pace_exit_selftest() u32 {
+	// a store batch after several: two quiet stops (its workers under 64 KB in a short interval)
+	// keep several; so does k - 1
+	if vgc_pace_exit(true, false, 2, 8) || vgc_pace_exit(true, false, 7, 8) {
+		return 1
+	}
+	// k quiet stops in a row: back to the quarter
+	if !vgc_pace_exit(true, false, 8, 8) || !vgc_pace_exit(true, false, 30, 8) {
+		return 2
+	}
+	// a one-thread program stays one (it never entered several), whatever quiet reads
+	if !vgc_pace_exit(true, true, 0, 8) || !vgc_pace_exit(true, true, 2, 8) {
+		return 3
+	}
+	// several by the counts is several
+	if vgc_pace_exit(false, true, 0, 8) || vgc_pace_exit(false, false, 0, 8) {
+		return 4
+	}
+	// k <= 2 is the head's rule (two agreeing quiet stops leave several)
+	if !vgc_pace_exit(true, false, 2, 2) || !vgc_pace_exit(true, false, 2, 0) {
+		return 5
+	}
+	// the trigger's quiet count: a stop with at most one stamped and at most one over 64 KB adds
+	// one, any other stop starts it again
+	if vgc_pace_quiet_next(3, 1, 1) != 4 || vgc_pace_quiet_next(3, 0, 0) != 4
+		|| vgc_pace_quiet_next(3, 0, 2) != 0 || vgc_pace_quiet_next(3, 2, 0) != 0 {
+		return 6
+	}
+	return 0
+}
