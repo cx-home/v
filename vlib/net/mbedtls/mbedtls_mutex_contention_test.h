@@ -61,15 +61,17 @@ static void *cx_mc_worker(void *p) {
 	return NULL;
 }
 
-static long cx_mc_csw(void) {
+static long cx_mc_csw(long *vol) {
 	struct rusage r;
 	getrusage(RUSAGE_SELF, &r);
+	*vol = r.ru_nvcsw;
 	return r.ru_nvcsw + r.ru_nivcsw;
 }
 
 // runs threads x iters key cycles; returns the failed PSA calls (0 = all good) or < 0 on a
-// setup failure; *acq / *parks / *csw = per cycle
-static int cx_mc_run(int threads, int iters, double *acq, double *parks, double *csw) {
+// setup failure; *acq / *parks / *csw / *vcsw = per cycle (*vcsw: the voluntary context
+// switches alone -- a park's wait; the rest are preemptions)
+static int cx_mc_run2(int threads, int iters, double *acq, double *parks, double *csw, double *vcsw) {
 	if (psa_crypto_init() != PSA_SUCCESS) return -1;
 	// a valid peer share: the public key of a fixed private key
 	{
@@ -98,14 +100,15 @@ static int cx_mc_run(int threads, int iters, double *acq, double *parks, double 
 		args[i].failed = 0;
 		pthread_create(&th[i], NULL, cx_mc_worker, &args[i]);
 	}
-	long c0 = cx_mc_csw();
+	long v0 = 0, v1 = 0;
+	long c0 = cx_mc_csw(&v0);
 	__atomic_store_n(&cx_mc_go, 1, __ATOMIC_RELEASE);
 	int failed = 0;
 	for (int i = 0; i < threads; i++) {
 		pthread_join(th[i], NULL);
 		failed += args[i].failed;
 	}
-	long c1 = cx_mc_csw();
+	long c1 = cx_mc_csw(&v1);
 	double cycles = (double)threads * (double)iters;
 #if defined(MBEDTLS_THREADING_PTHREAD)
 	*acq = (double)(__atomic_load_n(&v_mbedtls_mutex_acquires, __ATOMIC_RELAXED) - a0) / cycles;
@@ -115,5 +118,11 @@ static int cx_mc_run(int threads, int iters, double *acq, double *parks, double 
 	*parks = -1;
 #endif
 	*csw = (double)(c1 - c0) / cycles;
+	*vcsw = (double)(v1 - v0) / cycles;
 	return failed;
+}
+
+static int cx_mc_run(int threads, int iters, double *acq, double *parks, double *csw) {
+	double vcsw = 0;
+	return cx_mc_run2(threads, iters, acq, parks, csw, &vcsw);
 }
