@@ -38,6 +38,12 @@ pub interface IError {
 	code() int
 }
 
+// The header is written with vmemcpy, never a struct store through `res` /
+// `option`: the object is a typed wrapper (`_result_T`, `_option_T`) read back
+// as that type, and under C strict aliasing a store of `_result` / `_option`
+// may be dropped or reordered against those reads (gcc 11.4 -O2 lost a
+// `fr.key = v` and read the field as none —
+// https://github.com/cx-home/cx-private/issues/2019; option_header_alias_test.v).
 struct _result {
 	is_error bool
 	err      IError = none__
@@ -52,7 +58,8 @@ struct _result {
 @[vgc_no_wb]
 fn _result_ok(data voidptr, mut res _result, size int) {
 	unsafe {
-		*res = _result{}
+		h := _result{}
+		vmemcpy(res, &h, sizeof(_result))
 		// use err to get the end of ResultBase and then memcpy into it
 		vmemcpy(&u8(&res.err) + sizeof(IError), data, size)
 	}
@@ -60,10 +67,9 @@ fn _result_ok(data voidptr, mut res _result, size int) {
 
 fn _result_clone(current &_result, mut res _result, size int) {
 	unsafe {
-		*res = _result{
-			is_error: current.is_error
-			err:      current.err
-		}
+		mut h := _result{}
+		vmemcpy(&h, current, sizeof(_result))
+		vmemcpy(res, &h, sizeof(_result))
 		// use err to get the end of ResultBase and then memcpy into it
 		vmemcpy(&u8(&res.err) + sizeof(IError), &u8(&current.err) + sizeof(IError), size)
 	}
@@ -183,9 +189,10 @@ struct _option {
 @[vgc_no_wb]
 fn _option_none(data voidptr, mut option _option, size int) {
 	unsafe {
-		*option = _option{
+		h := _option{
 			state: 2
 		}
+		vmemcpy(option, &h, sizeof(_option))
 		// use err to get the end of OptionBase and then memcpy into it
 		vmemcpy(&u8(&option.err) + sizeof(IError), data, size)
 	}
@@ -197,7 +204,8 @@ fn _option_none(data voidptr, mut option _option, size int) {
 @[vgc_no_wb]
 fn _option_ok(data voidptr, mut option _option, size int) {
 	unsafe {
-		*option = _option{}
+		h := _option{}
+		vmemcpy(option, &h, sizeof(_option))
 		// use err to get the end of OptionBase and then memcpy into it
 		vmemcpy(&u8(&option.err) + sizeof(IError), data, size)
 	}
@@ -205,10 +213,9 @@ fn _option_ok(data voidptr, mut option _option, size int) {
 
 fn _option_clone(current &_option, mut option _option, size int) {
 	unsafe {
-		*option = _option{
-			state: current.state
-			err:   current.err
-		}
+		mut h := _option{}
+		vmemcpy(&h, current, sizeof(_option))
+		vmemcpy(option, &h, sizeof(_option))
 		// use err to get the end of OptionBase and then memcpy into it
 		vmemcpy(&u8(&option.err) + sizeof(IError), &u8(&current.err) + sizeof(IError), size)
 	}
