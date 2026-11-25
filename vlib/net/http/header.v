@@ -1,6 +1,7 @@
 // Copyright (c) 2019-2024 Alexander Medvednikov. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
+@[has_globals]
 module http
 
 import strings
@@ -240,109 +241,129 @@ pub fn (h CommonHeader) str() string {
 	}
 }
 
-const common_header_map = {
-	'accept':                              CommonHeader.accept
-	'accept-ch':                           .accept_ch
-	'accept-charset':                      .accept_charset
-	'accept-ch-lifetime':                  .accept_ch_lifetime
-	'accept-encoding':                     .accept_encoding
-	'accept-language':                     .accept_language
-	'accept-patch':                        .accept_patch
-	'accept-post':                         .accept_post
-	'accept-ranges':                       .accept_ranges
-	'access-control-allow-credentials':    .access_control_allow_credentials
-	'access-control-allow-headers':        .access_control_allow_headers
-	'access-control-allow-methods':        .access_control_allow_methods
-	'access-control-allow-origin':         .access_control_allow_origin
-	'access-control-expose-headers':       .access_control_expose_headers
-	'access-control-max-age':              .access_control_max_age
-	'access-control-request-headers':      .access_control_request_headers
-	'access-control-request-method':       .access_control_request_method
-	'age':                                 .age
-	'allow':                               .allow
-	'alt-svc':                             .alt_svc
-	'authorization':                       .authorization
-	'cache-control':                       .cache_control
-	'clear-site-data':                     .clear_site_data
-	'connection':                          .connection
-	'content-disposition':                 .content_disposition
-	'content-encoding':                    .content_encoding
-	'content-language':                    .content_language
-	'content-length':                      .content_length
-	'content-location':                    .content_location
-	'content-range':                       .content_range
-	'content-security-policy':             .content_security_policy
-	'content-security-policy-report-only': .content_security_policy_report_only
-	'content-type':                        .content_type
-	'cookie':                              .cookie
-	'cross-origin-embedder-policy':        .cross_origin_embedder_policy
-	'cross-origin-opener-policy':          .cross_origin_opener_policy
-	'cross-origin-resource-policy':        .cross_origin_resource_policy
-	'date':                                .date
-	'device-memory':                       .device_memory
-	'digest':                              .digest
-	'dnt':                                 .dnt
-	'early-data':                          .early_data
-	'etag':                                .etag
-	'expect':                              .expect
-	'expect-ct':                           .expect_ct
-	'expires':                             .expires
-	'feature-policy':                      .feature_policy
-	'forwarded':                           .forwarded
-	'from':                                .from
-	'host':                                .host
-	'if-match':                            .if_match
-	'if-modified-since':                   .if_modified_since
-	'if-none-match':                       .if_none_match
-	'if-range':                            .if_range
-	'if-unmodified-since':                 .if_unmodified_since
-	'index':                               .index
-	'keep-alive':                          .keep_alive
-	'large-allocation':                    .large_allocation
-	'last-modified':                       .last_modified
-	'link':                                .link
-	'location':                            .location
-	'nel':                                 .nel
-	'origin':                              .origin
-	'pragma':                              .pragma
-	'proxy-authenticate':                  .proxy_authenticate
-	'proxy-authorization':                 .proxy_authorization
-	'range':                               .range
-	'referer':                             .referer
-	'referrer-policy':                     .referrer_policy
-	'retry-after':                         .retry_after
-	'save-data':                           .save_data
-	'sec-fetch-dest':                      .sec_fetch_dest
-	'sec-fetch-mode':                      .sec_fetch_mode
-	'sec-fetch-site':                      .sec_fetch_site
-	'sec-fetch-user':                      .sec_fetch_user
-	'sec-websocket-accept':                .sec_websocket_accept
-	'sec_websocket_key':                   .sec_websocket_key
-	'server':                              .server
-	'server-timing':                       .server_timing
-	'set-cookie':                          .set_cookie
-	'sourcemap':                           .sourcemap
-	'strict-transport-security':           .strict_transport_security
-	'te':                                  .te
-	'timing-allow-origin':                 .timing_allow_origin
-	'tk':                                  .tk
-	'trailer':                             .trailer
-	'transfer-encoding':                   .transfer_encoding
-	'upgrade':                             .upgrade
-	'upgrade-insecure-requests':           .upgrade_insecure_requests
-	'user-agent':                          .user_agent
-	'vary':                                .vary
-	'via':                                 .via
-	'want-digest':                         .want_digest
-	'warning':                             .warning
-	'www-authenticate':                    .www_authenticate
-	'x-content-type-options':              .x_content_type_options
-	'x-dns-prefetch-control':              .x_dns_prefetch_control
-	'x-forwarded-for':                     .x_forwarded_for
-	'x-forwarded-host':                    .x_forwarded_host
-	'x-forwarded-proto':                   .x_forwarded_proto
-	'x-frame-options':                     .x_frame_options
-	'x-xss-protection':                    .x_xss_protection
+// common_header_map is built on first use and published once
+// (https://github.com/cx-home/cx-private/issues/2068: a const map is built before
+// main by every program that links net.http).
+__global g_common_header_map voidptr
+
+fn common_header_map() map[string]CommonHeader {
+	p := C.atomic_load_ptr(unsafe { voidptr(&g_common_header_map) })
+	if p != unsafe { nil } {
+		return unsafe { *&map[string]CommonHeader(p) }
+	}
+	m := &map[string]CommonHeader{}
+	unsafe {
+		*m = common_header_map_build()
+	}
+	C.atomic_store_ptr(unsafe { voidptr(&g_common_header_map) }, voidptr(m))
+	return *m
+}
+
+fn common_header_map_build() map[string]CommonHeader {
+	return {
+		'accept':                              CommonHeader.accept
+		'accept-ch':                           .accept_ch
+		'accept-charset':                      .accept_charset
+		'accept-ch-lifetime':                  .accept_ch_lifetime
+		'accept-encoding':                     .accept_encoding
+		'accept-language':                     .accept_language
+		'accept-patch':                        .accept_patch
+		'accept-post':                         .accept_post
+		'accept-ranges':                       .accept_ranges
+		'access-control-allow-credentials':    .access_control_allow_credentials
+		'access-control-allow-headers':        .access_control_allow_headers
+		'access-control-allow-methods':        .access_control_allow_methods
+		'access-control-allow-origin':         .access_control_allow_origin
+		'access-control-expose-headers':       .access_control_expose_headers
+		'access-control-max-age':              .access_control_max_age
+		'access-control-request-headers':      .access_control_request_headers
+		'access-control-request-method':       .access_control_request_method
+		'age':                                 .age
+		'allow':                               .allow
+		'alt-svc':                             .alt_svc
+		'authorization':                       .authorization
+		'cache-control':                       .cache_control
+		'clear-site-data':                     .clear_site_data
+		'connection':                          .connection
+		'content-disposition':                 .content_disposition
+		'content-encoding':                    .content_encoding
+		'content-language':                    .content_language
+		'content-length':                      .content_length
+		'content-location':                    .content_location
+		'content-range':                       .content_range
+		'content-security-policy':             .content_security_policy
+		'content-security-policy-report-only': .content_security_policy_report_only
+		'content-type':                        .content_type
+		'cookie':                              .cookie
+		'cross-origin-embedder-policy':        .cross_origin_embedder_policy
+		'cross-origin-opener-policy':          .cross_origin_opener_policy
+		'cross-origin-resource-policy':        .cross_origin_resource_policy
+		'date':                                .date
+		'device-memory':                       .device_memory
+		'digest':                              .digest
+		'dnt':                                 .dnt
+		'early-data':                          .early_data
+		'etag':                                .etag
+		'expect':                              .expect
+		'expect-ct':                           .expect_ct
+		'expires':                             .expires
+		'feature-policy':                      .feature_policy
+		'forwarded':                           .forwarded
+		'from':                                .from
+		'host':                                .host
+		'if-match':                            .if_match
+		'if-modified-since':                   .if_modified_since
+		'if-none-match':                       .if_none_match
+		'if-range':                            .if_range
+		'if-unmodified-since':                 .if_unmodified_since
+		'index':                               .index
+		'keep-alive':                          .keep_alive
+		'large-allocation':                    .large_allocation
+		'last-modified':                       .last_modified
+		'link':                                .link
+		'location':                            .location
+		'nel':                                 .nel
+		'origin':                              .origin
+		'pragma':                              .pragma
+		'proxy-authenticate':                  .proxy_authenticate
+		'proxy-authorization':                 .proxy_authorization
+		'range':                               .range
+		'referer':                             .referer
+		'referrer-policy':                     .referrer_policy
+		'retry-after':                         .retry_after
+		'save-data':                           .save_data
+		'sec-fetch-dest':                      .sec_fetch_dest
+		'sec-fetch-mode':                      .sec_fetch_mode
+		'sec-fetch-site':                      .sec_fetch_site
+		'sec-fetch-user':                      .sec_fetch_user
+		'sec-websocket-accept':                .sec_websocket_accept
+		'sec_websocket_key':                   .sec_websocket_key
+		'server':                              .server
+		'server-timing':                       .server_timing
+		'set-cookie':                          .set_cookie
+		'sourcemap':                           .sourcemap
+		'strict-transport-security':           .strict_transport_security
+		'te':                                  .te
+		'timing-allow-origin':                 .timing_allow_origin
+		'tk':                                  .tk
+		'trailer':                             .trailer
+		'transfer-encoding':                   .transfer_encoding
+		'upgrade':                             .upgrade
+		'upgrade-insecure-requests':           .upgrade_insecure_requests
+		'user-agent':                          .user_agent
+		'vary':                                .vary
+		'via':                                 .via
+		'want-digest':                         .want_digest
+		'warning':                             .warning
+		'www-authenticate':                    .www_authenticate
+		'x-content-type-options':              .x_content_type_options
+		'x-dns-prefetch-control':              .x_dns_prefetch_control
+		'x-forwarded-for':                     .x_forwarded_for
+		'x-forwarded-host':                    .x_forwarded_host
+		'x-forwarded-proto':                   .x_forwarded_proto
+		'x-frame-options':                     .x_frame_options
+		'x-xss-protection':                    .x_xss_protection
+	}
 }
 
 pub fn (mut h Header) free() {
@@ -724,8 +745,8 @@ pub fn (h Header) join(other Header) Header {
 // NOTE: Assumes sl is lowercase, since the caller usually already has the lowercase key
 fn canonicalize(name string) string {
 	// check if we have a common header
-	if name in common_header_map {
-		return common_header_map[name].str()
+	if h := common_header_map()[name] {
+		return h.str()
 	}
 	return name.split('-').map(it.capitalize()).join('-')
 }

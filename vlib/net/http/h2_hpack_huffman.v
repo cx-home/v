@@ -1,6 +1,7 @@
 // Copyright (c) 2019-2024 Alexander Medvednikov. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
+@[has_globals]
 module http
 
 import hash.huffman
@@ -11,18 +12,45 @@ const h2_huffman_eos = 256
 
 // h2_max_code_bits is the longest HPACK Huffman code length (RFC 7541
 // Appendix B). 30 bits is too wide for a flat decode table, so decoding goes
-// bit-at-a-time against h2_huffman_decode_map.
+// bit-at-a-time against h2_huffman_decode_map().
 const h2_max_code_bits = 30
 
-// h2_huffman_table holds the canonical HPACK Huffman codes, rebuilt at startup
-// from the per-symbol bit lengths via the shared hash.huffman builder. The
-// codes are MSB-first (the order they appear on the wire).
-const h2_huffman_table = build_h2_huffman_table()
+// h2_huffman_table holds the canonical HPACK Huffman codes, rebuilt from the
+// per-symbol bit lengths via the shared hash.huffman builder on first use and
+// published once (https://github.com/cx-home/cx-private/issues/2068: a const is
+// built before main by every program that links net.http, a lib-free cx
+// executable's start-up included). The codes are MSB-first (wire order).
+__global g_h2_huffman_table voidptr
+
+fn h2_huffman_table() huffman.Table {
+	p := C.atomic_load_ptr(unsafe { voidptr(&g_h2_huffman_table) })
+	if p != unsafe { nil } {
+		return unsafe { *&huffman.Table(p) }
+	}
+	t := build_h2_huffman_table()
+	tp := unsafe { memdup(&t, int(sizeof(huffman.Table))) }
+	C.atomic_store_ptr(unsafe { voidptr(&g_h2_huffman_table) }, tp)
+	return t
+}
 
 // h2_huffman_decode_map maps a (bit_length, code) pair, packed as
-// `(bit_length << 32) | code`, to its symbol. It is built once at startup
-// from the canonical code table and is read-only afterwards.
-const h2_huffman_decode_map = h2_huffman_table.decode_map() or { panic('hpack: ${err}') }
+// `(bit_length << 32) | code`, to its symbol. It is built from the canonical
+// code table on first use, published once and read-only afterwards (two racing
+// first uses build equal maps; one is published, the other dropped).
+__global g_h2_huffman_decode_map voidptr
+
+fn h2_huffman_decode_map() map[u64]int {
+	p := C.atomic_load_ptr(unsafe { voidptr(&g_h2_huffman_decode_map) })
+	if p != unsafe { nil } {
+		return unsafe { *&map[u64]int(p) }
+	}
+	m := &map[u64]int{}
+	unsafe {
+		*m = h2_huffman_table().decode_map() or { panic('hpack: ${err}') }
+	}
+	C.atomic_store_ptr(unsafe { voidptr(&g_h2_huffman_decode_map) }, voidptr(m))
+	return *m
+}
 
 fn build_h2_huffman_table() huffman.Table {
 	return huffman.build(
@@ -39,9 +67,10 @@ fn h2_huffman_encode(input []u8) []u8 {
 	mut out := []u8{cap: input.len}
 	mut acc := u64(0)
 	mut nbits := 0
+	table := h2_huffman_table()
 	for b in input {
-		code := u64(h2_huffman_table.codes[b])
-		clen := h2_huffman_table.lengths[b]
+		code := u64(table.codes[b])
+		clen := table.lengths[b]
 		acc = (acc << clen) | code
 		nbits += clen
 		for nbits >= 8 {
@@ -65,6 +94,7 @@ fn h2_huffman_decode(input []u8) ![]u8 {
 	mut out := []u8{cap: input.len + input.len / 2}
 	mut cur := u64(0)
 	mut cur_len := 0
+	dm := h2_huffman_decode_map()
 	for b in input {
 		for bit := 7; bit >= 0; bit-- {
 			cur = (cur << 1) | u64((b >> u8(bit)) & 1)
@@ -72,7 +102,7 @@ fn h2_huffman_decode(input []u8) ![]u8 {
 			if cur_len > h2_max_code_bits {
 				return error('hpack: invalid huffman code (no symbol within ${h2_max_code_bits} bits)')
 			}
-			if sym := h2_huffman_decode_map[(u64(cur_len) << 32) | cur] {
+			if sym := dm[(u64(cur_len) << 32) | cur] {
 				if sym == h2_huffman_eos {
 					return error('hpack: EOS symbol encountered in huffman string')
 				}
