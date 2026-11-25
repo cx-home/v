@@ -13,8 +13,9 @@
 // oversized spans stay hot to exit (peak 714-720 MB; pbm1 reads 720.70 x3).
 //
 // The test warms a small-object churn, then drops a 160 MB buffer. It keeps
-// churning until ONE natural collection has completed (gc_cycles() + 1, never
-// gc_collect(), which returns the whole pool). It then reads the bytes the
+// churning until TWO natural collections have completed after the drop (never
+// gc_collect(), which returns the whole pool); the first may already be in
+// flight at the drop. It then reads the bytes the
 // trim returned (gc_heap_usage().unmapped_bytes): they must have grown by at
 // least half the buffer.
 module main
@@ -59,18 +60,31 @@ fn test_an_oversized_buffer_dropped_before_the_last_collection_leaves_in_it() {
 	mut sink := churn(4000, 1) // the small pool warm: several cycles of 64 B chains
 	c0 := gc_cycles()
 	sink += hold_big(3)
-	sink += churn(10, 2)
+	// the baseline at the drop. The collection that returns the buffer is the
+	// first one to START after the drop: on x86 (ardec-dev3) that one already
+	// completed inside churn(10) (cycle 11); on arm64 the cycle completing
+	// there was in flight at the drop, and the next one returns it (cycle 12).
+	// So: up to two completed collections after the drop, and the highest
+	// unmapped reading in that window (later churn re-commits a few pages).
 	c1 := gc_cycles()
 	un0 := gc_heap_usage().unmapped_bytes
+	mut un1 := un0
+	sink += churn(10, 2)
 	mut n := 0
-	for gc_cycles() < c1 + 1 && n < 400 {
+	for {
+		u := gc_heap_usage().unmapped_bytes
+		if u > un1 {
+			un1 = u
+		}
+		if gc_cycles() >= c1 + 2 || n >= 800 {
+			break
+		}
 		sink += churn(50, n)
 		n++
 	}
 	c2 := gc_cycles()
-	un1 := gc_heap_usage().unmapped_bytes
 	returned := if un1 > un0 { un1 - un0 } else { usize(0) }
 	println('vgc_oversized_last_cycle: big=${big_len} cycles ${c0} -> ${c1} -> ${c2} (churn rounds ${n}) unmapped ${un0} -> ${un1} returned=${returned} returned_over_big=${f64(returned) / f64(big_len):.3f} keep=${keep[0]} sink=${sink}')
-	assert c2 > c1, 'no collection ran while the churn went on'
+	assert c2 >= c1 + 2, 'two collections did not run while the churn went on'
 	assert returned >= usize(big_len / 2), 'the collection after an oversized buffer was dropped returned ${returned} bytes of ${big_len}: the idle oversized span stayed resident (age-gated trim, no carve to compensate)'
 }
