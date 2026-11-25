@@ -72,12 +72,28 @@ static void threading_mutex_free_pthread(mbedtls_threading_mutex_t *mutex)
     (void) pthread_mutex_destroy(&mutex->mutex);
 }
 
+/* cx-home/cx-platform-net#29: every lock (v_mbedtls_mutex_acquires) and every lock that
+ * found the mutex held and went to pthread_mutex_lock to wait (v_mbedtls_mutex_parks) --
+ * read by vlib/net/mbedtls/mbedtls_mutex_contention_test.v. */
+unsigned long long v_mbedtls_mutex_acquires = 0;
+unsigned long long v_mbedtls_mutex_parks = 0;
+#if defined(__TINYC__)
+#define V_MBEDTLS_COUNT(c) ((c)++)
+#else
+#define V_MBEDTLS_COUNT(c) __atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#endif
+
 static int threading_mutex_lock_pthread(mbedtls_threading_mutex_t *mutex)
 {
     if (mutex == NULL) {
         return MBEDTLS_ERR_THREADING_BAD_INPUT_DATA;
     }
 
+    V_MBEDTLS_COUNT(v_mbedtls_mutex_acquires);
+    if (pthread_mutex_trylock(&mutex->mutex) == 0) {
+        return 0;
+    }
+    V_MBEDTLS_COUNT(v_mbedtls_mutex_parks);
     if (pthread_mutex_lock(&mutex->mutex) != 0) {
         return MBEDTLS_ERR_THREADING_MUTEX_ERROR;
     }
