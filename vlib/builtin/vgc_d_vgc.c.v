@@ -5024,12 +5024,18 @@ fn vgc_pool_trim() {
 	// Oversized spans first: multi-MB each, the highest RSS return per syscall.
 	// (Short list by construction — one span per oversized arena — so an age-
 	// unordered head walk is fine here.)
+	// cx-private#2052 (k-nucleotide): past the goal (committed span pages over
+	// next_gc, vgc_committed_above_goal) an idle oversized span goes at once,
+	// with no age gate — the carve-side compensation (bf2adb3926) only runs
+	// when a later carve comes, and after a program's last collection none
+	// may: k-nucleotide's 119 MB dropped buffer stayed resident to exit.
+	over_goal := vgc_committed_above_goal()
 	mut o := vgc_heap.free_oversized
 	for o != unsafe { nil } && decommits < vgc_pool_trim_max_decommits
 		&& examined < vgc_pool_trim_max_examined {
 		examined++
 		nxt := o.next // capture: a decommit re-pushes o at the list head
-		if !o.decommitted && cyc - o.pool_gen >= vgc_pool_trim_age {
+		if !o.decommitted && (over_goal || cyc - o.pool_gen >= vgc_pool_trim_age) {
 			vgc_pool_trim_decommit(mut o)
 			decommits++
 		}
