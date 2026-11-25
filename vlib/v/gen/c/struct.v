@@ -993,10 +993,16 @@ fn (mut g Gen) struct_decl(s ast.Struct, name string, is_anon bool, is_option bo
 	} else {
 		g.type_definitions.writeln('\tE_STRUCT_DECL;')
 	}
-	ti_attrs := if !g.is_cc_msvc && s.attrs.contains('packed') {
+	mut ti_attrs := if !g.is_cc_msvc && s.attrs.contains('packed') {
 		'__attribute__((__packed__))'
 	} else {
 		''
+	}
+	// @[may_alias] (cx-private#2019): a store through a pointer to this type may
+	// alias an object of any type (the option/result headers, stored as `_option` /
+	// `_result` into a `_option_T` / `_result_T` that is read back as that type).
+	if !g.is_cc_msvc && s.attrs.contains('may_alias') {
+		ti_attrs += '__attribute__((__may_alias__))'
 	}
 	g.type_definitions.write_string('}${ti_attrs}')
 	if !g.is_cc_msvc && aligned_attr != '' {

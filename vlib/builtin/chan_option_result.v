@@ -38,6 +38,15 @@ pub interface IError {
 	code() int
 }
 
+// @[may_alias]: the header is stored as `_result` / `_option` (`*res = _result{}`)
+// into an object that is a typed wrapper (`_result_T`, `_option_T`) read back as
+// that type. Under C strict aliasing that store has another type than every later
+// read, and gcc 11.4 -O2 dropped it after inlining (a `fr.key = v` read back as
+// none: https://github.com/cx-home/cx-private/issues/2019, option_header_alias_test.v).
+// may_alias makes the store alias every type and keeps it a plain struct store,
+// which clang folds into the caller (a header copied with vmemcpy instead costs an
+// unwrap chain 3x its instructions: bench/parallel-alloc/vgc_shadow_stack_cost_test.v).
+@[may_alias]
 struct _result {
 	is_error bool
 	err      IError = none__
@@ -169,6 +178,15 @@ struct Option {
 }
 
 // option is the base of V's internal option return system.
+// @[may_alias]: the header is stored as `_result` / `_option` (`*res = _result{}`)
+// into an object that is a typed wrapper (`_result_T`, `_option_T`) read back as
+// that type. Under C strict aliasing that store has another type than every later
+// read, and gcc 11.4 -O2 dropped it after inlining (a `fr.key = v` read back as
+// none: https://github.com/cx-home/cx-private/issues/2019, option_header_alias_test.v).
+// may_alias makes the store alias every type and keeps it a plain struct store,
+// which clang folds into the caller (a header copied with vmemcpy instead costs an
+// unwrap chain 3x its instructions: bench/parallel-alloc/vgc_shadow_stack_cost_test.v).
+@[may_alias]
 struct _option {
 	state u8
 	err   IError = none__
