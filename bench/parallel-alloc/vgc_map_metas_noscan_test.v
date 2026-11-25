@@ -1,7 +1,7 @@
 // vgc_map_metas_noscan_test.v — a map's metas (u32 hash bits and key-value
 // indices, pointer-free; vcalloc_noscan at new_map, v_realloc at
-// reserve_metas) lie in a noscan span from the map's birth through its
-// growth, as a field of a heap struct and as a local (cx-home/v#56: the
+// reserve_metas) lie in a noscan span from the map's first insert through its
+// growth (an empty map shares one zeroed block, cx-private#2068), as a field of a heap struct and as a local (cx-home/v#56: the
 // verifier's missed words were two metas pairs read as one 64-bit word in a
 // scanned, permanent 65,616-byte buffer — a map of 4096 int keys' metas —
 // naming a dead young object: perm_gen_verify7's 0x191a/0x191b/0x191c
@@ -26,7 +26,11 @@ mut:
 
 fn test_a_maps_metas_lie_in_a_noscan_span_through_its_growth() {
 	mut o := &Old{}
-	assert vgc_map_metas_noscan_probe(unsafe { voidptr(&o.m) }), "a fresh map field's metas are not noscan"
+	// an empty map allocates no metas: it points at the zeroed block every empty map
+	// shares until its first insert (cx-private#2068), which holds no pointer
+	empty := vgc_map_metas_addr_probe(unsafe { voidptr(&o.m) })
+	assert empty == vgc_map_metas_addr_probe(unsafe { voidptr(&o.mids) }), "two fresh map fields do not share the empty metas block"
+	assert unsafe { (&u32(voidptr(empty)))[0] } == 0, 'the shared empty metas block is not zero'
 	mut metas0 := usize(0)
 	for k in 0 .. 4096 {
 		o.m[k] = &Rec{
@@ -44,7 +48,7 @@ fn test_a_maps_metas_lie_in_a_noscan_span_through_its_growth() {
 	assert vgc_map_metas_noscan_probe(unsafe { voidptr(&o.m) }), "the pointer-valued map field's metas are not noscan at 4096 keys"
 	assert vgc_map_metas_noscan_probe(unsafe { voidptr(&o.mids) }), "the u64-valued map field's metas are not noscan at 4096 keys"
 	mut m := map[int]&Rec{}
-	assert vgc_map_metas_noscan_probe(unsafe { voidptr(&m) }), "a fresh local map's metas are not noscan"
+	assert vgc_map_metas_addr_probe(unsafe { voidptr(&m) }) == empty, "a fresh local map does not share the empty metas block"
 	for k in 0 .. 4096 {
 		m[k] = &Rec{
 			a: u64(k)
