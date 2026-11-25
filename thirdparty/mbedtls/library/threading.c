@@ -88,7 +88,30 @@ static void threading_mutex_free_pthread(mbedtls_threading_mutex_t *mutex)
 unsigned long long v_mbedtls_mutex_acquires = 0;
 unsigned long long v_mbedtls_mutex_parks = 0;
 #if defined(__APPLE__)
-#define V_MBEDTLS_SPIN_TRIES 64
+#include <mach/mach_time.h>
+/* cx-home/cx-platform-net#29 lever 11: the spin before a park is bounded in TIME, not in
+ * tries: lever 10's 64 tries x 32 relaxes lasted 73 us on x86 (ardec-dev3, pause) but 0.46 us
+ * on arm64 (dev1 M2 Max, yield is ~1 cycle) -- shorter than a queue of 16 threads' key-slot
+ * holds, so arm64 still parked ~1.1 times a TLS 1.3 handshake on dev2. 75 us = x86's budget. */
+#define V_MBEDTLS_SPIN_NS 75000ull
+static volatile uint64_t v_mbedtls_spin_ticks = 0; /* every thread computes the same value */
+static uint64_t v_mbedtls_spin_budget(void)
+{
+    uint64_t t = v_mbedtls_spin_ticks;
+    if (t == 0) {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) != 0 || tb.numer == 0) {
+            tb.numer = 1;
+            tb.denom = 1;
+        }
+        t = V_MBEDTLS_SPIN_NS * tb.denom / tb.numer;
+        if (t == 0) {
+            t = 1;
+        }
+        v_mbedtls_spin_ticks = t;
+    }
+    return t;
+}
 #if defined(__aarch64__) && !defined(__TINYC__)
 #define V_MBEDTLS_CPU_RELAX() __asm__ __volatile__ ("yield")
 #elif (defined(__x86_64__) || defined(__i386__)) && !defined(__TINYC__)
@@ -116,13 +139,17 @@ static int threading_mutex_lock_pthread(mbedtls_threading_mutex_t *mutex)
 #if defined(__APPLE__)
     /* cx-home/cx-platform-net#29 lever 10: the hot holders (PSA's key-slot table) keep the
      * mutex for a lookup, far less than a park and the two context switches it costs: pause
-     * a few dozen cycles and retry, up to V_MBEDTLS_SPIN_TRIES times, before parking. */
-    for (int spin = 0; spin < V_MBEDTLS_SPIN_TRIES; spin++) {
+     * a few dozen cycles and retry before parking -- lever 11: for up to V_MBEDTLS_SPIN_NS. */
+    uint64_t deadline = mach_absolute_time() + v_mbedtls_spin_budget();
+    for (;;) {
         for (int k = 0; k < 32; k++) {
             V_MBEDTLS_CPU_RELAX();
         }
         if (pthread_mutex_trylock(&mutex->mutex) == 0) {
             return 0;
+        }
+        if (mach_absolute_time() >= deadline) {
+            break;
         }
     }
 #endif
