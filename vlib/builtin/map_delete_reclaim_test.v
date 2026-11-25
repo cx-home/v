@@ -32,6 +32,9 @@ pub mut:
 fn test_map_delete_reclaims_dense_array_tail() {
 	mut m := map[string]string{}
 	raw := unsafe { &MapLayoutForTest(&m) }
+	// an empty map has no key/value store until its first insert (cx-private#2068)
+	m['first'] = 'first'
+	m.delete('first')
 	initial_cap := raw.key_values.cap
 	for i in 0 .. 100 {
 		key := i.str()

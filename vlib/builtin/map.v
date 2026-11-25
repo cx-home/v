@@ -1,6 +1,7 @@
 // Copyright (c) 2019-2024 Alexander Medvednikov. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
+@[has_globals]
 module builtin
 
 /*
@@ -398,8 +399,28 @@ fn map_free_string(pkey voidptr) {
 fn map_free_nop(_ voidptr) {
 }
 
+// map_empty_metas is the zeroed metas block every empty map shares until its first insert
+// (https://github.com/cx-home/cx-private/issues/2068): an empty map allocates nothing. Lookups
+// read it (all zero: no entry); every writer calls own() first, so it stays zero.
+__global map_empty_metas [36]u32
+
+@[inline]
+fn map_shared_metas() &u32 {
+	return unsafe { &u32(&map_empty_metas[0]) }
+}
+
+// own gives an empty map its own metas and key/value store (the ones new_map made before).
+@[inline]
+fn (mut m map) own() {
+	if m.metas != map_shared_metas() {
+		return
+	}
+	metasize := int(sizeof(u32) * (m.even_index + 2 + m.extra_metas))
+	m.metas = unsafe { &u32(vcalloc_noscan(metasize)) }
+	m.key_values = new_dense_array(m.key_bytes, m.value_bytes)
+}
+
 fn new_map(key_bytes int, value_bytes int, hash_fn MapHashFn, key_eq_fn MapEqFn, clone_fn MapCloneFn, free_fn MapFreeFn) map {
-	metasize := int(sizeof(u32) * (init_capicity + extra_metas_inc))
 	// for now assume anything bigger than a pointer is a string
 	has_string_keys := key_bytes > int(sizeof(voidptr))
 	return map{
@@ -408,8 +429,11 @@ fn new_map(key_bytes int, value_bytes int, hash_fn MapHashFn, key_eq_fn MapEqFn,
 		even_index:      init_even_index
 		cached_hashbits: max_cached_hashbits
 		shift:           init_log_capicity
-		key_values:      new_dense_array(key_bytes, value_bytes)
-		metas:           unsafe { &u32(vcalloc_noscan(metasize)) }
+		key_values:      DenseArray{
+			key_bytes:   key_bytes
+			value_bytes: value_bytes
+		}
+		metas:           map_shared_metas()
 		extra_metas:     extra_metas_inc
 		len:             0
 		has_string_keys: has_string_keys
@@ -465,6 +489,9 @@ pub fn (mut m map) move() map {
 // It does it by setting the map length to `0`
 // Example: mut m := {'abc': 'xyz', 'def': 'aaa'}; m.clear(); assert m.len == 0
 pub fn (mut m map) clear() {
+	if m.metas == map_shared_metas() {
+		return
+	}
 	unsafe {
 		if m.key_values.all_deleted != 0 {
 			free(m.key_values.all_deleted)
@@ -578,6 +605,7 @@ fn (mut m map) ensure_extra_metas(probe_count u32) {
 // not equivalent to the key of any other element already in the container.
 // If the key already exists, its value is changed to the value of the new element.
 fn (mut m map) set(key voidptr, value voidptr) {
+	m.own()
 	// Integer-based load factor check: equivalent to (2*len)/even_index > 0.8
 	// which simplifies to 5*len > 2*even_index (avoids float ops broken in ARM64 backend)
 	if u32(5) * u32(m.len) > u32(2) * m.even_index {
@@ -664,6 +692,7 @@ fn (mut m map) reserve_metas(meta_bytes u32) {
 
 // reserve ensures that the map can store at least `n` entries without rehashing.
 pub fn (mut m map) reserve(n u32) {
+	m.own()
 	for u64(n) * 5 > u64(m.even_index) * 2 {
 		m.expand()
 	}
@@ -929,6 +958,9 @@ fn (d &DenseArray) clone() DenseArray {
 // clone returns a clone of the `map`.
 @[unsafe]
 pub fn (m &map) clone() map {
+	if m.metas == map_shared_metas() {
+		return *m
+	}
 	metasize := int(sizeof(u32) * (m.even_index + 2 + m.extra_metas))
 	res := map{
 		key_bytes:       m.key_bytes
@@ -963,7 +995,9 @@ pub fn (m &map) clone() map {
 // free releases all memory resources occupied by the `map`.
 @[unsafe]
 pub fn (m &map) free() {
-	unsafe { free(m.metas) }
+	if m.metas != map_shared_metas() {
+		unsafe { free(m.metas) }
+	}
 	unsafe {
 		m.metas = nil
 	}
