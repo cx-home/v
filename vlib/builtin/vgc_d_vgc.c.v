@@ -4479,6 +4479,30 @@ fn vgc_large_round(npages u32) u32 {
 	return npages
 }
 
+// vgc_oversized_round rounds a request larger than one arena up to a sixteenth
+// of its power of two (vgc_large_round_up's granule; 4 MB between 64 and 128
+// MB), from its first request: an oversized request takes an arena of its own,
+// and the pool serves the freed span again only to a request no larger than it,
+// so unrounded, a buffer rebuilt a few pages larger each time carved a new
+// arena at every size and filled the arena table far below the heap's limit
+// (cx-private#2036 kind5e: 'arenas 249/249, heap_live 1029 MB, soft limit 2048
+// MB' on a 74,100,150-byte request). The slack is under a sixteenth, past the
+// object and never touched; the exact size stays the floor the pool and the
+// tails serve before an arena is carved (vgc_span_alloc_floor).
+// vgc_oversized_growth_arena_test.v.
+fn vgc_oversized_round(npages u32) u32 {
+	mut p := u32(1)
+	for p << 1 <= npages {
+		p <<= 1
+	}
+	g := p >> 4
+	r := (npages + g - 1) / g * g
+	if r < npages {
+		return npages
+	}
+	return r
+}
+
 // vgc_large_round_probe reports vgc_large_round_up (the rounding itself) to a
 // test.
 pub fn vgc_large_round_probe(npages u32) u32 {
@@ -8026,7 +8050,11 @@ fn vgc_alloc_large(n usize, noscan bool, zero_fill bool) voidptr {
 	// exact size is the floor the rounded request falls back to before it
 	// would carve an arena (vgc_span_alloc_floor)
 	exact := u32((n + vgc_page_size - 1) / vgc_page_size)
-	npages := vgc_large_round(exact)
+	npages := if exact > u32(vgc_max_pooled_pages) {
+		vgc_oversized_round(exact)
+	} else {
+		vgc_large_round(exact)
+	}
 	vgc_large_demand_note(npages)
 	mut span := vgc_span_alloc_floor(npages, exact)
 	if span == unsafe { nil } {
