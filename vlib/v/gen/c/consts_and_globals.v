@@ -100,6 +100,26 @@ fn (mut g Gen) const_decl(node ast.ConstDecl) {
 					|| !elems_are_const) {
 					g.const_decl_init_later_msvc_string_fixed_array(field.mod, name, const_name,
 						field.expr, field.typ)
+				} else if !field.expr.is_fixed && g.const_array_is_static(field.expr) {
+					// https://github.com/cx-home/cx-private/issues/2068: a const array literal of
+					// literals is static C data; _vinit only points the array at it (no heap copy).
+					elem_styp := g.styp(field.expr.elem_type)
+					n := field.expr.exprs.len
+					mut vals := []string{cap: n}
+					for e in field.expr.exprs {
+						if e is ast.StringLiteral {
+							escaped := cescape_nonascii(util.smart_quote(e.val, e.is_raw))
+							vals << '_SINIT(${cescaped_string_literal(escaped)})'
+						} else {
+							vals << '(${elem_styp})(${g.expr_string(e)})'
+						}
+					}
+					g.global_const_defs[name] = GlobalConstDef{
+						mod:   field.mod
+						def:   '${g.static_non_parallel}${elem_styp} ${const_name}__sdata[${n}] = {${vals.join(', ')}};\n${g.static_non_parallel}${g.styp(field.typ)} ${const_name}; // a const array of literals: static data'
+						init:  '\t${const_name} = builtin__new_array_static(${n}, sizeof(${elem_styp}), ${const_name}__sdata);'
+						order: -1
+					}
 				} else {
 					g.const_decl_init_later(field.mod, name, const_name, ast.Expr(field.expr),
 						field.typ, false)
@@ -977,5 +997,51 @@ fn (mut g Gen) sort_globals_consts() {
 				g.sorted_global_const_names << node.name
 			}
 		}
+	}
+}
+
+// const_array_is_static reports whether a (non-fixed) const array literal can live in static C
+// data: every element a literal of a number, bool, char/rune or (V) string element type, no
+// len/cap/init fields, no update expr, a C compiler that takes `_SINIT` in a static initializer.
+fn (mut g Gen) const_array_is_static(node ast.ArrayInit) bool {
+	if node.exprs.len == 0 || node.has_len || node.has_cap || node.has_init || node.has_index
+		|| node.has_update_expr || g.is_cc_msvc || g.pref.build_mode == .build_module {
+		return false
+	}
+	if node.elem_type.has_option_or_result() || node.elem_type.is_ptr()
+		|| node.elem_type.has_flag(.shared_f) {
+		return false
+	}
+	elem_sym := g.table.final_sym(node.elem_type)
+	is_str := node.elem_type == ast.string_type
+	if !is_str && elem_sym.kind !in [.bool, .i8, .i16, .i32, .int, .i64, .u8, .u16, .u32, .u64,
+		.f32, .f64, .char, .rune, .isize, .usize] {
+		return false
+	}
+	for e in node.exprs {
+		match e {
+			ast.StringLiteral {
+				if !is_str || e.language != .v {
+					return false
+				}
+			}
+			else {
+				if is_str || !const_array_number_literal(e) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// const_array_number_literal: `5`, `-4`, `1.5`, `true`, `` `a` ``, `u32(7)`, `-u32(7)`.
+fn const_array_number_literal(e ast.Expr) bool {
+	return match e {
+		ast.IntegerLiteral, ast.FloatLiteral, ast.BoolLiteral, ast.CharLiteral { true }
+		ast.PrefixExpr { e.op == .minus && const_array_number_literal(e.right) }
+		ast.CastExpr { e.expr is ast.IntegerLiteral || e.expr is ast.FloatLiteral }
+		ast.ParExpr { const_array_number_literal(e.expr) }
+		else { false }
 	}
 }

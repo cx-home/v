@@ -400,6 +400,21 @@ fn new_array_from_c_array(len int, cap int, elm_size int, c_array voidptr) array
 	return arr
 }
 
+// Private function, used by cgen for a const array literal whose elements are all literals
+// (https://github.com/cx-home/cx-private/issues/2068): the array points at static C data the
+// program image holds, so _vinit allocates nothing for it. `.nofree` keeps free() off that data;
+// a mutable copy that grows moves into the heap (ensure_cap copies, and frees only `.noslices`).
+@[markused]
+fn new_array_static(len int, elm_size int, data voidptr) array {
+	return array{
+		element_size: elm_size
+		data:         data
+		len:          len
+		cap:          len
+		flags:        .nofree
+	}
+}
+
 // Private function, used by V (`merged := [...base, 4, 5]`).
 // `base` is already an independent (typed/deep) clone produced by the caller
 // (cgen emits `array_clone_static_to_depth(base, depth)`), so this helper just
