@@ -60,6 +60,16 @@ static void threading_mutex_init_pthread(mbedtls_threading_mutex_t *mutex)
      * hit, so state transitions are checked in tests only via the state
      * variable. Please make sure any new mutex that gets added is exercised in
      * tests; see framework/tests/src/threading_helpers.c for more details. */
+#if defined(__APPLE__) && defined(PTHREAD_MUTEX_POLICY_FIRSTFIT_NP)
+    /* cx-home/cx-platform-net#29 lever 10: first-fit, as MUTEX_INIT below */
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) == 0) {
+        (void) pthread_mutexattr_setpolicy_np(&attr, PTHREAD_MUTEX_POLICY_FIRSTFIT_NP);
+        (void) pthread_mutex_init(&mutex->mutex, &attr);
+        (void) pthread_mutexattr_destroy(&attr);
+        return;
+    }
+#endif
     (void) pthread_mutex_init(&mutex->mutex, NULL);
 }
 
@@ -77,6 +87,16 @@ static void threading_mutex_free_pthread(mbedtls_threading_mutex_t *mutex)
  * read by vlib/net/mbedtls/mbedtls_mutex_contention_test.v. */
 unsigned long long v_mbedtls_mutex_acquires = 0;
 unsigned long long v_mbedtls_mutex_parks = 0;
+#if defined(__APPLE__)
+#define V_MBEDTLS_SPIN_TRIES 64
+#if defined(__aarch64__) && !defined(__TINYC__)
+#define V_MBEDTLS_CPU_RELAX() __asm__ __volatile__ ("yield")
+#elif (defined(__x86_64__) || defined(__i386__)) && !defined(__TINYC__)
+#define V_MBEDTLS_CPU_RELAX() __asm__ __volatile__ ("pause")
+#else
+#define V_MBEDTLS_CPU_RELAX() ((void) 0)
+#endif
+#endif
 #if defined(__TINYC__)
 #define V_MBEDTLS_COUNT(c) ((c)++)
 #else
@@ -93,6 +113,19 @@ static int threading_mutex_lock_pthread(mbedtls_threading_mutex_t *mutex)
     if (pthread_mutex_trylock(&mutex->mutex) == 0) {
         return 0;
     }
+#if defined(__APPLE__)
+    /* cx-home/cx-platform-net#29 lever 10: the hot holders (PSA's key-slot table) keep the
+     * mutex for a lookup, far less than a park and the two context switches it costs: pause
+     * a few dozen cycles and retry, up to V_MBEDTLS_SPIN_TRIES times, before parking. */
+    for (int spin = 0; spin < V_MBEDTLS_SPIN_TRIES; spin++) {
+        for (int k = 0; k < 32; k++) {
+            V_MBEDTLS_CPU_RELAX();
+        }
+        if (pthread_mutex_trylock(&mutex->mutex) == 0) {
+            return 0;
+        }
+    }
+#endif
     V_MBEDTLS_COUNT(v_mbedtls_mutex_parks);
     if (pthread_mutex_lock(&mutex->mutex) != 0) {
         return MBEDTLS_ERR_THREADING_MUTEX_ERROR;
@@ -122,7 +155,14 @@ int (*mbedtls_mutex_unlock)(mbedtls_threading_mutex_t *) = threading_mutex_unloc
 /*
  * With pthreads we can statically initialize mutexes
  */
+#if defined(__APPLE__) && defined(PTHREAD_FIRSTFIT_MUTEX_INITIALIZER)
+/* cx-home/cx-platform-net#29 lever 10: darwin's default (fair-share) mutex hands a released
+ * mutex to the oldest parked waiter, so under contention every acquire becomes a handoff
+ * through the kernel; a first-fit mutex lets a running thread take it. */
+#define MUTEX_INIT  = { PTHREAD_FIRSTFIT_MUTEX_INITIALIZER, 1 }
+#else
 #define MUTEX_INIT  = { PTHREAD_MUTEX_INITIALIZER, 1 }
+#endif
 
 #endif /* MBEDTLS_THREADING_PTHREAD */
 
