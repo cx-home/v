@@ -131,3 +131,12 @@ fn test_a_costly_one_thread_mutator_is_not_held_to_the_quarter() {
 	assert f64(cheap.cycles) <= bound_b, '(b) the cheaper mutator ran ${cheap.cycles} collections against its parent\'s ${parent.cycles} on the same live set'
 	assert heavy.tail_kb <= 2 * term_kb, '(c) a mutator whose collections are cheap left the quarter: ${heavy.tail_kb} KB (term ${term_kb} KB)'
 }
+
+// the lift's state machine (vgc_one_lift_next), white-box in module builtin
+fn test_the_one_thread_lift_state() {
+	if os.getenv('VGC_ONE_COST_CHILD') != '' {
+		return
+	}
+	rc := vgc_one_lift_selftest()
+	assert rc == 0, 'vgc_one_lift_selftest check ${rc}'
+}
