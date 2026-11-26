@@ -5471,6 +5471,62 @@ fn vgc_pace_one_thread(nt int, acct int, prev int, live int, was_one bool, cycle
 	return was_one
 }
 
+// vgc_one_lift_next answers (runs, lifted) after a cycle (https://github.com/cx-home/v/issues/94;
+// vgc_one_thread_lift doc, vgc_d_vgc.c.v): runs counts the band's readings in a row over its grow
+// line (a tenth) while one allocating thread paced at the quarter (`at_term`); at
+// vgc_one_lift_after of them the pacer is lifted. Lifted holds through the readings between the
+// band's lines, as the band's own headroom does, and through cycles that paced as several (a
+// put-docs batch's workers come and go), and ends at a reading under the shrink line (`cheap`).
+fn vgc_one_lift_next(runs int, lifted bool, at_term bool, expensive bool, cheap bool) (int, bool) {
+	if cheap {
+		return 0, false
+	}
+	if !expensive || !at_term {
+		return 0, lifted
+	}
+	n := runs + 1
+	return n, lifted || n >= vgc_one_lift_after
+}
+
+// vgc_one_lift_selftest checks vgc_one_lift_next (bench/parallel-alloc/vgc_one_thread_cost_test.v):
+// 0 = ok, else the number of the first failed case.
+pub fn vgc_one_lift_selftest() u32 {
+	// one reading over the line is not a lift (a noisy cycle)
+	r1, l1 := vgc_one_lift_next(0, false, true, true, false)
+	if r1 != 1 || l1 {
+		return 1
+	}
+	// two in a row lift
+	_, l2 := vgc_one_lift_next(1, false, true, true, false)
+	if !l2 {
+		return 2
+	}
+	// a reading between the lines breaks the run and keeps the state
+	r3, l3 := vgc_one_lift_next(1, false, true, false, false)
+	if r3 != 0 || l3 {
+		return 3
+	}
+	r4, l4 := vgc_one_lift_next(5, true, true, false, false)
+	if r4 != 0 || !l4 {
+		return 4
+	}
+	// a cheap reading ends the lift
+	r5, l5 := vgc_one_lift_next(5, true, true, false, true)
+	if r5 != 0 || l5 {
+		return 5
+	}
+	// several threads (or the switch off) neither lift nor end it
+	r6, l6 := vgc_one_lift_next(1, false, false, true, false)
+	if r6 != 0 || l6 {
+		return 6
+	}
+	_, l7 := vgc_one_lift_next(0, true, false, true, false)
+	if !l7 {
+		return 7
+	}
+	return 0
+}
+
 fn vgc_update_trigger() {
 	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
 	gc_percent := u64(vgc_heap.gc_percent)
@@ -5562,9 +5618,13 @@ fn vgc_update_trigger() {
 		// is cheap against it is cheap). Go's GC CPU limiter has this shape:
 		// the collector's CPU, not its wall time. No CPU clock (Windows) or
 		// VGC_PACER_WALL=1: the wall pause, as before.
+		// https://github.com/cx-home/v/issues/94: the lift off the one-thread quarter reads
+		// only this clock (vgc_one_thread_lift doc)
+		mut cpu_read := false
 		if vgc_pacer_wall == 0 && vgc_gc_cpu_t0 != 0 {
 			cpu_now := C.vgc_thread_cpu_ns()
 			if cpu_now > vgc_gc_cpu_t0 {
+				cpu_read = true
 				// the waits' spin is the box's contention, not the cycle's work
 				// (FreeBSD CI: 179-790 ms of CPU spun waiting for descheduled
 				// markers and parkers in cycles whose work is ~3 ms)
@@ -5582,13 +5642,20 @@ fn vgc_update_trigger() {
 		vgc_gate_last_pause = pause
 		vgc_gate_last_interval = interval
 		mut hr := vgc_headroom
-		if pause * vgc_overhead_grow_div > interval {
+		expensive := pause * vgc_overhead_grow_div > interval
+		cheap := !expensive && pause * vgc_overhead_shrink_div < interval
+		if expensive {
 			hr *= 2 // GC overhead > ~2%: buy throughput with space
 			vgc_headroom_floor_capped = false
-		} else if pause * vgc_overhead_shrink_div < interval {
+		} else if cheap {
 			hr /= 2 // GC overhead < ~0.25%: collections are cheap, collect eagerly
 			vgc_headroom_floor_capped = true
 		}
+		// https://github.com/cx-home/v/issues/94: one allocating thread's lift off the
+		// quarter (vgc_one_thread_lift doc, vgc_d_vgc.c.v)
+		vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs, vgc_one_lifted,
+			one && vgc_one_thread_small(marked) && vgc_one_thread_lift
+			&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
 		// the pause is span-walk-dominated up there, so more headroom does not
@@ -5653,6 +5720,21 @@ fn vgc_update_trigger() {
 			}
 			if live_cap < floor {
 				live_cap = floor
+			}
+			// https://github.com/cx-home/v/issues/94: a lifted one-thread pacer is bounded
+			// by Go's GOGC=100 term, clamp(1 x marked, vgc_headroom_floor_lo,
+			// vgc_headroom_live_floor) (cx-home/v#14, cx-private#1886), not the quarter
+			if vgc_one_lifted && one && vgc_one_thread_small(marked) {
+				mut lift := marked
+				if lift < vgc_headroom_floor_lo {
+					lift = vgc_headroom_floor_lo
+				}
+				if lift > vgc_headroom_live_floor {
+					lift = vgc_headroom_live_floor
+				}
+				if live_cap < lift {
+					live_cap = lift
+				}
 			}
 			if hr_max > live_cap {
 				hr_max = live_cap

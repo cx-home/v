@@ -1108,6 +1108,29 @@ __global vgc_headroom_floor_lo1 = u64(256) * 1024
 // its garbage to 0.5-1.2 MB and read 14.34 MB of peak RSS against Python 3.12's 14.11 — the quarter
 // is the term at every small size, its floor vgc_headroom_floor_lo1.
 __global vgc_one_thread_pct = u64(25)
+// https://github.com/cx-home/v/issues/94: ONE allocating thread whose collections cost over the
+// band's grow line (a tenth of the mutator interval, vgc_update_trigger) at vgc_one_lift_after
+// readings in a row leaves the quarter: the band's doubling may then carry its headroom up to Go's
+// GOGC=100 term, clamp(1 x marked, vgc_headroom_floor_lo, vgc_headroom_live_floor) — the one-thread
+// goal cx-home/v#14 / cx-private#1886 set before the quarter (cx-home/v#56) — not the fixed 32 MB
+// floor nor 2 x marked, whose carve over a small live set v#14 exists to prevent
+// (vgc_headroom_live_test holds the band up and reads both: 2 MB live <= 14 MB carved, one thread
+// over 8 MB live <= 2.5x) — and a reading under the shrink line (a fiftieth) ends the lift. The quarter's term and its
+// floor are both the term, so the band had no room: cx's put-docs (cx-core-data 0ab46d60, ~4 MB
+// live, its collections ~20-25 % of its time) paced 375-478 collections at 1-2 MB of headroom
+// against 70-81 with the fixed floor, and spent 20-25 % more user CPU; which runs escaped the
+// quarter through a worker's stop decided the shape's cost, so the cheaper commit read 7-10 %
+// slower than its parent. A mutator whose collections are cheap (json-codec 1 KB: ~0.12-0.2 ms
+// a cycle every few ms, under a tenth) keeps the quarter and its peak. The lift reads only the
+// collector's CPU clock (cx-home/v#42): a wall-time reading (VGC_PACER_WALL=1, a platform without a
+// thread CPU clock) counts the box's contention, and memory is not spent on load the program did
+// not make — so the band held up by a stalled collector on the wall clock (vgc_headroom_live_test's
+// v#14 / v#56 cases) keeps the quarter as before. VGC_ONE_THREAD_LIFT=0
+// restores the head's pacing (vgc_one_thread_cost_test reads both).
+__global vgc_one_thread_lift = true
+__global vgc_one_lift_after = int(2)
+__global vgc_one_lift_runs = int(0)
+__global vgc_one_lifted = false
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2727,6 +2750,10 @@ pub fn vgc_init() {
 	}
 	if vgc_headroom_live_floor < vgc_headroom_min {
 		vgc_headroom_live_floor = vgc_headroom_min
+	}
+	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
+	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {
+		vgc_one_thread_lift = false
 	}
 	af_env := C.getenv(c'VGC_HEADROOM_ADAPTIVE_FLOOR')
 	if af_env != unsafe { nil } && C.atoll(af_env) == 0 {
