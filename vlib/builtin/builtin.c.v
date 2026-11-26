@@ -54,11 +54,32 @@ fn v_segmentation_fault_handler(signal_number i32) {
 	$if v2_native_windows_pe_minimal ? {
 		eprintln('signal 11: segmentation fault')
 		exit(128 + signal_number)
-	} $else {
+	} $else $if windows || freestanding {
 		$if freestanding {
 			eprintln('signal 11: segmentation fault')
 		} $else {
 			C.fprintf(C.stderr, c'signal %d: segmentation fault\n', signal_number)
+		}
+		print_backtrace()
+		exit(128 + signal_number)
+	} $else {
+		// The process must DIE (https://github.com/cx-home/cx-private/issues/2036):
+		// a fault here usually means a corrupt heap, so nothing below may wait
+		// on a lock another thread holds — a daemon whose faulting thread hung
+		// in its handler kept serving with that thread gone. So: the default
+		// action first (a second fault inside this handler kills), the message
+		// by write(2), a watchdog (SIGALRM -> SIGSEGV) bounding the best-effort
+		// backtrace (it allocates: a fault inside malloc deadlocks on the
+		// allocator lock), then the signal re-raised — never exit(), whose
+		// atexit / stdio teardown runs under the program's live threads.
+		unsafe { C.signal(signal_number, C.SIG_DFL) }
+		v_segv_write_message(signal_number)
+		unsafe { C.signal(C.SIGALRM, voidptr(v_segv_watchdog)) }
+		C.alarm(v_segv_watchdog_seconds)
+		$if segv_handler_hang_test ? {
+			for {
+				C.pause()
+			}
 		}
 		$if use_libbacktrace ? && !tinyc {
 			$if openbsd {
@@ -71,8 +92,69 @@ fn v_segmentation_fault_handler(signal_number i32) {
 		} $else {
 			print_backtrace()
 		}
-		exit(128 + signal_number)
+		C.fflush(C.stderr)
+		// pending until this handler returns (the signal is blocked inside its
+		// own handler); a synchronous fault also re-faults on return. Either
+		// way the default action ends the process with SIGSEGV.
+		C.kill(C.getpid(), signal_number)
 	}
+}
+
+// v_segv_watchdog_seconds bounds the backtrace a SIGSEGV prints.
+const v_segv_watchdog_seconds = u32(3)
+
+fn C.alarm(seconds u32) u32
+fn C.pause() i32
+
+// v_segv_write_message writes 'signal <n>: segmentation fault' with write(2)
+// alone (async-signal-safe: no stdio, no allocation).
+fn v_segv_write_message(signal_number i32) {
+	mut buf := [64]u8{}
+	prefix := c'signal '
+	suffix := c': segmentation fault\n'
+	mut n := 0
+	unsafe {
+		for i := 0; prefix[i] != 0; i++ {
+			buf[n] = prefix[i]
+			n++
+		}
+		mut digits := [12]u8{}
+		mut nd := 0
+		mut v := u32(signal_number)
+		for {
+			digits[nd] = u8(`0` + v % 10)
+			nd++
+			v /= 10
+			if v == 0 {
+				break
+			}
+		}
+		for nd > 0 {
+			nd--
+			buf[n] = digits[nd]
+			n++
+		}
+		for i := 0; suffix[i] != 0; i++ {
+			buf[n] = suffix[i]
+			n++
+		}
+	}
+	C.write(2, &buf[0], usize(n))
+}
+
+// v_segv_watchdog: the backtrace outlived v_segv_watchdog_seconds — end the
+// process with the SIGSEGV it took (the default action is already restored).
+fn v_segv_watchdog(_ i32) {
+	msg := c'segmentation fault handler: backtrace timed out\n'
+	mut n := 0
+	unsafe {
+		for msg[n] != 0 {
+			n++
+		}
+	}
+	C.write(2, msg, usize(n))
+	unsafe { C.signal(C.SIGSEGV, C.SIG_DFL) }
+	C.kill(C.getpid(), C.SIGSEGV)
 }
 
 @[inline]
