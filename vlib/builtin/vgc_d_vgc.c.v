@@ -5033,13 +5033,20 @@ fn vgc_pool_trim() {
 	// with no age gate — the carve-side compensation (bf2adb3926) only runs
 	// when a later carve comes, and after a program's last collection none
 	// may: k-nucleotide's 119 MB dropped buffer stayed resident to exit.
-	over_goal := vgc_committed_above_goal()
+	excess := vgc_committed_excess()
+	over_goal := excess > 0
+	// sized runs past the goal: no age gate for at most the excess (the
+	// recommit cost of g_churn stays out: under the goal nothing changes, and
+	// past it only bytes the goal does not cover go young)
+	mut young_left := excess
 	mut o := vgc_heap.free_oversized
 	for o != unsafe { nil } && decommits < vgc_pool_trim_max_decommits
 		&& examined < vgc_pool_trim_max_examined {
 		examined++
 		nxt := o.next // capture: a decommit re-pushes o at the list head
 		if !o.decommitted && (over_goal || cyc - o.pool_gen >= vgc_pool_trim_age) {
+			ob := u64(o.npages) * u64(vgc_page_size)
+			young_left = if young_left > ob { young_left - ob } else { 0 }
 			vgc_pool_trim_decommit(mut o)
 			decommits++
 		}
@@ -5059,7 +5066,11 @@ fn vgc_pool_trim() {
 		for s != unsafe { nil } && decommits < vgc_pool_trim_max_decommits
 			&& examined < vgc_pool_trim_max_examined {
 			examined++
-			if cyc - s.pool_gen >= vgc_pool_trim_age {
+			sb := u64(s.npages) * u64(vgc_page_size)
+			if cyc - s.pool_gen >= vgc_pool_trim_age || young_left >= sb {
+				if cyc - s.pool_gen < vgc_pool_trim_age {
+					young_left -= sb
+				}
 				prv := s.prev
 				vgc_pool_trim_decommit(mut s)
 				decommits++
@@ -5271,8 +5282,15 @@ const vgc_compensate_min_run = u64(2)
 __global vgc_pool_goal_comp = true
 
 fn vgc_committed_above_goal() bool {
+	return vgc_committed_excess() > 0
+}
+
+// vgc_committed_excess: committed span pages (carved, less the pool's cold,
+// decommitted bytes) over next_gc, or 0 — the bytes a trim past the goal may
+// return with no age gate (cx-private#2052, vgc_pool_trim).
+fn vgc_committed_excess() u64 {
 	if !vgc_pool_goal_comp {
-		return false
+		return 0
 	}
 	n := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
 	mut carved := u64(0)
@@ -5281,9 +5299,13 @@ fn vgc_committed_above_goal() bool {
 	}
 	cold := vgc_heap.pool_trimmed_bytes
 	if carved <= cold {
-		return false
+		return 0
 	}
-	return carved - cold > C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	if carved - cold <= goal {
+		return 0
+	}
+	return carved - cold - goal
 }
 
 // vgc_pool_compensate decommits up to `nbytes` of committed pooled memory,
