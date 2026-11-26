@@ -1430,7 +1430,7 @@ fn vgc_scan_perm_obj(lo usize, hi usize, w int) bool {
 	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 	mut addr := start
 	for addr + sizeof(usize) <= hi {
-		val := unsafe { *(&usize(voidptr(addr))) }
+		val := C.vgc_load_word(addr)
 		addr += sizeof(usize)
 		if val < vgc_arena_lo || val >= vgc_arena_hi {
 			continue
@@ -2159,6 +2159,9 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			if c.cov_safe {
 				for k in 0 .. vgc_safe_spill_words {
 					vgc_shade(unsafe { vgc_cache(i).safe_regs[k] }, 0)
+					if C.vgc_asan_on() != 0 {
+						vgc_asan_follow(i, unsafe { vgc_cache(i).safe_regs[k] }, 0, 0)
+					}
 				}
 				continue
 			}
@@ -2173,6 +2176,9 @@ fn vgc_scan_suspended_roots(self_idx int) {
 			vgc_refresh_stack_range_for_sp(i, sp) // [sp, stack_base]
 			for k in 0 .. n {
 				vgc_shade(regs[k], 0) // register-resident roots
+				if C.vgc_asan_on() != 0 {
+					vgc_asan_follow(i, regs[k], 0, 0) // cx-home/v#92
+				}
 			}
 			// DIAGNOSTIC (root-scan-miss localizer): is the watched object held
 			// only in this suspended thread's registers (e.g. main spin-waiting
@@ -2509,7 +2515,7 @@ fn vgc_roots_stacks_slice(slot int, n int) {
 	for i < vgc_heap.ncaches {
 		cache := unsafe { vgc_cache(i) }
 		if cache.registered && cache.stack_lo > 0 && cache.stack_hi > cache.stack_lo {
-			vgc_scan_thread_stack(cache.stack_lo, cache.stack_hi, cache.spill_hi, slot)
+			vgc_scan_thread_stack(i, cache.stack_lo, cache.stack_hi, cache.spill_hi, slot)
 		}
 		i += n
 	}
@@ -2617,7 +2623,7 @@ fn vgc_mark_roots() {
 				vgc_ua_base = cache.stack_hi
 				vgc_ua_own = i == C.vgc_get_cache_idx()
 			}
-			vgc_scan_thread_stack(cache.stack_lo, cache.stack_hi, cache.spill_hi, 0)
+			vgc_scan_thread_stack(i, cache.stack_lo, cache.stack_hi, cache.spill_hi, 0)
 			$if vgc_rootdiag ? {
 				vgc_rd_cat = 0
 				vgc_rd_base = 0
@@ -2784,7 +2790,7 @@ fn vgc_scan_range(lo usize, hi usize, w int) {
 	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 	mut addr := start
 	for addr + sizeof(usize) <= hi {
-		val := unsafe { *(&usize(voidptr(addr))) }
+		val := C.vgc_load_word(addr)
 		if val != 0 {
 			$if vgc_rootdiag ? {
 				if vgc_rd_cat != 0 {
@@ -2821,8 +2827,7 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 		n := C.vgc_stack_candidates(addr, hi, vgc_arena_lo, vgc_arena_hi, &hits[0], 64, &next)
 		for k in 0 .. n {
 			at := hits[k]
-			mut val := usize(0)
-			unsafe { C.memcpy(&val, voidptr(at), sizeof(usize)) }
+			val := C.vgc_load_word_u(at) // cx-home/v#92: unchecked by ASan
 			$if vgc_unaligned_audit ? {
 				// cx-home/v#74 (c): an unaligned word waits for the aligned mark
 				if vgc_ua_defer && (at & (sizeof(usize) - 1)) != 0 && vgc_ua_push(at, val) {
@@ -2843,6 +2848,52 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 	}
 }
 
+// cx-home/v#92: ASan's fake stack. With detect_stack_use_after_return on, an
+// instrumented function's escaping locals live in a fake-stack frame off the
+// machine stack, and the machine stack (or a register) holds only the frame's
+// address. vgc_asan_scan_fake reads [lo, hi) of thread idx's stack and scans
+// every live fake frame a word of it lands in; vgc_asan_follow scans one such
+// frame and the frames its words land in, up to vgc_asan_depth deep. Only an
+// ASan build calls them (vgc_asan_on), and only a frame of the thread's own
+// fake stack counts (vgc_asan_fake_frame).
+const vgc_asan_depth = 8
+
+fn vgc_asan_scan_fake(idx int, lo usize, hi usize, w int) {
+	mut addr := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+	mut last := usize(0)
+	for addr + sizeof(usize) <= hi {
+		val := C.vgc_load_word(addr)
+		addr += sizeof(usize)
+		if val == 0 || val == last {
+			continue
+		}
+		if vgc_asan_follow(idx, val, w, 0) {
+			last = val
+		}
+	}
+}
+
+fn vgc_asan_follow(idx int, val usize, w int, depth int) bool {
+	mut beg := usize(0)
+	mut end := usize(0)
+	if C.vgc_asan_fake_frame(idx, val, &beg, &end) == 0 {
+		return false
+	}
+	mut a := (beg + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
+	for a + sizeof(usize) <= end {
+		v := C.vgc_load_word(a)
+		a += sizeof(usize)
+		if v == 0 {
+			continue
+		}
+		vgc_shade(v, w)
+		if depth < vgc_asan_depth && (v < beg || v >= end) {
+			vgc_asan_follow(idx, v, w, depth + 1)
+		}
+	}
+	return true
+}
+
 // vgc_scan_thread_stack scans a registered thread's [lo, hi) stack range. The
 // bottom of it, up to spill_hi, is the jmp_buf of callee-saved registers the
 // spill trampoline (vgc_run_gc_spilled, vgc_park_spill) put there and that
@@ -2853,7 +2904,10 @@ fn vgc_scan_stack_range(lo usize, hi usize, w int) {
 // low half of a register holding 1 read at a 4-byte offset as 0x1_28f5c28f, an
 // interior address of a dropped 240 MB list, which vgc_metadata_roots_test kept
 // marked at -O2. spill_hi 0 (a range another path set) scans the range as before.
-fn vgc_scan_thread_stack(lo usize, hi usize, spill_hi usize, w int) {
+fn vgc_scan_thread_stack(idx int, lo usize, hi usize, spill_hi usize, w int) {
+	if C.vgc_asan_on() != 0 {
+		vgc_asan_scan_fake(idx, lo, hi, w)
+	}
 	$if vgc_unaligned_audit ? {
 		// cx-home/v#74 piece 4: the audit of the shadow build reads the byte
 		// scan, so its unaligned words are counted (real / only), not dropped
@@ -3305,7 +3359,7 @@ fn vgc_ua_witness(cycle u64, obj usize, esz u32) {
 			own := i == C.vgc_get_cache_idx()
 			mut at := (c.stack_lo + 7) & ~usize(7)
 			for at + 8 <= c.stack_hi {
-				v := unsafe { *(&usize(at)) }
+				v := C.vgc_load_word(at)
 				if v >= obj && v < obj + usize(esz) {
 					lr := if own { C.vgc_ua_frame_lr(at) } else { C.vgc_ua_frame_lr_any(at, c.stack_lo, c.stack_hi) }
 					C.vgc_ua_line(if prev != 0 && at >= prev { 3 } else { 4 }, cycle, u32(i),
@@ -3354,7 +3408,7 @@ fn vgc_ua_finish() {
 							unsafe { vgc_ua_uwhere[i] }, unsafe { vgc_ua_uword[i] }, obj, u64(esz),
 							unsafe { vgc_ua_ulr[i] })
 						wa := (obj + usize(bad)) & ~usize(7)
-						C.vgc_ua_line(7, cycle, 0, bad, obj + usize(bad), unsafe { *(&usize(wa)) }, obj, u64(esz), 0)
+						C.vgc_ua_line(7, cycle, 0, bad, obj + usize(bad), C.vgc_load_word(wa), obj, u64(esz), 0)
 						vgc_ua_witness(cycle, obj, esz)
 						continue
 					}
@@ -4143,7 +4197,7 @@ fn vgc_mark_scan_obj(obj_addr usize, w int) {
 		if vgc_cmv_watch_hi != 0 {
 			mut a := obj_addr & ~(usize(sizeof(usize)) - 1)
 			for a + sizeof(usize) <= obj_addr + obj_size {
-				val := unsafe { *(&usize(voidptr(a))) }
+				val := C.vgc_load_word(a)
 				if val >= vgc_cmv_watch_lo && val < vgc_cmv_watch_hi {
 					oi := u32((obj_addr - span.base) / usize(span.elem_size))
 					mut pf := u64(0)
@@ -4257,7 +4311,7 @@ fn vgc_scan_precise(obj_addr usize, ptrmap u64, ptr_words u8) {
 		}
 		// Read the pointer at this offset
 		ptr_addr := obj_addr + usize(bit) * word_size
-		val := unsafe { *(&usize(voidptr(ptr_addr))) }
+		val := C.vgc_load_word(ptr_addr)
 		if val != 0 {
 			vgc_shade(val, 0)
 		}
@@ -4615,7 +4669,7 @@ fn vgc_verify_mark_closure() {
 			end := obj_addr + usize(span.elem_size)
 			mut addr := obj_addr
 			for addr + sizeof(usize) <= end {
-				val := unsafe { *(&usize(voidptr(addr))) }
+				val := C.vgc_load_word(addr)
 				if val >= vgc_arena_lo && val < vgc_arena_hi {
 					tspan := vgc_find_span(voidptr(val))
 					if tspan != unsafe { nil } && tspan.in_use && tspan.elem_size != 0
@@ -4674,7 +4728,7 @@ fn vgc_rootfind_region(lo usize, hi usize, kind int) {
 			addr += sizeof(usize)
 			continue
 		}
-		val := unsafe { *(&usize(voidptr(addr))) }
+		val := C.vgc_load_word(addr)
 		if val >= vgc_arena_lo && val < vgc_arena_hi {
 			span := vgc_find_span(voidptr(val))
 			if span != unsafe { nil } && span.in_use && span.elem_size != 0
@@ -4772,7 +4826,7 @@ fn vgc_do_sweep() {
 				}
 				mut w := (tc.stack_lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 				for w + sizeof(usize) <= tc.stack_hi {
-					val := unsafe { *(&usize(voidptr(w))) }
+					val := C.vgc_load_word(w)
 					if val >= vgc_arena_lo && val < vgc_arena_hi {
 						if vgc_ks_lookup(val) {
 							C.vgc_say(0x5ee9, u64(w)) // holder word (on a scanned stack!)
@@ -5996,7 +6050,7 @@ fn vgc_root_holders(mut hs []string, pre string, o usize, size u32) {
 fn vgc_holders_in(mut hs []string, kind string, lo usize, hi usize, rel usize, o usize, size u32) {
 	mut a := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 	for a + sizeof(usize) <= hi {
-		v := unsafe { *(&usize(voidptr(a))) }
+		v := C.vgc_load_word(a)
 		if v >= o && v < o + usize(size) && hs.len < 24 {
 			off := if rel > a { i64(rel - a) } else { i64(a - rel) }
 			hs << if kind.starts_with('heap') {

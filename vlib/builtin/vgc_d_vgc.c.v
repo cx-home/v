@@ -55,6 +55,13 @@ fn C.vgc_os_decommit(ptr voidptr, size usize)
 fn C.vgc_os_page() usize
 fn C.vgc_os_recommit(ptr voidptr, size usize) // undo decommit before reuse (cx #360)
 fn C.vgc_get_sp() voidptr
+// cx-home/v#92: the conservative scans' uninstrumented word reads and ASan's
+// fake-stack frames (vgc_platform.h, VGC_NO_ASAN doc)
+fn C.vgc_load_word(a usize) usize
+fn C.vgc_load_word_u(a usize) usize
+fn C.vgc_asan_on() int
+fn C.vgc_asan_note_thread(idx int)
+fn C.vgc_asan_fake_frame(idx int, v usize, beg &usize, end &usize) int
 fn C.vgc_get_stack_bounds(lo &usize, hi &usize) int
 fn C.vgc_bitmap_get(bits &u8, idx u32) int
 fn C.vgc_bitmap_set(bits &u8, idx u32)
@@ -2384,7 +2391,7 @@ fn vgc_bw_whereis(obj usize) {
 		}
 		mut w := (tc.stack_lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 		for w + sizeof(usize) <= tc.stack_hi {
-			if unsafe { *(&usize(voidptr(w))) } == obj {
+			if C.vgc_load_word(w) == obj {
 				C.vgc_say(0x10c1, u64(w))
 				C.vgc_say(0x10c9, u64(u32(ti)))
 				found = true
@@ -3123,6 +3130,7 @@ fn vgc_register_thread_opt(wait bool) bool {
 		}
 	}
 	C.vgc_set_cache_idx(idx)
+	C.vgc_asan_note_thread(idx) // cx-home/v#92
 	// Arrange for vgc_thread_exit_cb(idx) to fire when this thread exits.
 	C.vgc_install_thread_exit(idx)
 	sp := usize(C.vgc_get_sp())
@@ -8571,7 +8579,7 @@ fn vgc_watch_scan_range(lo usize, hi usize, idx int) {
 	start := (lo + sizeof(usize) - 1) & ~(usize(sizeof(usize)) - 1)
 	mut addr := start
 	for addr + sizeof(usize) <= hi {
-		val := unsafe { *(&usize(voidptr(addr))) }
+		val := C.vgc_load_word(addr)
 		if val == w {
 			vgc_watch_in_stack = u32(idx + 1)
 			return
@@ -8595,7 +8603,7 @@ fn vgc_watch_scan_obj(p usize) {
 	end := p + usize(span.elem_size)
 	mut addr := p & ~(usize(sizeof(usize)) - 1)
 	for addr + sizeof(usize) <= end {
-		val := unsafe { *(&usize(voidptr(addr))) }
+		val := C.vgc_load_word(addr)
 		if val == w {
 			vgc_watch_in_spawn |= 2
 			return
@@ -9114,7 +9122,7 @@ fn vgc_safe_cache_quarantine(cache_idx int) {
 		w := usize(sizeof(usize))
 		mut a := (sp + w - 1) & ~(w - 1)
 		for a + w <= hi {
-			vgc_quarantine_word(mut c, unsafe { *(&usize(voidptr(a))) })
+			vgc_quarantine_word(mut c, C.vgc_load_word(a))
 			a += w
 		}
 	}

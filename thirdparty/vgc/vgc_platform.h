@@ -4,6 +4,35 @@
 #ifndef VGC_PLATFORM_H
 #define VGC_PLATFORM_H
 
+// cx-home/v#92: AddressSanitizer. The collector reads stacks, spilled registers
+// and the data segment conservatively, word by word, and those words include
+// the redzones ASan poisons around stack locals and globals: an instrumented
+// read of one aborts the process (a cx built with -fsanitize=address died at
+// start-up, 'stack-buffer-overflow READ in vgc_preheap_guard'). VGC_NO_ASAN
+// leaves a function uninstrumented; every conservative read goes through one
+// (the register-spilling trampolines, the preheap guard, vgc_load_word /
+// vgc_load_word_u for the V-side scans, vgc_stack_candidates). Uninstrumented
+// functions also keep their locals on the machine stack, which the trampolines'
+// jmp_buf anchors need. With detect_stack_use_after_return on, ASan moves an
+// instrumented function's escaping locals into fake-stack frames off the
+// machine stack; the stack scan follows each word that lands in a live fake
+// frame of the thread (vgc_asan_fake_frame; each thread's fake stack is noted
+// at registration and at every spill, vgc_asan_note_thread). Without ASan all
+// of it compiles to the plain loads it replaced.
+#if defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define VGC_ASAN 1
+  #endif
+#endif
+#if !defined(VGC_ASAN) && defined(__SANITIZE_ADDRESS__)
+  #define VGC_ASAN 1
+#endif
+#if defined(VGC_ASAN)
+  #define VGC_NO_ASAN __attribute__((no_sanitize_address, noinline))
+#else
+  #define VGC_NO_ASAN
+#endif
+
 // cx-home/v#74 pieces 1 and 6: under -gc e (not -d vgc_byte_stack_scan) cgen follows the declaration of
 // every local clang's SROA can cut off a word with vgc_ss_ref(x, off, word) for the first reference of x
 // behind each run of fields narrower than a word (an option's error behind its state byte, its value's
@@ -74,6 +103,29 @@ static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h> // abort (span-registry-full hard fail in vgc_span_alloc)
+
+// cx-home/v#92: the conservative scans' word reads (VGC_NO_ASAN doc above).
+// vgc_load_word reads the aligned word at a, vgc_load_word_u the word at any
+// byte offset; neither is checked by ASan. vgc_asan_on answers 1 in an ASan
+// build, a constant the V side branches on.
+#if defined(VGC_ASAN)
+  VGC_NO_ASAN static uintptr_t vgc_load_word(uintptr_t a) { return *(const uintptr_t*)a; }
+  VGC_NO_ASAN static uintptr_t vgc_load_word_u(uintptr_t a) {
+      uintptr_t v;
+      __builtin_memcpy(&v, (const void*)a, sizeof(v));
+      return v;
+  }
+  static inline int vgc_asan_on(void) { return 1; }
+#else
+  static inline uintptr_t vgc_load_word(uintptr_t a) { return *(const uintptr_t*)a; }
+  static inline uintptr_t vgc_load_word_u(uintptr_t a) {
+      uintptr_t v;
+      memcpy(&v, (const void*)a, sizeof(v));
+      return v;
+  }
+  static inline int vgc_asan_on(void) { return 0; }
+#endif
+static inline void vgc_asan_note_thread(int idx); // cx-home/v#92, defined beside vgc_susp_at
 
 static inline void vgc_say(uint64_t tag, uint64_t v); // defined below (diagnostics section)
 // VGC_V_EXPORT: the linkage V gives an @[export] fn (VV_EXP: dllexport on
@@ -1593,7 +1645,7 @@ static inline uintptr_t vgc_spill_top(uintptr_t sp, uintptr_t base, void* buf, s
     if (base < sp || (uintptr_t)buf < sp || top > base) { return 0; }
     return top;
 }
-static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t* spill_hi, uintptr_t base) {
+VGC_NO_ASAN static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t* spill_hi, uintptr_t base) {
     jmp_buf buf;
     setjmp(buf);
     // Anchor at the REAL stack pointer (not the frame pointer): `buf` holding the
@@ -1604,6 +1656,7 @@ static inline void vgc_run_gc_spilled(uintptr_t* lo, uintptr_t* hi, uintptr_t* s
     if ((uintptr_t)&buf < sp) { sp = (uintptr_t)&buf; }
     if (base >= sp) { *lo = sp; *hi = base; } else { *lo = base; *hi = sp; }
     *spill_hi = vgc_spill_top(sp, base, &buf, sizeof(buf));
+    vgc_asan_note_thread(-1); // cx-home/v#92
     vgc_gc_start();
     vgc_keep_alive(&buf);
 }
@@ -1641,7 +1694,7 @@ static int vgc_preheap_pages = 0;
       if ((uintptr_t)p != pg) { munmap(p, ps); return 0; }
       return 1;
   }
-  __attribute__((noinline)) static int vgc_preheap_guard(void) {
+  VGC_NO_ASAN __attribute__((noinline)) static int vgc_preheap_guard(void) {
       jmp_buf buf;
       setjmp(buf);
       uintptr_t from = ((uintptr_t)&buf + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1);
@@ -1698,7 +1751,7 @@ static inline int vgc_preheap_guarded(void) { return vgc_preheap_pages; }
 #if defined(_MSC_VER) && !defined(__clang__)
   __declspec(noinline) static void vgc_zero_dead_stack(void) {
 #else
-  __attribute__((noinline)) static void vgc_zero_dead_stack(void) {
+  VGC_NO_ASAN __attribute__((noinline)) static void vgc_zero_dead_stack(void) {
 #endif
     volatile uintptr_t pad[VGC_DEAD_STACK_BYTES / sizeof(uintptr_t)];
     for (size_t i = 0; i < VGC_DEAD_STACK_BYTES / sizeof(uintptr_t); i++) pad[i] = 0;
@@ -1803,7 +1856,7 @@ static inline void vgc_wait_flag_clear(uint32_t* flag) {
 // hot loop variable like `last` is often kept in a callee-saved register and
 // never written to the stack). `buf` is kept alive across the spin so the
 // recorded [lo,hi] range, which covers this frame, includes the spilled regs.
-static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
+VGC_NO_ASAN static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
                                   uint32_t* stopped_count, uint32_t* my_stopped,
                                   uint32_t* my_park_seq, uintptr_t* range_lo,
                                   uintptr_t* range_hi, uintptr_t* spill_hi,
@@ -1817,6 +1870,7 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
     if (stack_base >= sp) { *range_lo = sp; *range_hi = stack_base; }
     else { *range_lo = stack_base; *range_hi = sp; }
     *spill_hi = vgc_spill_top(sp, stack_base, &buf, sizeof(buf));
+    vgc_asan_note_thread(-1); // cx-home/v#92
     // Stamp WHICH stop-cycle this park answers, BEFORE publishing stopped=1 (a
     // collector that trusts stopped therefore also sees a matching seq). A stale
     // stopped=1 from the previous cycle otherwise lets a back-to-back GC count a
@@ -1875,7 +1929,7 @@ static inline void vgc_park_spill(uint32_t* stop_flag, uint32_t* stop_seq,
 // vgc_spill_regs (cx-private#1886): the calling thread's callee-saved
 // registers into `regs` (setjmp's buffer, word by word) and its real SP, for a
 // thread that scans its OWN stack (vgc_safe_cache_quarantine).
-static inline uintptr_t vgc_spill_regs(uintptr_t* regs, int reg_max) {
+VGC_NO_ASAN static inline uintptr_t vgc_spill_regs(uintptr_t* regs, int reg_max) {
     jmp_buf buf;
     memset(&buf, 0, sizeof(buf));
     VGC_SPILL_SETJMP(buf);
@@ -2004,7 +2058,7 @@ void vgc_safe_region_enter_with(void* entry_regs);
 #if defined(_MSC_VER) && !defined(__clang__)
   __declspec(noinline) static void vgc_safe_region_enter_capture(void) {
 #else
-  __attribute__((noinline)) static void vgc_safe_region_enter_capture(void) {
+  VGC_NO_ASAN __attribute__((noinline)) static void vgc_safe_region_enter_capture(void) {
 #endif
     // uninitialized: -gc e builds pass -ftrivial-auto-var-init=zero, whose
     // zeroing call would come before the capture (VGC_ENTRY_REGS fills every word)
@@ -2210,6 +2264,9 @@ typedef struct {
     volatile uintptr_t sp;     // captured stack pointer
     volatile int nregs;
     uintptr_t regs[VGC_SUSP_MAXREG];
+#if defined(VGC_ASAN)
+    void* volatile asan_fake;  // cx-home/v#92: the thread's ASan fake stack (vgc_asan_note_thread)
+#endif
 #if defined(__APPLE__) && defined(VGC_SIGNAL_SUSPEND)
     pthread_t pt;              // unused since cx-home/v#43 (the port is the key; kept for layout)
     semaphore_t sem;           // park semaphore (created once per slot, reused)
@@ -2237,6 +2294,38 @@ static inline vgc_susp* vgc_susp_at(int idx) {
     vgc_susp* c = vgc_susp_chunks[ci]; // volatile load; the record is reached through the pointer (dependency order)
     return c ? &c[idx & (VGC_SUSP_CHUNK - 1)] : 0;
 }
+// cx-home/v#92: ASan's fake stacks (VGC_NO_ASAN doc). vgc_asan_note_thread
+// records the calling thread's fake stack in its suspend record (slot idx; -1 =
+// the thread's own TLS slot). __asan_get_current_fake_stack creates the stack
+// when detect_stack_use_after_return is on and answers 0 when it is off.
+// vgc_asan_fake_frame answers 1 and the frame's [beg, end) when v lies in a
+// live fake frame of slot idx's thread, 0 otherwise (always 0 without ASan).
+#if defined(VGC_ASAN)
+  extern void* __asan_get_current_fake_stack(void);
+  extern void* __asan_addr_is_in_fake_stack(void* fake_stack, void* addr, void** beg, void** end);
+  static inline void vgc_asan_note_thread(int idx) {
+      if (idx < 0) idx = vgc_get_cache_idx();
+      vgc_susp* r = vgc_susp_at(idx);
+      if (r) r->asan_fake = __asan_get_current_fake_stack();
+  }
+  static inline int vgc_asan_fake_frame(int idx, uintptr_t v, uintptr_t* beg, uintptr_t* end) {
+      vgc_susp* r = vgc_susp_at(idx);
+      void* fs = r ? r->asan_fake : 0;
+      if (!fs || v == 0) return 0;
+      void* b = 0;
+      void* e = 0;
+      if (!__asan_addr_is_in_fake_stack(fs, (void*)v, &b, &e) || !b || (uintptr_t)e <= (uintptr_t)b) return 0;
+      *beg = (uintptr_t)b;
+      *end = (uintptr_t)e;
+      return 1;
+  }
+#else
+  static inline void vgc_asan_note_thread(int idx) { (void)idx; }
+  static inline int vgc_asan_fake_frame(int idx, uintptr_t v, uintptr_t* beg, uintptr_t* end) {
+      (void)idx; (void)v; (void)beg; (void)end;
+      return 0;
+  }
+#endif
 // Make slot idx's cache record and suspend record addressable (under
 // cache_lock, from the V side's registration). 0 = the pointer table is
 // exhausted or the OS refused a chunk. Both chunks are zero-filled.
@@ -3999,7 +4088,15 @@ static inline int vgc_touched_ranges(uintptr_t lo, uintptr_t hi, uintptr_t* los,
 #else
   #define VGC_STACK_SCAN_FN __attribute__((noinline)) static
 #endif
-VGC_STACK_SCAN_FN int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t alo, uintptr_t ahi,
+// cx-home/v#92: an ASan build reads the words with the builtin, which the
+// compiler turns into plain loads; a call to memcpy would reach ASan's
+// interceptor, which checks the range.
+#if defined(VGC_ASAN)
+  #define VGC_WORD_MEMCPY __builtin_memcpy
+#else
+  #define VGC_WORD_MEMCPY memcpy
+#endif
+VGC_NO_ASAN VGC_STACK_SCAN_FN int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t alo, uintptr_t ahi,
                                            uintptr_t* out, int cap, uintptr_t* next) {
     const uintptr_t W = sizeof(uintptr_t);
     if (cap < 1) {
@@ -4015,14 +4112,14 @@ VGC_STACK_SCAN_FN int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t 
     int n = 0;
     while (a <= last && last - a >= 7) {
         uintptr_t v0, v1, v2, v3, v4, v5, v6, v7;
-        memcpy(&v0, (const void*)(a + 0), W);
-        memcpy(&v1, (const void*)(a + 1), W);
-        memcpy(&v2, (const void*)(a + 2), W);
-        memcpy(&v3, (const void*)(a + 3), W);
-        memcpy(&v4, (const void*)(a + 4), W);
-        memcpy(&v5, (const void*)(a + 5), W);
-        memcpy(&v6, (const void*)(a + 6), W);
-        memcpy(&v7, (const void*)(a + 7), W);
+        VGC_WORD_MEMCPY(&v0, (const void*)(a + 0), W);
+        VGC_WORD_MEMCPY(&v1, (const void*)(a + 1), W);
+        VGC_WORD_MEMCPY(&v2, (const void*)(a + 2), W);
+        VGC_WORD_MEMCPY(&v3, (const void*)(a + 3), W);
+        VGC_WORD_MEMCPY(&v4, (const void*)(a + 4), W);
+        VGC_WORD_MEMCPY(&v5, (const void*)(a + 5), W);
+        VGC_WORD_MEMCPY(&v6, (const void*)(a + 6), W);
+        VGC_WORD_MEMCPY(&v7, (const void*)(a + 7), W);
         unsigned m = (unsigned)(v0 - alo < span) | (unsigned)(v1 - alo < span) << 1
             | (unsigned)(v2 - alo < span) << 2 | (unsigned)(v3 - alo < span) << 3
             | (unsigned)(v4 - alo < span) << 4 | (unsigned)(v5 - alo < span) << 5
@@ -4042,7 +4139,7 @@ VGC_STACK_SCAN_FN int vgc_stack_candidates(uintptr_t a, uintptr_t hi, uintptr_t 
     }
     for (; a <= last; a++) {
         uintptr_t v;
-        memcpy(&v, (const void*)a, W);
+        VGC_WORD_MEMCPY(&v, (const void*)a, W);
         if (v - alo < span) {
             out[n++] = a;
             if (n == cap) {
