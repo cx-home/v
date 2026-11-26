@@ -1736,6 +1736,73 @@ pub fn vgc_cm_verify_watch(p voidptr) {
 	}
 }
 
+// v-writer11 DIAG (cx-home/v#93, not for landing): every heap object holding a word into the missed
+// object [mo, mo+ms): 0x1920 holder, 0x1921 offset<<32 | holder elem size, 0x1922 flags (bit0 the
+// cycle had marked the holder, bit1 holder in the young range, bit2 its card byte set, bit3 span dirty,
+// bit4 has_ptrmap, bit5 span noscan), 0x1923 the holder's first two words.
+__global vgc_cmv_holder_reports = 0
+
+fn vgc_cmv_find_holders(mo usize, ms usize, side &u8, nsp int) {
+	$if vgc_cm_verify ? {
+		C.vgc_say(0x191f, u64(mo))
+		mut found := 0
+		for j in 0 .. nsp {
+			sp := unsafe { vgc_heap.allspans[j] }
+			if sp == unsafe { nil } || !sp.in_use || sp.alloc_bits == unsafe { nil } || sp.elem_size == 0 {
+				continue
+			}
+			for k in 0 .. sp.nelems {
+				if unsafe { (sp.alloc_bits[k / 8] & (u8(1) << (k % 8))) } == 0 {
+					continue
+				}
+				obj := sp.base + usize(k) * usize(sp.elem_size)
+				nw := usize(sp.elem_size) / 8
+				for wi in 0 .. nw {
+					w := unsafe { *(&usize(voidptr(obj + wi * 8))) }
+					if w >= mo && w < mo + ms {
+						mut fl := u64(0)
+						if k < 1088 {
+							old := unsafe { *(&u8(voidptr(usize(side) + usize(j) * 136 + usize(k / 8)))) }
+							if (old & (u8(1) << (k % 8))) != 0 {
+								fl |= 1
+							}
+						}
+						if obj - vgc_young_lo < vgc_young_len {
+							fl |= 2
+						}
+						t := &&u8(vgc_wb_cards)
+						ci := obj >> 26
+						if t != unsafe { nil } && ci < 4194304 {
+							row := unsafe { t[ci] }
+							if row != unsafe { nil } && unsafe { row[(obj >> 13) & 8191] } != 0 {
+								fl |= 4
+							}
+						}
+						if sp.dirty != 0 {
+							fl |= 8
+						}
+						if sp.has_ptrmap {
+							fl |= 16
+						}
+						if sp.noscan {
+							fl |= 32
+						}
+						C.vgc_say(0x1920, u64(obj))
+						C.vgc_say(0x1921, (u64(wi * 8) << 32) | u64(sp.elem_size))
+						C.vgc_say(0x1922, fl)
+						C.vgc_say(0x1923, unsafe { *(&u64(voidptr(obj))) })
+						found++
+						if found >= 4 {
+							return
+						}
+					}
+				}
+			}
+		}
+		C.vgc_say(0x1924, u64(found))
+	}
+}
+
 fn vgc_cm_verify(self_idx int) {
 	$if vgc_cm_verify ? {
 		nsp := vgc_heap.nspans
@@ -1783,6 +1850,11 @@ fn vgc_cm_verify(self_idx int) {
 								C.vgc_say(0x1911, u64(span.base + usize(u32(b) * 8 +
 									u32(bit)) * usize(span.elem_size)))
 								C.vgc_say(0x1912, u64(span.elem_size))
+							}
+							if vgc_cmv_holder_reports < 6 {
+								vgc_cmv_holder_reports++
+								vgc_cmv_find_holders(span.base + usize(u32(b) * 8 + u32(bit)) * usize(span.elem_size),
+									usize(span.elem_size), side, nsp)
 							}
 							if vgc_cmv_pinned == 0 {
 								// the first miss pins the watch to its span, every slot of it
