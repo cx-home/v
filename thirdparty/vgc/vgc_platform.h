@@ -117,8 +117,17 @@ static inline void vgc_ss_unknown_set(double v) { vgc_ss_unknown = v; }
   }
   static inline int vgc_asan_on(void) { return 1; }
 #else
-  static inline uintptr_t vgc_load_word(uintptr_t a) { return *(const uintptr_t*)a; }
-  static inline uintptr_t vgc_load_word_u(uintptr_t a) {
+  // always inlined: an unoptimised build (v test's -O0) would otherwise make each
+  // read a call whose frame keeps the scanned address in the dead stack below
+  // the scan (the cx-home/v#51 class); inlined, the read is the plain load the
+  // V code had
+  #if defined(__GNUC__) || defined(__clang__)
+    #define VGC_LOAD_INLINE __attribute__((always_inline)) static inline
+  #else
+    #define VGC_LOAD_INLINE static inline
+  #endif
+  VGC_LOAD_INLINE uintptr_t vgc_load_word(uintptr_t a) { return *(const uintptr_t*)a; }
+  VGC_LOAD_INLINE uintptr_t vgc_load_word_u(uintptr_t a) {
       uintptr_t v;
       memcpy(&v, (const void*)a, sizeof(v));
       return v;
