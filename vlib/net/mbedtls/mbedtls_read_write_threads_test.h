@@ -328,3 +328,26 @@ static int cx_rw_threads(const char *cert_pem, const char *key_pem, int rounds, 
 	cx_rw_free(&t);
 	return 0;
 }
+
+// A TLS 1.3 server releases its handshake parameters at the end of its
+// handshake (mbedtls_ssl_cx_release). mbedtls_ssl_free frees
+// transform_negotiate and session_negotiate only while ssl->handshake is set,
+// so the release must free them with it or every server connection leaks
+// them. out: [0] handshake released (1/0), [1] transform_negotiate gone,
+// [2] session_negotiate gone.
+static int cx_rw_released(const char *cert_pem, const char *key_pem, int *out) {
+	static cx_rw_pair t;
+	out[0] = out[1] = out[2] = -1;
+	int rc = cx_rw_open(&t, cert_pem, key_pem);
+	if (rc == 0) {
+		out[0] = t.srv.private_handshake == NULL;
+#if defined(MBEDTLS_SSL_PROTO_TLS1_2)
+		out[1] = t.srv.private_transform_negotiate == NULL;
+#else
+		out[1] = 1;
+#endif
+		out[2] = t.srv.private_session_negotiate == NULL;
+	}
+	cx_rw_free(&t);
+	return rc;
+}
