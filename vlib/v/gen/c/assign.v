@@ -764,6 +764,8 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 					}
 					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
 					g.writeln('vgc_wb_gate((voidptr)((${base})${arrow}${val}key_values.values));')
+				} else {
+					g.cm_skip_report('ptrindex', left)
 				}
 			} else {
 				g.cm_skip_report('index', left)
