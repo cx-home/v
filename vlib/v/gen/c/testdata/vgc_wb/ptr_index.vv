@@ -1,0 +1,46 @@
+// ptr_index.vv — vgc_wb_ptr_index_test.v's program: stores through a raw pointer index.
+struct Box {
+	v int
+}
+
+struct Cell {
+	tag int
+	box &Box = unsafe { nil }
+}
+
+@[noinline]
+fn store_ptr(p &&Box, i int, b &Box) {
+	unsafe {
+		p[i] = b
+	}
+}
+
+@[noinline]
+fn store_cell(p &Cell, i int, b &Box) {
+	unsafe {
+		p[i] = Cell{
+			tag: i
+			box: b
+		}
+	}
+}
+
+@[noinline]
+fn store_ints(p &int, i int, v int) {
+	unsafe {
+		p[i] = v
+	}
+}
+
+fn main() {
+	mut a := []&Box{len: 4}
+	mut c := []Cell{len: 4}
+	mut n := []int{len: 4}
+	b := &Box{
+		v: 1
+	}
+	store_ptr(unsafe { &&Box(a.data) }, 1, b)
+	store_cell(unsafe { &Cell(c.data) }, 2, b)
+	store_ints(unsafe { &int(n.data) }, 3, 7)
+	println('${a[1].v} ${c[2].box.v} ${n[3]}')
+}
