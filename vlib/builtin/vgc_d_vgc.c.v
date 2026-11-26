@@ -471,8 +471,13 @@ mut:
 	gen_bytes   u64 // flushed bytes this thread allocated since the last stop (alloc_gen's ~1 MB)
 	// cx-home/v#77: a thread registered after a stop that left the one-thread
 	// 1 MB flush in force flushes at the cycle's scaled flush instead
-	// (vgc_acct_flush_late) until the next stop; 0 = the global vgc_acct_flush_cur
-	late_flush u64
+	// (vgc_acct_flush_late) until the next stop.
+	// cx-private#2040: flush_at is this thread's whole threshold -- vgc_acct_flush_cur,
+	// or vgc_acct_flush_late when lower (a late thread) -- set at its registration and at
+	// every stop, so vgc_acct_alloc reads no global: vgc_acct_flush_cur's line is
+	// shared with counters other threads write, and 16 allocating threads each waited
+	// on it once per allocation (dev2 profile: vgc_acct_alloc+84, 4.6 % of [par 16] json)
+	flush_at u64
 	// cx-private#1910: bytes of the objects this thread's alloc-black hook marked
 	// during the concurrent middle (the cycle's births), flushed into
 	// vgc_cm_born every vgc_cm_born_flush bytes; summed and reset at the
@@ -3112,10 +3117,10 @@ fn vgc_register_thread_opt(wait bool) bool {
 		vgc_cache(idx).gen_bytes = 0
 		// cx-home/v#77: born after a one-thread stop, this thread flushes at the
 		// scaled flush, so n late threads hold at most n of it unseen, not n MB
-		vgc_cache(idx).late_flush = if vgc_acct_flush_late < vgc_acct_flush_cur {
+		vgc_cache(idx).flush_at = if vgc_acct_flush_late < vgc_acct_flush_cur {
 			vgc_acct_flush_late
 		} else {
-			u64(0)
+			vgc_acct_flush_cur
 		}
 		vgc_cache(idx).next_free_p1 = 0
 		vgc_cache(idx).cov_safe = false
@@ -7787,9 +7792,7 @@ fn vgc_acct_alloc(cache_idx int, live_sz u64, total_n u64) {
 	unsafe {
 		vgc_cache(cache_idx).live_delta += i64(live_sz)
 		vgc_cache(cache_idx).alloc_delta += total_n
-		if vgc_cache(cache_idx).alloc_delta >= vgc_acct_flush_cur
-		|| (vgc_cache(cache_idx).late_flush != 0
-		&& vgc_cache(cache_idx).alloc_delta >= vgc_cache(cache_idx).late_flush) {
+		if vgc_cache(cache_idx).alloc_delta >= vgc_cache(cache_idx).flush_at {
 			// cx-home/v#16 / cx-private#1916: the pacer counts a thread as
 			// allocating this cycle once it has allocated ~1 MB: a server's
 			// many request threads that each allocate a little no longer scale

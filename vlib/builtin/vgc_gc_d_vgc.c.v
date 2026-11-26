@@ -5781,11 +5781,6 @@ fn vgc_update_trigger() {
 			vgc_acct_flush_late = lf
 		}
 	}
-	for li in 0 .. vgc_heap.ncaches {
-		unsafe {
-			vgc_cache(li).late_flush = 0
-		}
-	}
 	vgc_acct_flush_cur = vgc_acct_flush
 	if vgc_acct_flush_div > 0 && vgc_acct_threads > 1 && goal > marked {
 		mut f := (goal - marked) / vgc_acct_flush_div
@@ -5794,6 +5789,13 @@ fn vgc_update_trigger() {
 		}
 		if f < vgc_acct_flush {
 			vgc_acct_flush_cur = f
+		}
+	}
+	// cx-private#2040: every registered thread flushes at this cycle's flush (a late
+	// thread's lower one ends here), read from its own slot by vgc_acct_alloc
+	for li in 0 .. vgc_heap.ncaches {
+		unsafe {
+			vgc_cache(li).flush_at = vgc_acct_flush_cur
 		}
 	}
 }
