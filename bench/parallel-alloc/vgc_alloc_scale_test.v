@@ -11,15 +11,20 @@
 // alloc_scale/scale.v runs the same allocations on 1 thread, then on 16,
 // three rounds interleaved, and prints the process's cycles per allocation
 // for each (proc_pid_rusage; 0 where not kept — the test then only checks
-// the run, and on a box with fewer than 20 cpus). Bar: the median 16-thread cycles per allocation <= 1.10x the
-// median 1-thread one, both phases at EQUAL heap headroom a thread (operator
-// ruling BAR-2040-HEADROOM (a), 11-26: a measurement-method fix, the 1.10
-// unchanged). The pacer's own headroom differs by phase: several allocating
-// threads get its several-threads clamp, 4 MB a thread (64 MB at 16, marked
-// ~0 here), one thread its one-thread clamp (256 KB, cx-home/v#14), and each
-// phase starts at the headroom the other left. The run pins both at
-// headroom_per_thread_mb, the 16-thread phase's own 4 MB a thread
-// (scale.v: HEADROOM_PER_THREAD_MB).
+// the run, and on a box with fewer than 20 cpus). Both phases run at EQUAL
+// heap headroom a thread (operator ruling BAR-2040-HEADROOM (a), 11-26):
+// headroom_per_thread_mb, the 16-thread phase's own several-threads clamp
+// (scale.v: HEADROOM_PER_THREAD_MB). The pacer's own headroom differs by
+// phase (one thread gets its one-thread clamp, 256 KB, cx-home/v#14).
+// Bar (operator ruling VGC-SCALE-NET (c), 11-26; this test is a lever's guard,
+// not cx-private#2040's own bar): the median 16-thread cycles per allocation
+// over the median 1-thread one is at most the no-collector hardware control's
+// ratio + 0.10. The control is v-writer9's ring.c shape (cycles.h
+// vgc_as_ring_phase: the same 32-byte objects written through a private ring
+// of the same per-thread size, headroom_per_thread_mb, no collector), run in
+// each round of the same process right after the allocator's phases and
+// graded by its own medians. A working set of 4 MB a thread costs cache
+// misses on dev2 (L2 16 MB per 5-core cluster) that no allocator can avoid.
 module main
 
 import os
@@ -50,16 +55,20 @@ fn median(xs []f64) f64 {
 	return s[s.len / 2]
 }
 
-fn test_sixteen_threads_allocate_at_most_ten_percent_more_cycles_per_allocation_than_one() {
+fn test_sixteen_threads_allocate_within_ten_points_of_the_hardware_control_ratio() {
 	exe := build()
 	r :=
-		os.execute('HEADROOM_PER_THREAD_MB=${headroom_per_thread_mb} THREADS=${threads} ALLOCS=2000000 ROUNDS=3 ${os.quoted_path(exe)}')
+		os.execute('HEADROOM_PER_THREAD_MB=${headroom_per_thread_mb} CONTROL_KB=${headroom_per_thread_mb * 1024} THREADS=${threads} ALLOCS=2000000 ROUNDS=3 ${os.quoted_path(exe)}')
 	println(r.output)
 	assert r.exit_code == 0, r.output
 	rounds := r.output.split_into_lines().filter(it.starts_with('round '))
 	assert rounds.len == 3, r.output
 	t1 := rounds.map(field(it, 't1 cyc/alloc'))
 	tk := rounds.map(field(it, 't${threads} cyc/alloc'))
+	ctl := r.output.split_into_lines().filter(it.starts_with('control '))
+	assert ctl.len == 3, r.output
+	x1 := ctl.map(field(it, 't1 cyc/slot'))
+	xk := ctl.map(field(it, 't${threads} cyc/slot'))
 	if median(t1) == 0 {
 		println('no cycle counter on this platform: the run is checked, not the ratio')
 		return
@@ -70,7 +79,13 @@ fn test_sixteen_threads_allocate_at_most_ten_percent_more_cycles_per_allocation_
 		println('${runtime.nr_cpus()} cpus < ${threads + 4}: the run is checked, not the ratio')
 		return
 	}
+	assert median(x1) > 0, r.output
 	ratio := median(tk) / median(t1)
-	println('median t1 ${median(t1):.2f} t${threads} ${median(tk):.2f} cycles/alloc: ratio ${ratio:.3f} (bar 1.10; ${headroom_per_thread_mb} MB headroom a thread in both phases)')
-	assert ratio <= 1.10
+	control := median(xk) / median(x1)
+	bar := control + 0.10
+	// beside the grade, not graded: the allocator's extra cycles over the control's
+	// extra, as a ratio of the 1-thread allocation ((t16 - (c16 - c1)) / t1)
+	additive := (median(tk) - (median(xk) - median(x1))) / median(t1)
+	println('median t1 ${median(t1):.2f} t${threads} ${median(tk):.2f} cycles/alloc: ratio ${ratio:.3f}; control (${headroom_per_thread_mb} MB ring a thread, no collector) t1 ${median(x1):.2f} t${threads} ${median(xk):.2f} cycles/slot: ratio ${control:.3f}; bar ${bar:.3f} (control + 0.10, VGC-SCALE-NET (c)); additive net ${additive:.3f} (not graded)')
+	assert ratio <= bar
 }
