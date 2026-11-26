@@ -12,13 +12,24 @@
 // three rounds interleaved, and prints the process's cycles per allocation
 // for each (proc_pid_rusage; 0 where not kept — the test then only checks
 // the run, and on a box with fewer than 20 cpus). Bar: the median 16-thread cycles per allocation <= 1.10x the
-// median 1-thread one.
+// median 1-thread one, both phases at EQUAL heap headroom a thread (operator
+// ruling BAR-2040-HEADROOM (a), 11-26: a measurement-method fix, the 1.10
+// unchanged). The pacer's own headroom differs by phase: several allocating
+// threads get its several-threads clamp, 4 MB a thread (64 MB at 16, marked
+// ~0 here), one thread its one-thread clamp (256 KB, cx-home/v#14), and each
+// phase starts at the headroom the other left. The run pins both at
+// headroom_per_thread_mb, the 16-thread phase's own 4 MB a thread
+// (scale.v: HEADROOM_PER_THREAD_MB).
 module main
 
 import os
 import runtime
 
 const threads = 16
+
+// the heap headroom a thread both phases run at (MB): the pacer's several-
+// threads clamp (VGC_HEADROOM_FLOOR_LO_MB's default), which the 16-thread phase gets
+const headroom_per_thread_mb = 4
 
 fn build() string {
 	src := os.join_path(@DIR, 'alloc_scale', 'scale.v')
@@ -41,7 +52,8 @@ fn median(xs []f64) f64 {
 
 fn test_sixteen_threads_allocate_at_most_ten_percent_more_cycles_per_allocation_than_one() {
 	exe := build()
-	r := os.execute('THREADS=${threads} ALLOCS=2000000 ROUNDS=3 ${os.quoted_path(exe)}')
+	r :=
+		os.execute('HEADROOM_PER_THREAD_MB=${headroom_per_thread_mb} THREADS=${threads} ALLOCS=2000000 ROUNDS=3 ${os.quoted_path(exe)}')
 	println(r.output)
 	assert r.exit_code == 0, r.output
 	rounds := r.output.split_into_lines().filter(it.starts_with('round '))
@@ -59,6 +71,6 @@ fn test_sixteen_threads_allocate_at_most_ten_percent_more_cycles_per_allocation_
 		return
 	}
 	ratio := median(tk) / median(t1)
-	println('median t1 ${median(t1):.2f} t${threads} ${median(tk):.2f} cycles/alloc: ratio ${ratio:.3f} (bar 1.10)')
+	println('median t1 ${median(t1):.2f} t${threads} ${median(tk):.2f} cycles/alloc: ratio ${ratio:.3f} (bar 1.10; ${headroom_per_thread_mb} MB headroom a thread in both phases)')
 	assert ratio <= 1.10
 }
