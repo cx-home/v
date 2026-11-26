@@ -6635,11 +6635,14 @@ void mbedtls_ssl_pend_fatal_alert(mbedtls_ssl_context *ssl,
 
 #if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
 /* cx fork (cx-platform-xap#20): the record buffers shrink when a read or a
- * write returns with nothing held in them (MBEDTLS_SSL_CX_RELEASE_BUFFERS). */
+ * write returns with nothing held in them (MBEDTLS_SSL_CX_RELEASE_BUFFERS).
+ * A read releases only the input buffer, a write only the output buffer: one
+ * thread may read a connection while another writes it
+ * (cx-home/cx-platform-store#90). */
 int mbedtls_ssl_read(mbedtls_ssl_context *ssl, unsigned char *buf, size_t len)
 {
     int ret = ssl_cx_read(ssl, buf, len);
-    mbedtls_ssl_cx_release(ssl);
+    mbedtls_ssl_cx_release_read(ssl);
     return ret;
 }
 
@@ -6650,7 +6653,7 @@ int mbedtls_ssl_write(mbedtls_ssl_context *ssl, const unsigned char *buf, size_t
         mbedtls_ssl_cx_grow_out(ssl);
     }
     ret = ssl_cx_write(ssl, buf, len);
-    mbedtls_ssl_cx_release(ssl);
+    mbedtls_ssl_cx_release_write(ssl);
     return ret;
 }
 #endif /* MBEDTLS_SSL_CX_RELEASE_BUFFERS */

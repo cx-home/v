@@ -400,19 +400,61 @@ static void handle_buffer_resizing(mbedtls_ssl_context *ssl, int downsizing,
 }
 
 #if defined(MBEDTLS_SSL_CX_RELEASE_BUFFERS)
-/* cx fork (cx-platform-xap#20): see MBEDTLS_SSL_CX_RELEASE_BUFFERS. A resize
- * keeps every offset into the buffer (handle_buffer_resizing). */
+/* cx fork (cx-platform-xap#20): see MBEDTLS_SSL_CX_RELEASE_BUFFERS.
+ *
+ * cx-home/cx-platform-store#90: one connection is read by one thread and
+ * written by another (the store's XSP reader and writer), as upstream allows
+ * for the two record directions. So a resize touches ONE direction: the
+ * input buffer and the in_* pointers, or the output buffer and the out_*
+ * pointers, never both (handle_buffer_resizing re-points both sets even when
+ * it resizes one). mbedtls_ssl_read releases only the input buffer,
+ * mbedtls_ssl_write only the output buffer; both buffers, and a TLS 1.3
+ * server's handshake parameters, are released only where one thread owns the
+ * whole context: at the end of mbedtls_ssl_handshake. A resize keeps every
+ * offset into its buffer. */
+static void ssl_cx_resize_in(mbedtls_ssl_context *ssl, size_t len_new)
+{
+    size_t msg = (size_t) (ssl->in_msg - ssl->in_buf);
+    size_t iv = (size_t) (ssl->in_iv - ssl->in_buf);
+    size_t len = (size_t) (ssl->in_len - ssl->in_buf);
+    size_t hdr = (size_t) (ssl->in_hdr - ssl->in_buf);
+    /* handle_buffer_resizing does not carry in_offt (pending application
+     * data); keep its offset too */
+    size_t offt = ssl->in_offt != NULL ? (size_t) (ssl->in_offt - ssl->in_buf) : 0;
+    if (resize_buffer(&ssl->in_buf, len_new, &ssl->in_buf_len) != 0) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("input buffer resizing failed - out of memory"));
+        return;
+    }
+    ssl->in_hdr = ssl->in_buf + hdr;
+    mbedtls_ssl_update_in_pointers(ssl);
+    ssl->in_msg = ssl->in_buf + msg;
+    ssl->in_len = ssl->in_buf + len;
+    ssl->in_iv = ssl->in_buf + iv;
+    if (ssl->in_offt != NULL) {
+        ssl->in_offt = ssl->in_buf + offt;
+    }
+}
+
+static void ssl_cx_resize_out(mbedtls_ssl_context *ssl, size_t len_new)
+{
+    size_t msg = (size_t) (ssl->out_msg - ssl->out_buf);
+    size_t iv = (size_t) (ssl->out_iv - ssl->out_buf);
+    size_t len = (size_t) (ssl->out_len - ssl->out_buf);
+    if (resize_buffer(&ssl->out_buf, len_new, &ssl->out_buf_len) != 0) {
+        MBEDTLS_SSL_DEBUG_MSG(1, ("output buffer resizing failed - out of memory"));
+        return;
+    }
+    mbedtls_ssl_reset_out_pointers(ssl);
+    ssl->out_msg = ssl->out_buf + msg;
+    ssl->out_len = ssl->out_buf + len;
+    ssl->out_iv = ssl->out_buf + iv;
+}
+
 void mbedtls_ssl_cx_grow_in(mbedtls_ssl_context *ssl)
 {
     size_t full = mbedtls_ssl_get_input_buflen(ssl);
     if (ssl->in_buf != NULL && ssl->in_buf_len < full) {
-        /* handle_buffer_resizing does not carry in_offt (pending application
-         * data); keep its offset too */
-        size_t offt = ssl->in_offt != NULL ? (size_t) (ssl->in_offt - ssl->in_buf) : 0;
-        handle_buffer_resizing(ssl, 0, full, 0);
-        if (ssl->in_offt != NULL) {
-            ssl->in_offt = ssl->in_buf + offt;
-        }
+        ssl_cx_resize_in(ssl, full);
     }
 }
 
@@ -420,20 +462,67 @@ void mbedtls_ssl_cx_grow_out(mbedtls_ssl_context *ssl)
 {
     size_t full = mbedtls_ssl_get_output_buflen(ssl);
     if (ssl->out_buf != NULL && ssl->out_buf_len < full) {
-        handle_buffer_resizing(ssl, 0, 0, full);
+        ssl_cx_resize_out(ssl, full);
     }
 }
 
-/* The buffer half of mbedtls_ssl_cx_release, also run while a handshake waits
- * for the peer's next flight (mbedtls_ssl_cx_release_wait). */
-static void ssl_cx_release_buffers(mbedtls_ssl_context *ssl);
+/* The input buffer shrinks only when everything it still holds lies in its
+ * first MBEDTLS_SSL_CX_IDLE_IN_LEN / 2 bytes: the bytes fetched past the
+ * record header (in_left) and the current message (in_msglen: after a
+ * handshake the last handshake message stays current until the next read
+ * consumes it). The resize copies those bytes and keeps every offset. No
+ * pending application data (in_offt) and no handshake message in
+ * reassembly. */
+static void ssl_cx_release_in(mbedtls_ssl_context *ssl)
+{
+    size_t live = (size_t) (ssl->in_msg - ssl->in_buf) + ssl->in_msglen;
+    size_t fetched = (size_t) (ssl->in_hdr - ssl->in_buf) + ssl->in_left;
+    if (fetched > live) {
+        live = fetched;
+    }
+    if (ssl->in_offt == NULL && ssl->badmac_seen_or_in_hsfraglen == 0 &&
+        live <= MBEDTLS_SSL_CX_IDLE_IN_LEN / 2 &&
+        ssl->in_buf_len > MBEDTLS_SSL_CX_IDLE_IN_LEN &&
+        ssl->in_left < MBEDTLS_SSL_CX_IDLE_IN_LEN) {
+        ssl_cx_resize_in(ssl, MBEDTLS_SSL_CX_IDLE_IN_LEN);
+    }
+}
 
+static void ssl_cx_release_out(mbedtls_ssl_context *ssl)
+{
+    if (ssl->out_left == 0 &&
+        (size_t) (ssl->out_msg - ssl->out_buf) < MBEDTLS_SSL_CX_IDLE_OUT_LEN / 2 &&
+        ssl->out_buf_len > MBEDTLS_SSL_CX_IDLE_OUT_LEN) {
+        ssl_cx_resize_out(ssl, MBEDTLS_SSL_CX_IDLE_OUT_LEN);
+    }
+}
+
+/* a stream connection past its handshake: the read and write releases */
+static int ssl_cx_idle_stream(const mbedtls_ssl_context *ssl)
+{
+    return ssl != NULL && ssl->conf != NULL &&
+           ssl->conf->transport == MBEDTLS_SSL_TRANSPORT_STREAM &&
+           mbedtls_ssl_is_handshake_over(ssl);
+}
+
+void mbedtls_ssl_cx_release_read(mbedtls_ssl_context *ssl)
+{
+    if (ssl_cx_idle_stream(ssl) && ssl->in_buf != NULL) {
+        ssl_cx_release_in(ssl);
+    }
+}
+
+void mbedtls_ssl_cx_release_write(mbedtls_ssl_context *ssl)
+{
+    if (ssl_cx_idle_stream(ssl) && ssl->out_buf != NULL) {
+        ssl_cx_release_out(ssl);
+    }
+}
+
+/* the end of mbedtls_ssl_handshake: the caller owns the whole context */
 void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
 {
-    if (ssl == NULL || ssl->conf == NULL ||
-        ssl->conf->transport != MBEDTLS_SSL_TRANSPORT_STREAM ||
-        !mbedtls_ssl_is_handshake_over(ssl) ||
-        ssl->in_buf == NULL || ssl->out_buf == NULL) {
+    if (!ssl_cx_idle_stream(ssl) || ssl->in_buf == NULL || ssl->out_buf == NULL) {
         return;
     }
     /* TLS 1.3 keeps ssl->handshake after the handshake is over, so the state
@@ -450,7 +539,8 @@ void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
         ssl->handshake = NULL;
     }
 #endif
-    ssl_cx_release_buffers(ssl);
+    ssl_cx_release_in(ssl);
+    ssl_cx_release_out(ssl);
 }
 
 /* cx fork (cx-home/v#39): a handshake that returns MBEDTLS_ERR_SSL_WANT_READ
@@ -468,39 +558,8 @@ void mbedtls_ssl_cx_release_wait(mbedtls_ssl_context *ssl)
         ssl->in_buf == NULL || ssl->out_buf == NULL) {
         return;
     }
-    ssl_cx_release_buffers(ssl);
-}
-
-static void ssl_cx_release_buffers(mbedtls_ssl_context *ssl)
-{
-    size_t in_new, out_new;
-    in_new = ssl->in_buf_len;
-    out_new = ssl->out_buf_len;
-    /* The input buffer shrinks only when everything it still holds lies in
-     * its first MBEDTLS_SSL_CX_IDLE_IN_LEN / 2 bytes: the bytes fetched past
-     * the record header (in_left) and the current message (in_msglen: after
-     * a handshake the last handshake message stays current until the next
-     * read consumes it). The resize copies those bytes and keeps every
-     * offset. No pending application data (in_offt, which the resize would
-     * not carry) and no handshake message in reassembly. */
-    {
-        size_t live = (size_t) (ssl->in_msg - ssl->in_buf) + ssl->in_msglen;
-        size_t fetched = (size_t) (ssl->in_hdr - ssl->in_buf) + ssl->in_left;
-        if (fetched > live) {
-            live = fetched;
-        }
-        if (ssl->in_offt == NULL && ssl->badmac_seen_or_in_hsfraglen == 0 &&
-            live <= MBEDTLS_SSL_CX_IDLE_IN_LEN / 2) {
-            in_new = MBEDTLS_SSL_CX_IDLE_IN_LEN;
-        }
-    }
-    if (ssl->out_left == 0 &&
-        (size_t) (ssl->out_msg - ssl->out_buf) < MBEDTLS_SSL_CX_IDLE_OUT_LEN / 2) {
-        out_new = MBEDTLS_SSL_CX_IDLE_OUT_LEN;
-    }
-    if (in_new < ssl->in_buf_len || out_new < ssl->out_buf_len) {
-        handle_buffer_resizing(ssl, 1, in_new, out_new);
-    }
+    ssl_cx_release_in(ssl);
+    ssl_cx_release_out(ssl);
 }
 #endif /* MBEDTLS_SSL_CX_RELEASE_BUFFERS */
 #endif /* MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH */
