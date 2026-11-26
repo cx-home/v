@@ -689,16 +689,31 @@ pub fn vgc_mark_held_selftest() u32 {
 		return 12
 	}
 	// cx-home/v#62: a marked set under the several-thread floor (a server's sub-MB mark)
-	// plans as the head did: under the line four markers at most (cx-home/v#56's
-	// floor), over it one per ms — not a quarter of the held mutators. hello-http
-	// k=28 held ~29 threads over ~60 us marks, so the quarter fielded seven markers
-	// where four did, and every stop grew and woke them (misc-epic-62/-65/-66)
+	// plans as the head did UNDER the line: four markers at most (cx-home/v#56's
+	// floor) — not a quarter of the held mutators. hello-http k=28 held ~29 threads
+	// over ~60 us marks, so the quarter fielded seven markers where four did, and
+	// every stop grew and woke them (misc-epic-62/-65/-66)
 	small := vgc_headroom_floor_lo / 5
 	if vgc_mark_plan_count(8, 60 * us, ms, 29, 28, true, 0, small, true) != 4
-		|| vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, small, true) != 1
 		|| vgc_mark_plan_count(8, 60 * us, ms, 29, 3, true, 0, small, true) != 3
 		|| vgc_mark_plan_count(8, 60 * us, ms, 29, 0, true, 0, small, true) != 1 {
 		return 13
+	}
+	// https://github.com/cx-home/cx-core-code/issues/297: OVER the line the held floor
+	// holds at any marked size (vgc_mark_held_over_line): 20 held, a 1.3 ms mark of a
+	// sub-4 MB set, five markers — one per ms of work (the head's plan) is one marker
+	// while the held cores idle (fannkuch-redux 11 [par 28]: one marker on 424 of 880
+	// stops, stack scan + mark 2.4 ms against 0.97 ms on four); and the back-off's
+	// target does not take it under the floor. VGC_MARK_HELD_OVER_LINE=0: as the head.
+	saved_over := vgc_mark_held_over_line
+	vgc_mark_held_over_line = true
+	over_on := vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, small, true)
+	over_target := vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 2, small, true)
+	vgc_mark_held_over_line = false
+	over_off := vgc_mark_plan_count(8, 1300 * us, ms, 20, 28, true, 0, small, true)
+	vgc_mark_held_over_line = saved_over
+	if over_on != 5 || over_target != 5 || over_off != 1 {
+		return 16
 	}
 	// at the floor the quarter holds: 28 held, a 60 us mark, seven
 	if vgc_mark_plan_count(8, 60 * us, ms, 28, 28, true, 0, vgc_headroom_floor_lo, true) != 7 {

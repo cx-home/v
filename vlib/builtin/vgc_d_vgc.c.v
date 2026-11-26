@@ -1054,6 +1054,17 @@ __global vgc_headroom_floor_capped = true
 // 5 % of Python on the same box. VGC_HEADROOM_LIVE_FLOOR_MB overrides (decimal;
 // a value below vgc_headroom_min is raised to it).
 __global vgc_headroom_live_floor = u64(32) * 1024 * 1024
+// https://github.com/cx-home/cx-core-code/issues/297: under the live floor, the
+// several-threads floor times the allocating threads (cx-home/v#16) is capped at
+// this many times the marked set on every cycle (at least the several-threads
+// floor afloor), not only while the band reads the collections as cheap
+// (vgc_update_trigger). 8 is the measured trade (pbm1, x3 medians, 11-26): cx
+// fannkuch-redux 11 [par 28] (~3 MB marked) 256 -> 70.5 MB peak at 1.075x the
+// wall; many_workers/render.v (28 workers, ~8.7 MB marked, the cx-private#2040
+// template-render shape) 312 -> 121 MB at 1.10x; 4 cost 1.18x / 1.26x, 16 bought
+// only ~1.4-1.7x. VGC_HEADROOM_THREAD_LIVE_X=<n>; 0 = the band's cap alone (the
+// head's pacing).
+__global vgc_headroom_thread_live_x = u64(8)
 // The ADAPTIVE floor (cx-home/v#14, cx-private#1886, owner default (c)): the
 // bound's floor scales with the live set, clamp(2 x marked, vgc_headroom_floor_lo,
 // vgc_headroom_live_floor). A program that keeps 2 MB live paces to a ~6 MB goal
@@ -1779,6 +1790,11 @@ __global vgc_walk_min_spans = u64(8192)
 // cx-home/v#56: below the pool's lines, the work times the stopped mutators
 // (vgc_stop_weighed_cpus). VGC_STOP_WEIGH=0: the lines alone, as before.
 __global vgc_stop_weigh = true
+// https://github.com/cx-home/cx-core-code/issues/297: a stop that holds several
+// allocating mutators fields the held floor of markers (vgc_mark_held_floor) when
+// its mark is over the line (vgc_mark_par_min_ns) at any marked size, not only from
+// vgc_headroom_floor_lo up (vgc_mark_plan_count). VGC_MARK_HELD_OVER_LINE=0: as before.
+__global vgc_mark_held_over_line = true
 // spans in the table before a walk is split; one walker per quarter of it
 __global vgc_walk_rate1 = u64(0)
 // ns per span of the three walks with one walker (a running mean)
@@ -2699,6 +2715,13 @@ pub fn vgc_init() {
 			vgc_large_noscan_pct = u64(lnp)
 		}
 	}
+	tlx_env := C.getenv(c'VGC_HEADROOM_THREAD_LIVE_X')
+	if tlx_env != unsafe { nil } {
+		tlx := C.atoll(tlx_env)
+		if tlx >= 0 {
+			vgc_headroom_thread_live_x = u64(tlx)
+		}
+	}
 	floor_env := C.getenv(c'VGC_HEADROOM_LIVE_FLOOR_MB')
 	if floor_env != unsafe { nil } {
 		fmb := C.atoll(floor_env)
@@ -2902,6 +2925,10 @@ pub fn vgc_init() {
 	sw_env := C.getenv(c'VGC_STOP_WEIGH')
 	if sw_env != unsafe { nil } {
 		vgc_stop_weigh = C.atoll(sw_env) != 0
+	}
+	mho_env := C.getenv(c'VGC_MARK_HELD_OVER_LINE')
+	if mho_env != unsafe { nil } {
+		vgc_mark_held_over_line = C.atoll(mho_env) != 0
 	}
 	lg_env := C.getenv(c'VGC_WALK_LOAD_GATE')
 	if lg_env != unsafe { nil } {
