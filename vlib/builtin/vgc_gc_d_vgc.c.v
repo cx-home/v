@@ -411,6 +411,9 @@ fn vgc_gc_start() {
 	} else {
 		vgc_minor_count = 0
 	}
+	// cx-private#2040: an explicit or an OOM-retry collection leaves what it
+	// swept in the pool for the thread that asked (vgc_owner_stash_hand)
+	vgc_own_forced = C.vgc_atomic_load_u32(&vgc_force_full) != 0
 	C.vgc_atomic_store_u32(&vgc_force_full, 0)
 
 	// Compute live bytes from mark bits
@@ -530,6 +533,9 @@ fn vgc_gc_start() {
 		}
 	}
 	vgc_gctrace_emit()
+	// cx-private#2040: after the trim, the defrag and the trace line saw the
+	// whole free set, each parked allocating thread gets back its own spans
+	vgc_owner_stash_hand(self_idx)
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 
@@ -1940,6 +1946,9 @@ fn vgc_gc_start_concurrent() {
 	})
 	vgc_mark_work_from_cpu_at(mcpu0, mwait0, mcpu1, mwait1)
 	vgc_minor_count = 0 // cx-home/v#56 step 2: a concurrent cycle is a full one
+	// cx-private#2040: an explicit or an OOM-retry collection leaves what it
+	// swept in the pool for the thread that asked (vgc_owner_stash_hand)
+	vgc_own_forced = C.vgc_atomic_load_u32(&vgc_force_full) != 0
 	C.vgc_atomic_store_u32(&vgc_force_full, 0)
 
 	marked := vgc_count_marked()
@@ -2018,6 +2027,9 @@ fn vgc_gc_start_concurrent() {
 		}
 	}
 	vgc_gctrace_emit()
+	// cx-private#2040: after the trim, the defrag and the trace line saw the
+	// whole free set, each parked allocating thread gets back its own spans
+	vgc_owner_stash_hand(self_idx)
 	vgc_heap.gc_cycle++
 	vgc_heap.total_alloc_at_gc = C.vgc_atomic_load_u64(&vgc_heap.total_alloc)
 	vgc_stw_resume(self_idx)
@@ -4853,6 +4865,13 @@ fn vgc_do_sweep() {
 	// runs only (spans pooled by an earlier sweep and not re-popped since); a
 	// frag-gate request merges everything and covers it.
 	vgc_idle_defrag_merged_kb = 0
+	// cx-private#2040: a defrag or a whole-pool trim reshapes the pool — the
+	// candidates noted above may be merged or cold, so none is handed back
+	if C.vgc_atomic_load_u32(&vgc_defrag_pending) != 0
+		|| C.vgc_atomic_load_u32(&vgc_idle_defrag_pending) != 0
+		|| C.vgc_atomic_load_u32(&vgc_eager_trim_pending) != 0 {
+		vgc_own_n = 0
+	}
 	if C.vgc_atomic_load_u32(&vgc_defrag_pending) != 0 {
 		C.vgc_atomic_store_u32(&vgc_defrag_pending, 0)
 		C.vgc_atomic_store_u32(&vgc_idle_defrag_pending, 0)
@@ -5119,7 +5138,13 @@ fn vgc_sweep_span_apply(span &VGC_Span, tag u8) {
 				mspan.prev = nil
 			}
 		}
+		// cx-private#2040: a size class's span (not a large object's) is a
+		// candidate to go back to the slot that last took it (vgc_owner_stash_hand)
+		owned := mspan.class_idx != 0 && mspan.own_p1 != 0
 		vgc_put_free_span(mut mspan)
+		if owned {
+			vgc_owner_stash_note(mspan)
+		}
 		return
 	}
 
@@ -6062,5 +6087,134 @@ fn vgc_holders_in(mut hs []string, kind string, lo usize, hi usize, rel usize, o
 			}
 		}
 		a += sizeof(usize)
+	}
+}
+
+// ============================================================
+// Owner-affine reuse of swept spans (cx-private#2040)
+// ============================================================
+
+// The sweep recycles an empty span into the one global pool, and the next
+// refill of any thread takes it: at 16 allocating threads 94 % of reused
+// spans had last been written by ANOTHER thread (dev2, M3 Ultra: 5 cores an
+// L2), and the first stores into each object waited on lines another
+// cluster held — 1.75-1.84x the cycles per allocation of one thread
+// (vgc_alloc_scale_test). The sweep notes each recycled size-class span with
+// its last taker (VGC_Span.own_p1); at the end of the stop, after the trim,
+// the defrag and the trace line saw the whole free set, the spans still
+// pooled hot at their size go into their taker's stash (VGC_Cache.tpool) —
+// the state a refill batch leaves them in — so its next refills reuse lines
+// its own core last wrote. vgc_tpool_drain_stw returns every stash to the
+// pool at the next stop, as before.
+// Who gets spans: the collector's own thread and threads self-parked at the
+// poll this stop (an allocating thread). Not a thread inside a safe region
+// (cov_safe: a parked worker — cx-home/v#36's 10,000 idle workers would each
+// hold spans no one else may use) and not a mach-suspended straggler (it may
+// be frozen inside its own pop).
+// Not after a forced cycle (gc_collect, vgc_collect_and_retry_span): its
+// caller wants the swept spans in the pool.
+// How much: the cycle's headroom (goal - marked: what the threads will
+// allocate before the next trigger) at most in all, and at most its share
+// per thread (headroom / the threads that allocated this cycle) — a stash
+// never holds more than its thread will carve from it before the next stop.
+
+const vgc_own_cap = 8192
+
+__global vgc_own_cand = [8192]usize{}
+__global vgc_own_n = int(0)
+// this stop's bytes handed to slot i (i < vgc_own_slots; a slot past it gets none):
+// a side table, not a VGC_Cache field (the slot stays nine 128-byte lines)
+const vgc_own_slots = 4096
+
+__global vgc_own_tally = [4096]u64{}
+__global vgc_owner_stash_on = u64(1)
+__global vgc_own_forced = false // this cycle was forced (gc_collect, an OOM retry)
+// statistics (the VGC_GCTRACE=2 phase line's evidence; collector-written)
+__global vgc_own_handed = u64(0) // spans handed back, all cycles
+__global vgc_own_seen = u64(0) // candidates noted, all cycles
+
+// vgc_owner_stash_note records a span the sweep just pooled (collector only,
+// under the stop with free_spans_lock held).
+@[inline]
+fn vgc_owner_stash_note(span &VGC_Span) {
+	if vgc_owner_stash_on == 0 || vgc_own_n >= vgc_own_cap || span.npages == 0
+		|| span.npages >= u32(vgc_pool_merge_min) || span.npages > u32(vgc_tpool_max_pages) {
+		return
+	}
+	vgc_own_cand[vgc_own_n] = usize(voidptr(span))
+	vgc_own_n++
+}
+
+// vgc_owner_stash_hand moves the noted spans that are still pooled hot at
+// their size into their last taker's stash (see the block comment above).
+// Under the stop, free_spans_lock held, before the resume.
+fn vgc_owner_stash_hand(self_idx int) {
+	n := vgc_own_n
+	vgc_own_n = 0
+	if n == 0 || vgc_owner_stash_on == 0 || vgc_own_forced {
+		return
+	}
+	vgc_own_seen += u64(n)
+	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	marked := C.vgc_atomic_load_u64(&vgc_heap.heap_marked)
+	if goal <= marked {
+		return
+	}
+	mut left := goal - marked
+	nthreads := if vgc_acct_threads > 1 { u64(vgc_acct_threads) } else { u64(1) }
+	share := left / nthreads
+	seq := C.vgc_atomic_load_u32(&vgc_heap.gc_stop_seq)
+	for i in 0 .. n {
+		mut sp := unsafe { &VGC_Span(voidptr(vgc_own_cand[i])) }
+		o := int(sp.own_p1) - 1
+		if o < 0 || o >= vgc_heap.ncaches || o >= vgc_own_slots || !sp.pooled || sp.in_use || sp.decommitted
+			|| sp.npages == 0 || sp.npages > u32(vgc_tpool_max_pages) {
+			continue
+		}
+		// a stash serves size classes: small arenas' spans only (cx-home/v#58,
+		// as vgc_get_free_span_cached's refill)
+		if vgc_span_kind(sp) != vgc_kind_small {
+			continue
+		}
+		sz := u64(sp.npages) * u64(vgc_page_size)
+		if sz > left {
+			break
+		}
+		mut c := unsafe { vgc_cache(o) }
+		if !c.registered {
+			continue
+		}
+		if o != self_idx {
+			parked := C.vgc_atomic_load_u32(&vgc_cache(o).stopped) != 0 && c.park_seq == seq
+			if !parked || c.cov_safe || c.cov_susp {
+				continue
+			}
+		}
+		if vgc_own_tally[o] + sz > share {
+			continue
+		}
+		vgc_pool_unlink(mut sp)
+		unsafe {
+			sp.next = c.tpool[sp.npages]
+			c.tpool[sp.npages] = sp
+		}
+		c.tpool_n++
+		vgc_own_tally[o] += sz
+		left -= sz
+		vgc_own_handed++
+	}
+	$if vgc_own_stats ? {
+		if vgc_heap.gc_cycle % 64 == 0 {
+			C.fprintf(C.stderr, c'vgc_own cycle=%llu seen=%llu handed=%llu headroom=%llu threads=%d\n',
+				u64(vgc_heap.gc_cycle), vgc_own_seen, vgc_own_handed, goal - marked, vgc_acct_threads)
+		}
+	}
+	// the tally is this stop's only: zero the slots it touched
+	for i in 0 .. n {
+		sp := unsafe { &VGC_Span(voidptr(vgc_own_cand[i])) }
+		o := int(sp.own_p1) - 1
+		if o >= 0 && o < vgc_own_slots {
+			vgc_own_tally[o] = 0
+		}
 	}
 }

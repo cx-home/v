@@ -371,6 +371,11 @@ mut:
 	// pop path recommits (vgc_os_recommit) before handing a decommitted span out.
 	pooled      bool
 	decommitted bool
+	// cx-private#2040: the cache slot + 1 that last took this span for a size
+	// class (vgc_cache_get_span); 0 = none or a slot past u16. The sweep hands a
+	// recycled small span back to that slot's stash (vgc_owner_stash_hand).
+	// u16 fills the padding before pool_gen: the descriptor keeps its size.
+	own_p1 u16
 	pool_gen    u32
 	// INLINE allocation / mark bitmaps. The max objects per span across all size
 	// classes is 1024 (vgc_class_nobjs[1]) -> 128 bytes; large spans use 1 byte.
@@ -2689,6 +2694,8 @@ pub fn vgc_init() {
 		vgc_test_stall_us = u64(C.atoll(stall_env))
 	}
 	vgc_frag_gate_on = vgc_env_pct(c'VGC_FRAG_GATE', vgc_frag_gate_on)
+	// cx-private#2040: VGC_OWNER_STASH=0 pools every recycled span (no hand-back)
+	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
 	vgc_frag_gate_late_pct = vgc_env_pct(c'VGC_FRAG_GATE_LATE_PCT', vgc_frag_gate_late_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
@@ -7486,6 +7493,11 @@ fn vgc_cache_get_span(cache_idx int, span_class int) &VGC_Span {
 		// acquired in an epoch from the sweep that ends it: the pacer tests'
 		// carve ratios read 3-5x the live set.
 		vgc_span_release_acquisition(new_span)
+		if cache_idx >= 0 && cache_idx < 65535 {
+			unsafe {
+				new_span.own_p1 = u16(cache_idx + 1)
+			}
+		}
 	}
 	return new_span
 }
