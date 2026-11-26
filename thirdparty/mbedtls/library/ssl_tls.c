@@ -498,7 +498,7 @@ static void ssl_cx_release_out(mbedtls_ssl_context *ssl)
 }
 
 /* a stream connection past its handshake: the read and write releases */
-static int ssl_cx_idle_stream(const mbedtls_ssl_context *ssl)
+static int ssl_cx_idle_stream(mbedtls_ssl_context *ssl)
 {
     return ssl != NULL && ssl->conf != NULL &&
            ssl->conf->transport == MBEDTLS_SSL_TRANSPORT_STREAM &&
@@ -537,6 +537,15 @@ void mbedtls_ssl_cx_release(mbedtls_ssl_context *ssl)
         mbedtls_ssl_handshake_free(ssl);
         mbedtls_free(ssl->handshake);
         ssl->handshake = NULL;
+        /* mbedtls_ssl_free frees these only while ssl->handshake is set */
+#if defined(MBEDTLS_SSL_PROTO_TLS1_2)
+        mbedtls_ssl_transform_free(ssl->transform_negotiate);
+        mbedtls_free(ssl->transform_negotiate);
+        ssl->transform_negotiate = NULL;
+#endif
+        mbedtls_ssl_session_free(ssl->session_negotiate);
+        mbedtls_free(ssl->session_negotiate);
+        ssl->session_negotiate = NULL;
     }
 #endif
     ssl_cx_release_in(ssl);
