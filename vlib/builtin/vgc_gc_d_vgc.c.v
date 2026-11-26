@@ -5669,10 +5669,22 @@ fn vgc_update_trigger() {
 			vgc_headroom_floor_capped = true
 		}
 		// https://github.com/cx-home/v/issues/94: one allocating thread's lift off the
-		// quarter (vgc_one_thread_lift doc, vgc_d_vgc.c.v)
-		vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs, vgc_one_lifted,
-			one && vgc_one_thread_small(marked) && vgc_one_thread_lift
-			&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
+		// quarter (vgc_one_thread_lift doc, vgc_d_vgc.c.v). A forced cycle (gc_collect, an
+		// OOM retry) is not a reading of the mutator's cost: its pause sits against the
+		// interval since the cycle before, and two gc_collect() calls in a row read as two
+		// expensive cycles — which lifted the headroom to 4 MB over an empty heap, so the
+		// next requests carved fresh pages instead of collecting into a defragmenting sweep
+		// (bench/parallel-alloc/vgc_pool_defrag_test.v, cx-private#1892). A forced cycle
+		// ends the lift (the head's pacing until two unforced readings lift it again): the
+		// program asked for a collection, and a lift carried over from the cycles before
+		// it would leave the same 4 MB over the heap it just emptied.
+		if vgc_own_forced {
+			vgc_one_lift_runs, vgc_one_lifted = 0, false
+		} else {
+			vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs,
+				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
+				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
+		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
 		// the pause is span-walk-dominated up there, so more headroom does not
