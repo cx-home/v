@@ -759,6 +759,22 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 					}
 					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
 					g.writeln('vgc_wb_gate((voidptr)((${base})${arrow}${val}key_values.values));')
+				} else if left.left_type.is_ptr() || left.left_type.is_any_kind_of_pointer() {
+					// https://github.com/cx-home/v/issues/93: p[i] = v through a raw
+					// pointer (`unsafe { mut p := &T(a.data); p[i] = v }`) stores into
+					// whatever p points into — an array's buffer, a heap block — as
+					// surely as a[i] = v does: gate p as that store gates the buffer.
+					// p points at or inside the object it writes, and the card is
+					// read by the span. Without it a young value stored into an old
+					// buffer left no card and the next minor swept it (cx's
+					// interpreter appends to its node arrays this way, node_push).
+					// The collector's own files index its metadata (vgc_os_alloc
+					// slabs, never a heap object): no gate there, as for a field of
+					// that metadata above.
+					if !(g.file.mod.name == 'builtin'
+						&& g.file.path.all_after_last('/').starts_with('vgc_')) {
+						g.writeln('vgc_wb_gate((voidptr)(${base}));')
+					}
 				}
 			}
 		}

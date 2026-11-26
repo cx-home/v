@@ -101,7 +101,7 @@ fn main() {
 	n := 2000
 	mut bad := 0
 	for round in 0 .. rounds {
-		mut ptrs := []&Box{len: n}
+		mut ptrs := unsafe { []&Box{len: n} }
 		mut cells := []Cell{len: n}
 		// minors while the buffers are live: they are old from here on
 		_ := churn(2)
