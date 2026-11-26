@@ -6,6 +6,7 @@ module c
 import v.ast
 import v.util
 import v.token
+import os
 
 fn smartcast_selector_expr_str(expr ast.SelectorExpr) string {
 	mut expr_str := expr.expr.str()
@@ -672,6 +673,8 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 				if g.cm_is_pure_lvalue(left.expr) {
 					base := g.expr_string(left.expr)
 					g.writeln('vgc_wb_gate((voidptr)(${base}));')
+				} else {
+					g.cm_skip_report('sel', left)
 				}
 			} else if left.expr in [ast.SelectorExpr, ast.IndexExpr, ast.Ident] {
 				// an Ident owner is a value struct whose C name is a pointer when it is
@@ -704,6 +707,8 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 			if left.op == .mul && g.cm_is_pure_lvalue(left.right) {
 				base := g.expr_string(left.right)
 				g.writeln('vgc_wb_gate((voidptr)(${base}));')
+			} else if left.op == .mul {
+				g.cm_skip_report('deref', left)
 			}
 		}
 		ast.IndexExpr {
@@ -760,9 +765,19 @@ fn (mut g Gen) gen_cm_write_barrier(left ast.Expr, left_type ast.Type) {
 					val := if left.left_type.has_flag(.shared_f) { 'val.' } else { '' }
 					g.writeln('vgc_wb_gate((voidptr)((${base})${arrow}${val}key_values.values));')
 				}
+			} else {
+				g.cm_skip_report('index', left)
 			}
 		}
 		else {}
+	}
+}
+
+// DIAG (cx-home/v#93, not for landing): VGC_WB_SKIP_REPORT=1 names each pointer-bearing store whose
+// base is not a pure lvalue, so no gate is emitted for it.
+fn (mut g Gen) cm_skip_report(kind string, e ast.Expr) {
+	if os.getenv('VGC_WB_SKIP_REPORT') != '' {
+		eprintln('WBSKIP ${kind} ${g.file.path}:${e.pos().line_nr + 1}: ${e}')
 	}
 }
 
