@@ -16,7 +16,14 @@
 // own headroom, which gives one thread its one-thread clamp (256 KB) and
 // several threads 4 MB each, and carries one phase's headroom into the next.
 //
-//   HEADROOM_PER_THREAD_MB=4 THREADS=16 ALLOCS=2000000 ROUNDS=3 ./scale
+// CONTROL_KB=<kb> also runs the no-collector hardware control in each round,
+// right after the allocator's two phases (cycles.h vgc_as_ring_phase: the
+// same 32-byte objects written through a private ring of kb a thread, 1
+// thread then THREADS, ALLOCS slots each) and prints its cycles per slot
+// (operator ruling VGC-SCALE-NET (c), 11-26: the test grades the allocator's
+// ratio net of this one, measured in the same process and run).
+//
+//   HEADROOM_PER_THREAD_MB=4 CONTROL_KB=4096 THREADS=16 ALLOCS=2000000 ROUNDS=3 ./scale
 module main
 
 import os
@@ -25,6 +32,7 @@ import os
 
 fn C.vgc_as_cycles() u64
 fn C.vgc_as_instructions() u64
+fn C.vgc_as_ring_phase(threads int, n i64, ring_bytes u64) f64
 
 struct Small {
 	a u64
@@ -95,6 +103,7 @@ fn main() {
 	n := os.getenv_opt('ALLOCS') or { '2000000' }.int()
 	rounds := os.getenv_opt('ROUNDS') or { '3' }.int()
 	hr := os.getenv_opt('HEADROOM_PER_THREAD_MB') or { '0' }.int()
+	ctl_kb := os.getenv_opt('CONTROL_KB') or { '0' }.int()
 	// warm both shapes once (the heap's first spans, the threads' slots)
 	phase(1, n / 4, hr)
 	phase(threads, n / 4, hr)
@@ -102,5 +111,15 @@ fn main() {
 		c1, i1, a1 := phase(1, n, hr)
 		ck, ik, ak := phase(threads, n, hr)
 		println('round ${r} t1 cyc/alloc=${c1:.2f} ins/alloc=${i1:.2f} t${threads} cyc/alloc=${ck:.2f} ins/alloc=${ik:.2f} ratio=${ck / c1:.3f} acc=${a1 ^ ak}')
+		if ctl_kb > 0 {
+			rb := u64(ctl_kb) * 1024
+			x1 := C.vgc_as_ring_phase(1, i64(n), rb)
+			xk := C.vgc_as_ring_phase(threads, i64(n), rb)
+			mut xr := 0.0
+			if x1 > 0 {
+				xr = xk / x1
+			}
+			println('control ${r} kb=${ctl_kb} t1 cyc/slot=${x1:.2f} t${threads} cyc/slot=${xk:.2f} ratio=${xr:.3f}')
+		}
 	}
 }
