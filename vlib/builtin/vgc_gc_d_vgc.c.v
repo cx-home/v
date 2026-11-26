@@ -3774,8 +3774,18 @@ fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide boo
 		return 1
 	}
 	mut floor := 1
-	if free >= 2 && several && marked >= vgc_headroom_floor_lo {
+	// https://github.com/cx-home/cx-core-code/issues/297: a held stop whose mark is
+	// over the line takes the held floor at any marked size. fannkuch-redux 11
+	// [par 28] (~3 MB marked, a 1-2.5 ms mark) planned one marker per ms of work
+	// under the 4 MB line — 1-2 markers on 60 % of its stops while 27 held cores
+	// idled: stack scan 703 us + mark 1,693 us on one marker, 470 + 502 on four,
+	// 394 + 348 on seven (dev2, VGC_GCTRACE=2 at a 24 MB goal). A server's sub-MB
+	// mark stays under the line and plans as before.
+	over := vgc_mark_held_over_line && line > 0 && work >= line
+	mut held_over := false
+	if free >= 2 && several && (marked >= vgc_headroom_floor_lo || over) {
 		floor = vgc_mark_held_floor(live, free)
+		held_over = over && marked < vgc_headroom_floor_lo
 	} else if work < line {
 		// under the several-thread floor (`marked`, a server's sub-MB mark) the stop
 		// plans as cx-home/v#56 did: a held stop under the line, four markers at most
@@ -3797,6 +3807,13 @@ fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide boo
 	}
 	if target > 0 && target < total {
 		total = target
+		// the back-off (vgc_mark_adapt) judges a probe by its markers' CPU, but
+		// the held mutators' cores idle through the stop either way: a held
+		// stop over the line keeps its floor (fannkuch-redux 11 [par 28] at
+		// a 24 MB goal: one marker on 424 of 880 stops, cx-core-code#297)
+		if held_over && total < floor {
+			total = floor
+		}
 	}
 	return if total < 1 { 1 } else { total }
 }
@@ -5641,8 +5658,24 @@ fn vgc_update_trigger() {
 				// collections and 79k -> 57-62k req/s on a quiet box
 				// (cx-private#1910 PERF-EVID, 2026-10-11).
 				floor *= u64(nts)
-				if vgc_headroom_floor_capped {
+				// https://github.com/cx-home/cx-core-code/issues/297: under the live
+				// floor a cap holds on every cycle — fannkuch-redux 12 [par 28]
+				// keeps ~3 MB marked, and its stops of 28 mutators never read cheap,
+				// so the uncapped 6 MB x 28 rode the goal to ~195 MB and peak RSS to
+				// 310 MB (Python's largest pool process: 19.8 MB). The cap is then
+				// vgc_headroom_thread_live_x x marked (8: the measured trade) in both
+				// band states: the band's 4 x on a cheap reading made the cap flap
+				// between 4 x and 8 x on a loaded box (the CPU-timed pause shrinks
+				// against a stretched wall interval), and 4 x costs the #2040 shape
+				// 1.26x its wall (vgc_many_workers_pause_test: 230 cycles, never
+				// past 64 MB). 0: the band's cap alone, as the head.
+				thread_live_cap := vgc_headroom_thread_live_x > 0
+					&& marked < vgc_headroom_live_floor
+				if vgc_headroom_floor_capped || thread_live_cap {
 					mut cap := marked * 4
+					if thread_live_cap {
+						cap = marked * vgc_headroom_thread_live_x
+					}
 					if cap < afloor {
 						cap = afloor
 					}
