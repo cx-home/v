@@ -2879,6 +2879,10 @@ pub fn vgc_init() {
 	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
 	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
 	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
+	ca_env := C.getenv(c'VGC_COLD_ALL')
+	if ca_env != unsafe { nil } {
+		vgc_cold_all = u32(C.atoll(ca_env))
+	}
 	// https://github.com/cx-home/cx-examples/issues/249: VGC_SMALL_LIVE_KB = the small-live bound (0: off)
 	sl_env := C.getenv(c'VGC_SMALL_LIVE_KB')
 	if sl_env != unsafe { nil } {
@@ -7608,18 +7612,24 @@ fn vgc_cold_set(mut c VGC_Cache, sc int, n u8) {
 // class is warm.
 const vgc_cold_min_threads = u32(5)
 
+// INFO knob (never land): VGC_COLD_ALL=1 keeps every class cold (the shared span) for threads past the first.
+__global vgc_cold_all = u32(0)
+
 fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
 	if cache_idx < 0 {
 		return unsafe { nil }, unsafe { nil }
 	}
 	mut c := unsafe { vgc_cache(cache_idx) }
-	if unsafe { c.alloc[span_class] } != 0 || vgc_cold_count(c, span_class) >= vgc_cold_warm {
+	if unsafe { c.alloc[span_class] } != 0
+		|| (vgc_cold_all == 0 && vgc_cold_count(c, span_class) >= vgc_cold_warm) {
 		return unsafe { nil }, unsafe { nil }
 	}
 	if C.vgc_atomic_load_u32(&vgc_heap.live_threads) < vgc_cold_min_threads {
 		return unsafe { nil }, unsafe { nil }
 	}
-	vgc_cold_set(mut c, span_class, vgc_cold_count(c, span_class) + 1)
+	if vgc_cold_all == 0 {
+		vgc_cold_set(mut c, span_class, vgc_cold_count(c, span_class) + 1)
+	}
 	central := unsafe { &vgc_heap.central[span_class] }
 	mut span := unsafe { &VGC_Span(nil) }
 	for {
