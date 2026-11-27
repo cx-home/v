@@ -1986,6 +1986,7 @@ __global vgc_walk_backoff_len = int(32)
 __global vgc_walk_ncpu = int(1)
 __global vgc_biglive_pct = u64(0) // INFO knob VGC_BIGLIVE_PCT (never land)
 __global vgc_biglive_bytes = u64(64) * 1024 * 1024 // INFO knob VGC_BIGLIVE_MB
+__global vgc_biglive_thr = u64(0) // INFO knob VGC_BIGLIVE_THR_MB: the cap never under threads x this
 __global vgc_biglive_one = false // INFO knob VGC_BIGLIVE_ONE=1: the one-thread phase too
 // online CPUs at init, for the load gate (vgc_box_busy)
 __global vgc_walk_load_gate = true
@@ -2889,6 +2890,10 @@ pub fn vgc_init() {
 	}
 	if C.getenv(c'VGC_BIGLIVE_ONE') != unsafe { nil } {
 		vgc_biglive_one = true
+	}
+	blt_env := C.getenv(c'VGC_BIGLIVE_THR_MB')
+	if blt_env != unsafe { nil } {
+		vgc_biglive_thr = u64(C.atoll(blt_env)) * 1024 * 1024
 	}
 	blm_env := C.getenv(c'VGC_BIGLIVE_MB')
 	if blm_env != unsafe { nil } {

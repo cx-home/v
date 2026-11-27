@@ -5967,7 +5967,10 @@ fn vgc_update_trigger() {
 	// over a live set of T MB or more: the goal is marked + P % of marked, whatever the band
 	if vgc_biglive_pct > 0 && ((!one && vgc_scale_last > 1) || vgc_biglive_one) && vgc_scale_last <= vgc_walk_ncpu
 		&& marked >= vgc_biglive_bytes {
-		bx := marked * vgc_biglive_pct / 100
+		mut bx := marked * vgc_biglive_pct / 100
+		if bx < u64(vgc_scale_last) * vgc_biglive_thr {
+			bx = u64(vgc_scale_last) * vgc_biglive_thr
+		}
 		if extra > bx {
 			extra = bx
 		}
