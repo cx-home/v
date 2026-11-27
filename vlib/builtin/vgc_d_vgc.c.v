@@ -1164,10 +1164,13 @@ __global vgc_headroom_climb = true
 // CPUs keeps its markers through the mark back-off (vgc_mark_plan_count). VGC_MARK_HELD_FULL=0: the
 // back-off's target caps it, as before.
 __global vgc_mark_held_full = true
-// https://github.com/cx-home/v/issues/94: a lifted one-thread pacer sizes its headroom by the
-// marked set its program reaches, not the marked set of the last collection: a decaying peak, the
-// larger of this cycle's marked set and the last peak less a sixteenth (vgc_one_lift_decay), held
-// while the lift holds and reset to the marked set when it ends or a cycle is forced. cx's
+// https://github.com/cx-home/v/issues/94: a lifted one-thread pacer, and the adaptive floor of
+// several allocating threads (clamp(2 x marked, lo, live_floor)), size their headroom by the
+// marked set the program reaches, not the marked set of the last collection: a decaying peak, the
+// larger of this cycle's marked set and the last peak less a sixteenth (vgc_one_lift_decay), read
+// at every collection and reset to the marked set by a forced one; the one-thread quarter
+// (cx-home/v#56) keeps the marked set of the moment. A trough cycle's goal, trough + 2 x peak,
+// stays under the goal of the cycle at the peak (3 x peak), so the high-water heap does not grow. cx's
 // put-docs keeps each batch of documents live until the batch is flushed, so its marked set at a
 // collection runs 1-13 MB by where in the batch the collection lands; at 1 x the marked set of the
 // moment the first collections of every batch ran at 4 MB of headroom over a small mark, and which

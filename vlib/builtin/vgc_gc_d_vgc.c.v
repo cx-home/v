@@ -5685,6 +5685,16 @@ fn vgc_update_trigger() {
 	vgc_paced_one = one
 	vgc_trace_pace_nt = nt
 	vgc_trace_pace_one = one
+	// https://github.com/cx-home/v/issues/94: the marked set the program reaches, a decaying
+	// peak (vgc_one_lift_peak doc, vgc_d_vgc.c.v); a forced cycle resets it
+	mut peak := marked
+	if vgc_one_lift_peak_on && !vgc_own_forced && vgc_heap.gc_cycle > 0 {
+		held := vgc_one_lift_peak - vgc_one_lift_peak / vgc_one_lift_decay
+		if held > peak {
+			peak = held
+		}
+	}
+	vgc_one_lift_peak = peak
 	if vgc_headroom_adaptive_floor && !vgc_headroom_pinned && vgc_headroom_live_pct > 0 {
 		// cx-home/v#14, cx-private#1886: ONE allocating thread paces to Go's
 		// GOGC=100 goal, clamp(1 x marked, vgc_headroom_floor_lo1, live_floor),
@@ -5696,7 +5706,9 @@ fn vgc_update_trigger() {
 		// the base the per-thread scaling multiplies (integrator ruling
 		// 2026-10-11T08:19:47Z: that scaling is bounded by the live set only
 		// after the cx-private#1910 cycle-cost work).
-		mut f := marked * 2
+		// several threads: 2 x the peak (https://github.com/cx-home/v/issues/94: a batch's
+		// trough cycles keep the size its batches reach; a steady set's peak is its mark)
+		mut f := peak * 2
 		mut lo := vgc_headroom_floor_lo
 		if one {
 			lo = vgc_headroom_floor_lo1
@@ -5792,17 +5804,6 @@ fn vgc_update_trigger() {
 				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
 				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
 		}
-		// https://github.com/cx-home/v/issues/94: the marked set the lifted program reaches
-		// (vgc_one_lift_peak doc, vgc_d_vgc.c.v)
-		if vgc_one_lifted && !vgc_own_forced {
-			mut pk := vgc_one_lift_peak - vgc_one_lift_peak / vgc_one_lift_decay
-			if marked > pk {
-				pk = marked
-			}
-			vgc_one_lift_peak = pk
-		} else {
-			vgc_one_lift_peak = marked
-		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
 		// the pause is span-walk-dominated up there, so more headroom does not
@@ -5884,10 +5885,7 @@ fn vgc_update_trigger() {
 			// by Go's GOGC=100 term, clamp(1 x marked, vgc_headroom_floor_lo,
 			// vgc_headroom_live_floor) (cx-home/v#14, cx-private#1886), not the quarter
 			if vgc_one_lifted && one && vgc_one_thread_small(marked) {
-				mut lift := marked
-				if vgc_one_lift_peak_on && vgc_one_lift_peak > lift {
-					lift = vgc_one_lift_peak
-				}
+				mut lift := vgc_one_lift_peak
 				if lift < vgc_headroom_floor_lo {
 					lift = vgc_headroom_floor_lo
 				}
