@@ -2080,7 +2080,7 @@ fn vgc_gctrace_emit() {
 		// under the stop: the collector's own writer, never fprintf (a stopped mutator may hold
 		// libc's locale lock; vgc_gctrace_stop_safe_test)
 		C.vgc_gctrace_pace(u64(vgc_heap.gc_cycle), u64(vgc_trace_pace_nt), u64(vgc_acct_threads),
-			u64(vgc_acct_threads_prev), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
+			u64(vgc_acct_threads_prev) + (if vgc_big_live_pct > 0 { u64(if vgc_headroom_floor_capped { 1000 } else { 0 }) + u64(vgc_scale_last) * 100 + u64(vgc_gate_last_pause / 1000000) * 10000 + u64(vgc_gate_last_interval / 1000000) * 100000000 } else { u64(0) }), u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)),
 			u64(if vgc_trace_pace_one { 1 } else { 0 }))
 	}
 	if vgc_gctrace >= 2 {
