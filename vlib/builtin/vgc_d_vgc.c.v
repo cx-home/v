@@ -1135,6 +1135,12 @@ __global vgc_headroom_thread_live_x = u64(8)
 // VGC_HEADROOM_FLOOR_LO_MB sets the low clamp (decimal MB, default 4).
 __global vgc_headroom_adaptive_floor = true
 __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
+
+// vgc_several_floor_lo answers the low clamp of the several-thread adaptive floor
+// clamp(2 x marked, lo, live_floor) for a cycle that marked `marked` bytes.
+fn vgc_several_floor_lo(marked u64) u64 {
+	return vgc_headroom_floor_lo
+}
 // The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
 // live_floor) (cx-home/v#14, vgc_update_trigger), and the first collection's
 // trigger (cx-home/v#56: start-up is one thread). VGC_HEADROOM_FLOOR_LO1_MB overrides

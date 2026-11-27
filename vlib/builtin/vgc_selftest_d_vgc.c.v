@@ -1380,3 +1380,39 @@ pub fn vgc_pace_exit_selftest() u32 {
 	}
 	return 0
 }
+
+// https://github.com/cx-home/cx-examples/issues/249 (mandelbrot [par 4], ~1 MB marked): a small
+// live set under several allocating threads keeps the one-thread stash batch and half the
+// several-thread floor's low clamp; a live set at or over the bound keeps both as before.
+// bench/parallel-alloc/vgc_small_live_several_test.v drives it.
+pub fn vgc_small_live_several_selftest() u32 {
+	mb := u64(1024 * 1024)
+	saved_marked := vgc_heap.heap_marked
+	saved_acct := vgc_acct_threads
+	defer {
+		vgc_heap.heap_marked = saved_marked
+		vgc_acct_threads = saved_acct
+	}
+	vgc_acct_threads = 4
+	// 1 MB marked, four allocating threads, a thread past the batch threshold: the one-thread four
+	vgc_heap.heap_marked = mb
+	if vgc_tpool_batch(1, 8 * mb) != 4 {
+		return 1
+	}
+	if vgc_several_floor_lo(mb) != vgc_headroom_floor_lo / 2 {
+		return 2
+	}
+	// 8 MB marked: the scaled batch (x min(4 x T, 16)) and the full low clamp, as before
+	vgc_heap.heap_marked = 8 * mb
+	if vgc_tpool_batch(1, 8 * mb) != 4 * 16 {
+		return 3
+	}
+	if vgc_several_floor_lo(8 * mb) != vgc_headroom_floor_lo {
+		return 4
+	}
+	// the half clamp never goes under the one-thread low clamp
+	if vgc_several_floor_lo(0) < vgc_headroom_floor_lo1 {
+		return 5
+	}
+	return 0
+}
