@@ -536,16 +536,47 @@ const vgc_tpool_max_pages = 10
 // How many exact-fit spans one lock take moves into the stash: four 1- and
 // 2-page spans (a thread's working set of small classes refills from the
 // stash three times in four), two 3- and 4-page spans, one above (the lock
-// take is then the span itself, as before).
+// take is then the span itself, as before) — for one allocating thread.
+// cx-private#2040: with T threads (the larger of the live mutators and
+// vgc_acct_threads, the threads that allocated since the last stop — the live
+// count serves the first cycle, before any stop counted) the batch is
+// x min(4 x T, 16); a stash fills only when its thread refills, so an idle
+// thread never takes a batch. k fast
+// threads took the one free_spans_lock every ~32 KB each, and a pure-V loop of
+// small pointer nodes on dev2 read 20 threads / 1 thread = 2.45x the CPU per
+// unit (sys 1.7 of 4.7 s) against 1.12x as 20 processes; x16 read 1.76x,
+// x64 1.58x, x256 2.6x (the lock then held through a long pop); the cap is
+// x16, because a stash is part of vgc_thread_headroom_live_test's 1.5 MB a
+// worker and x64 read 71.0 MB of growth there against its 69.0 MB bar (28
+// threads, dev2). One thread
+// keeps the four; a stash returns to the pool at every stop
+// (vgc_tpool_drain_stw), so a batch holds spans for one cycle at most.
+// VGC_POOL_BATCH_THREADS=0 keeps the one-thread batch at any count.
+const vgc_tpool_batch_mul_max = 16
+
+__global vgc_tpool_batch_threads = u64(1)
+
+@[inline]
+fn vgc_tpool_batch_mul() int {
+	lt := int(C.vgc_atomic_load_u32(&vgc_heap.live_threads))
+	t := if lt > vgc_acct_threads { lt } else { vgc_acct_threads }
+	if vgc_tpool_batch_threads == 0 || t <= 1 {
+		return 1
+	}
+	m := 4 * t
+	return if m > vgc_tpool_batch_mul_max { vgc_tpool_batch_mul_max } else { m }
+}
+
 @[inline]
 fn vgc_tpool_batch(npages u32) int {
+	m := vgc_tpool_batch_mul()
 	if npages <= 2 {
-		return 4
+		return 4 * m
 	}
 	if npages <= 4 {
-		return 2
+		return 2 * m
 	}
-	return 1
+	return m
 }
 
 // vgc_cache answers slot idx's VGC_Cache (cx-home/v#27). Two dependent loads:
@@ -2745,6 +2776,8 @@ pub fn vgc_init() {
 	vgc_frag_gate_on = vgc_env_pct(c'VGC_FRAG_GATE', vgc_frag_gate_on)
 	// cx-private#2040: VGC_OWNER_STASH=0 pools every recycled span (no hand-back)
 	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
+	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
+	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
 	vgc_frag_gate_late_pct = vgc_env_pct(c'VGC_FRAG_GATE_LATE_PCT', vgc_frag_gate_late_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
