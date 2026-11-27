@@ -5713,7 +5713,9 @@ fn vgc_update_trigger() {
 		if one {
 			lo = vgc_headroom_floor_lo1
 			if vgc_one_thread_small(marked) {
-				f = vgc_one_thread_term(marked)
+				// https://github.com/cx-home/v/issues/94: the quarter of the peak — a
+				// batch's trough keeps a quarter of the size its batches reach
+				f = vgc_one_thread_term(peak)
 			}
 		}
 		if f < lo {
@@ -5802,7 +5804,7 @@ fn vgc_update_trigger() {
 		} else {
 			vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs,
 				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
-				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
+				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap && marked * 2 >= peak)
 		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
@@ -5828,7 +5830,7 @@ fn vgc_update_trigger() {
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
 			if one && vgc_one_thread_small(marked) {
-				term := vgc_one_thread_term(marked)
+				term := vgc_one_thread_term(peak)
 				if term < live_cap {
 					live_cap = term
 				}
