@@ -31,6 +31,15 @@
 //       heavy_churn_mb: well under a tenth of its time) keeps the quarter — the memory rows the term exists
 //       for (cx-examples#296/#297, cx-home/v#56): the headroom of its last
 //       quarter of collections stays at most 2 x the term.
+//   (d) RULING (OPERATOR) 94-CARVE (b), 07:45 ET 11-27: the bounded carve
+//       allowance — an expensive one-thread program (lifted off the quarter:
+//       two readings over the band's tenth in a row) paces up to GOGC=200,
+//       2 x marked (vgc_one_lift_pct), where the lift's GOGC=100 term held it
+//       to 1 x: work 0 runs at most churn / (2 x live) x 1.25 + 8 collections
+//       (~96 at 2 x marked; the head's 1 x marked runs ~200).
+//   (e) the allowance is BOUNDED: no collection of work 0 paces past 2 x the
+//       live set (+15 %) — not the fixed floor's 32 MB nor the band's cap,
+//       whose carve over a small live set cx-home/v#14 bars.
 //
 // Run: ./v test bench/parallel-alloc/vgc_one_thread_cost_test.v
 module main
@@ -81,6 +90,7 @@ struct Run {
 	mean_kb  u64
 	tail_kb  u64
 	marked_m u64
+	max_kb   u64
 }
 
 fn run(work int, mb int, env string) Run {
@@ -96,8 +106,12 @@ fn run(work int, mb int, env string) Run {
 	}
 	assert hs.len >= 4, 'too few collections (${hs.len}): ${r.output#[-400..]}'
 	mut sum := u64(0)
+	mut mx := u64(0)
 	for h in hs {
 		sum += h
+		if h > mx {
+			mx = h
+		}
 	}
 	mut tail := u64(0)
 	for h in hs#[hs.len - (hs.len + 3) / 4..] {
@@ -110,6 +124,7 @@ fn run(work int, mb int, env string) Run {
 		mean_kb:  sum / u64(hs.len)
 		tail_kb:  tail
 		marked_m: ms[ms.len - 1]
+		max_kb:   mx
 	}
 }
 
@@ -126,10 +141,14 @@ fn test_a_costly_one_thread_mutator_is_not_held_to_the_quarter() {
 	bound_a := 2 * churn_mb / (live_bytes / (1024 * 1024)) + 8
 	bound_b := f64(parent.cycles) * 1.10 + 2
 	term_kb := u64(live_bytes / 4 / 1024)
-	println('vgc_one_thread_cost: work 0 ${cheap.cycles} cycles (mean headroom ${cheap.mean_kb} KB, last quarter max ${cheap.tail_kb} KB, marked ${cheap.marked_m} MB); work ${parent_work} ${parent.cycles} cycles (mean ${parent.mean_kb} KB); work ${heavy_work} ${heavy.cycles} cycles (last quarter max ${heavy.tail_kb} KB) (bars: (a) work 0 <= ${bound_a} cycles; (b) work 0 <= ${bound_b:.1f}; (c) work ${heavy_work} last quarter <= ${2 * term_kb} KB)')
+	bound_d := f64(churn_mb) / f64(2 * live_bytes / (1024 * 1024)) * 1.25 + 8
+	bound_e := u64(f64(2 * live_bytes / 1024) * 1.15)
+	println('vgc_one_thread_cost: work 0 ${cheap.cycles} cycles (mean headroom ${cheap.mean_kb} KB, last quarter max ${cheap.tail_kb} KB, marked ${cheap.marked_m} MB); work ${parent_work} ${parent.cycles} cycles (mean ${parent.mean_kb} KB); work ${heavy_work} ${heavy.cycles} cycles (last quarter max ${heavy.tail_kb} KB) (bars: (a) work 0 <= ${bound_a} cycles; (b) work 0 <= ${bound_b:.1f}; (c) work ${heavy_work} last quarter <= ${2 * term_kb} KB; (d) work 0 <= ${bound_d:.1f} cycles; (e) work 0 max headroom ${cheap.max_kb} KB <= ${bound_e} KB)')
 	assert cheap.cycles <= bound_a, '(a) a mutator whose collections cost over a tenth of its time stayed at the quarter: ${cheap.cycles} cycles, mean headroom ${cheap.mean_kb} KB over a ${live_bytes / 1024} KB live set (bar ${bound_a})'
 	assert f64(cheap.cycles) <= bound_b, '(b) the cheaper mutator ran ${cheap.cycles} collections against its parent\'s ${parent.cycles} on the same live set'
 	assert heavy.tail_kb <= 2 * term_kb, '(c) a mutator whose collections are cheap left the quarter: ${heavy.tail_kb} KB (term ${term_kb} KB)'
+	assert f64(cheap.cycles) <= bound_d, '(d) an expensive one-thread mutator did not take the bounded carve allowance (GOGC=200, 2 x marked; RULING 94-CARVE (b)): ${cheap.cycles} cycles, mean headroom ${cheap.mean_kb} KB over a ${live_bytes / 1024} KB live set (bar ${bound_d:.1f})'
+	assert cheap.max_kb <= bound_e, '(e) the carve allowance is not bounded: a collection paced ${cheap.max_kb} KB of headroom over a ${live_bytes / 1024} KB live set (bar 2 x live + 15 %: ${bound_e} KB)'
 }
 
 // the lift's state machine (vgc_one_lift_next), white-box in module builtin
