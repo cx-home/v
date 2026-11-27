@@ -5817,8 +5817,7 @@ fn vgc_update_trigger() {
 		} else {
 			vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs,
 				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
-				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap && marked * 2 >= peak
-				&& !(vgc_one_lift_flat && vgc_one_lifted))
+				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap && marked * 2 >= peak)
 		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —

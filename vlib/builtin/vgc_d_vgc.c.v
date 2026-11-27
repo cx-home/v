@@ -1186,8 +1186,8 @@ __global vgc_mark_held_full = true
 __global vgc_one_lift_peak_on = true
 // https://github.com/cx-home/v/issues/94: while lifted and under the live floor, the headroom is
 // timing-free — clamp(decaying peak of the marked set, vgc_headroom_floor_lo, vgc_headroom_live_floor)
-// on every cycle, one allocating thread or several — and a cheap reading no longer ends the lift (a
-// forced cycle still does). The overhead band above the peak doubled and halved it by the
+// on every cycle, one allocating thread or several (a cheap reading or a forced cycle still ends the
+// lift: vgc_one_thread_cost_test (c)). The overhead band above the peak doubled and halved it by the
 // mutator's timing, so the resting headroom followed the run: put-docs c8505ef4 caught 16-32 MB
 // that its cheaper child 0ab46d60 missed (dev2 11-27: 97-145 collections against 105-157 on the
 // same batches). VGC_ONE_LIFT_FLAT=0: the band, as before (vgc_one_thread_flat_test reads both).
