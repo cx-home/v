@@ -1432,3 +1432,49 @@ pub fn vgc_small_live_several_selftest() u32 {
 	}
 	return 0
 }
+
+// https://github.com/cx-home/cx-examples/issues/249 (binary-trees 21 under [par]: 110-190 MB
+// marked, six to eleven allocating threads on a 12-28 CPU box): several allocating threads,
+// no more than the CPUs, over a big live set pace the goal at marked + 40 %, whatever the
+// band — the GOGC term (100 %) and the per-thread floor (32 MB a thread, to the 3 x 64 MB cap)
+// held it at 2-2.2 x marked, 398-407 MB peak RSS against Python 3.12's 270.42 MB (bar 283.9).
+// One thread, a live set under the bound, more threads than CPUs (cx-private#2040's k=56,
+// 380-410 MB marked, whose time row needs the floor) and an extra already under the cap keep
+// the pacer's extra. bench/parallel-alloc/vgc_big_live_goal_test.v drives it.
+pub fn vgc_big_live_goal_selftest() u32 {
+	mb := u64(1024 * 1024)
+	saved_ncpu := vgc_walk_ncpu
+	defer {
+		vgc_walk_ncpu = saved_ncpu
+	}
+	vgc_walk_ncpu = 28
+	// 160 MB marked, nine threads, the pacer's 192 MB: 40 % of marked (64 MB)
+	if vgc_big_live_extra(192 * mb, 160 * mb, 9, false) != 64 * mb {
+		return 1
+	}
+	// the GOGC term alone (160 MB extra over 160 MB marked): 64 MB
+	if vgc_big_live_extra(160 * mb, 160 * mb, 6, false) != 64 * mb {
+		return 2
+	}
+	// one-thread pacing: the pacer's extra
+	if vgc_big_live_extra(192 * mb, 160 * mb, 1, true) != 192 * mb {
+		return 3
+	}
+	// a live set under the bound (32 MB marked): the pacer's extra
+	if vgc_big_live_extra(64 * mb, 32 * mb, 9, false) != 64 * mb {
+		return 4
+	}
+	// more allocating threads than CPUs (cx-private#2040 k=56): the pacer's extra
+	if vgc_big_live_extra(512 * mb, 400 * mb, 56, false) != 512 * mb {
+		return 5
+	}
+	// an extra already under 40 % of marked: kept
+	if vgc_big_live_extra(40 * mb, 160 * mb, 9, false) != 40 * mb {
+		return 6
+	}
+	// exactly at the bound (64 MB marked) applies: 25.6 MB
+	if vgc_big_live_extra(64 * mb, 64 * mb, 4, false) != 64 * mb * 40 / 100 {
+		return 7
+	}
+	return 0
+}

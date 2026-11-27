@@ -1192,6 +1192,13 @@ fn vgc_small_live_threads_now() int {
 fn vgc_small_live(marked u64) bool {
 	return vgc_small_live_bound > 0 && marked < vgc_small_live_bound
 }
+
+// vgc_big_live_extra answers the goal's extra bytes over `marked` for a cycle with `threads`
+// allocating threads (one: the one-thread pacing) from the pacer's `extra`
+// (https://github.com/cx-home/cx-examples/issues/249 binary-trees 21). Extracted unchanged.
+fn vgc_big_live_extra(extra u64, marked u64, threads int, one bool) u64 {
+	return extra
+}
 // The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
 // live_floor) (cx-home/v#14, vgc_update_trigger), and the first collection's
 // trigger (cx-home/v#56: start-up is one thread). VGC_HEADROOM_FLOOR_LO1_MB overrides
