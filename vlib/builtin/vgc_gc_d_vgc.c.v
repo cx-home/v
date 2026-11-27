@@ -5962,6 +5962,7 @@ fn vgc_update_trigger() {
 	if extra < vgc_headroom {
 		extra = vgc_headroom
 	}
+	extra = vgc_big_live_extra(extra, marked, vgc_scale_last, one)
 	mut goal := marked + extra
 	// the grow gate's credit (cx-private#1916, vgc_d_vgc.c.v)
 	vgc_grow_gate_credit += vgc_grow_gate_rate_pct * 10

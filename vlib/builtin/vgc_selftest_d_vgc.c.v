@@ -1432,3 +1432,60 @@ pub fn vgc_small_live_several_selftest() u32 {
 	}
 	return 0
 }
+
+// https://github.com/cx-home/cx-examples/issues/249 (binary-trees 21 under [par]: 110-190 MB
+// marked, six to eleven allocating threads on a 12-28 CPU box): several allocating threads,
+// no more than the CPUs, over a big live set pace the goal at marked + 40 %, whatever the
+// band — the GOGC term (100 %) and the per-thread floor (32 MB a thread, to the 3 x 64 MB cap)
+// held it at 2-2.2 x marked, 398-407 MB peak RSS against Python 3.12's 270.42 MB (bar 283.9).
+// One thread, a live set under the bound, a live set under 8 MB a thread (cx-private#2040's
+// json-codec 1 MB holds ~7.3 MB a thread at k=20 and k=56, and its time rows need the
+// per-thread floor), more threads than CPUs and an extra already under the cap keep the
+// pacer's extra. bench/parallel-alloc/vgc_big_live_goal_test.v drives it.
+pub fn vgc_big_live_goal_selftest() u32 {
+	mb := u64(1024 * 1024)
+	saved_ncpu := vgc_walk_ncpu
+	defer {
+		vgc_walk_ncpu = saved_ncpu
+	}
+	vgc_walk_ncpu = 28
+	// 160 MB marked, nine threads, the pacer's 192 MB: 40 % of marked (64 MB)
+	if vgc_big_live_extra(192 * mb, 160 * mb, 9, false) != 64 * mb {
+		return 1
+	}
+	// the GOGC term alone (160 MB extra over 160 MB marked): 64 MB
+	if vgc_big_live_extra(160 * mb, 160 * mb, 6, false) != 64 * mb {
+		return 2
+	}
+	// one-thread pacing: the pacer's extra
+	if vgc_big_live_extra(192 * mb, 160 * mb, 1, true) != 192 * mb {
+		return 3
+	}
+	// a live set under the bound (32 MB marked): the pacer's extra
+	if vgc_big_live_extra(64 * mb, 32 * mb, 9, false) != 64 * mb {
+		return 4
+	}
+	// more allocating threads than CPUs (cx-private#2040 k=56): the pacer's extra
+	if vgc_big_live_extra(512 * mb, 400 * mb, 56, false) != 512 * mb {
+		return 5
+	}
+	// an extra already under 40 % of marked: kept
+	if vgc_big_live_extra(40 * mb, 160 * mb, 9, false) != 40 * mb {
+		return 6
+	}
+	// exactly at the bound (64 MB marked, four threads) applies: 25.6 MB
+	if vgc_big_live_extra(64 * mb, 64 * mb, 4, false) != 64 * mb * 40 / 100 {
+		return 7
+	}
+	// cx-private#2040 json-codec 1 MB at k=20 (146-149 MB marked, twenty threads on 28 CPUs:
+	// ~7.3 MB of live set a thread): the pacer's extra — 40 % read 0.61 -> 1.12-1.22 s
+	if vgc_big_live_extra(256 * mb, 146 * mb, 20, false) != 256 * mb {
+		return 8
+	}
+	// binary-trees' lowest [par] cycle on the official size (106 MB marked, eleven threads:
+	// 9.6 MB a thread): 40 % of marked
+	if vgc_big_live_extra(192 * mb, 106 * mb, 11, false) != 106 * mb * 40 / 100 {
+		return 9
+	}
+	return 0
+}
