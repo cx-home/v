@@ -1152,6 +1152,14 @@ __global vgc_one_lifted = false
 // 512 (x8) 0.66 s / 1,264 MB. At and under the core count the x4 stays (k=28: ~490 MB peak
 // against Python's 519-1,228). VGC_HEADROOM_OVERSUB=0 keeps the x4 at any thread count.
 __global vgc_headroom_oversub = true
+// https://github.com/cx-home/cx-private/issues/2040: past the core count (four cores or more) an
+// expensive cycle takes the headroom straight to the cycle's ceiling (vgc_climb_jumps, after every
+// live and per-thread cap) instead of doubling it from the 8 MB floor. Each doubling step is a stop
+// of every allocating thread, and with more of them than cores the climb was a third of the stops:
+// json-codec 1 MB [par 56] on dev2 climbed 8 -> 256/512 MB while the live set grew 1 -> 380 MB (14
+// cycles, 587 ms of pause in 1.04-1.12 s; Python 3.12 Pool(56) 0.78 s); pinned at 384 MB, 9 cycles
+// and 0.70 s. A cheap reading still halves it. VGC_HEADROOM_CLIMB=0 keeps the doubling.
+__global vgc_headroom_climb = true
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2787,6 +2795,10 @@ pub fn vgc_init() {
 	oversub_env := C.getenv(c'VGC_HEADROOM_OVERSUB')
 	if oversub_env != unsafe { nil } && C.atoll(oversub_env) == 0 {
 		vgc_headroom_oversub = false
+	}
+	climb_env := C.getenv(c'VGC_HEADROOM_CLIMB')
+	if climb_env != unsafe { nil } && C.atoll(climb_env) == 0 {
+		vgc_headroom_climb = false
 	}
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {

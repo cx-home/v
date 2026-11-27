@@ -5527,6 +5527,48 @@ fn vgc_flat_cap_mult(nts int, ncpu int, oversub bool) u64 {
 	return mult
 }
 
+// vgc_climb_jumps says whether an expensive cycle takes the headroom straight to its ceiling
+// (vgc_headroom_climb doc, vgc_d_vgc.c.v): more allocating threads than cores, on four cores or more.
+fn vgc_climb_jumps(nts int, ncpu int, on bool) bool {
+	return on && ncpu >= 4 && nts > ncpu
+}
+
+// vgc_climb_hr is the headroom after the ceiling hr_max is known: hr_max on a jump, else hr.
+fn vgc_climb_hr(hr u64, hr_max u64, jump bool) u64 {
+	if jump && hr < hr_max {
+		return hr_max
+	}
+	return hr
+}
+
+// vgc_climb_selftest checks vgc_climb_jumps / vgc_climb_hr (bench/parallel-alloc/vgc_headroom_climb_test.v):
+// 0 = all hold, else the first failing check.
+pub fn vgc_climb_selftest() u32 {
+	if !vgc_climb_jumps(56, 28, true) || !vgc_climb_jumps(29, 28, true) {
+		return 1 // past the core count: the jump
+	}
+	if vgc_climb_jumps(28, 28, true) || vgc_climb_jumps(8, 28, true) || vgc_climb_jumps(1, 28, true) {
+		return 2 // at or under it: the doubling
+	}
+	if vgc_climb_jumps(56, 28, false) {
+		return 3 // VGC_HEADROOM_CLIMB=0
+	}
+	if vgc_climb_jumps(16, 2, true) || vgc_climb_jumps(16, 0, true) {
+		return 4 // under four cores (or none read)
+	}
+	mb := u64(1024 * 1024)
+	if vgc_climb_hr(16 * mb, 512 * mb, true) != 512 * mb {
+		return 5 // to the ceiling
+	}
+	if vgc_climb_hr(16 * mb, 512 * mb, false) != 16 * mb {
+		return 6
+	}
+	if vgc_climb_hr(600 * mb, 512 * mb, true) != 600 * mb {
+		return 7 // never raises past hr; the clamp below lowers it
+	}
+	return 0
+}
+
 // vgc_flat_cap_mult_selftest checks vgc_flat_cap_mult (bench/parallel-alloc/vgc_flat_cap_oversub_test.v):
 // 0 = all hold, else the first failing check.
 pub fn vgc_flat_cap_mult_selftest() u32 {
@@ -5715,6 +5757,10 @@ fn vgc_update_trigger() {
 			hr /= 2 // GC overhead < ~0.25%: collections are cheap, collect eagerly
 			vgc_headroom_floor_capped = true
 		}
+		// https://github.com/cx-home/cx-private/issues/2040: past the core count an expensive
+		// reading takes hr to the ceiling below (vgc_headroom_climb doc, vgc_d_vgc.c.v)
+		climb := expensive && vgc_headroom_per_thread && vgc_heap.gc_cycle > 0
+			&& vgc_climb_jumps(nts, vgc_walk_ncpu, vgc_headroom_climb)
 		// https://github.com/cx-home/v/issues/94: one allocating thread's lift off the
 		// quarter (vgc_one_thread_lift doc, vgc_d_vgc.c.v). A forced cycle (gc_collect, an
 		// OOM retry) is not a reading of the mutator's cost: its pause sits against the
@@ -5828,6 +5874,7 @@ fn vgc_update_trigger() {
 				hr_max = live_cap
 			}
 		}
+		hr = vgc_climb_hr(hr, hr_max, climb)
 		if hr < hr_min {
 			hr = hr_min
 		}
