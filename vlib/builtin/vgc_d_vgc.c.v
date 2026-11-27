@@ -1194,6 +1194,14 @@ __global vgc_one_thread_lift = true
 // <= 3.3x). The further question (a rule without a fixed allowance) is the Backlog issue
 // https://github.com/cx-home/v/issues/95. VGC_ONE_LIFT_PCT=<n> (100: the lift before the ruling).
 __global vgc_one_lift_pct = u64(200)
+// RULING 94-CARVE (b): the lift and its allowance read ONE allocating thread by this cycle's count
+// (vgc_alloc_threads: nt <= 1) as well as by the pacing's one/several decision. cx put-docs runs its
+// interpreter thread alone between stops (nt=1 at ~95 % of its stops), but its parquet workers' bursts
+// keep the pacing at several (vgc_pace_prev_window, vgc_pace_exit) for most of them, where the
+// adaptive floor is clamp(2 x marked, 4 MB, 32 MB) over a live set that saws 1-19 MB with its batches:
+// dev2 timed x5, 1.12-1.15 s user against VGC_HEADROOM_ADAPTIVE_FLOOR=0's 1.04-1.08 (attrs).
+// VGC_ONE_LIFT_SOLO=0: the pacing's decision alone.
+__global vgc_one_lift_solo = true
 __global vgc_one_lift_after = int(2)
 __global vgc_one_lift_runs = int(0)
 __global vgc_one_lifted = false
@@ -2876,6 +2884,10 @@ pub fn vgc_init() {
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {
 		vgc_one_thread_lift = false
+	}
+	ols_env := C.getenv(c'VGC_ONE_LIFT_SOLO')
+	if ols_env != unsafe { nil } && C.atoll(ols_env) == 0 {
+		vgc_one_lift_solo = false
 	}
 	olp_env := C.getenv(c'VGC_ONE_LIFT_PCT')
 	if olp_env != unsafe { nil } {

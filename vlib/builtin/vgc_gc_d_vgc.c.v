@@ -5791,11 +5791,14 @@ fn vgc_update_trigger() {
 		// ends the lift (the head's pacing until two unforced readings lift it again): the
 		// program asked for a collection, and a lift carried over from the cycles before
 		// it would leave the same 4 MB over the heap it just emptied.
+		// RULING 94-CARVE (b): ONE allocating thread this cycle (nt <= 1) is one for the lift and its
+		// allowance even where the pacing reads several (vgc_one_lift_solo doc, vgc_d_vgc.c.v)
+		solo := one || (vgc_one_lift_solo && nt <= 1)
 		if vgc_own_forced {
 			vgc_one_lift_runs, vgc_one_lifted = 0, false
 		} else {
 			vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs,
-				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
+				vgc_one_lifted, solo && vgc_one_thread_small(marked) && vgc_one_thread_lift
 				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
 		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
@@ -5879,7 +5882,7 @@ fn vgc_update_trigger() {
 			// by clamp(vgc_one_lift_pct x marked, vgc_headroom_floor_lo,
 			// vgc_headroom_live_floor), not the quarter: GOGC=200, the bounded carve
 			// allowance of RULING 94-CARVE (b) (vgc_one_lift_pct doc, vgc_d_vgc.c.v)
-			if vgc_one_lifted && one && vgc_one_thread_small(marked) {
+			if vgc_one_lifted && solo && vgc_one_thread_small(marked) {
 				mut lift := marked * vgc_one_lift_pct / 100
 				if lift < vgc_headroom_floor_lo {
 					lift = vgc_headroom_floor_lo
