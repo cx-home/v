@@ -1142,6 +1142,21 @@ __global vgc_one_thread_lift = true
 __global vgc_one_lift_after = int(2)
 __global vgc_one_lift_runs = int(0)
 __global vgc_one_lifted = false
+// https://github.com/cx-home/v/issues/94: a lifted one-thread pacer sizes its headroom by the
+// marked set its program reaches, not the marked set of the last collection: a decaying peak, the
+// larger of this cycle's marked set and the last peak less an eighth (vgc_one_lift_decay), held
+// while the lift holds and reset to the marked set when it ends or a cycle is forced. cx's
+// put-docs keeps each batch of documents live until the batch is flushed, so its marked set at a
+// collection runs 1-13 MB by where in the batch the collection lands; at 1 x the marked set of the
+// moment the first collections of every batch ran at 4 MB of headroom over a small mark, and which
+// cycles fell early in a batch decided the count (cx-core-data 0ab46d60: 136-173 collections
+// against its parent's 93-115, dev1 arm64). A steady live set reads its own marked set as the peak,
+// so v#14's bounds over a small live set (vgc_headroom_live_test) are unchanged; the lift stays
+// clamped to vgc_headroom_live_floor. VGC_ONE_LIFT_PEAK=0 sizes by the last marked set, as before
+// (vgc_one_thread_sawtooth_test reads both).
+__global vgc_one_lift_peak_on = true
+__global vgc_one_lift_peak = u64(0)
+__global vgc_one_lift_decay = u64(8)
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2777,6 +2792,10 @@ pub fn vgc_init() {
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {
 		vgc_one_thread_lift = false
+	}
+	peak_env := C.getenv(c'VGC_ONE_LIFT_PEAK')
+	if peak_env != unsafe { nil } && C.atoll(peak_env) == 0 {
+		vgc_one_lift_peak_on = false
 	}
 	af_env := C.getenv(c'VGC_HEADROOM_ADAPTIVE_FLOOR')
 	if af_env != unsafe { nil } && C.atoll(af_env) == 0 {
