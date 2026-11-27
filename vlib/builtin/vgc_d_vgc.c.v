@@ -2927,6 +2927,10 @@ pub fn vgc_init() {
 			vgc_big_live_bytes = u64(blm) * 1024 * 1024
 		}
 	}
+	ttg_env := C.getenv(c'VGC_TRIM_TO_GOAL')
+	if ttg_env != unsafe { nil } {
+		vgc_trim_to_goal = u32(C.atoll(ttg_env))
+	}
 	ca_env := C.getenv(c'VGC_COLD_ALL')
 	if ca_env != unsafe { nil } {
 		vgc_cold_all = u32(C.atoll(ca_env))
@@ -5331,6 +5335,20 @@ const vgc_pool_trim_age = u32(2)
 const vgc_pool_trim_max_decommits = 128
 const vgc_pool_trim_max_examined = 2048
 
+// INFO knob (never land): VGC_TRIM_TO_GOAL=1 — past the goal the sized hot chains trim with no age gate down to the goal.
+__global vgc_trim_to_goal = u32(0)
+
+fn vgc_committed_surplus() u64 {
+	n := int(C.vgc_atomic_load_u32(&u32(voidptr(&vgc_heap.narenas))))
+	mut carved := u64(0)
+	for i in 0 .. n {
+		carved += u64(vgc_heap.arenas[i].used)
+	}
+	committed := if carved > vgc_heap.pool_trimmed_bytes { carved - vgc_heap.pool_trimmed_bytes } else { u64(0) }
+	goal := C.vgc_atomic_load_u64(&vgc_heap.next_gc)
+	return if committed > goal { committed - goal } else { u64(0) }
+}
+
 fn vgc_pool_trim() {
 	if vgc_heap.pool_bytes == 0 {
 		return
@@ -5364,15 +5382,19 @@ fn vgc_pool_trim() {
 	// (decommitted spans live on the segregated cold lists and are never
 	// re-visited). The examine budget only pays for actual decommits plus one
 	// young-blocker probe per chain, never for a hot chain's young majority.
+	mut surplus := if vgc_trim_to_goal != 0 { vgc_committed_surplus() } else { u64(0) }
+	max_dec := if surplus > 0 { 1024 } else { vgc_pool_trim_max_decommits }
 	for idx := vgc_max_pooled_pages; idx >= 1; idx-- {
-		if decommits >= vgc_pool_trim_max_decommits || examined >= vgc_pool_trim_max_examined {
+		if decommits >= max_dec || examined >= vgc_pool_trim_max_examined {
 			break
 		}
 		mut s := vgc_heap.free_spans_tail[idx]
-		for s != unsafe { nil } && decommits < vgc_pool_trim_max_decommits
+		for s != unsafe { nil } && decommits < max_dec
 			&& examined < vgc_pool_trim_max_examined {
 			examined++
-			if cyc - s.pool_gen >= vgc_pool_trim_age {
+			if surplus > 0 || cyc - s.pool_gen >= vgc_pool_trim_age {
+				sb := u64(s.npages) * vgc_page_size
+				surplus = if surplus > sb { surplus - sb } else { u64(0) }
 				prv := s.prev
 				vgc_pool_trim_decommit(mut s)
 				decommits++
