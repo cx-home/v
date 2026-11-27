@@ -1193,11 +1193,37 @@ fn vgc_small_live(marked u64) bool {
 	return vgc_small_live_bound > 0 && marked < vgc_small_live_bound
 }
 
-// vgc_big_live_extra answers the goal's extra bytes over `marked` for a cycle with `threads`
-// allocating threads (one: the one-thread pacing) from the pacer's `extra`
-// (https://github.com/cx-home/cx-examples/issues/249 binary-trees 21). Extracted unchanged.
+// The big-live goal (https://github.com/cx-home/cx-examples/issues/249 binary-trees 21):
+// several allocating threads, no more than the CPUs, over a live set of vgc_big_live_bytes
+// or more pace the goal at marked + vgc_big_live_pct % of marked, whatever the band. Under
+// [par] binary-trees holds 110-190 MB marked with six to eleven allocating threads; the
+// GOGC term (100 %) and the per-thread floor (32 MB a thread, to the 3 x 64 MB cap) paced
+// it at 2-2.2 x marked, and the band reads its cycles expensive (~19 ms of collector a
+// ~240 ms interval), so the floor never capped: 398-407 MB peak RSS against Python 3.12's
+// 270.42 MB (bar 283.9). At 40 %: 277.0 MB dev1 (wall +10 %), 277.2 MB dev2 (wall +2.5 %),
+// md5 equal; 50 % read 285.1 (dev1). A live set that large leaves each thread its share of
+// 40 % of it between two collections (64 MB over 160 MB marked), and the collections it
+// adds are the price of the memory, not a thrash: a big live set's cycle cost grows with
+// marked, its count with 1 / 0.4. One thread keeps the one-thread pacing (its rows are
+// cx-home/v#14's and #94's); a live set under the bound or under 8 MB a thread keeps the
+// per-thread floor (vgc_big_live_thread_bytes: cx-private#2040's json-codec), and so do more
+// allocating threads than CPUs: json-codec 1 MB at k=56 (401-420 MB marked, 56 threads on 28
+// CPUs) read 0.56-0.63 -> 0.88-0.91 s without the floor (Python 0.73).
+// VGC_BIG_LIVE_PCT sets the percent (0: off, the head's pacing); VGC_BIG_LIVE_MB the bound.
+__global vgc_big_live_pct = u64(40)
+__global vgc_big_live_bytes = u64(64) * 1024 * 1024
+// ... and at least this much of it a thread: cx-private#2040's json-codec 1 MB holds ~7.3 MB a
+// thread (146-149 MB marked at k=20, 401-420 MB at k=56) and read 0.61 -> 1.12-1.22 s at k=20
+// under 40 % (dev2, 20 threads on 28 CPUs); binary-trees' lowest [par] cycle holds 9.6 MB a thread.
+const vgc_big_live_thread_bytes = u64(8) * 1024 * 1024
+
 fn vgc_big_live_extra(extra u64, marked u64, threads int, one bool) u64 {
-	return extra
+	if vgc_big_live_pct == 0 || one || threads <= 1 || threads > vgc_walk_ncpu
+		|| marked < vgc_big_live_bytes || marked < u64(threads) * vgc_big_live_thread_bytes {
+		return extra
+	}
+	cap := marked * vgc_big_live_pct / 100
+	return if extra > cap { cap } else { extra }
 }
 // The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
 // live_floor) (cx-home/v#14, vgc_update_trigger), and the first collection's
@@ -2886,6 +2912,21 @@ pub fn vgc_init() {
 	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
 	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
 	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
+	// https://github.com/cx-home/cx-examples/issues/249: VGC_BIG_LIVE_PCT = the big-live goal's percent (0: off), VGC_BIG_LIVE_MB its bound
+	blp_env := C.getenv(c'VGC_BIG_LIVE_PCT')
+	if blp_env != unsafe { nil } {
+		blp := C.atoll(blp_env)
+		if blp >= 0 {
+			vgc_big_live_pct = u64(blp)
+		}
+	}
+	blm_env := C.getenv(c'VGC_BIG_LIVE_MB')
+	if blm_env != unsafe { nil } {
+		blm := C.atoll(blm_env)
+		if blm >= 0 {
+			vgc_big_live_bytes = u64(blm) * 1024 * 1024
+		}
+	}
 	// https://github.com/cx-home/cx-examples/issues/249: VGC_SMALL_LIVE_KB = the small-live bound (0: off)
 	sl_env := C.getenv(c'VGC_SMALL_LIVE_KB')
 	if sl_env != unsafe { nil } {
