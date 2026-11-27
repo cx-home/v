@@ -5792,6 +5792,17 @@ fn vgc_update_trigger() {
 				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
 				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
 		}
+		// https://github.com/cx-home/v/issues/94: the marked set the lifted program reaches
+		// (vgc_one_lift_peak doc, vgc_d_vgc.c.v)
+		if vgc_one_lifted && !vgc_own_forced {
+			mut pk := vgc_one_lift_peak - vgc_one_lift_peak / vgc_one_lift_decay
+			if marked > pk {
+				pk = marked
+			}
+			vgc_one_lift_peak = pk
+		} else {
+			vgc_one_lift_peak = marked
+		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
 		// the pause is span-walk-dominated up there, so more headroom does not
@@ -5874,6 +5885,9 @@ fn vgc_update_trigger() {
 			// vgc_headroom_live_floor) (cx-home/v#14, cx-private#1886), not the quarter
 			if vgc_one_lifted && one && vgc_one_thread_small(marked) {
 				mut lift := marked
+				if vgc_one_lift_peak_on && vgc_one_lift_peak > lift {
+					lift = vgc_one_lift_peak
+				}
 				if lift < vgc_headroom_floor_lo {
 					lift = vgc_headroom_floor_lo
 				}
