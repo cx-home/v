@@ -5739,7 +5739,7 @@ fn vgc_update_trigger() {
 		// 2026-10-11T08:19:47Z: that scaling is bounded by the live set only
 		// after the cx-private#1910 cycle-cost work).
 		mut f := marked * 2
-		mut lo := vgc_several_floor_lo(marked, vgc_acct_threads)
+		mut lo := vgc_several_floor_lo(marked, vgc_small_live_threads_now())
 		if one {
 			lo = vgc_headroom_floor_lo1
 			if vgc_one_thread_small(marked) {
