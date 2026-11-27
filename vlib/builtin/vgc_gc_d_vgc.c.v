@@ -5799,6 +5799,7 @@ fn vgc_update_trigger() {
 		if hr_max > vgc_heap_soft_limit {
 			hr_max = vgc_heap_soft_limit
 		}
+		flat_max := hr_max
 		if vgc_headroom_live_pct > 0 {
 			mut live_cap := marked * vgc_headroom_live_pct / 100
 			if one && vgc_one_thread_small(marked) {
@@ -5873,6 +5874,9 @@ fn vgc_update_trigger() {
 			if hr_max > live_cap {
 				hr_max = live_cap
 			}
+		}
+		if climb && vgc_climb_past_live {
+			hr_max = flat_max
 		}
 		hr = vgc_climb_hr(hr, hr_max, climb)
 		if hr < hr_min {
