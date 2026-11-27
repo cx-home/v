@@ -575,12 +575,25 @@ fn vgc_tpool_batch_mul() int {
 	if vgc_tpool_batch_threads == 0 || t <= 1 {
 		return 1
 	}
+	// https://github.com/cx-home/cx-examples/issues/249: a few threads over a small live
+	// set keep the one-thread four (vgc_small_live; heap_marked is the last collection's,
+	// a racy hint) — the lock the batch answers is contended by many fast threads
+	// (vgc_pool_batch_threads_test: eight), and cx's four [par] workers over ~1 MB marked
+	// held its x16 stash in RSS
+	// (the threads that allocated since the last stop: a [par] parent waiting on its
+	// workers is live but does not allocate; before the first stop, the live count)
+	na := if vgc_acct_threads > 0 { vgc_acct_threads } else { t }
+	if na <= vgc_small_live_threads && vgc_small_live(C.vgc_atomic_load_u64(&vgc_heap.heap_marked)) {
+		return 1
+	}
 	m := 4 * t
 	return if m > vgc_tpool_batch_mul_max { vgc_tpool_batch_mul_max } else { m }
 }
 
 @[inline]
 fn vgc_tpool_batch(npages u32, allocated u64) int {
+	// https://github.com/cx-home/cx-examples/issues/249: under the small-live bound the
+	// one-thread four (vgc_small_live; heap_marked is the last collection's, a racy hint)
 	m := if allocated < vgc_tpool_batch_min { 1 } else { vgc_tpool_batch_mul() }
 	if npages <= 2 {
 		return 4 * m
@@ -1137,9 +1150,39 @@ __global vgc_headroom_adaptive_floor = true
 __global vgc_headroom_floor_lo = u64(4) * 1024 * 1024
 
 // vgc_several_floor_lo answers the low clamp of the several-thread adaptive floor
-// clamp(2 x marked, lo, live_floor) for a cycle that marked `marked` bytes.
+// clamp(2 x marked, lo, live_floor) for a cycle that marked `marked` bytes: a live set
+// under the small-live bound (vgc_small_live) takes half of vgc_headroom_floor_lo, never
+// under the one-thread clamp lo1 (https://github.com/cx-home/cx-examples/issues/249).
 fn vgc_several_floor_lo(marked u64) u64 {
+	if vgc_small_live(marked) {
+		half := vgc_headroom_floor_lo / 2
+		return if half < vgc_headroom_floor_lo1 { vgc_headroom_floor_lo1 } else { half }
+	}
 	return vgc_headroom_floor_lo
+}
+
+// The small-live bound (https://github.com/cx-home/cx-examples/issues/249): several
+// allocating threads over a live set under it (2 MB marked by the last collection) pay
+// for their threads in RSS the live set never needed. cx mandelbrot n=2000 [par 4]
+// keeps 0-1 MB marked: the 4 MB low clamp of the several-thread floor and the x16
+// stash batch (vgc_tpool_batch_mul) read 15.6-15.9 MB peak RSS against 10.5 MB for one
+// thread and Python 3.12's 13.41 MB (dev1/dev2 arm64, interpreted, md5 equal). Under
+// the bound the several-thread low clamp halves (2 MB), and at most six allocating
+// threads (vgc_small_live_threads) keep the one-thread batch: 13.4-13.7
+// MB at the same wall (dev1 x3, the knob arms VGC_HEADROOM_FLOOR_LO_MB=2 +
+// VGC_POOL_BATCH_THREADS=0; either alone read 14.8-15.2). The lock contention the batch
+// answers (cx-private#2040) is a heap of several MB live; a live set at or over the bound
+// keeps both as before. VGC_SMALL_LIVE_KB sets the bound (0: off, the head's pacing).
+__global vgc_small_live_bound = u64(2) * 1024 * 1024
+// The batch half applies to at most this many allocating threads: cx's [par 4] counts
+// five (the four workers and the interpreter thread that feeds them; VGC_GCTRACE=2
+// 'pace acct=4-5'), and the stash batch's lock contention grows with the threads
+// (vgc_pool_batch_threads_test's eight keep x16).
+const vgc_small_live_threads = 6
+
+@[inline]
+fn vgc_small_live(marked u64) bool {
+	return vgc_small_live_bound > 0 && marked < vgc_small_live_bound
 }
 // The low clamp of ONE allocating thread's floor, clamp(1 x marked, lo1,
 // live_floor) (cx-home/v#14, vgc_update_trigger), and the first collection's
@@ -2828,6 +2871,14 @@ pub fn vgc_init() {
 	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
 	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
 	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
+	// https://github.com/cx-home/cx-examples/issues/249: VGC_SMALL_LIVE_KB = the small-live bound (0: off)
+	sl_env := C.getenv(c'VGC_SMALL_LIVE_KB')
+	if sl_env != unsafe { nil } {
+		slk := C.atoll(sl_env)
+		if slk >= 0 {
+			vgc_small_live_bound = u64(slk) * 1024
+		}
+	}
 	// cx-private#2040: VGC_POOL_BATCH_MIN_KB = the bytes a thread allocates before its batch scales
 	bmin_env := C.getenv(c'VGC_POOL_BATCH_MIN_KB')
 	if bmin_env != unsafe { nil } {
