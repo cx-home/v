@@ -727,6 +727,22 @@ pub fn vgc_mark_held_selftest() u32 {
 		|| vgc_mark_plan_count(8, 1300 * us, ms, 87, 28, true, 0, huge, true) != 21 {
 		return 15
 	}
+	// https://github.com/cx-home/cx-private/issues/2040: a stop that holds more mutators
+	// than the free CPUs (every free core is a held mutator's) keeps its markers through
+	// the back-off — up to the plan before the target, never past it. json-codec 1 MB
+	// [par 56] on dev2 (28 cores, 58 held, 380-410 MB marked) marked each stop on two
+	// markers (the target of a lost probe from the start-up's small cycles, 32 cycles
+	// long: the whole run) — 56-69 ms of mark per stop, 12 stops, while the held cores
+	// idled. 20 held on 28 free still takes the target (case 10).
+	mb := u64(1024) * 1024
+	if vgc_mark_plan_count(8, 60 * ms, ms, 58, 28, true, 2, 380 * mb, true) != 8
+		|| vgc_mark_plan_count(8, 60 * ms, ms, 58, 28, true, 0, 380 * mb, true) != 8 {
+		return 17
+	}
+	// the floor bounds it: 30 held on 28 free over a 5 ms mark — the quarter (7)
+	if vgc_mark_plan_count(8, 5 * ms, ms, 30, 28, true, 2, big, true) != 7 {
+		return 18
+	}
 	return 0
 }
 
