@@ -5610,6 +5610,62 @@ pub fn vgc_flat_cap_mult_selftest() u32 {
 	return 0
 }
 
+// vgc_one_solo says whether this cycle is ONE allocating thread's for the lift and its carve allowance
+// (RULING 94-CARVE (b); vgc_one_lift_solo doc, vgc_d_vgc.c.v): the pacing's one/several decision says
+// one, or (`on`) at most one thread allocated since the stop before (nt, vgc_alloc_threads).
+fn vgc_one_solo(one bool, nt int, on bool) bool {
+	return one || (on && nt <= 1)
+}
+
+// vgc_one_lift_bound is a lifted one-thread pacer's bound, the carve allowance of RULING 94-CARVE (b):
+// clamp(pct % of the marked set, lo, hi) (vgc_one_lift_pct doc, vgc_d_vgc.c.v).
+fn vgc_one_lift_bound(marked u64, pct u64, lo u64, hi u64) u64 {
+	mut b := marked * pct / 100
+	if b < lo {
+		b = lo
+	}
+	if b > hi {
+		b = hi
+	}
+	return b
+}
+
+// vgc_one_solo_selftest pins vgc_one_solo and vgc_one_lift_bound
+// (bench/parallel-alloc/vgc_one_thread_solo_test.v): 0 = ok, else the number of the first failed case.
+pub fn vgc_one_solo_selftest() u32 {
+	// the pacing's one stays one
+	if !vgc_one_solo(true, 3, true) || !vgc_one_solo(true, 1, false) {
+		return 1
+	}
+	// cx put-docs: several by the pacing, one allocating thread by the count (nt=1, or 0: none
+	// past its first span since the stop before) — one for the allowance
+	if !vgc_one_solo(false, 1, true) || !vgc_one_solo(false, 0, true) {
+		return 2
+	}
+	// two allocating threads are several (cx-private#2040's workers, cx-core-code#297's [par])
+	if vgc_one_solo(false, 2, true) || vgc_one_solo(false, 28, true) {
+		return 3
+	}
+	// VGC_ONE_LIFT_SOLO=0: the pacing's decision alone
+	if vgc_one_solo(false, 1, false) {
+		return 4
+	}
+	mb := u64(1024 * 1024)
+	// the bound at the default: 4 MB marked (put-docs' mean) -> vgc_one_lift_pct % of it
+	if vgc_one_lift_bound(4 * mb, vgc_one_lift_pct, 4 * mb, 32 * mb) != 4 * mb * vgc_one_lift_pct / 100 {
+		return 5
+	}
+	// a 1 MB live set gets the 4 MB low clamp, not less
+	if vgc_one_lift_bound(mb, 200, 4 * mb, 32 * mb) != 4 * mb {
+		return 6
+	}
+	// never past the live floor (32 MB): the fixed floor cx-home/v#14 replaced is the ceiling
+	if vgc_one_lift_bound(20 * mb, 800, 4 * mb, 32 * mb) != 32 * mb {
+		return 7
+	}
+	return 0
+}
+
 pub fn vgc_one_lift_selftest() u32 {
 	// one reading over the line is not a lift (a noisy cycle)
 	r1, l1 := vgc_one_lift_next(0, false, true, true, false)
@@ -5791,11 +5847,14 @@ fn vgc_update_trigger() {
 		// ends the lift (the head's pacing until two unforced readings lift it again): the
 		// program asked for a collection, and a lift carried over from the cycles before
 		// it would leave the same 4 MB over the heap it just emptied.
+		// RULING 94-CARVE (b): ONE allocating thread this cycle (nt <= 1) is one for the lift and its
+		// allowance even where the pacing reads several (vgc_one_lift_solo doc, vgc_d_vgc.c.v)
+		solo := vgc_one_solo(one, nt, vgc_one_lift_solo)
 		if vgc_own_forced {
 			vgc_one_lift_runs, vgc_one_lifted = 0, false
 		} else {
 			vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs,
-				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
+				vgc_one_lifted, solo && vgc_one_thread_small(marked) && vgc_one_thread_lift
 				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap)
 		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
@@ -5879,14 +5938,9 @@ fn vgc_update_trigger() {
 			// by clamp(vgc_one_lift_pct x marked, vgc_headroom_floor_lo,
 			// vgc_headroom_live_floor), not the quarter: GOGC=200, the bounded carve
 			// allowance of RULING 94-CARVE (b) (vgc_one_lift_pct doc, vgc_d_vgc.c.v)
-			if vgc_one_lifted && one && vgc_one_thread_small(marked) {
-				mut lift := marked * vgc_one_lift_pct / 100
-				if lift < vgc_headroom_floor_lo {
-					lift = vgc_headroom_floor_lo
-				}
-				if lift > vgc_headroom_live_floor {
-					lift = vgc_headroom_live_floor
-				}
+			if vgc_one_lifted && solo && vgc_one_thread_small(marked) {
+				lift := vgc_one_lift_bound(marked, vgc_one_lift_pct, vgc_headroom_floor_lo,
+					vgc_headroom_live_floor)
 				if live_cap < lift {
 					live_cap = lift
 				}

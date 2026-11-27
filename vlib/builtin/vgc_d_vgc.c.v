@@ -1185,15 +1185,28 @@ __global vgc_one_thread_lift = true
 // RULING (OPERATOR) 94-CARVE (b), 07:45 ET 11-27 (https://github.com/cx-home/v/issues/94): the
 // bounded carve allowance for an expensive one-thread program. A lifted one-thread pacer (above:
 // two readings in a row over the band's tenth) may pace up to vgc_one_lift_pct % of its marked
-// set, clamp(pct x marked, vgc_headroom_floor_lo, vgc_headroom_live_floor) — GOGC=200 by default,
-// where the lift's GOGC=100 term left cx's put-docs (~4 MB live) at a 4 MB headroom and 3-7 % more
-// user CPU than VGC_HEADROOM_ADAPTIVE_FLOOR=0 (its 8-32 MB). The band still reaches it only by
-// doubling on readings over a tenth, and a reading under a fiftieth ends the lift; a cheap program
-// keeps the quarter and a heap over the live floor keeps Go's pacing. The bound is pinned by
-// vgc_one_thread_cost_test (d)/(e) and vgc_headroom_live_test (one costly thread over 8 MB live
-// <= 3.3x). The further question (a rule without a fixed allowance) is the Backlog issue
+// set, clamp(pct x marked, vgc_headroom_floor_lo, vgc_headroom_live_floor) (vgc_one_lift_bound) —
+// 4 x marked by default, where the lift's GOGC=100 term left cx's put-docs (~4 MB live, sawing
+// 1-19 MB with its batches) at 4 MB of headroom and 3-7 % more user CPU than
+// VGC_HEADROOM_ADAPTIVE_FLOOR=0 (its 8-32 MB). Sized on dev2 (timed x3, put-docs N=100000
+// B=2500, with vgc_one_lift_solo): at 2 x the kit that allocates less still read more collections
+// (attrs 100-115 against 91-101), at 4 x fewer (93-99 against 100-102); 8 x bought put-docs
+// nothing more and cost pi-digits 3000 its peak (23.8 MB against 19.6). The band still reaches
+// the bound only by doubling on readings over a tenth and a reading under a fiftieth ends the
+// lift; a cheap program keeps the quarter, a heap over the live floor keeps Go's pacing, and the
+// wall-clock band never lifts. Pinned by vgc_one_thread_cost_test (d)/(e), vgc_one_thread_solo_test
+// and vgc_headroom_live_test (one costly thread over 8 MB live: at most live + the 32 MB ceiling).
+// The further question (a rule without a fixed allowance) is the Backlog issue
 // https://github.com/cx-home/v/issues/95. VGC_ONE_LIFT_PCT=<n> (100: the lift before the ruling).
-__global vgc_one_lift_pct = u64(200)
+__global vgc_one_lift_pct = u64(400)
+// RULING 94-CARVE (b): the lift and its allowance read ONE allocating thread by this cycle's count
+// (vgc_alloc_threads: nt <= 1) as well as by the pacing's one/several decision. cx put-docs runs its
+// interpreter thread alone between stops (nt=1 at ~95 % of its stops), but its parquet workers' bursts
+// keep the pacing at several (vgc_pace_prev_window, vgc_pace_exit) for most of them, where the
+// adaptive floor is clamp(2 x marked, 4 MB, 32 MB) over a live set that saws 1-19 MB with its batches:
+// dev2 timed x5, 1.12-1.15 s user against VGC_HEADROOM_ADAPTIVE_FLOOR=0's 1.04-1.08 (attrs).
+// VGC_ONE_LIFT_SOLO=0: the pacing's decision alone.
+__global vgc_one_lift_solo = true
 __global vgc_one_lift_after = int(2)
 __global vgc_one_lift_runs = int(0)
 __global vgc_one_lifted = false
@@ -2876,6 +2889,10 @@ pub fn vgc_init() {
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {
 		vgc_one_thread_lift = false
+	}
+	ols_env := C.getenv(c'VGC_ONE_LIFT_SOLO')
+	if ols_env != unsafe { nil } && C.atoll(ols_env) == 0 {
+		vgc_one_lift_solo = false
 	}
 	olp_env := C.getenv(c'VGC_ONE_LIFT_PCT')
 	if olp_env != unsafe { nil } {
