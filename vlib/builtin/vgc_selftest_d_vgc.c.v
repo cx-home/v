@@ -1415,6 +1415,7 @@ pub fn vgc_small_live_several_selftest() u32 {
 		return 5
 	}
 	// six allocating threads over 1 MB marked ([par 4] and its feeder, with a margin): the one-thread four
+	vgc_heap.heap_marked = mb
 	vgc_acct_threads = 6
 	if vgc_tpool_batch(1, 8 * mb) != 4 {
 		return 7
