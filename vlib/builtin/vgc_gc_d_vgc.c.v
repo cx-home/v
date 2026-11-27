@@ -433,12 +433,17 @@ fn vgc_gc_start() {
 	// the true live set — so flush each thread's total-alloc stat and zero both
 	// deltas. Safe: the world is stopped, so no mutator is mid-update.
 	mut acct_threads := 0
+	mut pace_acct := 0
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
 			// cx-home/v#56: a thread that allocated vgc_acct_flush_min or more
 			// since the last stop counts toward the scaled flush
 			if vgc_cache(ci).gen_bytes + vgc_cache(ci).alloc_delta >= vgc_acct_flush_min {
 				acct_threads++
+			}
+			// https://github.com/cx-home/v/issues/94: the pacing decision's count (vgc_pace_acct)
+			if vgc_cache(ci).gen_bytes + vgc_cache(ci).alloc_delta >= vgc_pace_count_min_cur {
+				pace_acct++
 			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_flushed += vgc_cache(ci).alloc_delta
@@ -449,6 +454,8 @@ fn vgc_gc_start() {
 	}
 	vgc_acct_threads_prev = vgc_acct_threads
 	vgc_acct_threads = acct_threads
+	vgc_pace_acct_prev = vgc_pace_acct
+	vgc_pace_acct = pace_acct
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
 
 	// === Phase 4: Sweep ===
@@ -1971,12 +1978,17 @@ fn vgc_gc_start_concurrent() {
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.heap_marked, net)
 	mut acct_threads := 0
+	mut pace_acct := 0
 	for ci in 0 .. vgc_heap.ncaches {
 		unsafe {
 			// cx-home/v#56: a thread that allocated vgc_acct_flush_min or more
 			// since the last stop counts toward the scaled flush
 			if vgc_cache(ci).gen_bytes + vgc_cache(ci).alloc_delta >= vgc_acct_flush_min {
 				acct_threads++
+			}
+			// https://github.com/cx-home/v/issues/94: the pacing decision's count (vgc_pace_acct)
+			if vgc_cache(ci).gen_bytes + vgc_cache(ci).alloc_delta >= vgc_pace_count_min_cur {
+				pace_acct++
 			}
 			vgc_heap.total_alloc += vgc_cache(ci).alloc_delta
 			vgc_cache(ci).alloc_flushed += vgc_cache(ci).alloc_delta
@@ -1987,6 +1999,8 @@ fn vgc_gc_start_concurrent() {
 	}
 	vgc_acct_threads_prev = vgc_acct_threads
 	vgc_acct_threads = acct_threads
+	vgc_pace_acct_prev = vgc_pace_acct
+	vgc_pace_acct = pace_acct
 	C.vgc_atomic_store_u64(&vgc_heap.heap_live, marked)
 
 	// Sweep, stopped: no span is freed during the middle, so this is the STW
@@ -5676,11 +5690,12 @@ fn vgc_update_trigger() {
 	}
 	vgc_scale_last = nts
 	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
-	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev,
+	// https://github.com/cx-home/v/issues/94: counted at the budget's threshold (vgc_pace_acct doc)
+	counts_one := vgc_pace_one_thread(nt, vgc_pace_acct, vgc_pace_acct_prev,
 		int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_paced_one, u64(vgc_heap.gc_cycle))
 	// https://github.com/cx-home/cx-platform-store/issues/29: after several, k quiet stops in a
 	// row before the quarter comes back (vgc_pace_exit)
-	vgc_pace_quiet = vgc_pace_quiet_next(vgc_pace_quiet, nt, vgc_acct_threads)
+	vgc_pace_quiet = vgc_pace_quiet_next(vgc_pace_quiet, nt, vgc_pace_acct)
 	one := vgc_heap.gc_cycle == 0 || vgc_pace_exit(counts_one, vgc_paced_one, vgc_pace_quiet, vgc_pace_exit_stops)
 	vgc_paced_one = one
 	vgc_trace_pace_nt = nt
@@ -6021,6 +6036,13 @@ fn vgc_update_trigger() {
 		}
 	}
 	C.vgc_atomic_store_u64(&vgc_heap.next_gc, goal)
+	// https://github.com/cx-home/v/issues/94: the next stop counts the pacing's threads at this
+	// cycle's budget (vgc_pace_count_min)
+	if goal > marked {
+		vgc_pace_count_min_cur = vgc_pace_count_min(goal - marked)
+	} else {
+		vgc_pace_count_min_cur = vgc_pace_count_min(0)
+	}
 	// cx-home/v#56: the per-thread accounting flush follows the budget when
 	// more than one thread allocated 64 KB or more this cycle (vgc_acct_threads,
 	// counted at the stop's fold; alloc_gen's ~1 MB stamp misses a short pass's

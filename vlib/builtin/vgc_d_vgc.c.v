@@ -2939,6 +2939,14 @@ pub fn vgc_init() {
 		mw = vgc_max_markers
 	}
 	vgc_mark_workers_cfg = mw
+	// https://github.com/cx-home/v/issues/94: VGC_PACE_COUNT_DIV=0 = the fixed 64 KB pacing count
+	pcd_env := C.getenv(c'VGC_PACE_COUNT_DIV')
+	if pcd_env != unsafe { nil } {
+		pcd := C.atoll(pcd_env)
+		if pcd >= 0 {
+			vgc_pace_count_div = u64(pcd)
+		}
+	}
 	pexit_env := C.getenv(c'VGC_PACE_EXIT_STOPS')
 	if pexit_env != unsafe { nil } {
 		vgc_pace_exit_stops = int(C.atoll(pexit_env))
@@ -7923,6 +7931,78 @@ __global vgc_paced_one = true
 // quarter comes back (vgc_pace_exit; VGC_PACE_EXIT_STOPS, default 8; 2 or less is the counts' rule)
 __global vgc_pace_quiet = int(0)
 __global vgc_pace_exit_stops = int(8)
+// https://github.com/cx-home/v/issues/94: the pacing decision's own count of allocating threads
+// (vgc_pace_one_thread, vgc_pace_quiet_next): the threads that allocated vgc_pace_count_min or
+// more between the last two stops, and that count at the stop before. vgc_acct_threads counts at
+// a fixed 64 KB, and the budget a cycle gives its threads is the pacing's own answer: under the
+// quarter (a 1-2 MB budget over a 4-6 MB live set) a worker that allocates 2-4 % of the bytes stays
+// under 64 KB between stops, the run reads one thread and keeps the quarter; under GOGC=100 (a
+// 9 MB budget) the same worker crosses 64 KB and the run reads several. Which one a run fell into
+// decided cx's put-docs collections (cx-core-data 0ab46d60, ~4 MB live, the interpreter thread
+// and 2-4 parquet workers; dev2 VGC_GCTRACE=2 x3, same binary: one=1 in 10, 27, 45 of 110-133
+// cycles for one kit and 19, 32, 209 for the other — 209 of 219 at 3.8 MB of headroom, the
+// 130-180-collection runs), so the cheaper kit read more collections than its parent. The
+// threshold follows the budget instead: vgc_pace_count_min(budget) = budget /
+// vgc_pace_count_div (64: a thread with 1.6 % of the cycle's bytes), between 8 KB and 64 KB —
+// the same reading at either pacing. Only the pacing decision reads it; the flush, the per-thread
+// scaling and the stash batch keep vgc_acct_threads (a server's few threads over 64 KB, cx-home/v#62).
+// VGC_PACE_COUNT_DIV=0 counts at 64 KB, as the head.
+__global vgc_pace_acct = int(0)
+__global vgc_pace_acct_prev = int(0)
+__global vgc_pace_count_min_cur = u64(65536)
+__global vgc_pace_count_div = u64(64)
+const vgc_pace_count_lo = u64(8) * 1024
+
+// vgc_pace_count_min answers the bytes a thread allocates between two stops to count toward the
+// pacing decision when the cycle's budget (goal - marked) is `budget` (vgc_pace_acct doc).
+fn vgc_pace_count_min(budget u64) u64 {
+	if vgc_pace_count_div == 0 {
+		return vgc_acct_flush_min
+	}
+	mut t := budget / vgc_pace_count_div
+	if t < vgc_pace_count_lo {
+		t = vgc_pace_count_lo
+	}
+	if t > vgc_acct_flush_min {
+		t = vgc_acct_flush_min
+	}
+	return t
+}
+
+// vgc_pace_count_selftest checks vgc_pace_count_min (bench/parallel-alloc/vgc_pace_count_test.v):
+// 0 = ok, else the number of the first failed case.
+pub fn vgc_pace_count_selftest() u32 {
+	saved := vgc_pace_count_div
+	defer {
+		vgc_pace_count_div = saved
+	}
+	vgc_pace_count_div = 64
+	// the quarter's 1.5 MB budget: 24 KB, a worker with 1.6 % of the bytes counts
+	if vgc_pace_count_min(1536 * 1024) != 24 * 1024 {
+		return 1
+	}
+	// GOGC=100's 9 MB budget: the head's 64 KB
+	if vgc_pace_count_min(9 * 1024 * 1024) != 64 * 1024 {
+		return 2
+	}
+	// a 256 KB budget (json-codec 1 KB's floor): 8 KB, not 4
+	if vgc_pace_count_min(256 * 1024) != 8 * 1024 {
+		return 3
+	}
+	// a server's 256 MB budget: 64 KB
+	if vgc_pace_count_min(u64(256) * 1024 * 1024) != 64 * 1024 {
+		return 4
+	}
+	// the same share reads alike at both pacings: 2 % of 1.5 MB and of 3 MB both count
+	if u64(1536 * 1024 / 50) < vgc_pace_count_min(1536 * 1024) || u64(3072 * 1024 / 50) < vgc_pace_count_min(3072 * 1024) {
+		return 5
+	}
+	vgc_pace_count_div = 0
+	if vgc_pace_count_min(1536 * 1024) != 64 * 1024 {
+		return 6
+	}
+	return 0
+}
 // cx-home/v#62: the last cycle's pacing answer and stamp count, for VGC_GCTRACE's pace line
 __global vgc_trace_pace_nt = int(0)
 __global vgc_trace_pace_one = true
