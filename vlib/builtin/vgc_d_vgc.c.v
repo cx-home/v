@@ -1184,6 +1184,14 @@ __global vgc_mark_held_full = true
 // collections of a batch (an eighth: mean headroom 8.0-8.4 MB over a 10-11 MB peak, 89-93 cycles;
 // a sixteenth 9.1 MB, 81-83; the head 6.2-6.5 MB, 111-115); VGC_ONE_LIFT_DECAY=n sets 1/n.
 __global vgc_one_lift_peak_on = true
+// https://github.com/cx-home/v/issues/94: while lifted and under the live floor, the headroom is
+// timing-free — clamp(decaying peak of the marked set, vgc_headroom_floor_lo, vgc_headroom_live_floor)
+// on every cycle, one allocating thread or several — and a cheap reading no longer ends the lift (a
+// forced cycle still does). The overhead band above the peak doubled and halved it by the
+// mutator's timing, so the resting headroom followed the run: put-docs c8505ef4 caught 16-32 MB
+// that its cheaper child 0ab46d60 missed (dev2 11-27: 97-145 collections against 105-157 on the
+// same batches). VGC_ONE_LIFT_FLAT=0: the band, as before (vgc_one_thread_flat_test reads both).
+__global vgc_one_lift_flat = true
 __global vgc_one_lift_peak = u64(0)
 __global vgc_one_lift_decay = u64(16)
 
@@ -2829,6 +2837,10 @@ pub fn vgc_init() {
 	climb_env := C.getenv(c'VGC_HEADROOM_CLIMB')
 	if climb_env != unsafe { nil } && C.atoll(climb_env) == 0 {
 		vgc_headroom_climb = false
+	}
+	flat_env := C.getenv(c'VGC_ONE_LIFT_FLAT')
+	if flat_env != unsafe { nil } && C.atoll(flat_env) == 0 {
+		vgc_one_lift_flat = false
 	}
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {

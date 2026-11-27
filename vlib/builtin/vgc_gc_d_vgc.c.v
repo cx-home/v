@@ -5610,6 +5610,19 @@ pub fn vgc_flat_cap_mult_selftest() u32 {
 	return 0
 }
 
+// vgc_one_flat_hr is a lifted pacer's timing-free headroom (https://github.com/cx-home/v/issues/94):
+// the decaying peak of the marked set, clamped to [lo, hi].
+fn vgc_one_flat_hr(peak u64, lo u64, hi u64) u64 {
+	mut h := peak
+	if h < lo {
+		h = lo
+	}
+	if h > hi {
+		h = hi
+	}
+	return h
+}
+
 pub fn vgc_one_lift_selftest() u32 {
 	// one reading over the line is not a lift (a noisy cycle)
 	r1, l1 := vgc_one_lift_next(0, false, true, true, false)
@@ -5804,7 +5817,8 @@ fn vgc_update_trigger() {
 		} else {
 			vgc_one_lift_runs, vgc_one_lifted = vgc_one_lift_next(vgc_one_lift_runs,
 				vgc_one_lifted, one && vgc_one_thread_small(marked) && vgc_one_thread_lift
-				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap && marked * 2 >= peak)
+				&& vgc_headroom_adaptive_floor && cpu_read, expensive, cheap && marked * 2 >= peak
+				&& !(vgc_one_lift_flat && vgc_one_lifted))
 		}
 		// Ceiling = a flat, deliberately SMALL cap (see the vgc_headroom_cap doc:
 		// growing past it measured as pure space burn on every workload probed —
@@ -5908,6 +5922,11 @@ fn vgc_update_trigger() {
 		}
 		if hr > hr_max {
 			hr = hr_max
+		}
+		// https://github.com/cx-home/v/issues/94: lifted, under the live floor, the headroom is
+		// timing-free (vgc_one_lift_flat doc, vgc_d_vgc.c.v)
+		if vgc_one_lift_flat && vgc_one_lifted && vgc_one_thread_small(marked) && !vgc_own_forced {
+			hr = vgc_one_flat_hr(vgc_one_lift_peak, vgc_headroom_floor_lo, vgc_headroom_live_floor)
 		}
 		vgc_headroom = hr
 	}
