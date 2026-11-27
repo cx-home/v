@@ -251,12 +251,12 @@ fn test_one_allocating_thread_paces_to_twice_the_live_set() {
 	// RULING (OPERATOR) 94-CARVE (b), 07:45 ET 11-27 (https://github.com/cx-home/v/issues/94):
 	// the bounded carve allowance — on the collector's CPU clock one thread whose
 	// collections cost over a tenth of its time (marking 8 MB of nodes against a
-	// 4 KB churn) is lifted off the quarter and may pace up to GOGC=200, 2 x marked
-	// (vgc_one_lift_pct): live + 2 x live = ~3x, never the fixed floor's 32 MB over
-	// 8 MB (~5x). The 2.5x bar above (the band held up on the WALL clock, which never
-	// lifts) and the 2 MB-live bar (test_the_adaptive_floor_follows_a_tiny_live_set)
-	// are unchanged.
-	assert one_free <= 3.3, 'one costly allocating thread carved ${one_free:.3f}x over 8 MB live (the carve allowance bounds it at live + 2 x marked, ~3x; bar 3.3x)'
+	// 4 KB churn) is lifted off the quarter and may pace up to 4 x marked
+	// (vgc_one_lift_pct), never past the live floor (32 MB): live + 32 MB = ~5x over
+	// 8 MB, the fixed floor's carve, for an expensive program only. The 2.5x bar above
+	// (the band held up on the WALL clock, which never lifts) and the 2 MB-live bar
+	// (test_the_adaptive_floor_follows_a_tiny_live_set) are unchanged.
+	assert one_free <= 5.5, 'one costly allocating thread carved ${one_free:.3f}x over 8 MB live (the carve allowance bounds it at live + min(4 x marked, 32 MB), ~5x; bar 5.5x)'
 	assert four > one_free, 'four allocating threads carved ${four:.3f}x, not more than one thread ${one_free:.3f}x: the per-thread floor lost its 2 x marked base'
 }
 
