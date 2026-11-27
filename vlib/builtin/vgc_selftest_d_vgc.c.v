@@ -1414,5 +1414,11 @@ pub fn vgc_small_live_several_selftest() u32 {
 	if vgc_several_floor_lo(0) < vgc_headroom_floor_lo1 {
 		return 5
 	}
+	// eight allocating threads over 1 MB marked (vgc_pool_batch_threads_test's shape): x16, as before
+	vgc_heap.heap_marked = mb
+	vgc_acct_threads = 8
+	if vgc_tpool_batch(1, 8 * mb) != 4 * 16 {
+		return 6
+	}
 	return 0
 }
