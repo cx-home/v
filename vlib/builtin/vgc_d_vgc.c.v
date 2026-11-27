@@ -1984,6 +1984,8 @@ __global vgc_walk_backoff_len = int(32)
 // the next back-off's length: doubles per back-off up to 1024, resets to 32
 // after a parallel cycle that paid
 __global vgc_walk_ncpu = int(1)
+__global vgc_biglive_pct = u64(0) // INFO knob VGC_BIGLIVE_PCT (never land)
+__global vgc_biglive_bytes = u64(128) * 1024 * 1024 // INFO knob VGC_BIGLIVE_MB
 // online CPUs at init, for the load gate (vgc_box_busy)
 __global vgc_walk_load_gate = true
 // VGC_WALK_LOAD_GATE=0 switches the load gate off (measurement)
@@ -2880,6 +2882,14 @@ pub fn vgc_init() {
 	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
 	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
 	// https://github.com/cx-home/cx-examples/issues/249: VGC_SMALL_LIVE_KB = the small-live bound (0: off)
+	blp_env := C.getenv(c'VGC_BIGLIVE_PCT')
+	if blp_env != unsafe { nil } {
+		vgc_biglive_pct = u64(C.atoll(blp_env))
+	}
+	blm_env := C.getenv(c'VGC_BIGLIVE_MB')
+	if blm_env != unsafe { nil } {
+		vgc_biglive_bytes = u64(C.atoll(blm_env)) * 1024 * 1024
+	}
 	sl_env := C.getenv(c'VGC_SMALL_LIVE_KB')
 	if sl_env != unsafe { nil } {
 		slk := C.atoll(sl_env)

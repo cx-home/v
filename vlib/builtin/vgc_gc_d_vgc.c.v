@@ -5962,6 +5962,16 @@ fn vgc_update_trigger() {
 	if extra < vgc_headroom {
 		extra = vgc_headroom
 	}
+	// INFO knob (never land; https://github.com/cx-home/cx-examples/issues/249 binary-trees):
+	// VGC_BIGLIVE_PCT=P with VGC_BIGLIVE_MB=T — several threads, no more than the CPUs,
+	// over a live set of T MB or more: the goal is marked + P % of marked, whatever the band
+	if vgc_biglive_pct > 0 && !one && vgc_scale_last > 1 && vgc_scale_last <= vgc_walk_ncpu
+		&& marked >= vgc_biglive_bytes {
+		bx := marked * vgc_biglive_pct / 100
+		if extra > bx {
+			extra = bx
+		}
+	}
 	mut goal := marked + extra
 	// the grow gate's credit (cx-private#1916, vgc_d_vgc.c.v)
 	vgc_grow_gate_credit += vgc_grow_gate_rate_pct * 10
