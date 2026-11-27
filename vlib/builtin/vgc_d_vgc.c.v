@@ -1142,6 +1142,16 @@ __global vgc_one_thread_lift = true
 __global vgc_one_lift_after = int(2)
 __global vgc_one_lift_runs = int(0)
 __global vgc_one_lifted = false
+// https://github.com/cx-home/cx-private/issues/2040: past the core count the flat cap
+// (vgc_headroom_cap x ceil(threads / 4), at most x4: cx-home/v#16) scales with the allocating
+// threads per core, x ceil(4 x threads / cores) (vgc_flat_cap_mult). Every stop holds all the
+// allocating mutators, so with more of them than cores the cycle rate per thread climbs while
+// the cap stays flat and the stops dominate: cx's json-codec 1 MB at [par 56] on dev2 (28
+// cores, x4 = 256 MB) spent 842-932 ms of stop-the-world pause in a 1.23-1.28 s wall (Python
+// 3.12 Pool(56): 0.763 s at a 591-2,276 MB peak); at 384 MB of headroom 0.70 s / 1,019 MB, at
+// 512 (x8) 0.66 s / 1,264 MB. At and under the core count the x4 stays (k=28: ~490 MB peak
+// against Python's 519-1,228). VGC_HEADROOM_OVERSUB=0 keeps the x4 at any thread count.
+__global vgc_headroom_oversub = true
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2773,6 +2783,10 @@ pub fn vgc_init() {
 	}
 	if vgc_headroom_live_floor < vgc_headroom_min {
 		vgc_headroom_live_floor = vgc_headroom_min
+	}
+	oversub_env := C.getenv(c'VGC_HEADROOM_OVERSUB')
+	if oversub_env != unsafe { nil } && C.atoll(oversub_env) == 0 {
+		vgc_headroom_oversub = false
 	}
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {

@@ -5507,6 +5507,53 @@ fn vgc_one_lift_next(runs int, lifted bool, at_term bool, expensive bool, cheap 
 
 // vgc_one_lift_selftest checks vgc_one_lift_next (bench/parallel-alloc/vgc_one_thread_cost_test.v):
 // 0 = ok, else the number of the first failed case.
+// vgc_flat_cap_mult is the flat cap's multiplier for nts allocating threads on ncpu cores
+// (vgc_headroom_oversub doc, vgc_d_vgc.c.v): x ceil(nts / 4), at most x4 (cx-home/v#16); past
+// the core count (on four cores or more), when `oversub`, x ceil(4 x nts / ncpu).
+fn vgc_flat_cap_mult(nts int, ncpu int, oversub bool) u64 {
+	if nts <= 4 {
+		return 1
+	}
+	mut mult := u64((nts + 3) / 4)
+	if mult > 4 {
+		mult = 4
+	}
+	if oversub && ncpu >= 4 && nts > ncpu {
+		over := u64((4 * nts + ncpu - 1) / ncpu)
+		if over > mult {
+			mult = over
+		}
+	}
+	return mult
+}
+
+// vgc_flat_cap_mult_selftest checks vgc_flat_cap_mult (bench/parallel-alloc/vgc_flat_cap_oversub_test.v):
+// 0 = all hold, else the first failing check.
+pub fn vgc_flat_cap_mult_selftest() u32 {
+	if vgc_flat_cap_mult(1, 28, true) != 1 || vgc_flat_cap_mult(4, 28, true) != 1 {
+		return 1
+	}
+	if vgc_flat_cap_mult(8, 28, true) != 2 || vgc_flat_cap_mult(16, 28, true) != 4 {
+		return 2
+	}
+	if vgc_flat_cap_mult(28, 28, true) != 4 {
+		return 3 // at the core count: the x4 of cx-home/v#16
+	}
+	if vgc_flat_cap_mult(56, 28, true) != 8 || vgc_flat_cap_mult(29, 28, true) != 5 {
+		return 4 // past it: x ceil(4 x threads / cores)
+	}
+	if vgc_flat_cap_mult(56, 28, false) != 4 {
+		return 5 // VGC_HEADROOM_OVERSUB=0: x4 everywhere
+	}
+	if vgc_flat_cap_mult(20, 12, true) != 7 {
+		return 6
+	}
+	if vgc_flat_cap_mult(16, 2, true) != 4 || vgc_flat_cap_mult(16, 0, true) != 4 {
+		return 7 // under four cores (or none read): the x4 of cx-home/v#16
+	}
+	return 0
+}
+
 pub fn vgc_one_lift_selftest() u32 {
 	// one reading over the line is not a lift (a noisy cycle)
 	r1, l1 := vgc_one_lift_next(0, false, true, true, false)
@@ -5698,14 +5745,10 @@ fn vgc_update_trigger() {
 		if vgc_headroom_per_thread && vgc_heap.gc_cycle > 0 {
 			// cx-home/v#16: the threads that allocated this cycle scale the flat
 			// cap too — x ceil(nt / 4), at most x4 (eight threads: 128 MB; the
-			// reference, Python's multiprocessing, spends eight heaps).
-			if nts > 4 {
-				mut mult := u64((nts + 3) / 4)
-				if mult > 4 {
-					mult = 4
-				}
-				hr_max *= mult
-			}
+			// reference, Python's multiprocessing, spends eight heaps); past the
+			// core count x ceil(4 x nt / cores) (vgc_flat_cap_mult,
+			// https://github.com/cx-home/cx-private/issues/2040)
+			hr_max *= vgc_flat_cap_mult(nts, vgc_walk_ncpu, vgc_headroom_oversub)
 		}
 		if hr_max > vgc_heap_soft_limit {
 			hr_max = vgc_heap_soft_limit
