@@ -551,10 +551,22 @@ const vgc_tpool_max_pages = 10
 // threads, dev2). One thread
 // keeps the four; a stash returns to the pool at every stop
 // (vgc_tpool_drain_stw), so a batch holds spans for one cycle at most.
-// VGC_POOL_BATCH_THREADS=0 keeps the one-thread batch at any count.
+// Only a thread that has itself allocated vgc_tpool_batch_min bytes (1 MB, its
+// monotone count alloc_flushed + alloc_delta — the arena owner's rule,
+// vgc_arena_owner_me) takes the scaled batch: a short thread — a thread per
+// request that allocates a few KB and exits, or threads started together that
+// touch a few cold classes — keeps the one-thread four. The scaled batch from
+// any thread's first take carved 4,440 KB against
+// vgc_thread_exit_returns_spans_test's 3,596 KB bound (2,000 spawned threads)
+// on dev1 under its 8-job suite; a slow start per lock take read
+// vgc_cold_class_pack_five_test 16.0x against its 10x (each cold class's first
+// span is a take of its own, so the fifth class took x16).
+// VGC_POOL_BATCH_THREADS=0 keeps the one-thread batch at any count;
+// VGC_POOL_BATCH_MIN_KB sets the threshold (0: every thread scales).
 const vgc_tpool_batch_mul_max = 16
 
 __global vgc_tpool_batch_threads = u64(1)
+__global vgc_tpool_batch_min = u64(1024 * 1024)
 
 @[inline]
 fn vgc_tpool_batch_mul() int {
@@ -568,8 +580,8 @@ fn vgc_tpool_batch_mul() int {
 }
 
 @[inline]
-fn vgc_tpool_batch(npages u32) int {
-	m := vgc_tpool_batch_mul()
+fn vgc_tpool_batch(npages u32, allocated u64) int {
+	m := if allocated < vgc_tpool_batch_min { 1 } else { vgc_tpool_batch_mul() }
 	if npages <= 2 {
 		return 4 * m
 	}
@@ -2790,6 +2802,14 @@ pub fn vgc_init() {
 	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
 	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
 	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
+	// cx-private#2040: VGC_POOL_BATCH_MIN_KB = the bytes a thread allocates before its batch scales
+	bmin_env := C.getenv(c'VGC_POOL_BATCH_MIN_KB')
+	if bmin_env != unsafe { nil } {
+		bkb := C.atoll(bmin_env)
+		if bkb >= 0 {
+			vgc_tpool_batch_min = u64(bkb) * 1024
+		}
+	}
 	vgc_frag_gate_late_pct = vgc_env_pct(c'VGC_FRAG_GATE_LATE_PCT', vgc_frag_gate_late_pct)
 	cap_env := C.getenv(c'VGC_HEADROOM_MB')
 	if cap_env != unsafe { nil } {
@@ -4963,7 +4983,7 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32, kind u8) (&VGC_Span, bool
 	if first != unsafe { nil } {
 		cold := first.decommitted
 		vgc_pool_unlink(mut first)
-		want := vgc_tpool_batch(npages) - 1
+		want := vgc_tpool_batch(npages, c.alloc_flushed + c.alloc_delta) - 1
 		mut got := 0
 		for got < want {
 			mut more := vgc_pool_at(npages, vgc_kind_small)
@@ -4992,7 +5012,7 @@ fn vgc_get_free_span_cached(cache_idx int, npages u32, kind u8) (&VGC_Span, bool
 	// exact fit, 12 a short batch, 12 a stash the stop had drained). Only
 	// pooled runs are split; nothing is carved for the stash.
 	if span != unsafe { nil } {
-		want := vgc_tpool_batch(npages) - 1
+		want := vgc_tpool_batch(npages, c.alloc_flushed + c.alloc_delta) - 1
 		mut got := 0
 		for got < want {
 			mut cand, _ := vgc_pool_best_fit(npages, cap, vgc_kind_small)
@@ -6830,7 +6850,7 @@ fn vgc_span_alloc_once(npages_in u32, floor u32, may_wait bool) (&VGC_Span, bool
 		ci := C.vgc_get_cache_idx()
 		if ci >= 0 && ci < vgc_heap.ncaches {
 			mut c := unsafe { vgc_cache(ci) }
-			for _ in 1 .. vgc_tpool_batch(npages) {
+			for _ in 1 .. vgc_tpool_batch(npages, c.alloc_flushed + c.alloc_delta) {
 				base2, idx2 := vgc_arena_tail_take(nbytes, kind)
 				if base2 == 0 {
 					break
