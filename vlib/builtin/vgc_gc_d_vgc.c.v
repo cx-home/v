@@ -5908,6 +5908,22 @@ fn vgc_update_trigger() {
 					}
 				}
 			}
+			// INFO knob (https://github.com/cx-home/cx-examples/issues/249 binary-trees): VGC_BIG_LIVE_PCT=P — several
+			// threads over a live set at or over the live floor, the band cheap: the per-thread floor and the live cap
+			// stop at P % of marked (never under the live floor)
+			if vgc_big_live_pct > 0 && !one && nts > 1 && vgc_headroom_floor_capped
+				&& marked >= vgc_headroom_live_floor {
+				mut bc := marked * vgc_big_live_pct / 100
+				if bc < vgc_headroom_live_floor {
+					bc = vgc_headroom_live_floor
+				}
+				if floor > bc {
+					floor = bc
+				}
+				if live_cap > bc {
+					live_cap = bc
+				}
+			}
 			if live_cap < floor {
 				live_cap = floor
 			}
@@ -5949,7 +5965,12 @@ fn vgc_update_trigger() {
 	if lns > marked {
 		lns = marked
 	}
-	mut extra := (marked - lns) * gc_percent / 100
+	mut gcp := gc_percent
+	if vgc_big_live_pct > 0 && !one && vgc_scale_last > 1 && vgc_headroom_floor_capped
+		&& marked >= vgc_headroom_live_floor && vgc_big_live_pct < gcp {
+		gcp = vgc_big_live_pct
+	}
+	mut extra := (marked - lns) * gcp / 100
 	if vgc_large_noscan_pct < gc_percent {
 		extra += lns * vgc_large_noscan_pct / 100
 	} else {

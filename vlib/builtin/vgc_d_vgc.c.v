@@ -1098,6 +1098,8 @@ __global vgc_headroom_cap = u64(64 * 1024 * 1024)
 // (dev2, the same build): json-codec 1 MB peak 153 → 73 MB, 1 KB 88 → 47 MB.
 // VGC_HEADROOM_LIVE_PCT overrides (decimal; 0 removes the bound).
 __global vgc_headroom_live_pct = u64(100)
+// INFO knob VGC_BIG_LIVE_PCT (0: off), see vgc_update_trigger
+__global vgc_big_live_pct = u64(0)
 // The GOGC term over large pointer-free objects (https://github.com/cx-home/cx-private/issues/2052):
 // a large noscan span's object costs its mark one bit and its sweep one span,
 // whatever its size, so the goal grows by vgc_large_noscan_pct % of those bytes,
@@ -2839,6 +2841,10 @@ pub fn vgc_init() {
 	}
 	vgc_heap.gc_enabled = 1
 	vgc_heap.gc_percent = 100
+	bl_env := C.getenv(c'VGC_BIG_LIVE_PCT')
+	if bl_env != unsafe { nil } {
+		vgc_big_live_pct = u64(C.atoll(bl_env))
+	}
 	// INFO knob (https://github.com/cx-home/cx-examples/issues/249 binary-trees): VGC_GOGC = the GOGC term's percent
 	gogc_env := C.getenv(c'VGC_GOGC')
 	if gogc_env != unsafe { nil } {
