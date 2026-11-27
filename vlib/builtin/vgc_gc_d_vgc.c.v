@@ -5965,7 +5965,7 @@ fn vgc_update_trigger() {
 	// INFO knob (never land; https://github.com/cx-home/cx-examples/issues/249 binary-trees):
 	// VGC_BIGLIVE_PCT=P with VGC_BIGLIVE_MB=T — several threads, no more than the CPUs,
 	// over a live set of T MB or more: the goal is marked + P % of marked, whatever the band
-	if vgc_biglive_pct > 0 && !one && vgc_scale_last > 1 && vgc_scale_last <= vgc_walk_ncpu
+	if vgc_biglive_pct > 0 && ((!one && vgc_scale_last > 1) || vgc_biglive_one) && vgc_scale_last <= vgc_walk_ncpu
 		&& marked >= vgc_biglive_bytes {
 		bx := marked * vgc_biglive_pct / 100
 		if extra > bx {
