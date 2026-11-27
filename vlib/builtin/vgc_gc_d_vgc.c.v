@@ -3783,9 +3783,13 @@ fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide boo
 	// mark stays under the line and plans as before.
 	over := vgc_mark_held_over_line && line > 0 && work >= line
 	mut held_over := false
+	mut held_full := false
 	if free >= 2 && several && (marked >= vgc_headroom_floor_lo || over) {
 		floor = vgc_mark_held_floor(live, free)
 		held_over = over && marked < vgc_headroom_floor_lo
+		// https://github.com/cx-home/cx-private/issues/2040: more held mutators than free
+		// CPUs — every free core is a held mutator's, idle through the stop
+		held_full = vgc_mark_held_full && live > free
 	} else if work < line {
 		// under the several-thread floor (`marked`, a server's sub-MB mark) the stop
 		// plans as cx-home/v#56 did: a held stop under the line, four markers at most
@@ -3805,6 +3809,7 @@ fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide boo
 	if by_work < total {
 		total = by_work
 	}
+	pre := total
 	if target > 0 && target < total {
 		total = target
 		// the back-off (vgc_mark_adapt) judges a probe by its markers' CPU, but
@@ -3813,6 +3818,15 @@ fn vgc_mark_plan_count(cfg int, work u64, line u64, live int, free int, wide boo
 		// a 24 MB goal: one marker on 424 of 880 stops, cx-core-code#297)
 		if held_over && total < floor {
 			total = floor
+		}
+		// https://github.com/cx-home/cx-private/issues/2040: a stop holding more mutators
+		// than the free CPUs keeps the plan before the target, at most its held floor:
+		// the back-off saves the markers' CPU on a loaded box, and here the only load is
+		// the held mutators, whose cores idle through the stop either way. json-codec 1 MB
+		// [par 56] on dev2 (58 held, 380-410 MB marked) marked every stop on two markers
+		// (a lost start-up probe's 32-cycle target: the whole run), 56-69 ms of mark each.
+		if held_full && total < floor {
+			total = if pre < floor { pre } else { floor }
 		}
 	}
 	return if total < 1 { 1 } else { total }

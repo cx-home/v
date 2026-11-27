@@ -1160,6 +1160,10 @@ __global vgc_headroom_oversub = true
 // cycles, 587 ms of pause in 1.04-1.12 s; Python 3.12 Pool(56) 0.78 s); pinned at 384 MB, 9 cycles
 // and 0.70 s. A cheap reading still halves it. VGC_HEADROOM_CLIMB=0 keeps the doubling.
 __global vgc_headroom_climb = true
+// https://github.com/cx-home/cx-private/issues/2040: a stop that holds more mutators than the free
+// CPUs keeps its markers through the mark back-off (vgc_mark_plan_count). VGC_MARK_HELD_FULL=0: the
+// back-off's target caps it, as before.
+__global vgc_mark_held_full = true
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2795,6 +2799,10 @@ pub fn vgc_init() {
 	oversub_env := C.getenv(c'VGC_HEADROOM_OVERSUB')
 	if oversub_env != unsafe { nil } && C.atoll(oversub_env) == 0 {
 		vgc_headroom_oversub = false
+	}
+	mhf_env := C.getenv(c'VGC_MARK_HELD_FULL')
+	if mhf_env != unsafe { nil } && C.atoll(mhf_env) == 0 {
+		vgc_mark_held_full = false
 	}
 	climb_env := C.getenv(c'VGC_HEADROOM_CLIMB')
 	if climb_env != unsafe { nil } && C.atoll(climb_env) == 0 {
