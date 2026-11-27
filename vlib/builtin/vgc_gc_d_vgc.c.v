@@ -5415,13 +5415,15 @@ pub fn vgc_limit_selftest() u32 {
 // live set: goal 9 -> 17 MB, peak 28-44 MB against Python 3.12's 24.4). So the winner re-reads
 // the trigger against the goal the last cycle set, as Go's gcStart re-tests its trigger after
 // taking the start lock, and stands down when it is no longer met. A forced collection
-// (vgc_force_collect: gc_collect, the OOM retry) always runs; so does every call while one is in
-// flight (vgc_force_calls). VGC_PACE_RECHECK=0: the call runs, as before.
+// (vgc_force_collect: gc_collect, the OOM retry) sets vgc_force_full first and runs; when a
+// cycle that began after the request consumed the flag, that cycle was the one asked for (the
+// flag's own rule: beside a cycle in flight it holds for the next one). VGC_PACE_RECHECK=0: the
+// call runs, as before.
 fn vgc_pace_due() bool {
 	if !vgc_pace_recheck || vgc_heap.gc_cycle == 0 {
 		return true
 	}
-	if C.vgc_atomic_load_u64(&vgc_force_calls) != 0 || C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
+	if C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
 		return true
 	}
 	if C.vgc_atomic_load_u64(&vgc_heap.heap_live) >= C.vgc_atomic_load_u64(&vgc_heap.next_gc) {
