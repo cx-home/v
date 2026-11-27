@@ -1166,7 +1166,7 @@ __global vgc_headroom_climb = true
 __global vgc_mark_held_full = true
 // https://github.com/cx-home/v/issues/94: a lifted one-thread pacer sizes its headroom by the
 // marked set its program reaches, not the marked set of the last collection: a decaying peak, the
-// larger of this cycle's marked set and the last peak less an eighth (vgc_one_lift_decay), held
+// larger of this cycle's marked set and the last peak less a sixteenth (vgc_one_lift_decay), held
 // while the lift holds and reset to the marked set when it ends or a cycle is forced. cx's
 // put-docs keeps each batch of documents live until the batch is flushed, so its marked set at a
 // collection runs 1-13 MB by where in the batch the collection lands; at 1 x the marked set of the
@@ -1175,10 +1175,12 @@ __global vgc_mark_held_full = true
 // against its parent's 93-115, dev1 arm64). A steady live set reads its own marked set as the peak,
 // so v#14's bounds over a small live set (vgc_headroom_live_test) are unchanged; the lift stays
 // clamped to vgc_headroom_live_floor. VGC_ONE_LIFT_PEAK=0 sizes by the last marked set, as before
-// (vgc_one_thread_sawtooth_test reads both).
+// (vgc_one_thread_sawtooth_test reads both). A sixteenth holds a batch's peak across the 3-5
+// collections of a batch (an eighth: mean headroom 8.0-8.4 MB over a 10-11 MB peak, 89-93 cycles;
+// a sixteenth 9.1 MB, 81-83; the head 6.2-6.5 MB, 111-115); VGC_ONE_LIFT_DECAY=n sets 1/n.
 __global vgc_one_lift_peak_on = true
 __global vgc_one_lift_peak = u64(0)
-__global vgc_one_lift_decay = u64(8)
+__global vgc_one_lift_decay = u64(16)
 
 // vgc_one_thread_small says whether one allocating thread's percentage paces this cycle: while the
 // marked set is under the live floor (vgc_headroom_live_floor, 32 MB). The 50 % term exists for the
@@ -2830,6 +2832,10 @@ pub fn vgc_init() {
 	peak_env := C.getenv(c'VGC_ONE_LIFT_PEAK')
 	if peak_env != unsafe { nil } && C.atoll(peak_env) == 0 {
 		vgc_one_lift_peak_on = false
+	}
+	decay_env := C.getenv(c'VGC_ONE_LIFT_DECAY')
+	if decay_env != unsafe { nil } && C.atoll(decay_env) > 0 {
+		vgc_one_lift_decay = u64(C.atoll(decay_env))
 	}
 	af_env := C.getenv(c'VGC_HEADROOM_ADAPTIVE_FLOOR')
 	if af_env != unsafe { nil } && C.atoll(af_env) == 0 {
