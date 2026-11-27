@@ -158,6 +158,10 @@ fn vgc_gc_start() {
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
 		return
 	}
+	if !vgc_pace_due() {
+		C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
+		return
+	}
 	$if vgc_concurrent ? {
 		vgc_minor_this_cycle = minor // this cycle's kind, now that it is this thread's cycle
 		// one backoff cycle spent (after the CAS: every thread that reached the
@@ -1825,6 +1829,10 @@ fn vgc_cm_verify(self_idx int) {
 fn vgc_gc_start_concurrent() {
 	mut expected := vgc_phase_off
 	if !C.vgc_atomic_cas_u32(&vgc_heap.gc_phase, &expected, vgc_phase_mark) {
+		return
+	}
+	if !vgc_pace_due() {
+		C.vgc_atomic_store_u32(&vgc_heap.gc_phase, vgc_phase_off)
 		return
 	}
 	vgc_gc_owner = C.vgc_get_cache_idx()
@@ -5397,6 +5405,32 @@ pub fn vgc_limit_selftest() u32 {
 // 14+ workers over 64 KB at both stops ran under 32 MB of headroom (pace nt=0 acct=28), 17
 // more after one low reading; 183 ms of its 0.97 s stopped. A server's few threads over 64 KB
 // at a stop (2-7 of 87; vgc_pace_one_thread's doc) scale it by those few.
+// vgc_pace_due answers whether a collection whose phase CAS this thread just won is still due
+// (cx-core-code#133). A paced call (vgc_maybe_gc) read heap_live >= next_gc before it got here;
+// several threads read it at about the same moment, one wins the CAS and collects, and a thread
+// that read the trigger before that cycle's stop resumes after it and wins the CAS again — a
+// cycle with nothing allocated since the last (pace acct=0), whose few-microsecond interval the
+// overhead band read as the collector costing over 10 % of the mutators' time: the headroom
+// doubled and the per-thread floor uncapped (doubleselect 100000, 6 allocating threads, a 2 MB
+// live set: goal 9 -> 17 MB, peak 28-44 MB against Python 3.12's 24.4). So the winner re-reads
+// the trigger against the goal the last cycle set, as Go's gcStart re-tests its trigger after
+// taking the start lock, and stands down when it is no longer met. A forced collection
+// (vgc_force_collect: gc_collect, the OOM retry) always runs; so does every call while one is in
+// flight (vgc_force_calls). VGC_PACE_RECHECK=0: the call runs, as before.
+fn vgc_pace_due() bool {
+	if !vgc_pace_recheck || vgc_heap.gc_cycle == 0 {
+		return true
+	}
+	if C.vgc_atomic_load_u64(&vgc_force_calls) != 0 || C.vgc_atomic_load_u32(&vgc_force_full) != 0 {
+		return true
+	}
+	if C.vgc_atomic_load_u64(&vgc_heap.heap_live) >= C.vgc_atomic_load_u64(&vgc_heap.next_gc) {
+		return true
+	}
+	vgc_pace_stood_down++
+	return false
+}
+
 fn vgc_scale_threads(nt int, acct int, prev int, last int) int {
 	mut n := nt
 	if acct > 1 && prev > 1 {

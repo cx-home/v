@@ -1484,6 +1484,13 @@ __global vgc_minor_last_objs = u64(0)
 // cx-home/v#56 lever 9: the spans whose cards the last minor cycle read
 __global vgc_minor_last_visited = u64(0)
 __global vgc_force_full = u32(0)
+// cx-core-code#133: the forced collections in flight (vgc_force_collect); while one is, every
+// call that wins the phase CAS runs its cycle (vgc_pace_due)
+__global vgc_force_calls = u64(0)
+// cx-core-code#133: a paced call re-reads its trigger after it wins the phase CAS
+// (vgc_pace_due; VGC_PACE_RECHECK=0 off), and the calls that stood down
+__global vgc_pace_recheck = true
+__global vgc_pace_stood_down = u64(0)
 // cx-home/v#56 lever 10: the gate reads the card through the table of chunk
 // tables (vgc_chunk_cards in vgc_platform.h: one byte a page, 8,192 a 64 MB
 // chunk, found from the stored-into address by one shift) — any arena's,
@@ -2792,6 +2799,10 @@ pub fn vgc_init() {
 			vgc_headroom_min = vgc_base_floor
 			vgc_headroom_pinned = true
 		}
+	}
+	pr_env := C.getenv(c'VGC_PACE_RECHECK')
+	if pr_env != unsafe { nil } && C.atoll(pr_env) == 0 {
+		vgc_pace_recheck = false
 	}
 	trace_env := C.getenv(c'VGC_GCTRACE')
 	if trace_env != unsafe { nil } && C.atoll(trace_env) > 0 {
@@ -7806,6 +7817,10 @@ fn vgc_force_collect() {
 	// an explicit collection is a full cycle (cx-home/v#56 step 2); beside a
 	// cycle in flight the flag holds for the next one
 	C.vgc_atomic_store_u32(&vgc_force_full, 1)
+	C.vgc_atomic_add_u64(&vgc_force_calls, 1)
+	defer {
+		C.vgc_atomic_sub_u64(&vgc_force_calls, 1)
+	}
 	$if vgc_concurrent ? {
 		// cx-private#1910: a forced collection beside a cycle in flight waits
 		// for that cycle (its sweep is the reclaim the caller is after) instead
