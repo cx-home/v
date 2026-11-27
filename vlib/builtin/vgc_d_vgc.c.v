@@ -2939,6 +2939,14 @@ pub fn vgc_init() {
 		mw = vgc_max_markers
 	}
 	vgc_mark_workers_cfg = mw
+	// https://github.com/cx-home/v/issues/94: VGC_PACE_ENTER_WINDOW (stops; 0 or 1 = the head)
+	pew_env := C.getenv(c'VGC_PACE_ENTER_WINDOW')
+	if pew_env != unsafe { nil } {
+		pew := C.atoll(pew_env)
+		if pew >= 0 {
+			vgc_pace_enter_window = u64(pew)
+		}
+	}
 	pexit_env := C.getenv(c'VGC_PACE_EXIT_STOPS')
 	if pexit_env != unsafe { nil } {
 		vgc_pace_exit_stops = int(C.atoll(pexit_env))
@@ -7923,6 +7931,60 @@ __global vgc_paced_one = true
 // quarter comes back (vgc_pace_exit; VGC_PACE_EXIT_STOPS, default 8; 2 or less is the counts' rule)
 __global vgc_pace_quiet = int(0)
 __global vgc_pace_exit_stops = int(8)
+// https://github.com/cx-home/v/issues/94: the last stop past start-up that counted two or more threads over
+// 64 KB, and how many stops back such a reading still stands as 'the stop before' for entering several
+// (vgc_pace_prev_window; VGC_PACE_ENTER_WINDOW, default 16; 0 or 1 = the stop before only, as the head).
+__global vgc_pace_several_at = u64(0)
+__global vgc_pace_enter_window = u64(16)
+
+// vgc_pace_prev_window answers the `prev` count vgc_pace_one_thread reads at stop `cycle`: the stop
+// before's count, or 2 when a stop within the last `window` stops (not this one, not start-up) counted
+// two or more over 64 KB. https://github.com/cx-home/v/issues/94: cx's put-docs runs its interpreter
+// thread alone between stops and its 2-4 parquet workers in bursts that one stop reads (VGC_GCTRACE=2:
+// acct=4 live=5 once every ~7 stops, acct=1 live=2 between). Entering several took two such stops
+// running, which the quarter's short intervals never give, and leaving it takes 8 quiet stops
+// (vgc_pace_exit), which GOGC=100's long intervals never give: a run stayed in whichever pacing it
+// fell into — one=1 in 7-45 of 110-133 cycles in some runs, 130-209 of 143-219 in others, one binary
+// — and the kit that allocates less (cx-core-data 0ab46d60) read more collections than its parent
+// whenever it fell into the quarter. A burst that recurs within the window now enters several as
+// one that spans two stops did; a one-off burst (json-codec k=1's hand-over) still reads one.
+fn vgc_pace_prev_window(prev int, cycle u64, several_at u64, window u64) int {
+	if prev > 1 || window <= 1 || several_at == 0 || several_at >= cycle {
+		return prev
+	}
+	if cycle - several_at <= window {
+		return 2
+	}
+	return prev
+}
+
+// vgc_pace_window_selftest checks vgc_pace_prev_window and its reading through vgc_pace_one_thread
+// (bench/parallel-alloc/vgc_pace_window_test.v): 0 = ok, else the number of the first failed case.
+pub fn vgc_pace_window_selftest() u32 {
+	// put-docs: a burst 7 stops back and one now, the interpreter alone between: several
+	if vgc_pace_one_thread(1, 4, vgc_pace_prev_window(1, 107, 100, 16), 5, true, 107) {
+		return 1
+	}
+	// a one-off burst (json-codec k=1's hand-over): one; and one burst now with none in the window: one
+	if !vgc_pace_one_thread(1, 2, vgc_pace_prev_window(1, 500, 0, 16), 3, true, 500)
+		|| !vgc_pace_one_thread(1, 2, vgc_pace_prev_window(1, 500, 480, 16), 3, true, 500) {
+		return 2
+	}
+	// the stop before's own reading stands as before
+	if vgc_pace_prev_window(7, 500, 0, 16) != 7 || vgc_pace_prev_window(0, 500, 0, 16) != 0 {
+		return 3
+	}
+	// window 0 or 1: the head (the stop before only)
+	if vgc_pace_prev_window(1, 107, 100, 1) != 1 || vgc_pace_prev_window(1, 101, 100, 0) != 1 {
+		return 4
+	}
+	// the reading of this very stop is not its own stop before; the window's edge is inclusive
+	if vgc_pace_prev_window(1, 100, 100, 16) != 1 || vgc_pace_prev_window(1, 116, 100, 16) != 2
+		|| vgc_pace_prev_window(1, 117, 100, 16) != 1 {
+		return 5
+	}
+	return 0
+}
 // cx-home/v#62: the last cycle's pacing answer and stamp count, for VGC_GCTRACE's pace line
 __global vgc_trace_pace_nt = int(0)
 __global vgc_trace_pace_one = true

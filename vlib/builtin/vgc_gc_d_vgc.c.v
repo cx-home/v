@@ -5676,8 +5676,14 @@ fn vgc_update_trigger() {
 	}
 	vgc_scale_last = nts
 	// cx-home/v#62: one allocating thread is one by both counts (vgc_pace_one_thread)
-	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, vgc_acct_threads_prev,
-		int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_paced_one, u64(vgc_heap.gc_cycle))
+	// https://github.com/cx-home/v/issues/94: a burst within the window stands as the stop before
+	pcyc := u64(vgc_heap.gc_cycle)
+	pprev := vgc_pace_prev_window(vgc_acct_threads_prev, pcyc, vgc_pace_several_at, vgc_pace_enter_window)
+	counts_one := vgc_pace_one_thread(nt, vgc_acct_threads, pprev,
+		int(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_paced_one, pcyc)
+	if vgc_acct_threads > 1 && pcyc > 0 {
+		vgc_pace_several_at = pcyc
+	}
 	// https://github.com/cx-home/cx-platform-store/issues/29: after several, k quiet stops in a
 	// row before the quarter comes back (vgc_pace_exit)
 	vgc_pace_quiet = vgc_pace_quiet_next(vgc_pace_quiet, nt, vgc_acct_threads)
