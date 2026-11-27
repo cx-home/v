@@ -5876,10 +5876,11 @@ fn vgc_update_trigger() {
 				live_cap = floor
 			}
 			// https://github.com/cx-home/v/issues/94: a lifted one-thread pacer is bounded
-			// by Go's GOGC=100 term, clamp(1 x marked, vgc_headroom_floor_lo,
-			// vgc_headroom_live_floor) (cx-home/v#14, cx-private#1886), not the quarter
+			// by clamp(vgc_one_lift_pct x marked, vgc_headroom_floor_lo,
+			// vgc_headroom_live_floor), not the quarter: GOGC=200, the bounded carve
+			// allowance of RULING 94-CARVE (b) (vgc_one_lift_pct doc, vgc_d_vgc.c.v)
 			if vgc_one_lifted && one && vgc_one_thread_small(marked) {
-				mut lift := marked
+				mut lift := marked * vgc_one_lift_pct / 100
 				if lift < vgc_headroom_floor_lo {
 					lift = vgc_headroom_floor_lo
 				}

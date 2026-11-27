@@ -1182,6 +1182,18 @@ __global vgc_one_thread_pct = u64(25)
 // v#14 / v#56 cases) keeps the quarter as before. VGC_ONE_THREAD_LIFT=0
 // restores the head's pacing (vgc_one_thread_cost_test reads both).
 __global vgc_one_thread_lift = true
+// RULING (OPERATOR) 94-CARVE (b), 07:45 ET 11-27 (https://github.com/cx-home/v/issues/94): the
+// bounded carve allowance for an expensive one-thread program. A lifted one-thread pacer (above:
+// two readings in a row over the band's tenth) may pace up to vgc_one_lift_pct % of its marked
+// set, clamp(pct x marked, vgc_headroom_floor_lo, vgc_headroom_live_floor) — GOGC=200 by default,
+// where the lift's GOGC=100 term left cx's put-docs (~4 MB live) at a 4 MB headroom and 3-7 % more
+// user CPU than VGC_HEADROOM_ADAPTIVE_FLOOR=0 (its 8-32 MB). The band still reaches it only by
+// doubling on readings over a tenth, and a reading under a fiftieth ends the lift; a cheap program
+// keeps the quarter and a heap over the live floor keeps Go's pacing. The bound is pinned by
+// vgc_one_thread_cost_test (d)/(e) and vgc_headroom_live_test (one costly thread over 8 MB live
+// <= 3.3x). The further question (a rule without a fixed allowance) is the Backlog issue
+// https://github.com/cx-home/v/issues/95. VGC_ONE_LIFT_PCT=<n> (100: the lift before the ruling).
+__global vgc_one_lift_pct = u64(200)
 __global vgc_one_lift_after = int(2)
 __global vgc_one_lift_runs = int(0)
 __global vgc_one_lifted = false
@@ -2864,6 +2876,13 @@ pub fn vgc_init() {
 	lift_env := C.getenv(c'VGC_ONE_THREAD_LIFT')
 	if lift_env != unsafe { nil } && C.atoll(lift_env) == 0 {
 		vgc_one_thread_lift = false
+	}
+	olp_env := C.getenv(c'VGC_ONE_LIFT_PCT')
+	if olp_env != unsafe { nil } {
+		olp := C.atoll(olp_env)
+		if olp > 0 {
+			vgc_one_lift_pct = u64(olp)
+		}
 	}
 	af_env := C.getenv(c'VGC_HEADROOM_ADAPTIVE_FLOOR')
 	if af_env != unsafe { nil } && C.atoll(af_env) == 0 {
