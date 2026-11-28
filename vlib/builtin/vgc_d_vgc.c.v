@@ -2912,6 +2912,8 @@ pub fn vgc_init() {
 	vgc_owner_stash_on = vgc_env_pct(c'VGC_OWNER_STASH', vgc_owner_stash_on)
 	// cx-private#2040: VGC_POOL_BATCH_THREADS=0 keeps the one-thread stash batch at any thread count
 	vgc_tpool_batch_threads = vgc_env_pct(c'VGC_POOL_BATCH_THREADS', vgc_tpool_batch_threads)
+	// https://github.com/cx-home/cx-examples/issues/249: VGC_COLD_SHARED_THREADS = the live mutators from which slow threads share every class span (0: off)
+	vgc_cold_shared_threads = vgc_env_pct(c'VGC_COLD_SHARED_THREADS', vgc_cold_shared_threads)
 	// https://github.com/cx-home/cx-examples/issues/249: VGC_BIG_LIVE_PCT = the big-live goal's percent (0: off), VGC_BIG_LIVE_MB its bound
 	blp_env := C.getenv(c'VGC_BIG_LIVE_PCT')
 	if blp_env != unsafe { nil } {
@@ -7656,12 +7658,29 @@ fn vgc_cold_set(mut c VGC_Cache, sc int, n u8) {
 // class is warm.
 const vgc_cold_min_threads = u32(5)
 
-// https://github.com/cx-home/cx-examples/issues/249 (mandelbrot 16000 under [par], 28 workers):
-// vgc_cold_shared answers whether every class stays on its shared span — the head: never.
+// https://github.com/cx-home/cx-examples/issues/249: with this many live mutators or more
+// and no thread past the accounting flush at this stop or the one before (vgc_acct_threads,
+// vgc_acct_threads_prev: the threads that allocated vgc_acct_flush_min or more between two
+// stops), every class stays on the class's one shared span (vgc_cold_alloc) — a private
+// span a class a thread is a lock saved per span's objects, and threads this slow take the
+// shared span's lock a few thousand times a stop. cx mandelbrot 16000 under bare [par]: 28
+// workers over 0-2 MB marked, the pacer reading acct=0 at every stop, each worker warmed a
+// private 8 KB span in every class it touched (~13): 3.0 MB of spans cached in the slots
+// holding 0.64 MB of objects at a collection's end, 19.84 MB peak RSS against Python 3.12's
+// 13.39 MB (bar 14.06); shared, 16.7-17.8 MB at the same output, 5-15 % more wall at a
+// time ratio of 0.172 (dev2 arm64 interpreted). Allocating threads keep their private spans:
+// cx-private#2040's json-codec k=20 counts its workers at every stop, and one fast thread
+// among idle ones would make the shared span its lock. Fewer threads keep
+// cx-core-code#295's warm rule (vgc_cold_min_threads). VGC_COLD_SHARED_THREADS=0 = the head.
 __global vgc_cold_shared_threads = u64(8)
 
+// vgc_cold_shared answers whether every class stays on its shared span for `live` live
+// mutators with `acct` / `prev` threads past the accounting flush at the last two stops (racy
+// hints, read on the allocation slow path).
+@[inline]
 fn vgc_cold_shared(live u32, acct int, prev int) bool {
-	return false
+	return vgc_cold_shared_threads != 0 && u64(live) >= vgc_cold_shared_threads && acct == 0
+		&& prev == 0
 }
 
 fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
@@ -7669,13 +7688,30 @@ fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
 		return unsafe { nil }, unsafe { nil }
 	}
 	mut c := unsafe { vgc_cache(cache_idx) }
-	if unsafe { c.alloc[span_class] } != 0 || vgc_cold_count(c, span_class) >= vgc_cold_warm {
-		return unsafe { nil }, unsafe { nil }
+	live := C.vgc_atomic_load_u32(&vgc_heap.live_threads)
+	if vgc_cold_shared(live, vgc_acct_threads, vgc_acct_threads_prev) {
+		// https://github.com/cx-home/cx-examples/issues/249: every class on its shared span. A
+		// slot span with room serves first (vgc_cache_span_ready); a full one is dropped
+		// as vgc_cache_get_span drops it (B18: the sweep puts it back in circulation) and
+		// not refilled, so a warmed class drains back to the shared span.
+		cached := vgc_cache_span(c, span_class)
+		if cached != unsafe { nil } {
+			if cached.alloc_count < cached.nelems {
+				return unsafe { nil }, unsafe { nil }
+			}
+			unsafe {
+				c.alloc[span_class] = 0
+			}
+		}
+	} else {
+		if unsafe { c.alloc[span_class] } != 0 || vgc_cold_count(c, span_class) >= vgc_cold_warm {
+			return unsafe { nil }, unsafe { nil }
+		}
+		if live < vgc_cold_min_threads {
+			return unsafe { nil }, unsafe { nil }
+		}
+		vgc_cold_set(mut c, span_class, vgc_cold_count(c, span_class) + 1)
 	}
-	if C.vgc_atomic_load_u32(&vgc_heap.live_threads) < vgc_cold_min_threads {
-		return unsafe { nil }, unsafe { nil }
-	}
-	vgc_cold_set(mut c, span_class, vgc_cold_count(c, span_class) + 1)
 	central := unsafe { &vgc_heap.central[span_class] }
 	mut span := unsafe { &VGC_Span(nil) }
 	for {
