@@ -7656,6 +7656,14 @@ fn vgc_cold_set(mut c VGC_Cache, sc int, n u8) {
 // class is warm.
 const vgc_cold_min_threads = u32(5)
 
+// https://github.com/cx-home/cx-examples/issues/249 (mandelbrot 16000 under [par], 28 workers):
+// vgc_cold_shared answers whether every class stays on its shared span — the head: never.
+__global vgc_cold_shared_threads = u64(8)
+
+fn vgc_cold_shared(live u32, acct int, prev int) bool {
+	return false
+}
+
 fn vgc_cold_alloc(cache_idx int, span_class int) (voidptr, &VGC_Span) {
 	if cache_idx < 0 {
 		return unsafe { nil }, unsafe { nil }

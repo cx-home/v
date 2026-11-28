@@ -1489,3 +1489,105 @@ pub fn vgc_big_live_goal_selftest() u32 {
 	}
 	return 0
 }
+
+// https://github.com/cx-home/cx-examples/issues/249 (mandelbrot 16000 under bare [par]: 28 workers,
+// 0-2 MB marked, no thread allocating 64 KB between two stops — the pacer reads acct=0 at
+// every stop): each worker warmed its private span in every class it touched (~13 classes, one
+// 8 KB span each, ~20 % used at a collection's end): 3.0 MB of spans cached in the slots over
+// 2.1 MB marked, 19.84 MB peak RSS against Python 3.12's 13.39 MB (bar 14.06). With eight or
+// more live mutators and no thread past the accounting flush at this stop or the one before,
+// every class stays on the class's one shared span (vgc_cold_alloc) and a full private span is
+// dropped from its slot (B18) instead of refilled. Allocating threads (cx-private#2040's
+// json-codec k=20: acct = the workers) and fewer than eight threads (cx-core-code#295's
+// warm rule) keep their private spans. VGC_COLD_SHARED_THREADS=0 = the head.
+// bench/parallel-alloc/vgc_cold_shared_slow_threads_test.v drives it.
+pub fn vgc_cold_shared_selftest() u32 {
+	saved_n := vgc_cold_shared_threads
+	defer {
+		vgc_cold_shared_threads = saved_n
+	}
+	vgc_cold_shared_threads = 8
+	// 28 workers, nobody past the flush at this stop or the last: shared
+	if !vgc_cold_shared(28, 0, 0) {
+		return 1
+	}
+	// eight live threads, the bound: shared
+	if !vgc_cold_shared(8, 0, 0) {
+		return 2
+	}
+	// cx-private#2040's json-codec k=20: twenty allocating threads keep their spans
+	if vgc_cold_shared(28, 20, 20) {
+		return 3
+	}
+	// one fast thread among idle ones keeps its spans (its lock would be the shared span's)
+	if vgc_cold_shared(28, 1, 0) || vgc_cold_shared(28, 0, 1) {
+		return 4
+	}
+	// seven threads: the warm rule as before
+	if vgc_cold_shared(7, 0, 0) {
+		return 5
+	}
+	// the knob at 0: the head
+	vgc_cold_shared_threads = 0
+	if vgc_cold_shared(28, 0, 0) {
+		return 6
+	}
+	vgc_cold_shared_threads = 8
+	// the wiring, on this thread's slot: a warmed class (cold count at vgc_cold_warm) whose
+	// slot holds a full span carves from the shared span and drops the full one
+	ci := C.vgc_get_cache_idx()
+	if ci < 0 {
+		return 7
+	}
+	mut c := unsafe { vgc_cache(ci) }
+	sc := 2 * int(C.vgc_size_class(u32(3000))) + 1 // a noscan class this thread does not use
+	saved_slot := unsafe { c.alloc[sc] }
+	saved_count := vgc_cold_count(c, sc)
+	saved_live := C.vgc_atomic_load_u32(&vgc_heap.live_threads)
+	saved_acct := vgc_acct_threads
+	saved_prev := vgc_acct_threads_prev
+	defer {
+		unsafe {
+			c.alloc[sc] = saved_slot
+		}
+		vgc_cold_set(mut c, sc, saved_count)
+		C.vgc_atomic_store_u32(&vgc_heap.live_threads, saved_live)
+		vgc_acct_threads = saved_acct
+		vgc_acct_threads_prev = saved_prev
+	}
+	// a private span, filled
+	full := vgc_cache_get_span(ci, sc)
+	if full == unsafe { nil } {
+		return 8
+	}
+	for full.alloc_count < full.nelems {
+		if unsafe { vgc_span_alloc_obj(mut full) } == unsafe { nil } {
+			break
+		}
+	}
+	vgc_cold_set(mut c, sc, vgc_cold_warm)
+	C.vgc_atomic_store_u32(&vgc_heap.live_threads, 28)
+	vgc_acct_threads = 0
+	vgc_acct_threads_prev = 0
+	for i in 0 .. 64 {
+		p, sp := vgc_cold_alloc(ci, sc)
+		if p == unsafe { nil } || sp == unsafe { nil } || sp == full {
+			return 9 + u32(if i == 0 {
+				0
+			} else {
+				1
+			})
+		}
+	}
+	if unsafe { c.alloc[sc] } != 0 {
+		return 11
+	}
+	// twenty allocating threads: a warmed class takes no shared object
+	vgc_acct_threads = 20
+	vgc_acct_threads_prev = 20
+	p2, _ := vgc_cold_alloc(ci, sc)
+	if p2 != unsafe { nil } {
+		return 12
+	}
+	return 0
+}
