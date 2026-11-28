@@ -2073,6 +2073,7 @@ fn vgc_gctrace_emit() {
 		C.vgc_atomic_load_u64(&vgc_heap.next_gc), u64(vgc_heap.narenas), u64(vgc_heap.nspans),
 		u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)), vgc_headroom / 1024, pause_us,
 		vgc_heap.pool_bytes / 1024, vgc_heap.pool_trimmed_bytes / 1024, vgc_idle_defrag_merged_kb)
+	vgc_spanmap_emit()
 	// cx-home/v#62: at VGC_GCTRACE=2, the cycle's pacing answer and its inputs — the threads the
 	// ~1 MB stamp counted, the threads over 64 KB at this stop and the stop before, the live
 	// mutators, one thread or several (level 1 keeps one line per collection)
@@ -6492,4 +6493,144 @@ fn vgc_owner_stash_hand(self_idx int) {
 			vgc_own_tally[o] = 0
 		}
 	}
+}
+
+// INFO (never land; https://github.com/cx-home/cx-examples/issues/249 mandelbrot peak): VGC_SPANMAP=1 adds one
+// line a collection — the span pages by state, so a resident surplus over the live set names its holder.
+fn C.vgc__ws(s &char)
+fn C.vgc__wdec(v u64)
+
+__global vgc_spanmap = i32(-1)
+
+fn vgc_spanmap_kv(k &char, v u64) {
+	C.vgc__ws(k)
+	C.vgc__wdec(v)
+}
+
+@[markused]
+fn vgc_spanmap_emit() {
+	if vgc_spanmap < 0 {
+		e := C.getenv(c'VGC_SPANMAP')
+		vgc_spanmap = if e != unsafe { nil } { i32(C.atoi(e)) } else { 0 }
+	}
+	if vgc_spanmap == 0 {
+		return
+	}
+	// classify every span: cached (a thread slot's span or a class's shared span), on central,
+	// other in-use (dropped full / dropped partial), pooled (committed / decommitted), stashed
+	mut cached_p := u64(0)
+	mut cached_n := u64(0)
+	mut cached_used := u64(0)
+	mut cent_p := u64(0)
+	mut cent_used := u64(0)
+	mut other_p := u64(0)
+	mut other_used := u64(0)
+	mut large_p := u64(0)
+	mut large_n := u64(0)
+	mut pool_p := u64(0)
+	mut dec_p := u64(0)
+	mut idle_p := u64(0)
+	mut cls_p := [136]u64{}
+	// mark the cached spans by slot (allspans slot + 1 in alloc[])
+	mut cs := [8192]u32{}
+	mut ncs := 0
+	for ci in 0 .. vgc_heap.ncaches {
+		c := unsafe { vgc_cache(ci) }
+		if !c.registered {
+			continue
+		}
+		for sc in 0 .. 136 {
+			s := unsafe { c.alloc[sc] }
+			if s != 0 && ncs < 8192 {
+				cs[ncs] = s - 1
+				ncs++
+			}
+		}
+		for np in 1 .. 11 {
+			mut t := unsafe { c.tpool[np] }
+			for t != unsafe { nil } {
+				idle_p += u64(t.npages)
+				t = t.next
+			}
+		}
+	}
+	for sc in 0 .. 136 {
+		sh := unsafe { vgc_heap.central[sc].shared }
+		if sh != unsafe { nil } && ncs < 8192 {
+			cs[ncs] = sh.slot
+			ncs++
+		}
+	}
+	for i in 0 .. vgc_heap.nspans {
+		s := unsafe { vgc_heap.allspans[i] }
+		if s == unsafe { nil } {
+			continue
+		}
+		np := u64(s.npages)
+		if s.pooled {
+			if s.decommitted {
+				dec_p += np
+			} else {
+				pool_p += np
+			}
+			continue
+		}
+		if !s.in_use {
+			continue
+		}
+		used := u64(s.alloc_count) * u64(s.elem_size)
+		if s.class_idx == 0 {
+			large_p += np
+			large_n++
+			continue
+		}
+		sc := int(s.class_idx) * 2 + (if s.noscan { 1 } else { 0 })
+		if sc < 136 {
+			cls_p[sc] += np
+		}
+		mut hit := false
+		for k in 0 .. ncs {
+			if cs[k] == u32(i) {
+				hit = true
+				break
+			}
+		}
+		if hit {
+			cached_p += np
+			cached_n++
+			cached_used += used
+		} else if s.on_central != 0 {
+			cent_p += np
+			cent_used += used
+		} else {
+			other_p += np
+			other_used += used
+		}
+	}
+	kb := u64(vgc_page_size / 1024)
+	vgc_spanmap_kv(c'[spanmap ', u64(vgc_heap.gc_cycle))
+	vgc_spanmap_kv(c'] cachedKB=', cached_p * kb)
+	vgc_spanmap_kv(c' n=', cached_n)
+	vgc_spanmap_kv(c' usedKB=', cached_used / 1024)
+	vgc_spanmap_kv(c' centralKB=', cent_p * kb)
+	vgc_spanmap_kv(c' usedKB=', cent_used / 1024)
+	vgc_spanmap_kv(c' otherKB=', other_p * kb)
+	vgc_spanmap_kv(c' usedKB=', other_used / 1024)
+	vgc_spanmap_kv(c' largeKB=', large_p * kb)
+	vgc_spanmap_kv(c' n=', large_n)
+	vgc_spanmap_kv(c' poolKB=', pool_p * kb)
+	vgc_spanmap_kv(c' decommitKB=', dec_p * kb)
+	vgc_spanmap_kv(c' stashKB=', idle_p * kb)
+	vgc_spanmap_kv(c' marked=', C.vgc_atomic_load_u64(&vgc_heap.heap_marked) / 1024)
+	vgc_spanmap_kv(c'KB threads=', u64(C.vgc_atomic_load_u32(&vgc_heap.live_threads)))
+	if vgc_spanmap >= 2 {
+		C.vgc__ws(c' cls:')
+		for sc in 0 .. 136 {
+			if cls_p[sc] * kb >= 64 {
+				vgc_spanmap_kv(c' ', u64(sc))
+				vgc_spanmap_kv(c'=', cls_p[sc] * kb)
+			}
+		}
+	}
+	C.vgc__ws(c'\n')
 }
